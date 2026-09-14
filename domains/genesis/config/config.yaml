@@ -1,0 +1,49 @@
+envs:
+  # names: "go2walking-go2walkback"  # Environments to evaluate, separated by hyphens
+  names: "go2walking"
+  num_envs: 4096
+  env_kwargs:
+    seed: null
+  go2walking_kwargs:
+    lin_vel_x_range: [0.2, 0.8]  # Linear velocity range in x direction
+  go2walkback_kwargs:
+    lin_vel_x_range: [-0.2, -0.8]  # Linear velocity range in x direction
+  go2hop_kwargs: {}
+  add_camera: True
+  show_viewer: False # for headless mode
+
+utils:
+  root_dir: null
+
+tasks:
+  go2walking_tasks:
+    - "Go2WalkingCommand-v0/speed"    # Variations in forward speeds
+  go2walkback_tasks:
+    - "Go2WalkBackCommand-v0/speed"    # Variations in backward speeds
+  go2hop_tasks:
+    - "Go2HoppingCommand-v0/hop"    # Hopping on the spot with 2 feet
+
+task_description:
+  Go2WalkingCommand-v0: "Write a reward function that will guide the RL agent learn the following task:  Unitree Go2 robot dogs learn to walk forward according to the speed command."
+  Go2WalkBackCommand-v0: "Write a reward function that will guide the RL agent learn the following task:  Unitree Go2 robot dogs learn to walk backward according to the speed command."
+  Go2HoppingCommand-v0: "Write a reward function that will guide the RL agent learn the following task: Unitree Go2 robot dogs learn to jump as high as possible."
+
+eval:
+  output_dir: "results"  # Directory where evaluation results will be saved
+  run_id: null           # Unique identifier for the evaluation run; null uses a random UUID
+  resume_from: null      # Path to to the incomplete results file to resume an incomplete run
+  num_workers: 1        # Number of parallel workers. Increase for faster evaluation if you have enough resources
+  num_episodes:          # Minimum number of episodes to run for each environment. You can optionally increase this to get more reliable results
+    go2walking: 6        # Number of episodes for the 'go2walking' environment
+    go2walkback: 6        # Number of episodes for the 'go2walkback' environment
+    go2hop: 6            # Number of episodes for the 'go2hop' environment
+  max_steps_per_episode: null   # Max steps per episode; null uses the environment default
+
+
+rl_trainer:
+  # num_steps_per_env: 24 #  Steps collected per environment before policy update
+  max_iterations: 101 #  Maximum number of policy updates
+
+rl_eval:
+  max_steps: 1000 # 1000 steps × 0.02 seconds/step = 20 seconds during evaluation
+  record_video: False

@@ -1,0 +1,86 @@
+# GAN-style three-role self-evolution framework - loop / reward / gating config
+schema_version: v1
+
+# ---------------------------------------------------------------------------
+# 双循环调度
+# ---------------------------------------------------------------------------
+loop:
+  outer_generations: 2          # G: number of meta-level (outer) generations
+  inner_max: 3                  # I_max: max inner iterations per outer generation
+  stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
+  stagnation_epsilon: 0.005     # delta score threshold
+  trigger_outer_on_hard_failure: true
+
+# ---------------------------------------------------------------------------
+# task 树约束与父代选择
+# ---------------------------------------------------------------------------
+tree:
+  branch_limit: 2               # B: max children per node
+  depth_limit: 5                # D: max depth
+  selection: ucb                # ucb | score_child_prop | best | latest
+  ucb_c: 1.0                    # exploration constant
+  depth_penalty: 0.05           # penalty per unit depth
+  cost_penalty: 0.0             # penalty on normalized cost (0 disables)
+
+# ---------------------------------------------------------------------------
+# 算子预算（planner 每代）
+# ---------------------------------------------------------------------------
+operators:
+  max_ops_per_gen: 3            # N_op
+  max_code_edits_per_gen: 1     # gated source-code edits per generation
+
+# ---------------------------------------------------------------------------
+# 修改深度 / 源码门控（v1.1 修订）
+# ---------------------------------------------------------------------------
+source_access:
+  default_mode: config_and_ops  # default surface = config + operators
+  require_declaration: true     # source code only after explicit request
+  auto_approve: true            # v0: auto approve + full audit
+  workspace_src_dir: src        # granted source is copied into <workspace>/src
+  deny_paths: []                # glob blacklist
+
+# ---------------------------------------------------------------------------
+# 成本
+# ---------------------------------------------------------------------------
+cost:
+  token_budget_per_gen: 200000
+  record_usage: true
+
+# ---------------------------------------------------------------------------
+# evaluator 外循环奖励（v1.2 定稿）
+#   定位: 找 benchmark 看不到的问题（过程/作弊/细节/防过拟合），不拟合得分
+# ---------------------------------------------------------------------------
+evaluator_reward:
+  # (1) 采纳/修复 2x2 矩阵
+  matrix:
+    accepted_fixed: 2.0
+    accepted_unfixed: 1.0
+    rejected_with_feedback: -1.0
+    rejected_no_feedback: 2.0     # check step vindicates evaluator
+  # (2) 盲评校准: 先预测, 再揭示 benchmark
+  calibration:
+    enabled: true
+    mode: blind_then_reveal
+    weight: 1.0
+    error_scale: 1.0              # reward = -error_scale * |pred - actual|
+  # (3) 作弊检测误报惩罚
+  penalty:
+    reward_hacking_false_positive: -1.0
+    rule_violation_false_positive: -1.0
+
+# ---------------------------------------------------------------------------
+# 可见范围 / 反馈 schema
+# ---------------------------------------------------------------------------
+feedback:
+  schema_version: v1
+  planner_sees: textual_and_penalties      # planner 看到 evaluator 的评估理由
+  evaluator_sees: diff_summary_only        # evaluator 只收 diff 摘要(不收 rationale)
+  evaluator_sees_prev_feedback: true       # 内循环评估时可见上一轮反馈
+
+# ---------------------------------------------------------------------------
+# 模型（可被 .env 的 GAN_MODEL_* 覆盖）
+# ---------------------------------------------------------------------------
+models:
+  task: gpt-4o-mini
+  planner: gpt-4o-mini
+  evaluator: gpt-4o-mini

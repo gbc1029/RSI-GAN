@@ -1,0 +1,8 @@
+venv_nat/
+.git/
+_outputs/
+outputs/
+*.log
+__pycache__/
+*.pyc
+.env

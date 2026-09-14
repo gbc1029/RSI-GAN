@@ -1,0 +1,80 @@
+# Domain registry - migrated from utils/domain_utils.py
+# Resolution order for a domain name:
+#   1) exact match in `domains`
+#   2) longest prefix match in `families`
+#   3) `default`
+# Each entry is merged over `default`.
+#
+# Placeholders in numeric fractions are written as decimals.
+
+default:
+  score_key: null
+  splits: [train]
+  ensembled: false
+  eval_subset: ""
+  test_subset: ""
+  stagedeval_samples: 10
+  stagedeval_frac: 0.1
+  has_val_subset: false
+
+domains:
+  paper_review:
+    score_key: overall_accuracy
+    splits: [train, val]
+    ensembled: true
+    eval_subset: _filtered_100_train
+    test_subset: _filtered_100_test
+    stagedeval_samples: 10
+    stagedeval_frac: 0.1
+    has_val_subset: true
+
+  search_arena:
+    score_key: overall_accuracy
+    splits: [train, val]
+    ensembled: true
+    eval_subset: _filtered_100_train
+    test_subset: _filtered_100_test
+    stagedeval_samples: 10
+    stagedeval_frac: 0.1
+    has_val_subset: true
+
+  imo_grading:
+    score_key: overall_accuracy
+    splits: [train, val]
+    ensembled: true
+    eval_subset: _filtered_100_train
+    test_subset: _filtered_100_test
+    stagedeval_samples: 10
+    stagedeval_frac: 0.1
+    has_val_subset: true
+
+  polyglot:
+    score_key: accuracy_score
+    splits: [train]
+    ensembled: false
+    stagedeval_samples: 10
+    stagedeval_frac: 0.16666666666666666
+
+  imo_proof:
+    score_key: points_percentage
+    splits: [train]
+    ensembled: false
+    stagedeval_samples: 10
+    stagedeval_frac: 0.16666666666666666
+
+# family prefixes (longest match wins)
+families:
+  balrog:
+    score_key: average_progress
+    splits: [train]
+    ensembled: false
+    stagedeval_samples: 1
+    stagedeval_frac: 0.1            # default for babyai; minihack overrides below
+  balrog_minihack:
+    stagedeval_frac: 0.2
+  genesis:
+    score_key: average_fitness
+    splits: [train]
+    ensembled: false
+    stagedeval_samples: 3
+    stagedeval_frac: 0.5

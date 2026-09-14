@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# Secrets / environment files (NEVER commit)
+# ---------------------------------------------------------------------------
+.env
+*.env
+.env.*
+
+# ---------------------------------------------------------------------------
+# Python caches / build artifacts
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# Local virtualenvs
+# ---------------------------------------------------------------------------
+venv_nat/
+venv/
+venv_*/
+
+# ---------------------------------------------------------------------------
+# Generated outputs / logs
+# ---------------------------------------------------------------------------
+outputs/
+outputs_os/
+*.log
+
+# ---------------------------------------------------------------------------
+# Local-only verification / test scripts (kept on disk, not published)
+# ---------------------------------------------------------------------------
+scripts/local/
+
+# ---------------------------------------------------------------------------
+# Large datasets / external data (fetch or regenerate separately; see README)
+# ---------------------------------------------------------------------------
+domains/paper_review/dataset.csv
+domains/paper_review/dataset_filtered_100_*.csv
+domains/polyglot/polyglot-benchmark/
+domains/polyglot/SWE-bench/
+domains/polyglot/polyglot_benchmark_metadata.json
+domains/polyglot/logs/
+domains/*/logs/
+domains/*/predictions/
