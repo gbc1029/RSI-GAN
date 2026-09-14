@@ -12,9 +12,11 @@ A **GAN-inspired three-role self-evolution framework** built on top of
 
 The design and rationale are documented in:
 
+- [`docs/深入设计说明.md`](docs/深入设计说明.md) — deep design (loops, config/operators, versioning, isolation) with code locations.
 - [`docs/plan.md`](docs/plan.md) — full design + implementation plan.
 - [`docs/GAN实现记录.md`](docs/GAN实现记录.md) — implementation record (files, problems, fixes, minimal run).
 - [`docs/部署记录.md`](docs/部署记录.md) — deployment / environment record.
+- [`AGENTS.md`](AGENTS.md) — contributor/agent guide.
 
 > This repository also contains the original HyperAgents (DGM-H) codebase, which
 > the GAN framework reuses (archive/version trees, container harness, domain

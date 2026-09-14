@@ -41,7 +41,7 @@
 | `scripts/smoke_gan.py` | P0 冒烟测试（配置/注册表/reward/树/llm 钩子/自定义工具目录） |
 
 ### 2.2 改动文件
-
+ 
 | 文件 | 原功能 | 改动内容 | 原因 |
 |---|---|---|---|
 | `agent/llm.py` | litellm 封装；模型常量硬编码；backoff 仅捕 RequestException/JSONDecodeError/KeyError | ①新增 `GAN_MODEL_DEFAULT` 环境覆盖 `OPENAI_MODEL`；②新增 `USAGE_HOOKS`/`register_usage_hook`/`_run_usage_hooks`（每次调用后回调 usage 供成本核算）；③backoff 增补 `litellm.exceptions.RateLimitError` | 三角色用 glm；成本进 RewardPacket；实测 Zhipu 429 限流需重试 |
