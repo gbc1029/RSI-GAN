@@ -5,7 +5,7 @@ import importlib.util
 
 from domains.harness import get_dataset
 from domains.report import report
-from ensemble import ensemble
+from scripts.dgmh.ensemble import ensemble
 
 
 def get_ensemble_score(

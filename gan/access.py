@@ -10,7 +10,6 @@ Grants are audited to ``<output_dir>/events.jsonl`` and to the node metadata.
 """
 from __future__ import annotations
 
-import contextvars
 import fnmatch
 import json
 import os
@@ -18,26 +17,12 @@ import shutil
 import time
 from typing import Any, Dict, List, Optional
 
-_ACCESS_CTX: contextvars.ContextVar = contextvars.ContextVar("gan_access_ctx", default=None)
-
-
-class AccessContext:
-    def __init__(self, broker: "AccessBroker", role: str, node_id: Any):
-        self.broker = broker
-        self.role = role
-        self.node_id = node_id
-
-
-def set_access_context(broker: "AccessBroker", role: str, node_id: Any):
-    return _ACCESS_CTX.set(AccessContext(broker, role, node_id))
-
-
-def get_access_context() -> Optional[AccessContext]:
-    return _ACCESS_CTX.get()
-
-
-def reset_access_context(token) -> None:
-    _ACCESS_CTX.reset(token)
+from gan.context import (  # noqa: F401
+    AccessContext,
+    get_access_context,
+    reset_access_context,
+    set_access_context,
+)
 
 
 class AccessBroker:
@@ -97,16 +82,23 @@ class AccessBroker:
         if not self.auto_approve:
             raise PermissionError("source access requires approval (auto_approve=False)")
         granted: List[str] = []
+        denied_list: List[str] = []
+        missing: List[str] = []
         src_root = self.src_dir(role, node_id)
         for rel in paths or []:
             rel = str(rel).replace("\\", "/").lstrip("/")
-            if not rel or self._is_denied(rel):
+            if not rel:
+                continue
+            if self._is_denied(rel):
+                denied_list.append(rel)
                 continue
             try:
                 s = self._safe_join(self.repo_root, rel)
             except ValueError:
+                denied_list.append(rel)
                 continue
             if not os.path.exists(s):
+                missing.append(rel)
                 continue
             d = self._safe_join(src_root, rel)
             os.makedirs(os.path.dirname(d) or src_root, exist_ok=True)
@@ -121,6 +113,8 @@ class AccessBroker:
             "role": role,
             "node_id": str(node_id),
             "paths": granted,
+            "denied": denied_list,
+            "missing": missing,
             "intent": intent,
             "reason": reason,
             "ts": time.time(),
@@ -128,6 +122,8 @@ class AccessBroker:
         }
         self.grants.setdefault((role, str(node_id)), []).append(rec)
         self.log_event(rec)
+        # expose last result for the calling tool to report
+        self.last_result = {"granted": granted, "denied": denied_list, "missing": missing}
         return granted
 
     def granted_paths(self, role: str, node_id: Any) -> List[str]:

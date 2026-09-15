@@ -33,7 +33,7 @@ def build_diff_summary(
             entry["module_b"] = r.get("module_b")
         elif op == "add_config":
             entry["key"] = r.get("key")            # rationale intentionally stripped
-        elif op == "code_edit":
+        elif op in ("code_edit", "request_source_access"):
             entry["paths"] = list(r.get("paths", []) or [])  # reason intentionally stripped
             for p in r.get("paths", []) or []:
                 files.add(p)

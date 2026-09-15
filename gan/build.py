@@ -5,11 +5,23 @@ import os
 from typing import List, Optional
 
 from gan.access import AccessBroker
-from gan.config.loader import load_gan_loop_config
+from gan.framework.loader import load_gan_loop_config
+from gan.design import load_seed
+from gan.design.store import DesignStore
 from gan.loop import GanLoop
 from gan.roles.evaluator import Evaluator
 from gan.roles.planner import Planner
 from gan.task_runner import DomainTaskRunner
+
+
+def _seed_self_designs(output_dir: str) -> None:
+    """Seed planner/evaluator self-design prompts from the seed templates."""
+    store = DesignStore(os.path.join(output_dir, "design"))
+    for role in ("planner", "evaluator"):
+        cfg = store.load(role)
+        if not cfg.get("prompt"):
+            cfg["prompt"] = load_seed(role)
+        store.save(cfg, role)
 
 
 def build_gan_loop(
@@ -31,6 +43,9 @@ def build_gan_loop(
     p_model = planner_model or os.environ.get("GAN_MODEL_PLANNER") or cfg.get("models.planner", t_model)
     e_model = evaluator_model or os.environ.get("GAN_MODEL_EVALUATOR") or cfg.get("models.evaluator", t_model)
 
+    os.makedirs(output_dir, exist_ok=True)
+    _seed_self_designs(output_dir)
+
     planner = Planner(p_model, output_dir)
     evaluator = Evaluator(e_model, output_dir)
     runner = DomainTaskRunner(
@@ -41,5 +56,5 @@ def build_gan_loop(
         num_samples=num_samples,
         default_model=t_model,
     )
-    broker = AccessBroker(repo_root, output_dir)
+    broker = AccessBroker(repo_root, output_dir, deny_paths=cfg.get("source_access.deny_paths") or [])
     return GanLoop(output_dir, domains, cfg, planner, evaluator, runner, broker=broker)

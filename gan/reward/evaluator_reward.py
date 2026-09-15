@@ -1,45 +1,26 @@
-"""Evaluator outer-loop reward (v1.2).
+"""Evaluator feedback as TEXT (v2).
 
-Design
-------
-The evaluator exists to find problems that benchmark-only scoring cannot see
-(process quality, reward hacking, detail defects, overfitting). Its own reward
-therefore must NOT be "agree with the benchmark score", but measure the
-*accuracy and usefulness* of its judgement. It has three parts:
-
-1. Acceptance / Fix 2x2 matrix
-   - "accepted"  is decided by the *check step* from the planner's response.
-   - "fixed"     is judged by the evaluator from the trajectory / code
-                 (NOT merely "was there any change").
-   Matrix:
-       accepted   & fixed      -> accepted_fixed       (+2.0)
-       accepted   & not fixed  -> accepted_unfixed     (+1.0)
-       rejected   & feedback   -> rejected_with_feedback (-1.0)  # planner rebutted with reason
-       rejected   & no feedback-> rejected_no_feedback (+2.0)    # planner silently ignored -> evaluator vindicated
-
-2. Blind-score calibration
-   - In each inner round the evaluator first predicts the score *without*
-     seeing the benchmark objective score, then the benchmark score is
-     revealed. Calibration reward = -error_scale * |predicted - actual|.
-
-3. Cheat-detection false-positive penalty (reward_hacking / rule_violation).
+Design (agreed):
+- The evaluator finds problems benchmark-only scoring cannot see.
+- The planner's response ("accepted?/reason") and the evaluator's own fix verdict
+  are organised as a **qualitative label** (the old 2x2), NOT a weighted numeric
+  reward.
+- The evaluator receives a **text digest** of what happened to its issues, and
+  self-improves by narrative reflection over those digests. Blind-score
+  calibration is also expressed as text, not a reward term.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-DEFAULT_MATRIX: Dict[str, float] = {
-    "accepted_fixed": 2.0,
-    "accepted_unfixed": 1.0,
-    "rejected_with_feedback": -1.0,
-    "rejected_no_feedback": 2.0,
-}
+# Qualitative labels (diagnostic only; no numeric weights)
+CELL_ACCEPTED_FIXED = "accepted_fixed"
+CELL_ACCEPTED_UNFIXED = "accepted_unfixed"
+CELL_REJECTED_WITH_FEEDBACK = "rejected_with_feedback"
+CELL_REJECTED_NO_FEEDBACK = "rejected_no_feedback"
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
 @dataclass
 class EvaluatorIssue:
     issue_id: str
@@ -58,11 +39,7 @@ class PlannerResponse:
 
 @dataclass
 class FixVerdict:
-    """Judgement of whether an issue was actually fixed/improved.
-
-    ``judged_by`` should be "evaluator" (from trajectory/code), not a mere
-    "there was a diff" flag.
-    """
+    """Whether an issue was actually fixed/improved (judged from trajectory/code)."""
     issue_id: str
     fixed: bool
     evidence: str = ""
@@ -76,7 +53,6 @@ class IssueOutcome:
     has_feedback: bool
     fixed: bool
     cell: str
-    reward: float
     evidence: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -86,84 +62,36 @@ class IssueOutcome:
             "has_feedback": self.has_feedback,
             "fixed": self.fixed,
             "cell": self.cell,
-            "reward": self.reward,
             "evidence": self.evidence,
         }
 
 
-@dataclass
-class CalibrationRecord:
-    predicted_score: float
-    benchmark_score: float
-
-    @property
-    def error(self) -> float:
-        return abs(float(self.predicted_score) - float(self.benchmark_score))
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "predicted_score": self.predicted_score,
-            "benchmark_score": self.benchmark_score,
-            "error": self.error,
-        }
-
-
-@dataclass
-class EvaluatorReward:
-    issue_reward: float
-    calibration_reward: float
-    penalty_reward: float
-    total: float
-    outcomes: List[IssueOutcome] = field(default_factory=list)
-    calibration: Optional[Dict[str, Any]] = None
-    notes: List[str] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "issue_reward": self.issue_reward,
-            "calibration_reward": self.calibration_reward,
-            "penalty_reward": self.penalty_reward,
-            "total": self.total,
-            "outcomes": [o.to_dict() for o in self.outcomes],
-            "calibration": self.calibration,
-            "notes": self.notes,
-        }
-
-
 # ---------------------------------------------------------------------------
-# dict <-> dataclass converters (loop works with plain dicts)
+# dict <-> dataclass converters
 # ---------------------------------------------------------------------------
 def issues_from_dicts(items: Optional[List[Dict[str, Any]]]) -> List[EvaluatorIssue]:
-    out = []
-    for it in items or []:
-        out.append(EvaluatorIssue(**{k: v for k, v in it.items() if k in EvaluatorIssue.__dataclass_fields__}))
-    return out
+    return [EvaluatorIssue(**{k: v for k, v in it.items() if k in EvaluatorIssue.__dataclass_fields__})
+            for it in (items or [])]
 
 
 def responses_from_dicts(items: Optional[List[Dict[str, Any]]]) -> List[PlannerResponse]:
-    out = []
-    for it in items or []:
-        out.append(PlannerResponse(**{k: v for k, v in it.items() if k in PlannerResponse.__dataclass_fields__}))
-    return out
+    return [PlannerResponse(**{k: v for k, v in it.items() if k in PlannerResponse.__dataclass_fields__})
+            for it in (items or [])]
 
 
 def verdicts_from_dicts(items: Optional[List[Dict[str, Any]]]) -> List[FixVerdict]:
-    out = []
-    for it in items or []:
-        out.append(FixVerdict(**{k: v for k, v in it.items() if k in FixVerdict.__dataclass_fields__}))
-    return out
+    return [FixVerdict(**{k: v for k, v in it.items() if k in FixVerdict.__dataclass_fields__})
+            for it in (items or [])]
 
 
 # ---------------------------------------------------------------------------
-# 2x2 matrix classification
+# Qualitative classification (the old 2x2, now label-only)
 # ---------------------------------------------------------------------------
 def classify_issue(
     issue: EvaluatorIssue,
     response: Optional[PlannerResponse],
     verdict: Optional[FixVerdict],
-    matrix: Optional[Dict[str, float]] = None,
 ) -> IssueOutcome:
-    matrix = matrix or DEFAULT_MATRIX
     accepted = bool(response.accepted) if response is not None else False
     has_feedback = bool(
         response is not None and response.feedback and str(response.feedback).strip()
@@ -171,9 +99,9 @@ def classify_issue(
     fixed = bool(verdict.fixed) if verdict is not None else False
 
     if accepted:
-        cell = "accepted_fixed" if fixed else "accepted_unfixed"
+        cell = CELL_ACCEPTED_FIXED if fixed else CELL_ACCEPTED_UNFIXED
     else:
-        cell = "rejected_with_feedback" if has_feedback else "rejected_no_feedback"
+        cell = CELL_REJECTED_WITH_FEEDBACK if has_feedback else CELL_REJECTED_NO_FEEDBACK
 
     return IssueOutcome(
         issue_id=issue.issue_id,
@@ -181,130 +109,95 @@ def classify_issue(
         has_feedback=has_feedback,
         fixed=fixed,
         cell=cell,
-        reward=float(matrix.get(cell, 0.0)),
         evidence=(verdict.evidence if verdict is not None else ""),
     )
 
 
-# ---------------------------------------------------------------------------
-# Check step (runs inside the inner loop)
-# ---------------------------------------------------------------------------
 def run_check_step(
     issues: List[EvaluatorIssue],
     responses: Optional[List[PlannerResponse]] = None,
     verdicts: Optional[List[FixVerdict]] = None,
-    matrix: Optional[Dict[str, float]] = None,
 ) -> List[IssueOutcome]:
-    """Resolve acceptance (from planner response) + fix (from evaluator verdict).
+    """Resolve acceptance (planner response) + fix (evaluator verdict) per issue.
 
-    A missing planner response is treated as ``accepted=False, no feedback``
-    (i.e. silently ignored -> ``rejected_no_feedback``), which the check step
-    surfaces back to the evaluator.
+    A missing planner response is treated as "silently ignored"
+    (``rejected_no_feedback``).
     """
     by_response = {r.issue_id: r for r in (responses or [])}
     by_verdict = {v.issue_id: v for v in (verdicts or [])}
-    outcomes: List[IssueOutcome] = []
-    for issue in issues:
-        outcomes.append(
-            classify_issue(
-                issue,
-                by_response.get(issue.issue_id),
-                by_verdict.get(issue.issue_id),
-                matrix=matrix,
-            )
-        )
-    return outcomes
+    return [
+        classify_issue(issue, by_response.get(issue.issue_id), by_verdict.get(issue.issue_id))
+        for issue in issues
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Calibration
+# Text digest (what the evaluator receives / reflects on)
 # ---------------------------------------------------------------------------
-def compute_calibration_reward(
-    predicted_score: float,
-    benchmark_score: float,
-    error_scale: float = 1.0,
-) -> float:
-    return -float(error_scale) * abs(float(predicted_score) - float(benchmark_score))
+_LABEL_TEXT = {
+    CELL_ACCEPTED_FIXED: "accepted and actually fixed",
+    CELL_ACCEPTED_UNFIXED: "accepted but NOT fixed",
+    CELL_REJECTED_WITH_FEEDBACK: "rejected by planner with a reason",
+    CELL_REJECTED_NO_FEEDBACK: "silently ignored by planner",
+}
 
 
-# ---------------------------------------------------------------------------
-# Aggregate
-# ---------------------------------------------------------------------------
-def compute_evaluator_reward(
-    issues: List[EvaluatorIssue],
-    responses: Optional[List[PlannerResponse]] = None,
-    verdicts: Optional[List[FixVerdict]] = None,
+def build_feedback_digest(
+    issues: Optional[List[Dict[str, Any]]] = None,
+    responses: Optional[List[Dict[str, Any]]] = None,
+    verdicts: Optional[List[Dict[str, Any]]] = None,
     predicted_score: Optional[float] = None,
     benchmark_score: Optional[float] = None,
-    matrix: Optional[Dict[str, float]] = None,
-    calibration_cfg: Optional[Dict[str, Any]] = None,
-    penalties: Optional[Dict[str, Any]] = None,
-) -> EvaluatorReward:
-    """Compute the evaluator's outer-loop reward for one inner round."""
-    matrix = matrix or DEFAULT_MATRIX
-    calibration_cfg = calibration_cfg or {}
-    penalties = penalties or {}
+    diff_summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build a plain-text digest of what happened to the evaluator's issues.
 
-    outcomes = run_check_step(issues, responses, verdicts, matrix=matrix)
-    issue_reward = sum(o.reward for o in outcomes)
+    No scores/weights are attached to outcomes; the blind-vs-actual calibration
+    is also stated textually.
+    """
+    lines: List[str] = ["# Feedback digest for your previous issues"]
 
-    calibration_reward = 0.0
-    calibration_dict: Optional[Dict[str, Any]] = None
-    if (
-        calibration_cfg.get("enabled", True)
-        and predicted_score is not None
-        and benchmark_score is not None
-    ):
-        rec = CalibrationRecord(predicted_score, benchmark_score)
-        calibration_reward = compute_calibration_reward(
-            predicted_score,
-            benchmark_score,
-            error_scale=float(calibration_cfg.get("error_scale", 1.0)),
-        ) * float(calibration_cfg.get("weight", 1.0))
-        calibration_dict = rec.to_dict()
+    if predicted_score is not None or benchmark_score is not None:
+        p = "?" if predicted_score is None else predicted_score
+        b = "?" if benchmark_score is None else benchmark_score
+        if isinstance(predicted_score, (int, float)) and isinstance(benchmark_score, (int, float)):
+            delta = predicted_score - benchmark_score
+            lines.append(
+                f"- Blind prediction vs actual: you predicted {p}, actual was {b} "
+                f"(delta {delta:+.3f}). Reflect on the direction/magnitude of your bias."
+            )
+        else:
+            lines.append(f"- Blind prediction vs actual: predicted {p}, actual {b}.")
 
-    penalty_reward = 0.0
-    if penalties.get("reward_hacking_false_positive"):
-        penalty_reward += float(penalties.get("reward_hacking_false_positive", 0.0))
-    if penalties.get("rule_violation_false_positive"):
-        penalty_reward += float(penalties.get("rule_violation_false_positive", 0.0))
+    i_list = issues_from_dicts(issues)
+    outcomes = run_check_step(i_list, responses_from_dicts(responses), verdicts_from_dicts(verdicts))
+    if not outcomes:
+        lines.append("- (no issues were raised in that round)")
+    else:
+        responses_by_id = {r.get("issue_id"): r for r in (responses or [])}
+        issues_by_id = {it.get("issue_id"): it for it in (issues or [])}
+        for o in outcomes:
+            it = issues_by_id.get(o.issue_id, {})
+            resp = responses_by_id.get(o.issue_id, {})
+            lines.append(f"- issue {o.issue_id}: {it.get('description', '')}".rstrip())
+            lines.append(f"    outcome: {_LABEL_TEXT.get(o.cell, o.cell)}")
+            if resp:
+                fb = str(resp.get("feedback") or "").strip()
+                lines.append(
+                    f"    planner: accepted={bool(resp.get('accepted'))}" + (f", said: {fb}" if fb else "")
+                )
+            else:
+                lines.append("    planner: (no response)")
+            if o.evidence:
+                lines.append(f"    your evidence: {o.evidence}")
 
-    notes: List[str] = []
-    cells = {o.cell for o in outcomes}
-    if "rejected_no_feedback" in cells:
-        notes.append(
-            "check step found issue(s) silently ignored by planner (vindicates evaluator)"
-        )
-    if "rejected_with_feedback" in cells:
-        notes.append("planner rebutted with reason (negative signal for evaluator)")
+    if diff_summary:
+        ops = [o.get("op") for o in (diff_summary.get("ops") or [])]
+        files = diff_summary.get("files") or []
+        lines.append(f"- planner changes (sanitized): ops={ops or '[]'}, files={files or '[]'}")
 
-    return EvaluatorReward(
-        issue_reward=issue_reward,
-        calibration_reward=calibration_reward,
-        penalty_reward=penalty_reward,
-        total=issue_reward + calibration_reward + penalty_reward,
-        outcomes=outcomes,
-        calibration=calibration_dict,
-        notes=notes,
+    lines.append(
+        "- Reflect: were your issues valid and useful? Did you over/under-claim? "
+        "Refine your eval points / criteria accordingly."
     )
-
-
-# ---------------------------------------------------------------------------
-# Feedback rendering (shown to the evaluator on the next inner round)
-# ---------------------------------------------------------------------------
-def render_feedback(outcomes: List[IssueOutcome]) -> Dict[str, Any]:
-    """Render the check-step result into the feedback the evaluator sees next round."""
-    return {
-        "schema_version": "v1",
-        "issues": [
-            {
-                "issue_id": o.issue_id,
-                "cell": o.cell,
-                "accepted": o.accepted,
-                "fixed": o.fixed,
-                "reward": o.reward,
-                "evidence": o.evidence,
-            }
-            for o in outcomes
-        ],
-    }
+    return "\n".join(lines)

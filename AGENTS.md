@@ -13,8 +13,22 @@ Guidance for AI coding agents working in this repository.
   problems); self-improves.
 
 New framework code lives in `gan/`. The rest (`agent/`, `domains/`, `utils/`,
-`task_agent.py`, `meta_agent.py`, `generate_loop.py`, `Dockerfile`) is the
-HyperAgents base, reused with minimal adaptations.
+`task_agent.py`, `Dockerfile`) is the HyperAgents base, reused with minimal
+adaptations. DGM-H-only entry scripts (`generate_loop.py`, `meta_agent.py`,
+`run_meta_agent.py`, `run_task_agent.py`, `select_next_parent.py`, `ensemble.py`)
+live under `scripts/dgmh/`.
+
+## `gan/` layout (nature × mutability)
+
+- `gan/framework/` — **frozen**: `loop.yaml` (hyperparams), `domains.yaml`, `loader.py`.
+- `gan/context.py` — **frozen**: all contextvars (plan/eval/design/access).
+- `gan/tools/` — **always-on** callables: `work/<role>/` (work tools),
+  `design/` (shallow design operators), `deep/` (gated deep gate), `assembly.py`.
+- `gan/components/` — **opt-in** implementations: `shared/{skills,memory}/`,
+  `task/skills/`, `evaluator/eval_points/`.
+- `gan/registries/` — component catalog: `shared.json` + `<role>.json` + `loader.py`.
+- `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `composer.py`, `seeds/`.
+- `gan/roles/`, `gan/tree/`, `gan/reward/`, `gan/loop.py`, `gan/build.py`, `gan/task_runner.py`, `gan/access.py`.
 
 ## Setup
 
@@ -47,17 +61,28 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
 
 ## Conventions
 
-- Config over code: prefer `gan/config/*.yaml` (+ `Config.add_custom`) and
-  operators over editing source. Source edits require the gated path
-  (`request_source_access` / `code_edit`).
-- Operators are tools: a module under `gan/operators/{planner_ops,evaluator_ops}`
-  exposing `tool_info()` + `tool_function(**kwargs)`.
-- Session state travels via contextvars (`gan/operators/context.py`:
-  `PlanContext` / `EvalContext`), not function arguments.
+- **Shallow vs deep**: each agent's *shallow design* is a single config JSON in
+  `gan/design/` (selection from per-role registries). Shallow operators live in
+  `gan/tools/design/` and may only set **existing** keys or select **registered**
+  components. Adding a new key / new component / new implementation is a **deep**
+  change via the gated `gan/tools/deep/request_source_access`.
+- **Activation rule**: `always-on → gan/tools/`, `opt-in → gan/components/`
+  (registered in `gan/registries/` and selected by the design config).
+- **Frozen substrate**: the shared runtime (`agent/llm.py`, `agent/llm_withtools.py`,
+  `agent/base_agent.py`, `gan/framework/*`, `gan/context.py`) must NOT be modified
+  during evolution (trust anchor / anti-hacking). Enforced via
+  `gan/framework/loop.yaml: source_access.deny_paths`.
+- `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable.
+- **Work tools vs design operators**: evaluator scoring and planner
+  `respond_issue` are work tools (`gan/tools/work/`); design operators are in
+  `gan/tools/design/`.
+- Operators are tools: a module exposing `tool_info()` + `tool_function(**kwargs)`.
+- Session state travels via contextvars (`gan/context.py`), not function arguments.
 - Do not expose planner rationale/reason to the evaluator (use
   `gan/summary.py:build_diff_summary`).
-- Keep the evaluator honest: it must not fit the benchmark score (blind score
-  first, then reveal).
+- Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator
+  must not fit the benchmark score (blind score first, then reveal).
+- The task agent has **no always-on tools**; its capabilities are opt-in skills.
 
 ## Do NOT
 

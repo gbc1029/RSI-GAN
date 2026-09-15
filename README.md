@@ -28,17 +28,18 @@ The design and rationale are documented in:
 
 ```
 gan/                     # the GAN framework (new)
-  config/                #   yaml registries + prompts + loader
-  reward/                #   RewardPacket + evaluator reward (2x2 matrix + calibration)
-  tree/                  #   task/planner/evaluator version trees
-  operators/             #   planner operators + evaluator eval points (+ source-access gate)
-  roles/                 #   planner / evaluator roles
-  access.py              #   on-demand source-code access gating
-  loop.py build.py task_runner.py patch.py summary.py
+  framework/             #   frozen: loop.yaml + domains.yaml + loader
+  context.py             #   all contextvars (plan/eval/design/access)
+  tools/                 #   always-on: work/ + design/ (operators) + deep/ (gate) + assembly.py
+  components/            #   opt-in: shared/{skills,memory}, task/skills, evaluator/eval_points
+  registries/            #   component catalog (json) + loader
+  design/                #   shallow evolvable design (schema/store/composer/seeds)
+  roles/ tree/ reward/ access.py loop.py build.py task_runner.py patch.py summary.py
 scripts/run_gan.py       # GAN dual-loop CLI entry
+scripts/dgmh/            # DGM-H-only entry scripts (generate_loop/meta_agent/run_meta_agent/...)
 docs/                    # design / implementation / deployment docs
 agent/ domains/ utils/   # HyperAgents base code (reused)
-task_agent.py meta_agent.py generate_loop.py   # HyperAgents base
+task_agent.py            # the (design-driven) task agent
 Dockerfile               # HyperAgents container image
 ```
 
@@ -122,7 +123,7 @@ python -m domains.harness --domain paper_review --run_id demo --subset _filtered
 python -m domains.report  --domain paper_review --dname ./outputs/demo
 
 # full self-improvement loop (requires Docker + `hyperagents` image)
-python generate_loop.py --domains paper_review
+python scripts/dgmh/generate_loop.py --domains paper_review
 ```
 
 ## Data (excluded from this repo, fetch separately)

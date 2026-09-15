@@ -1,12 +1,13 @@
 """Concrete task runners.
 
 ``DomainTaskRunner`` runs the ORIGINAL DGM-H per-domain harness (``domains.harness``)
-+ ``domains.report`` for a generation and returns a task-tree ``Node`` with the
-benchmark score read from ``report.json``.
++ ``domains.report`` for a generation and returns a task-tree ``Node``.
 
-Default modification surface (config) is injected via the ``GAN_TASK_MODEL``
-environment variable, which ``domains/harness.py`` honours. Code patches
-(``code_edit``) are applied to a throwaway repo copy for that generation only.
+The task agent is **design-driven**: its design config (shallow, from the planner)
+is written via :class:`DesignStore` and passed to the harness through
+``GAN_TASK_DESIGN``; selected skills are exposed via ``GAN_TASK_SKILLS_DIR``.
+Deep changes (``code_edit``) are applied to a throwaway repo copy for that
+generation only.
 """
 from __future__ import annotations
 
@@ -17,8 +18,10 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional
 
-from gan.config.loader import load_registry, resolve_domain
+from gan.framework.loader import load_registry, resolve_domain
+from gan.design.store import DesignStore
 from gan.patch import apply_patch
+from gan.tools.assembly import assemble_tools_dir
 from gan.tree.store import Node, NodeValue
 
 _COPY_IGNORE = shutil.ignore_patterns(
@@ -27,14 +30,13 @@ _COPY_IGNORE = shutil.ignore_patterns(
 )
 
 _CODE_OPS = {"code_edit"}
-_CONFIG_ONLY_OPS = {"tune_param", "apply_config", "add_config"}
 
 
 def _modify_depth(records: List[Dict[str, Any]]) -> int:
     ops = {r.get("op") for r in records or []}
     if ops & _CODE_OPS:
         return 2
-    if ops - _CONFIG_ONLY_OPS:
+    if ops:
         return 1
     return 0
 
@@ -59,14 +61,17 @@ class DomainTaskRunner:
         self.default_model = default_model
         self.python = python or sys.executable
         self.timeout = timeout
+
         reg = load_registry()
         self.domain_cfg = resolve_domain(reg, domain)
         self.score_key = self.domain_cfg.get("score_key")
 
+        self.design_store = DesignStore(os.path.join(self.output_dir, "design"))
+
     # -- helpers -----------------------------------------------------------
     def _resolve_model(self, config: Any) -> str:
-        if config is not None:
-            m = config.get("models.task") or config.get("agent.model")
+        if isinstance(config, dict):
+            m = (config.get("params") or {}).get("model")
             if m:
                 return m
         return os.environ.get("GAN_TASK_MODEL") or self.default_model
@@ -85,17 +90,22 @@ class DomainTaskRunner:
         plan = plan or {}
         records = plan.get("records", []) or []
         config = plan.get("config")
+        if not isinstance(config, dict):
+            config = {}
         patch_str = plan.get("patch", "") or ""
 
         node_dir = os.path.join(self.output_dir, "nodes", str(genid))
         os.makedirs(node_dir, exist_ok=True)
-        if config is not None:
-            with open(os.path.join(node_dir, "config.json"), "w", encoding="utf-8") as f:
-                json.dump(config.to_dict(), f, ensure_ascii=False, indent=2)
+        design_path = self.design_store.save(config, "task", node_id=genid)
 
         model = self._resolve_model(config)
         env = os.environ.copy()
         env["GAN_TASK_MODEL"] = model
+        env["GAN_TASK_DESIGN"] = design_path
+        # assemble the task agent's opt-in skills for this node
+        skills_dir = os.path.join(node_dir, "skills")
+        assemble_tools_dir("task", skills_dir, config=config, include_always_on=False)
+        env["GAN_TASK_SKILLS_DIR"] = skills_dir
 
         run_dir = self.repo_root
         patch_applied = False
@@ -137,13 +147,14 @@ class DomainTaskRunner:
         return Node(
             genid=genid,
             parent_genid=(parent.genid if parent is not None else None),
-            curr_patch_files=[os.path.join(node_dir, "config.json")],
+            curr_patch_files=[design_path],
             value=NodeValue(score=score),
             scores={self.domain: score},
             modify_depth=_modify_depth(records),
             meta={
                 "run_dir": run_dir,
                 "report_path": report_path,
+                "design_path": design_path,
                 "harness_rc": rc,
                 "model": model,
                 "delta_vs_parent": delta,

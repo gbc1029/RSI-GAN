@@ -1,0 +1,50 @@
+"""DEEP gate: the single entry for source-level changes (gated + audited).
+
+Merges the former ``request_source_access`` (view/modify) and ``code_edit``
+operators: any change that is NOT expressible by shallow config/design operators
+(new config keys, new/edited component implementations, new operator logic)
+must go through here. Requested paths are copied into the role workspace
+``src/`` so they can then be edited with the ``editor``/``bash`` skills.
+"""
+from gan.context import get_access_context, get_design_context
+
+
+def tool_info():
+    return {
+        "name": "request_source_access",
+        "description": (
+            "DEEP change: request source access to VIEW or MODIFY the given paths. Use only "
+            "when shallow design/config operators cannot express the change (e.g. adding a new "
+            "config key, a new component implementation, or editing an implementation)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}},
+                "intent": {"type": "string", "enum": ["view", "modify"]},
+                "reason": {"type": "string"},
+            },
+            "required": ["paths", "reason"],
+        },
+    }
+
+
+def tool_function(paths=None, intent="view", reason="", **kwargs):
+    actx = get_access_context()
+    dctx = get_design_context()
+    if actx is None:
+        return "Error: no access context"
+    if isinstance(paths, str):
+        paths = [paths]
+    granted = actx.broker.grant(actx.role, actx.node_id, paths or [], intent=intent, reason=reason)
+    if dctx is not None:
+        dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)
+    denied = (getattr(actx.broker, "last_result", {}) or {}).get("denied", []) or []
+    msg = f"Granted {intent} access to: {granted or '[]'} (copied to workspace src/). Reason recorded."
+    if denied:
+        msg += f" DENIED (frozen substrate, cannot modify): {denied}."
+    return msg
+
+
+op_info = tool_info
+op_function = tool_function

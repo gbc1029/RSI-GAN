@@ -1,0 +1,108 @@
+"""Framework config loader (FRAMEWORK, frozen).
+
+Holds runtime hyperparameters and the domain registry. This is NOT part of any
+agent's evolvable design surface — it is invisible to evolution.
+"""
+from __future__ import annotations
+
+import copy
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+_CONFIG_DIR = Path(__file__).resolve().parent
+
+
+def config_dir() -> Path:
+    return _CONFIG_DIR
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+class Config:
+    """A thin, dict-backed config wrapper with dotted-path access."""
+
+    def __init__(self, data: Optional[Dict[str, Any]] = None):
+        self._data: Dict[str, Any] = data or {}
+
+    @classmethod
+    def from_yaml(cls, path: str | os.PathLike) -> "Config":
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return cls(data)
+
+    def get(self, dotted_key: str, default: Any = None) -> Any:
+        node: Any = self._data
+        for part in dotted_key.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def set(self, dotted_key: str, value: Any) -> None:
+        parts = dotted_key.split(".")
+        node = self._data
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+
+    def merge(self, override: Optional[Dict[str, Any]]) -> "Config":
+        return Config(_deep_merge(self._data, override or {}))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return copy.deepcopy(self._data)
+
+
+def load_gan_loop_config(overrides: Optional[Dict[str, Any]] = None) -> Config:
+    cfg = Config.from_yaml(_CONFIG_DIR / "loop.yaml")
+    return cfg.merge(overrides)
+
+
+def load_registry() -> Config:
+    """Domain registry (framework-level)."""
+    return Config.from_yaml(_CONFIG_DIR / "domains.yaml")
+
+
+def resolve_domain(registry: Config, domain: str) -> Dict[str, Any]:
+    """Resolve a domain config: exact ``domains`` > longest prefix ``families`` > ``default``."""
+    default = registry.get("default", {}) or {}
+    resolved = copy.deepcopy(default)
+
+    families = registry.get("families", {}) or {}
+    best_prefix = None
+    for prefix in families:
+        if domain == prefix or domain.startswith(prefix):
+            if best_prefix is None or len(prefix) > len(best_prefix):
+                best_prefix = prefix
+    if best_prefix is not None:
+        resolved = _deep_merge(resolved, families[best_prefix])
+
+    domains = registry.get("domains", {}) or {}
+    if domain in domains:
+        resolved = _deep_merge(resolved, domains[domain])
+
+    resolved["domain"] = domain
+    return resolved
+
+
+def list_registered_domains(registry: Config) -> List[str]:
+    return sorted((registry.get("domains", {}) or {}).keys())
+
+
+def validate(data: Dict[str, Any], schema: Dict[str, Any]) -> bool:
+    try:
+        import jsonschema  # type: ignore
+    except Exception:
+        return True
+    jsonschema.validate(instance=data, schema=schema)
+    return True

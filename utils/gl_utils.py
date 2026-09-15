@@ -361,7 +361,7 @@ def setup_initial_gen(
     if copy_root_dir is None and run_baseline and "dgm" in run_baseline:
         shutil.copyfile("./baselines/dgm/coding_agent.py", os.path.join(root_dir, "coding_agent.py"))
         os.remove(os.path.join(root_dir, "meta_agent.py"))
-        os.remove(os.path.join(root_dir, "run_meta_agent.py"))
+        os.remove(os.path.join(root_dir, "scripts", "dgmh", "run_meta_agent.py"))
 
     # Get commit hash
     commit_hash = commit_repo(root_dir)
@@ -626,7 +626,7 @@ def run_commands_to_check_compilation(container, run_baseline=None, edit_select_
             "300",  # 5m timeout
             "python",
             "-c",
-            "from meta_agent import MetaAgent",
+            "from scripts.dgmh.meta_agent import MetaAgent",
         ]
         exec_result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
         log_container_output(exec_result)
@@ -651,7 +651,7 @@ def run_commands_to_check_compilation(container, run_baseline=None, edit_select_
             "300",  # 5m timeout
             "python",
             "-c",
-            "from select_next_parent import select_next_parent",
+            "from scripts.dgmh.select_next_parent import select_next_parent",
         ]
         exec_result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
         log_container_output(exec_result)

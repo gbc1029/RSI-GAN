@@ -4,7 +4,7 @@ import json
 import sys
 
 from utils.gl_utils import load_archive_data
-from select_next_parent import select_next_parent
+from scripts.dgmh.select_next_parent import select_next_parent
 
 
 if __name__ == "__main__":

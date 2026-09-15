@@ -1,0 +1,10 @@
+{
+  "components": [
+    {"name": "bash", "kind": "skill", "module": "shared/skills/bash.py",
+     "description": "Run shell commands (re-export of agent/tools/bash).", "params_schema": {}},
+    {"name": "editor", "kind": "skill", "module": "shared/skills/editor.py",
+     "description": "View/create/edit files (re-export of agent/tools/edit).", "params_schema": {}},
+    {"name": "naive", "kind": "memory", "module": "shared/memory/naive.py",
+     "description": "Keep the last N messages.", "params_schema": {"max_items": "int"}}
+  ]
+}

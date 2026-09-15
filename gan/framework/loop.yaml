@@ -1,0 +1,75 @@
+# GAN-style three-role self-evolution framework - loop / reward / gating config
+schema_version: v1
+
+# ---------------------------------------------------------------------------
+# 双循环调度
+# ---------------------------------------------------------------------------
+loop:
+  outer_generations: 2          # G: number of meta-level (outer) generations
+  inner_max: 3                  # I_max: max inner iterations per outer generation
+  stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
+  stagnation_epsilon: 0.005     # delta score threshold
+  trigger_outer_on_hard_failure: true
+
+# ---------------------------------------------------------------------------
+# task 树/DAG 约束与父代选择
+# ---------------------------------------------------------------------------
+tree:
+  branch_limit: 2               # B: max children per node
+  depth_limit: 5                # D: max depth
+  num_parents: 1                # >1 enables crossover (DAG, shallow config merge)
+  selection: ucb                # ucb | best | latest
+  ucb_c: 1.0                    # exploration constant
+  depth_penalty: 0.05           # penalty per unit depth
+  cost_penalty: 0.0             # penalty on normalized cost (0 disables)
+
+# ---------------------------------------------------------------------------
+# 算子预算（planner 每代）
+# ---------------------------------------------------------------------------
+operators:
+  max_ops_per_gen: 3            # N_op
+  max_code_edits_per_gen: 1     # gated source-code edits per generation
+
+# ---------------------------------------------------------------------------
+# 修改深度 / 源码门控（v1.1 修订）
+# ---------------------------------------------------------------------------
+source_access:
+  default_mode: config_and_ops  # default surface = config + operators
+  require_declaration: true     # source code only after explicit request
+  auto_approve: true            # v0: auto approve + full audit
+  workspace_src_dir: src        # granted source is copied into <workspace>/src
+  # FROZEN substrate: shared runtime that agents must NOT modify (trust anchor).
+  deny_paths:
+    - "agent/llm.py"
+    - "agent/llm_withtools.py"
+    - "agent/base_agent.py"
+    - "gan/framework/*"
+    - "gan/context.py"
+
+# ---------------------------------------------------------------------------
+# 成本
+# ---------------------------------------------------------------------------
+cost:
+  token_budget_per_gen: 200000
+  record_usage: true
+
+# ---------------------------------------------------------------------------
+# evaluator 反馈（v2：文字化，无标量奖励）
+#   定位: 找 benchmark 看不到的问题（过程/作弊/细节/防过拟合），不拟合得分
+# ---------------------------------------------------------------------------
+feedback:
+  schema_version: v1
+  # 反馈以文字 digest 形式给出（issue -> planner 回应 -> 你的修复判定），不设数值权重
+  mode: text_digest
+  calibration: text             # 盲评偏差也以文字记录，不作奖励项
+  planner_sees: issues_and_diff_summary
+  evaluator_sees: diff_summary_and_digest
+  evaluator_sees_prev_feedback: true
+
+# ---------------------------------------------------------------------------
+# 模型（可被 .env 的 GAN_MODEL_* 覆盖）
+# ---------------------------------------------------------------------------
+models:
+  task: gpt-4o-mini
+  planner: gpt-4o-mini
+  evaluator: gpt-4o-mini

@@ -4,25 +4,23 @@ Outer loop = one meta generation (planner + evaluator self-improve).
 Inner loop = one task-agent generation (plan -> task run -> evaluate -> commit).
 
 Collaborators are duck-typed so the loop can be smoke-tested offline:
-    planner.plan(parent_summary, last_feedback, evaluator_issues, config, node_id, broker)
+    planner.plan(parent_summary, parents, last_feedback, evaluator_issues, config, node_id, broker)
         -> {"records": [...], "responses": [...], "config": Config, "patch": str}
     task_runner(plan, parent, genid) -> Node
     evaluator.evaluate(run_summary, prev_feedback, benchmark_score, node_id, broker) -> EvalContext-like
     planner.self_improve(recent) / evaluator.self_improve(recent)
+
+Evaluator feedback is TEXT (a digest), not a numeric reward.
 """
 from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
-from gan.config.loader import Config
-from gan.reward.evaluator_reward import (
-    compute_evaluator_reward,
-    issues_from_dicts,
-    responses_from_dicts,
-    verdicts_from_dicts,
-)
+from gan.design.schema import default_config
+from gan.reward.evaluator_reward import build_feedback_digest
 from gan.reward.packet import RewardPacket
 from gan.summary import build_diff_summary, make_feedback
 from gan.tree.store import Node, NodeValue, TreeStore
@@ -53,9 +51,10 @@ class GanLoop:
         self._gen_counter = self._max_int_genid() + 1
         # rolling state
         self._last_feedback: Optional[Dict[str, Any]] = None
+        self._last_digest: Optional[str] = None
         self._prev_predicted: Optional[float] = None
         self._prev_benchmark: Optional[float] = None
-        self._evaluator_rewards: List[Dict[str, Any]] = []
+        self._digests: List[str] = []
         self._advantages: List[float] = []
 
     # -- helpers -----------------------------------------------------------
@@ -75,6 +74,7 @@ class GanLoop:
     def _parent_summary(self, parent: Node) -> Dict[str, Any]:
         return {
             "genid": parent.genid,
+            "parents": parent.parents,
             "depth": parent.depth,
             "children": parent.children,
             "score": parent.value.score,
@@ -82,17 +82,14 @@ class GanLoop:
             "modify_depth": parent.modify_depth,
         }
 
-    def _initial_task_config(self) -> Config:
-        return Config({
-            "models": {"task": self.cfg.get("models.task", "gpt-4o-mini")},
-            "prompts": {},
-            "tools": {},
-            "custom": {},
-        })
+    def _initial_task_config(self) -> Dict[str, Any]:
+        cfg = default_config("task")
+        cfg.setdefault("params", {})["model"] = self.cfg.get("models.task", "gpt-4o-mini")
+        return cfg
 
-    def _parent_config(self, parent: Optional[Node]) -> Config:
+    def _parent_config(self, parent: Optional[Node]) -> Dict[str, Any]:
         cd = parent.meta.get("config_dict") if (parent is not None and parent.meta) else None
-        return Config(cd) if cd else self._initial_task_config()
+        return deepcopy(cd) if cd else self._initial_task_config()
 
     def _build_packet(self, child: Node, ctx: Any) -> RewardPacket:
         return RewardPacket(
@@ -110,40 +107,38 @@ class GanLoop:
             penalties=dict(getattr(ctx, "penalties", {}) or {}),
         )
 
-    def _calibration_cfg(self) -> Dict[str, Any]:
-        return {
-            "enabled": self.cfg.get("evaluator_reward.calibration.enabled", True),
-            "error_scale": self.cfg.get("evaluator_reward.calibration.error_scale", 1.0),
-            "weight": self.cfg.get("evaluator_reward.calibration.weight", 1.0),
-        }
+    def _settle_feedback_digest(
+        self,
+        plan_result: Dict[str, Any],
+        ctx: Any,
+        diff_summary: Optional[Dict[str, Any]],
+        genid: Any,
+    ) -> Optional[str]:
+        """Build the TEXT digest for the *previous* round's issues.
 
-    def _settle_evaluator_reward(self, plan_result: Dict[str, Any], ctx: Any, genid: Any) -> Optional[Dict[str, Any]]:
-        """Compute the evaluator's reward for the PREVIOUS round (now that the
-        planner responses and the evaluator's fix verdicts are available)."""
+        Uses this round's planner ``responses`` and the evaluator's
+        ``fix_verdicts`` (both now available). No numeric reward.
+        """
         if self._last_feedback is None:
             return None
         prev_issues = self._last_feedback.get("issues") or []
         if not prev_issues:
             return None
-        rw = compute_evaluator_reward(
-            issues_from_dicts(prev_issues),
-            responses_from_dicts(plan_result.get("responses")),
-            verdicts_from_dicts(getattr(ctx, "fix_verdicts", [])),
+        digest = build_feedback_digest(
+            issues=prev_issues,
+            responses=plan_result.get("responses") or [],
+            verdicts=getattr(ctx, "fix_verdicts", []) or [],
             predicted_score=self._prev_predicted,
             benchmark_score=self._prev_benchmark,
-            matrix=self.cfg.get("evaluator_reward.matrix"),
-            calibration_cfg=self._calibration_cfg(),
-            penalties={},
+            diff_summary=diff_summary,
         )
-        rw_dict = rw.to_dict()
         run_dir = os.path.join(self.output_dir, "runs", str(genid))
         os.makedirs(run_dir, exist_ok=True)
-        with open(os.path.join(run_dir, "evaluator_reward.json"), "w", encoding="utf-8") as f:
-            json.dump(rw_dict, f, ensure_ascii=False, indent=2)
-        self._evaluator_rewards.append(rw_dict)
-        self.log_event({"type": "evaluator_reward", "genid": genid, "reward": rw_dict["total"],
-                        "cells": [o["cell"] for o in rw_dict["outcomes"]]})
-        return rw_dict
+        with open(os.path.join(run_dir, "feedback_digest.md"), "w", encoding="utf-8") as f:
+            f.write(digest)
+        self._digests.append(digest)
+        self.log_event({"type": "feedback_digest", "genid": genid, "bytes": len(digest)})
+        return digest
 
     # -- main loop ---------------------------------------------------------
     def run(self) -> TreeStore:
@@ -158,6 +153,7 @@ class GanLoop:
         ucb_c = float(cfg.get("tree.ucb_c", 1.0))
         depth_penalty = float(cfg.get("tree.depth_penalty", 0.05))
         cost_penalty = float(cfg.get("tree.cost_penalty", 0.0))
+        n_parents = int(cfg.get("tree.num_parents", 1))  # >1 enables crossover
 
         if len(self.task_tree) == 0:
             self.task_tree.add_node(Node(genid="initial", value=NodeValue(score=None)))
@@ -167,13 +163,14 @@ class GanLoop:
             no_improve = 0
             self.log_event({"type": "outer_start", "outer": outer})
             for inner in range(1, I_max + 1):
-                parent = self.task_tree.select_parent(
-                    branch_limit=bl, depth_limit=dl, method=method,
+                parents = self.task_tree.select_parents(
+                    k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                     ucb_c=ucb_c, depth_penalty=depth_penalty, cost_penalty=cost_penalty,
                 )
-                if parent is None:
+                if not parents:
                     self.log_event({"type": "inner_skip", "reason": "no_candidate", "outer": outer, "inner": inner})
                     break
+                parent = parents[0]
 
                 genid = self._gen_counter
                 self._gen_counter += 1
@@ -182,6 +179,7 @@ class GanLoop:
 
                 plan_result = self.planner.plan(
                     parent_summary=self._parent_summary(parent),
+                    parents=[self._parent_summary(p) for p in parents],
                     last_feedback=self._last_feedback,
                     evaluator_issues=evaluator_issues,
                     config=parent_cfg,
@@ -193,14 +191,17 @@ class GanLoop:
                 if child is None:
                     self.log_event({"type": "inner_skip", "reason": "task_runner_none", "outer": outer, "inner": inner})
                     continue
+                # DAG: record all parents used
+                child.parents = [p.genid for p in parents]
+                child.parent_genid = parent.genid
 
-                # lineage config snapshot
+                # lineage config snapshot (task design)
                 plan_cfg = plan_result.get("config")
-                child.meta["config_dict"] = plan_cfg.to_dict() if plan_cfg is not None else parent_cfg.to_dict()
+                child.meta["config_dict"] = plan_cfg if isinstance(plan_cfg, dict) else parent_cfg
 
                 ctx = self.evaluator.evaluate(
                     run_summary={"genid": genid, "score": child.value.score, "meta": child.meta},
-                    prev_feedback=self._last_feedback,
+                    prev_feedback={**(self._last_feedback or {}), "digest": self._last_digest},
                     benchmark_score=child.value.score,
                     node_id=genid,
                     broker=self.broker,
@@ -216,8 +217,12 @@ class GanLoop:
 
                 self.task_tree.add_node(child)
 
-                # evaluator reward for the *previous* round
-                self._settle_evaluator_reward(plan_result, ctx, genid)
+                # sanitized diff summary + text digest for the previous round
+                diff_summary = build_diff_summary(
+                    plan_result.get("records"),
+                    [child.meta.get("report_path")] if child.meta.get("report_path") else None,
+                )
+                self._last_digest = self._settle_feedback_digest(plan_result, ctx, diff_summary, genid)
 
                 # stagnation + advantage
                 ps, cs = parent.value.score, child.value.score
@@ -228,17 +233,13 @@ class GanLoop:
 
                 self.log_event({
                     "type": "inner_done", "outer": outer, "inner": inner,
-                    "genid": genid, "parent_genid": parent.genid,
+                    "genid": genid, "parent_genid": parent.genid, "parents": child.parents,
                     "score": cs, "parent_score": ps, "improved": improved,
                     "no_improve": no_improve, "penalties": packet.penalties,
                     "modify_depth": child.modify_depth,
                 })
 
-                # feedback for next round (issues + sanitized diff summary)
-                diff_summary = build_diff_summary(
-                    plan_result.get("records"),
-                    [child.meta.get("report_path")] if child.meta.get("report_path") else None,
-                )
+                # feedback for next round: planner gets issues + diff summary
                 self._last_feedback = make_feedback(
                     issues=getattr(ctx, "issues", []),
                     diff_summary=diff_summary,
@@ -252,8 +253,7 @@ class GanLoop:
                     break
 
             # ---------------- outer self-improvement ----------------
-            recent_eval = {"evaluator_rewards": self._evaluator_rewards[-I_max:],
-                           "last_feedback": self._last_feedback}
+            recent_eval = {"digests": self._digests[-I_max:], "last_feedback": self._last_feedback}
             recent_plan = {"advantages": self._advantages[-I_max:],
                            "task_tree_size": len(self.task_tree)}
             try:
@@ -265,7 +265,7 @@ class GanLoop:
             except Exception as e:
                 self.log_event({"type": "self_improve_error", "role": "planner", "error": str(e)})
 
-            self.evaluator_tree.add_node(Node(genid=f"eval_{outer}", meta={"rewards": self._evaluator_rewards[-I_max:]}))
+            self.evaluator_tree.add_node(Node(genid=f"eval_{outer}", meta={"num_digests": len(self._digests)}))
             self.planner_tree.add_node(Node(genid=f"plan_{outer}", meta={"advantages": self._advantages[-I_max:]}))
             self.log_event({"type": "outer_done", "outer": outer})
 

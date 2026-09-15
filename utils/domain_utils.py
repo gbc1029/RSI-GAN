@@ -54,7 +54,7 @@ def _legacy_key(domain):
 
 def _load_registry():
     try:
-        from gan.config.loader import load_registry, resolve_domain  # type: ignore
+        from gan.framework.loader import load_registry, resolve_domain  # type: ignore
         return load_registry(), resolve_domain
     except Exception:
         return None, None

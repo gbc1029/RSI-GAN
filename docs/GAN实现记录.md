@@ -267,3 +267,82 @@ GAN loop done. task tree size=3
 - 重复调用型退化：更强的模型或"算子去重/预算"硬约束可缓解。
 - `self_improve` 目前对 evaluator 的自改只落到内存（未落地评估点文件）；planner 已落地 `planner_self_config.json`。
 - 真实多代（outer>1）与多域未跑；作弊误报惩罚、容器隔离仍为 §7.6 的遗留项。
+
+---
+
+## 九、v2 设计重构（P0 执行）
+
+按讨论结论对设计做四处修订并落地（详见 `docs/深入设计说明.md` 的「v2 设计修订」）。
+
+### 9.1 文件改动
+
+| 变更 | 文件 | 说明 |
+|---|---|---|
+| **DAG** | `gan/tree/store.py` | `Node.parents: List`（兼容 `parent_genid`）；`add_node` 多父代记 children、`depth=max+1`；`select_parents(k)` |
+| **反馈文字化** | `gan/reward/evaluator_reward.py` | 删除 `compute_evaluator_reward`/`render_feedback`/矩阵权重；`classify_issue` 仅出标签；新增 `build_feedback_digest`（纯文本） |
+|  | `gan/reward/__init__.py` | 导出更新 |
+|  | `gan/loop.py` | `_settle_feedback_digest` 落 `runs/<genid>/feedback_digest.md`；`self_improve(recent={digests})`；DAG `parents` 传递 |
+|  | `gan/roles/evaluator.py` | 盲评指令注入 digest；`self_improve` 改为读文本 digest 的叙事式自省 |
+|  | `gan/config/gan_loop.yaml` | 删除 `evaluator_reward.matrix/calibration.weight`；新增 `feedback.mode=text_digest`；`tree.num_parents` |
+| **设计包** | `gan/design/{schema,context,registry,store,composer}.py` | 各角色**极小** schema；`design/<role|task-node>/config.json`；分角色注册表 + 组件目录；`DesignContext` |
+|  | `gan/design/registries/{task,planner,evaluator}_registry.json`、`gan/design/components/{skills/echo,memory/naive}.py` | 种子注册表与组件 |
+|  | `task_agent.py` | 改为**设计驱动**（`GAN_TASK_DESIGN` + `GAN_TASK_SKILLS_DIR`） |
+|  | `gan/task_runner.py` | 用 `DesignStore` 写节点设计并注入环境变量；`_modify_depth` 适配新算子 |
+|  | `gan/build.py` | 装配时种子化 planner/evaluator 自身设计 prompt |
+| **算子分层** | `gan/operators/work_tools/{planner,evaluator}/` | 工作 tools（`respond_issue`；评分/检查/judge_fix）——**从旧 planner_ops/evaluator_ops 迁移** |
+|  | `gan/operators/design_ops/*.py` | 浅层设计算子 `set_prompt`/`set_config`/`select_component`/`set_param`/`mint_operator` + 深层 `code_edit` |
+|  | `gan/operators/registry.py` | `default_dirs(role)` 改为 work_tools+design_ops+common（task→skills） |
+|  | `gan/roles/base_role.py` | 工具集装配适配；`current_prompt()` 从自身设计读取；自设计经 `DesignStore` |
+
+### 9.2 关键裁定
+- **“新增配置项”不是算子**：新键必须改代码才能被消费 → 归为**源码级（deep）**，经 `code_edit` 门控。浅层算子只能改**已有键的值** + 从注册表选择。
+- **evaluator 的逐项评分是工作 tools**；“新增评分项/组件”才是深层。
+- `mint_operator` 仅限**组合式**（声明式）——浅层；需新逻辑则深层。
+
+### 9.3 验证
+- `scripts/local/smoke_p1.py`（v2）**全绿**：设计包/浅层算子（含“新键被拒”）/工作 tools/工具集/文字 digest/DAG/双循环（digest 结算与落盘）。
+- `scripts/local/smoke_gan.py`（P0）**全绿**（去掉数值矩阵断言）。
+- 模块导入、`build_gan_loop` 装配（设计种子化、工具集内容、任务 skills 目录）均通过。
+
+### 9.4 遗留
+- 未做真实运行（需 API）；交叉算子的**实际启用**（`tree.num_parents>1` + config 合并执行）留待 P2。
+- evaluator 的 `eval_points` 选择已由 `gan/tools/assembly.py` **按选择裁剪**（仅装载被选中的可选评估点）。
+
+---
+
+## 十、v3 目录规划（配置/算子/tools 文件管理重构）
+
+按「性质 × 可变性」重组目录，落地“总是启用=tools / 可选启用=components”的划分。
+
+### 10.1 目录变动
+| 旧 | 新 |
+|---|---|
+| `gan/config/gan_loop.yaml` | `gan/framework/loop.yaml` |
+| `gan/config/registry.yaml` | `gan/framework/domains.yaml` |
+| `gan/config/loader.py` | `gan/framework/loader.py` |
+| `gan/config/prompts/*.md` | `gan/design/seeds/*.md`（+ `task.md`） |
+| `gan/config/eval_points.yaml` | 删除（单一来源：registries + 实现） |
+| `gan/operators/context.py`、`gan/design/context.py`、access ctx | `gan/context.py` |
+| `gan/operators/registry.py` | `gan/tools/assembly.py` |
+| `gan/operators/common/request_source_access.py` + `design_ops/code_edit.py` | `gan/tools/deep/request_source_access.py`（合并） |
+| `gan/operators/design_ops/*` | `gan/tools/design/*` |
+| `gan/operators/work_tools/planner/*` | `gan/tools/work/planner/*` |
+| `gan/operators/work_tools/evaluator/{report_issue,record_predicted_score,judge_fix}` | `gan/tools/work/evaluator/*` |
+| `gan/operators/work_tools/evaluator/eval_*` | `gan/components/evaluator/eval_points/*`（可选） |
+| `gan/design/registry.py` | `gan/registries/loader.py` |
+| `gan/design/registries/*_registry.json` | `gan/registries/{shared,task,planner,evaluator}.json` |
+| `gan/design/components/{skills,memory}` | `gan/components/{shared,task}/…` |
+
+### 10.2 语义规则
+- **总是启用 → `gan/tools/`**；**可选启用 → `gan/components/`**（注册 + 选择）。
+- **task agent 无常驻工具**：能力全为可选 skills（空种子起步），深层新增经 `tools/deep`。
+- **evaluator 评估点**：核心 3 个常驻（`tools/work/evaluator`），可选 4 个入 `components/evaluator/eval_points`（按 config 装载）。
+- `agent/tools/`（bash/editor）为框架基础；以 `components/shared/skills/*.py` re-export 登记为通用可选技能。
+- schema 增加 `operators` 槽；`mint_operator` 写该槽。
+
+### 10.3 验证
+- `scripts/local/smoke_gan.py` ✅、`scripts/local/smoke_p1.py`（v3：设计包/浅层算子/工作 tools/可选评估点/工具集按需装配/摘要脱敏/DAG/双循环）✅。
+- 导入回归、`build_gan_loop` 装配（planner/evaluator 工具集内容、设计种子化）✅。
+
+### 10.4 遗留
+- 未跑真实 API 端到端；交叉算子的**实际启用**（`tree.num_parents>1` + config 合并）与 memory 策略的**运行期接入**留待后续。

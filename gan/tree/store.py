@@ -1,10 +1,14 @@
-"""Version trees for the three roles.
+"""Version DAG for the three roles.
 
 A :class:`TreeStore` persists an append-only event log (JSONL) per tree and
-reconstructs node state by replay. It enforces the task-tree constraints
-(branch limit / depth limit / stagnation) and offers a UCB-based parent
-selection. It is intentionally self-contained but can bootstrap from a DGM-H
-``archive.jsonl`` via :meth:`TreeStore.import_from_dgm_archive`.
+reconstructs node state by replay. It supports a **DAG** (a node may have
+multiple parents, e.g. produced by a crossover operator) while staying
+backward-compatible with the old single-parent ``parent_genid`` field.
+
+It enforces the task constraints (branch limit / depth limit / stagnation) and
+offers a UCB-based parent selection, optionally returning ``k`` parents for
+crossover. Can bootstrap from a DGM-H ``archive.jsonl`` via
+:meth:`TreeStore.import_from_dgm_archive`.
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ from typing import Any, Dict, List, Optional
 @dataclass
 class NodeValue:
     score: Optional[float] = None       # report.json numeric score (from benchmark)
-    potential: Optional[float] = None   # evaluator judgement 0..10 (tie-break / context only)
+    potential: Optional[float] = None   # evaluator blind prediction (tie-break / context only)
     cost_tokens: Optional[float] = None
     cost_wallclock_s: Optional[float] = None
 
@@ -29,7 +33,8 @@ class NodeValue:
 @dataclass
 class Node:
     genid: Any
-    parent_genid: Any = None
+    parent_genid: Any = None                 # primary parent (kept for compatibility)
+    parents: List[Any] = field(default_factory=list)  # full parent list (DAG)
     planner_genid: Any = None
     evaluator_genid: Any = None
     prev_patch_files: List[str] = field(default_factory=list)
@@ -44,6 +49,13 @@ class Node:
     modify_depth: int = 0               # 0=config 1=operator 2=code
     source_access_log: List[Dict[str, Any]] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # normalise the two representations so both work
+        if self.parents and self.parent_genid is None:
+            self.parent_genid = self.parents[0]
+        elif self.parent_genid is not None and not self.parents:
+            self.parents = [self.parent_genid]
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -109,14 +121,17 @@ class TreeStore:
 
     # -- mutations ---------------------------------------------------------
     def add_node(self, node: Node) -> Node:
-        # maintain parent child-count and depth
-        if node.parent_genid is not None and _key(node.parent_genid) in self.nodes:
-            parent = self.nodes[_key(node.parent_genid)]
-            parent.children += 1
-            node.depth = parent.depth + 1
-            self._append(
-                {"op": "update", "genid": parent.genid, "fields": {"children": parent.children}}
-            )
+        # register child with every parent; depth = max(parent depths)+1
+        depths: List[int] = []
+        for p in node.parents:
+            if _key(p) in self.nodes:
+                parent = self.nodes[_key(p)]
+                parent.children += 1
+                depths.append(parent.depth)
+                self._append(
+                    {"op": "update", "genid": parent.genid, "fields": {"children": parent.children}}
+                )
+        node.depth = (max(depths) + 1) if depths else 0
         self.nodes[_key(node.genid)] = node
         if _key(node.genid) not in self.order:
             self.order.append(_key(node.genid))
@@ -160,6 +175,41 @@ class TreeStore:
             out.append(n)
         return out
 
+    def _metric(self, n: Node, total_children: int, max_cost: float,
+                method: str, ucb_c: float, depth_penalty: float, cost_penalty: float) -> float:
+        score = n.value.score if n.value.score is not None else 0.0
+        if method == "best":
+            return score
+        visits = n.children + 1
+        explore = ucb_c * math.sqrt(math.log(total_children + 1) / visits)
+        cost = (n.value.cost_tokens or 0.0) / max_cost
+        return score + explore - depth_penalty * n.depth - cost_penalty * cost
+
+    def select_parents(
+        self,
+        k: int = 1,
+        branch_limit: int = 2,
+        depth_limit: int = 5,
+        method: str = "ucb",
+        ucb_c: float = 1.0,
+        depth_penalty: float = 0.05,
+        cost_penalty: float = 0.0,
+    ) -> List[Node]:
+        """Return up to ``k`` parents (``k>1`` used by crossover)."""
+        cands = self._candidates(branch_limit, depth_limit)
+        if not cands:
+            return []
+        if method == "latest":
+            return list(reversed(cands[-k:]))
+        total_children = sum(n.children for n in cands) + len(cands)
+        max_cost = max((n.value.cost_tokens or 0.0) for n in cands) or 1.0
+        ranked = sorted(
+            cands,
+            key=lambda n: self._metric(n, total_children, max_cost, method, ucb_c, depth_penalty, cost_penalty),
+            reverse=True,
+        )
+        return ranked[:k]
+
     def select_parent(
         self,
         branch_limit: int = 2,
@@ -169,26 +219,8 @@ class TreeStore:
         depth_penalty: float = 0.05,
         cost_penalty: float = 0.0,
     ) -> Optional[Node]:
-        cands = self._candidates(branch_limit, depth_limit)
-        if not cands:
-            return None
-
-        if method == "latest":
-            return cands[-1]
-        if method == "best":
-            return max(cands, key=lambda n: (n.value.score if n.value.score is not None else -1e9))
-
-        total_children = sum(n.children for n in cands) + len(cands)
-        max_cost = max((n.value.cost_tokens or 0.0) for n in cands) or 1.0
-
-        def metric(n: Node) -> float:
-            score = n.value.score if n.value.score is not None else 0.0
-            visits = n.children + 1
-            explore = ucb_c * math.sqrt(math.log(total_children + 1) / visits)
-            cost = (n.value.cost_tokens or 0.0) / max_cost
-            return score + explore - depth_penalty * n.depth - cost_penalty * cost
-
-        return max(cands, key=metric)
+        ps = self.select_parents(1, branch_limit, depth_limit, method, ucb_c, depth_penalty, cost_penalty)
+        return ps[0] if ps else None
 
     # -- import from DGM-H -------------------------------------------------
     def import_from_dgm_archive(self, genids: List[Any]) -> None:

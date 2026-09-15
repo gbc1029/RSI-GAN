@@ -5,14 +5,14 @@ import json
 from typing import Any, Dict, List, Optional
 
 from gan.access import reset_access_context, set_access_context
-from gan.config.loader import load_prompt
-from gan.operators.context import EvalContext, reset_eval_context, set_eval_context
+from gan.design import load_seed
+from gan.context import EvalContext, reset_eval_context, set_eval_context
 from gan.roles.base_role import Role
 
 
 class Evaluator(Role):
     def __init__(self, model: str, output_dir: str, **kwargs):
-        super().__init__("evaluator", model, output_dir, load_prompt("evaluator"), **kwargs)
+        super().__init__("evaluator", model, output_dir, load_seed("evaluator"), **kwargs)
 
     # -- instructions ------------------------------------------------------
     def _blind_instruction(
@@ -29,6 +29,11 @@ class Evaluator(Role):
                 "for each problem you find (process / cheating / detail / overfitting)."
             )
         parts.append(f"\n## Run artifacts (trajectory / results summary)\n```json\n{json.dumps(run_summary, ensure_ascii=False, indent=2)[:6000]}\n```")
+        if prev_feedback and prev_feedback.get("digest"):
+            parts.append(
+                "\n## Feedback digest on YOUR previous issues (text; no scores)\n"
+                f"{prev_feedback.get('digest')}"
+            )
         if prev_feedback and prev_feedback.get("issues"):
             parts.append(
                 "\n## YOUR issues from the previous round\n"
@@ -83,18 +88,24 @@ class Evaluator(Role):
         return ctx
 
     def self_improve(self, recent: Optional[Dict[str, Any]] = None):
-        from gan.operators.context import EvalContext, reset_eval_context, set_eval_context
+        from gan.context import DesignContext, reset_design_context, set_design_context
 
-        ctx = EvalContext()
-        tok = set_eval_context(ctx)
+        digests = (recent or {}).get("digests") or []
+        digest_text = "\n\n".join(str(d)[:2000] for d in digests[-3:]) or "(no digests yet)"
+        cfg = self.load_self_config()
+        dctx = DesignContext(role="evaluator", config=cfg, node_id="self")
+        tok = set_design_context(dctx)
         try:
             instruction = (
-                "Improve YOURSELF (the evaluator): refine eval points / prompt so you find "
-                "benchmark-invisible problems more accurately and usefully (not by fitting the "
-                "benchmark score). Do not repeat the same tool call; when done, stop.\n"
-                f"Recent evaluator rewards / 2x2 outcomes: {json.dumps(recent or {}, ensure_ascii=False)[:2000]}"
+                "Improve YOURSELF (the evaluator's own design) using only design operators "
+                "(`set_prompt`/`set_config`/`select_component`/`set_param`/`mint_operator`; deep "
+                "changes need `code_edit`). Reflect on the TEXT feedback digests below to judge "
+                "your issues more accurately and usefully — do NOT fit the benchmark score. "
+                "Do not repeat the same tool call; when done, stop.\n"
+                f"\n## Feedback digests\n{digest_text}"
             )
             self.run(instruction, max_tool_calls=8)
         finally:
-            reset_eval_context(tok)
-        return {"issues": ctx.issues, "eval_points": ctx.eval_point_results}
+            reset_design_context(tok)
+        self.save_self_config(cfg)
+        return {"records": dctx.records, "self_design": self.self_design_path()}

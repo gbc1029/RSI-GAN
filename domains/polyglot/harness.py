@@ -73,7 +73,7 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
         copy_to_container(container, os.path.join(root_dir, 'agent/'), f'/{REPO_NAME}/agent/')
         copy_to_container(container, os.path.join(root_dir, 'utils/'), f'/{REPO_NAME}/utils/')
         copy_to_container(container, os.path.join(root_dir, 'meta_agent.py'), f'/{REPO_NAME}/meta_agent.py')
-        copy_to_container(container, os.path.join(root_dir, 'run_meta_agent.py'), f'/{REPO_NAME}/run_meta_agent.py')
+        copy_to_container(container, os.path.join(root_dir, 'scripts', 'dgmh', 'run_meta_agent.py'), f'/{REPO_NAME}/scripts/dgmh/run_meta_agent.py')
         copy_to_container(container, os.path.join(root_dir, 'README.md'), f'/{REPO_NAME}/README.md')
         chat_history_file_container = f'/{REPO_NAME}/{chat_history_file.name}'
 

@@ -1,0 +1,16 @@
+{
+  "components": [
+    {"name": "trajectory_quality", "kind": "eval_point",
+     "module": "evaluator/eval_points/eval_trajectory_quality.py",
+     "description": "Process-level judgement of the execution trajectory.", "params_schema": {}},
+    {"name": "hard_failure", "kind": "eval_point",
+     "module": "evaluator/eval_points/eval_hard_failure.py",
+     "description": "Cannot-run / obviously unreasonable -> strong penalty.", "params_schema": {}},
+    {"name": "reward_hacking", "kind": "eval_point",
+     "module": "evaluator/eval_points/eval_reward_hacking.py",
+     "description": "Reward hacking check (may need source access).", "params_schema": {}},
+    {"name": "rule_violation", "kind": "eval_point",
+     "module": "evaluator/eval_points/eval_rule_violation.py",
+     "description": "Cheating / rule violation check (may need source access).", "params_schema": {}}
+  ]
+}
