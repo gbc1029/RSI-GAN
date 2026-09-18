@@ -1,5 +1,5 @@
 """report_issue - record a discovered issue (tracked through the 2x2 matrix)."""
-from gan.context import get_eval_context
+from gan.framework.context import get_eval_context
 
 
 def tool_info():

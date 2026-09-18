@@ -20,15 +20,18 @@ live under `scripts/dgmh/`.
 
 ## `gan/` layout (nature × mutability)
 
-- `gan/framework/` — **frozen**: `loop.yaml` (hyperparams), `domains.yaml`, `loader.py`.
-- `gan/context.py` — **frozen**: all contextvars (plan/eval/design/access).
+- `gan/framework/` — **frozen** (trust anchor): `loop.yaml` (hyperparams),
+  `domains.yaml` (incl. per-domain `output_contract`), `loader.py`, `frozen.py`
+  (single source of the deny list), `task_execution.py` (design persistence +
+  harness glue), `task_runner.py`, `checkpoint.py`, `context.py`, `access.py`,
+  `loop.py`, `tree/`, `reward/`.
 - `gan/tools/` — **always-on** callables: `work/<role>/` (work tools),
   `design/` (shallow design operators), `deep/` (gated deep gate), `assembly.py`.
 - `gan/components/` — **opt-in** implementations: `shared/{skills,memory}/`,
   `task/skills/`, `evaluator/eval_points/`.
 - `gan/registries/` — component catalog: `shared.json` + `<role>.json` + `loader.py`.
 - `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `composer.py`, `seeds/`.
-- `gan/roles/`, `gan/tree/`, `gan/reward/`, `gan/loop.py`, `gan/build.py`, `gan/task_runner.py`, `gan/access.py`.
+- `gan/roles/`, `gan/build.py`, `gan/summary.py` — evolvable orchestration/glue.
 
 ## Setup
 
@@ -68,16 +71,18 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   change via the gated `gan/tools/deep/request_source_access`.
 - **Activation rule**: `always-on → gan/tools/`, `opt-in → gan/components/`
   (registered in `gan/registries/` and selected by the design config).
-- **Frozen substrate**: the shared runtime (`agent/llm.py`, `agent/llm_withtools.py`,
-  `agent/base_agent.py`, `gan/framework/*`, `gan/context.py`) must NOT be modified
-  during evolution (trust anchor / anti-hacking). Enforced via
-  `gan/framework/loop.yaml: source_access.deny_paths`.
+- **Frozen substrate**: the trust anchor is declared once in
+  `gan/framework/frozen.py` — everything under `gan/framework/*` plus the external
+  shared substrate/measurement (`agent/llm.py`, `agent/llm_withtools.py`,
+  `agent/base_agent.py`, `domains/harness.py`, `domains/report.py`) must NOT be
+  modified during evolution (anti-hacking). `gan/build.py` builds the gate's deny
+  list from there; invariants are checked by `scripts/tests/test_frozen.py`.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable.
 - **Work tools vs design operators**: evaluator scoring and planner
   `respond_issue` are work tools (`gan/tools/work/`); design operators are in
   `gan/tools/design/`.
 - Operators are tools: a module exposing `tool_info()` + `tool_function(**kwargs)`.
-- Session state travels via contextvars (`gan/context.py`), not function arguments.
+- Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - Do not expose planner rationale/reason to the evaluator (use
   `gan/summary.py:build_diff_summary`).
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator

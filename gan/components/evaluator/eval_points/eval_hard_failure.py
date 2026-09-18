@@ -1,5 +1,5 @@
 """eval_hard_failure - strong penalty for cannot-run / obviously-unreasonable output."""
-from gan.context import get_eval_context
+from gan.framework.context import get_eval_context
 
 
 def tool_info():

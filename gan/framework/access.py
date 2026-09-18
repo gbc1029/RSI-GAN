@@ -17,7 +17,7 @@ import shutil
 import time
 from typing import Any, Dict, List, Optional
 
-from gan.context import (  # noqa: F401
+from gan.framework.context import (  # noqa: F401
     AccessContext,
     get_access_context,
     reset_access_context,

@@ -53,15 +53,40 @@ def _run_usage_hooks(model, response):
             pass
 
 
-# Retry on rate limits: APIs such as Zhipu GLM raise 429 aggressively.
+# Retry on transient provider failures (rate limit / 5xx / timeout / conn drops).
 _BACKOFF_EXCEPTIONS = [requests.exceptions.RequestException, json.JSONDecodeError, KeyError]
-try:
-    _BACKOFF_EXCEPTIONS.append(litellm.exceptions.RateLimitError)
+for _name in ("RateLimitError", "ServiceUnavailableError", "Timeout", "APIConnectionError"):
+    _exc = getattr(getattr(litellm, "exceptions", None), _name, None)
+    if isinstance(_exc, type):
+        _BACKOFF_EXCEPTIONS.append(_exc)
+try:  # also cover raw openai SDK errors
+    import openai as _openai
+    for _name in ("APIError", "APIConnectionError", "APITimeoutError", "RateLimitError"):
+        _exc = getattr(_openai, _name, None)
+        if isinstance(_exc, type) and _exc not in _BACKOFF_EXCEPTIONS:
+            _BACKOFF_EXCEPTIONS.append(_exc)
 except Exception:
     pass
 _BACKOFF_EXCEPTIONS = tuple(_BACKOFF_EXCEPTIONS)
 
 litellm.drop_params=True
+
+
+def _completion_kwargs(model, messages, temperature, max_tokens):
+    """Model-specific completion kwargs (GPT-5 / Claude-Haiku quirks)."""
+    kw = {"model": model, "messages": messages}
+    # GPT-5 and GPT-5-mini only support default temperature (1); GPT-5.2 does.
+    if model not in ["openai/gpt-5", "openai/gpt-5-mini"]:
+        kw["temperature"] = temperature
+    # GPT-5 models require max_completion_tokens instead of max_tokens.
+    if "gpt-5" in model:
+        kw["max_completion_tokens"] = max_tokens
+    elif "claude-3-haiku" in model:
+        kw["max_tokens"] = min(max_tokens, 4096)
+    else:
+        kw["max_tokens"] = max_tokens
+    return kw
+
 
 @backoff.on_exception(
     backoff.expo,
@@ -87,31 +112,21 @@ def get_response_from_llm(
 
     new_msg_history = msg_history + [{"role": "user", "content": msg}]
 
-    # Build kwargs - handle model-specific requirements
-    completion_kwargs = {
-        "model": model,
-        "messages": new_msg_history,
-    }
-
-    # GPT-5 and GPT-5-mini only support default temperature (1), skip it
-    # GPT-5.2 supports temperature
-    if model in ["openai/gpt-5", "openai/gpt-5-mini"]:
-        pass  # Don't set temperature
-    else:
-        completion_kwargs["temperature"] = temperature
-
-    # GPT-5 models require max_completion_tokens instead of max_tokens
-    if "gpt-5" in model:
-        completion_kwargs["max_completion_tokens"] = max_tokens
-    else:
-        # Claude Haiku has a 4096 token limit
-        if "claude-3-haiku" in model:
-            completion_kwargs["max_tokens"] = min(max_tokens, 4096)
-        else:
-            completion_kwargs["max_tokens"] = max_tokens
-
-    response = litellm.completion(**completion_kwargs)
-    _run_usage_hooks(model, response)
+    # Primary call; on failure fall back once to GAN_MODEL_FALLBACK (if configured).
+    effective_model = model
+    try:
+        response = litellm.completion(
+            **_completion_kwargs(model, new_msg_history, temperature, max_tokens)
+        )
+    except Exception:
+        fallback = os.environ.get("GAN_MODEL_FALLBACK")
+        if not fallback or fallback == model:
+            raise
+        effective_model = fallback
+        response = litellm.completion(
+            **_completion_kwargs(fallback, new_msg_history, temperature, max_tokens)
+        )
+    _run_usage_hooks(effective_model, response)
     response_text = response['choices'][0]['message']['content']  # pyright: ignore
     new_msg_history.append({"role": "assistant", "content": response['choices'][0]['message']['content']})
 

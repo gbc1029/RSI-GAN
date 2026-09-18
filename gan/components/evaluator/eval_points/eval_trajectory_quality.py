@@ -1,5 +1,5 @@
 """eval_trajectory_quality - process-level judgement of the execution trajectory."""
-from gan.context import get_eval_context
+from gan.framework.context import get_eval_context
 
 
 def tool_info():

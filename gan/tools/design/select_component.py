@@ -4,7 +4,7 @@ Shallow: only selects among components already present in the role's registry
 (``gan/design/registries/<role>_registry.json``). Registering a NEW component is
 a source-level (deep) change.
 """
-from gan.context import get_design_context
+from gan.framework.context import get_design_context
 from gan.registries.loader import load_registry_for_role
 
 _SLOT_KIND = {"skills": "skill", "eval_points": "eval_point"}

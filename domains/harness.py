@@ -7,6 +7,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import argparse
 import importlib
 import importlib.util
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -99,9 +100,12 @@ def harness(
     # Load existing predictions if available
     if os.path.exists(output_path):
         existing_df = pd.read_csv(output_path, dtype=str)
-        completed_ids = set(
-            existing_df[~existing_df["prediction"].isna()][question_id_col]
+        # A prediction only counts as "done" if it is non-null AND non-blank;
+        # blank predictions (e.g. after an isolated per-question failure) must be retried.
+        _done = existing_df["prediction"].notna() & (
+            existing_df["prediction"].astype(str).str.strip() != ""
         )
+        completed_ids = set(existing_df[_done][question_id_col])
     else:
         existing_df = None
         completed_ids = set()
@@ -129,9 +133,9 @@ def harness(
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         for i, row in dataset.iterrows():
-            if (
-                pd.notna(row["prediction"]) or row[question_id_col] in completed_ids
-            ):  # pyright: ignore
+            pred = row["prediction"]
+            is_done = pd.notna(pred) and str(pred).strip() != ""
+            if is_done or row[question_id_col] in completed_ids:  # pyright: ignore
                 continue
             futures.append(
                 (
@@ -144,8 +148,22 @@ def harness(
                 )
             )
 
+        failures = []
         for idx, future in futures:
-            prediction = future.result()
+            try:
+                prediction = future.result()
+            except Exception as e:
+                # Per-question isolation: a single failure must not abort the batch.
+                # Record a blank prediction (dropped by report -> lower coverage) and
+                # log the failure for the record.
+                prediction = ""
+                try:
+                    qid = dataset.at[idx, question_id_col]
+                except Exception:
+                    qid = str(idx)
+                failures.append(
+                    {"idx": int(idx), "question_id": str(qid), "error": str(e)[:500]}
+                )
             predictions[idx] = prediction
 
             if (idx + 1) % save_interval == 0:
@@ -157,6 +175,12 @@ def harness(
     dataset["prediction"] = predictions
     dataset.to_csv(output_path, index=False)
     print(f"Final predictions saved to {output_path}")
+
+    if failures:
+        with open(os.path.join(evals_folder, "eval_failures.jsonl"), "w", encoding="utf-8") as f:
+            for rec in failures:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"{len(failures)} question(s) failed and were isolated (see eval_failures.jsonl)")
 
     return output_folder
 

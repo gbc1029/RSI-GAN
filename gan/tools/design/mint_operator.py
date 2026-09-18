@@ -3,7 +3,7 @@
 Composition-only operators are declarative and may be minted at the shallow
 layer. An operator that needs new logic is a source-level (deep) change.
 """
-from gan.context import get_design_context
+from gan.framework.context import get_design_context
 
 
 def tool_info():

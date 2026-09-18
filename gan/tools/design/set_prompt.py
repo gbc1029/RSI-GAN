@@ -1,5 +1,5 @@
 """Design operator: set the prompt (a config key)."""
-from gan.context import get_design_context
+from gan.framework.context import get_design_context
 
 
 def tool_info():

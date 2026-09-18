@@ -16,6 +16,14 @@ default:
   stagedeval_samples: 10
   stagedeval_frac: 0.1
   has_val_subset: false
+  # Objective output contract of the task agent's answer. Used by the framework
+  # (NOT by an evaluator eval point) to compute report_summary.contract_ok /
+  # invalid_rate. kind: label | freeform | numeric.
+  output_contract:
+    kind: freeform
+    allowed_labels: null
+    case_insensitive: true
+    strip: true
 
 domains:
   paper_review:
@@ -27,6 +35,11 @@ domains:
     stagedeval_samples: 10
     stagedeval_frac: 0.1
     has_val_subset: true
+    output_contract:
+      kind: label
+      allowed_labels: [accept, reject]
+      case_insensitive: true
+      strip: true
 
   search_arena:
     score_key: overall_accuracy
@@ -47,6 +60,11 @@ domains:
     stagedeval_samples: 10
     stagedeval_frac: 0.1
     has_val_subset: true
+    output_contract:
+      kind: label
+      allowed_labels: [incorrect, partial, almost, correct]
+      case_insensitive: true
+      strip: true
 
   polyglot:
     score_key: accuracy_score

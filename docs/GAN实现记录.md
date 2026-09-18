@@ -3,6 +3,12 @@
 > 记录实现过程中的文件改动、作用、遇到的问题与解决。
 > 关联文件：`plan.md`（设计与实现方案）、`部署记录.md`（HyperAgents 部署）。
 > 代码位置：WSL `/root/HyperAgents`（Windows 路径 `\\wsl$\Ubuntu\root\HyperAgents`）。
+>
+> **布局变更（后加）**：冻结物已统一迁入 `gan/framework/`：
+> `gan/loop.py`→`gan/framework/loop.py`、`gan/context.py`→`gan/framework/context.py`、
+> `gan/access.py`→`gan/framework/access.py`、`gan/tree/`→`gan/framework/tree/`、
+> `gan/task_runner.py`→`gan/framework/task_runner.py`、`gan/reward/`→`gan/framework/reward/`。
+> 本记录下方出现的旧路径为**迁移前**的历史快照；现行布局见 `GAN设计决策.md` 与 `AGENTS.md`。
 
 ---
 

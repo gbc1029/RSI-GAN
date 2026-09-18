@@ -25,6 +25,8 @@ class NodeValue:
     potential: Optional[float] = None   # evaluator blind prediction (tie-break / context only)
     cost_tokens: Optional[float] = None
     cost_wallclock_s: Optional[float] = None
+    score_status: str = "ok"            # ok | partial | imputed | failed | invalid
+    coverage: Optional[float] = None    # valid_samples / requested_samples
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

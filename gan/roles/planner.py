@@ -9,10 +9,10 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from gan.access import reset_access_context, set_access_context
+from gan.framework.access import reset_access_context, set_access_context
 from gan.design import load_seed
-from gan.context import DesignContext, reset_design_context, set_design_context
-from gan.context import PlanContext, reset_plan_context, set_plan_context
+from gan.framework.context import DesignContext, reset_design_context, set_design_context
+from gan.framework.context import PlanContext, reset_plan_context, set_plan_context
 from gan.patch import build_patch_from_workspace
 from gan.roles.base_role import Role
 from gan.summary import validate_feedback

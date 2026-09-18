@@ -6,7 +6,7 @@ operators: any change that is NOT expressible by shallow config/design operators
 must go through here. Requested paths are copied into the role workspace
 ``src/`` so they can then be edited with the ``editor``/``bash`` skills.
 """
-from gan.context import get_access_context, get_design_context
+from gan.framework.context import get_access_context, get_design_context
 
 
 def tool_info():
@@ -39,11 +39,13 @@ def tool_function(paths=None, intent="view", reason="", **kwargs):
     granted = actx.broker.grant(actx.role, actx.node_id, paths or [], intent=intent, reason=reason)
     if dctx is not None:
         dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)
-    denied = (getattr(actx.broker, "last_result", {}) or {}).get("denied", []) or []
-    msg = f"Granted {intent} access to: {granted or '[]'} (copied to workspace src/). Reason recorded."
-    if denied:
-        msg += f" DENIED (frozen substrate, cannot modify): {denied}."
-    return msg
+    # NOTE: denied/missing paths are audited (events.jsonl + broker.last_result) but are
+    # intentionally NOT surfaced here. Telling the agent which paths are frozen would steer
+    # it toward the trust anchor / the gate itself (see DGM-H drift analysis). The agent
+    # only learns what it actually received.
+    if granted:
+        return f"Granted {intent} access to: {granted} (copied to workspace src/)."
+    return "No source paths were provided for this request."
 
 
 op_info = tool_info

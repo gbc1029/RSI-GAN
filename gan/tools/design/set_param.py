@@ -1,5 +1,5 @@
 """Design operator: set a free parameter under config.params."""
-from gan.context import get_design_context
+from gan.framework.context import get_design_context
 
 
 def tool_info():
@@ -18,6 +18,10 @@ def tool_function(name, value, **kwargs):
     ctx = get_design_context()
     if ctx is None:
         return "Error: no design context"
+    if str(name) == "model":
+        # Frozen framework setting: the role model is resolved from the framework
+        # config / environment, never from an evolvable design.
+        return "Error: parameter 'model' is reserved and cannot be set here."
     params = ctx.config.setdefault("params", {})
     params[name] = value
     ctx.record("set_param", name=name, value=value)

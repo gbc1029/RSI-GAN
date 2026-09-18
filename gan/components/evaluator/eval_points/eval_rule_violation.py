@@ -1,5 +1,5 @@
 """eval_rule_violation - detect cheating beyond benchmark rules."""
-from gan.context import get_eval_context
+from gan.framework.context import get_eval_context
 
 
 def tool_info():

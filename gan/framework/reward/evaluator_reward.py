@@ -19,6 +19,7 @@ CELL_ACCEPTED_FIXED = "accepted_fixed"
 CELL_ACCEPTED_UNFIXED = "accepted_unfixed"
 CELL_REJECTED_WITH_FEEDBACK = "rejected_with_feedback"
 CELL_REJECTED_NO_FEEDBACK = "rejected_no_feedback"
+CELL_UNJUDGED = "unjudged"          # accepted, but no judge_fix verdict was given
 
 
 @dataclass
@@ -54,6 +55,7 @@ class IssueOutcome:
     fixed: bool
     cell: str
     evidence: str = ""
+    judged: bool = True               # False when no fix verdict was given
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -63,6 +65,7 @@ class IssueOutcome:
             "fixed": self.fixed,
             "cell": self.cell,
             "evidence": self.evidence,
+            "judged": self.judged,
         }
 
 
@@ -96,10 +99,17 @@ def classify_issue(
     has_feedback = bool(
         response is not None and response.feedback and str(response.feedback).strip()
     )
-    fixed = bool(verdict.fixed) if verdict is not None else False
+    judged = verdict is not None
+    fixed = bool(verdict.fixed) if judged else False
 
     if accepted:
-        cell = CELL_ACCEPTED_FIXED if fixed else CELL_ACCEPTED_UNFIXED
+        if not judged:
+            # tri-state: accepted but the evaluator never called judge_fix -> UNJUDGED.
+            # Never silently downgrade to accepted_unfixed (that would be an untrue
+            # claim that the planner failed to fix it).
+            cell = CELL_UNJUDGED
+        else:
+            cell = CELL_ACCEPTED_FIXED if fixed else CELL_ACCEPTED_UNFIXED
     else:
         cell = CELL_REJECTED_WITH_FEEDBACK if has_feedback else CELL_REJECTED_NO_FEEDBACK
 
@@ -110,6 +120,7 @@ def classify_issue(
         fixed=fixed,
         cell=cell,
         evidence=(verdict.evidence if verdict is not None else ""),
+        judged=judged,
     )
 
 
@@ -139,6 +150,7 @@ _LABEL_TEXT = {
     CELL_ACCEPTED_UNFIXED: "accepted but NOT fixed",
     CELL_REJECTED_WITH_FEEDBACK: "rejected by planner with a reason",
     CELL_REJECTED_NO_FEEDBACK: "silently ignored by planner",
+    CELL_UNJUDGED: "accepted but NOT judged this round (no judge_fix given)",
 }
 
 

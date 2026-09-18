@@ -38,13 +38,12 @@ source_access:
   require_declaration: true     # source code only after explicit request
   auto_approve: true            # v0: auto approve + full audit
   workspace_src_dir: src        # granted source is copied into <workspace>/src
-  # FROZEN substrate: shared runtime that agents must NOT modify (trust anchor).
-  deny_paths:
-    - "agent/llm.py"
-    - "agent/llm_withtools.py"
-    - "agent/base_agent.py"
-    - "gan/framework/*"
-    - "gan/context.py"
+  # FROZEN trust anchor: the deny list is NOT configured here. It is derived from
+  # the physical layout by gan/framework/frozen.py (single source of truth):
+  #   - everything under gan/framework/*  (frozen by construction)
+  #   - external shared substrate/measurement (agent/llm*.py, agent/base_agent.py,
+  #     domains/harness.py, domains/report.py)
+  # Denied requests are audited but their reason is not surfaced to the agent.
 
 # ---------------------------------------------------------------------------
 # 成本

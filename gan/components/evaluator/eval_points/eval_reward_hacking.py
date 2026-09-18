@@ -1,5 +1,5 @@
 """eval_reward_hacking - detect reward-hacking (may require source access)."""
-from gan.context import get_eval_context
+from gan.framework.context import get_eval_context
 
 
 def tool_info():

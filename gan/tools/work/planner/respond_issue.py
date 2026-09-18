@@ -3,7 +3,7 @@
 Required for the acceptance half of the 2x2 matrix. A missing response is
 treated by the check step as "silently ignored" (rejected_no_feedback).
 """
-from gan.context import get_plan_context
+from gan.framework.context import get_plan_context
 
 
 def tool_info():

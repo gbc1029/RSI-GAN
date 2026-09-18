@@ -1,33 +1,27 @@
-"""Concrete task runners.
+"""Concrete task runners (thin glue).
 
-``DomainTaskRunner`` runs the ORIGINAL DGM-H per-domain harness (``domains.harness``)
-+ ``domains.report`` for a generation and returns a task-tree ``Node``.
+Heavy lifting (design persistence, env assembly, repo copy/patch, harness/report
+invocation and the objective ``report_summary``) lives in the frozen framework:
+``gan/framework/task_execution.py``.
 
-The task agent is **design-driven**: its design config (shallow, from the planner)
-is written via :class:`DesignStore` and passed to the harness through
-``GAN_TASK_DESIGN``; selected skills are exposed via ``GAN_TASK_SKILLS_DIR``.
-Deep changes (``code_edit``) are applied to a throwaway repo copy for that
-generation only.
+``DomainTaskRunner`` runs the ORIGINAL DGM-H per-domain harness
+(``domains.harness``) + ``domains.report`` for a generation and returns a
+task-tree ``Node``. The task agent is **design-driven**: its design config
+(shallow, from the planner) is persisted by the framework and passed to the
+harness through ``GAN_TASK_DESIGN``; selected skills are exposed via
+``GAN_TASK_SKILLS_DIR``. Deep changes (``code_edit``) are applied to a throwaway
+repo copy for that generation only.
 """
 from __future__ import annotations
 
-import json
 import os
-import shutil
-import subprocess
 import sys
 from typing import Any, Dict, List, Optional
 
+from gan.framework import task_execution as tx
 from gan.framework.loader import load_registry, resolve_domain
 from gan.design.store import DesignStore
-from gan.patch import apply_patch
-from gan.tools.assembly import assemble_tools_dir
-from gan.tree.store import Node, NodeValue
-
-_COPY_IGNORE = shutil.ignore_patterns(
-    "venv_nat", "outputs", ".git", "__pycache__", "*.pyc",
-    "polyglot-benchmark", "SWE-bench", "logs",
-)
+from gan.framework.tree.store import Node, NodeValue
 
 _CODE_OPS = {"code_edit"}
 
@@ -65,8 +59,10 @@ class DomainTaskRunner:
         reg = load_registry()
         self.domain_cfg = resolve_domain(reg, domain)
         self.score_key = self.domain_cfg.get("score_key")
+        self.output_contract = self.domain_cfg.get("output_contract") or {}
 
         self.design_store = DesignStore(os.path.join(self.output_dir, "design"))
+        self.log_path = os.path.join(self.output_dir, "task_runner.log")
 
     # -- helpers -----------------------------------------------------------
     def _resolve_model(self, config: Any) -> str:
@@ -75,15 +71,6 @@ class DomainTaskRunner:
             if m:
                 return m
         return os.environ.get("GAN_TASK_MODEL") or self.default_model
-
-    def _run(self, cmd: List[str], cwd: str, env: Dict[str, str]) -> int:
-        proc = subprocess.run(
-            cmd, cwd=cwd, env=env, text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=self.timeout,
-        )
-        with open(os.path.join(self.output_dir, "task_runner.log"), "a", encoding="utf-8") as f:
-            f.write(f"\n$ {' '.join(cmd)} (cwd={cwd})\n{proc.stdout[-4000:]}\n")
-        return proc.returncode
 
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None, genid: Any = None) -> Node:
@@ -96,50 +83,40 @@ class DomainTaskRunner:
 
         node_dir = os.path.join(self.output_dir, "nodes", str(genid))
         os.makedirs(node_dir, exist_ok=True)
-        design_path = self.design_store.save(config, "task", node_id=genid)
 
+        # framework: design persistence + env/toolset assembly + run dir
+        design_path = tx.persist_design(self.design_store, config, genid)
         model = self._resolve_model(config)
-        env = os.environ.copy()
-        env["GAN_TASK_MODEL"] = model
-        env["GAN_TASK_DESIGN"] = design_path
-        # assemble the task agent's opt-in skills for this node
-        skills_dir = os.path.join(node_dir, "skills")
-        assemble_tools_dir("task", skills_dir, config=config, include_always_on=False)
-        env["GAN_TASK_SKILLS_DIR"] = skills_dir
-
-        run_dir = self.repo_root
-        patch_applied = False
-        if patch_str.strip():
-            run_dir = os.path.join(node_dir, "repo")
-            if os.path.exists(run_dir):
-                shutil.rmtree(run_dir)
-            shutil.copytree(self.repo_root, run_dir, ignore=_COPY_IGNORE)
-            patch_applied = apply_patch(run_dir, patch_str)
+        env = tx.assemble_task_env(
+            os.environ.copy(), model=model, design_path=design_path,
+            node_dir=node_dir, config=config,
+        )
+        run_dir, patch_applied = tx.prepare_run_dir(self.repo_root, node_dir, patch_str)
 
         run_id = f"gan_{genid}"
         report_path = os.path.join(run_dir, "outputs", run_id, "report.json")
         if os.path.exists(report_path):
             os.remove(report_path)
 
-        harness_cmd = [
-            self.python, "-m", "domains.harness",
-            "--domain", self.domain,
-            "--run_id", run_id,
-            "--subset", self.subset,
-            "--num_samples", str(self.num_samples),
-        ]
-        rc = self._run(harness_cmd, run_dir, env)
-        self._run([self.python, "-m", "domains.report", "--domain", self.domain,
-                   "--dname", os.path.join("./outputs", run_id)], run_dir, env)
+        # framework: harness + report invocation (frozen measurement path)
+        rc, _out = tx.run_harness_and_report(
+            self.python, run_dir, self.domain, run_id, self.subset,
+            self.num_samples, env, self.timeout, log_path=self.log_path,
+        )
+        report = tx.read_report(report_path)
+        score = tx.extract_score(report, self.score_key)
+        report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
 
-        score = None
-        if os.path.exists(report_path):
-            try:
-                with open(report_path, "r", encoding="utf-8") as f:
-                    report = json.load(f)
-                score = report.get(self.score_key)
-            except Exception:
-                score = None
+        # score status (unscored taxonomy; imputation is decided by the loop)
+        if score is None:
+            score_status = "failed"
+            invalid_reason = None if report is not None else (
+                "harness_failed" if rc != 0 else "no_report"
+            )
+        else:
+            cov = report_summary.get("coverage")
+            score_status = "partial" if (cov is not None and cov < 1.0) else "ok"
+            invalid_reason = None
 
         parent_score = parent.value.score if parent is not None else None
         delta = (score - parent_score) if (score is not None and parent_score is not None) else None
@@ -148,7 +125,8 @@ class DomainTaskRunner:
             genid=genid,
             parent_genid=(parent.genid if parent is not None else None),
             curr_patch_files=[design_path],
-            value=NodeValue(score=score),
+            value=NodeValue(score=score, score_status=score_status,
+                            coverage=report_summary.get("coverage")),
             scores={self.domain: score},
             modify_depth=_modify_depth(records),
             meta={
@@ -160,5 +138,8 @@ class DomainTaskRunner:
                 "delta_vs_parent": delta,
                 "patch_applied": patch_applied,
                 "records": records,
+                "report_summary": report_summary,
+                "score_status": score_status,
+                "invalid_reason": invalid_reason,
             },
         )

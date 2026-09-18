@@ -1,5 +1,5 @@
 """record_predicted_score - blind evaluation score (before benchmark is revealed)."""
-from gan.context import get_eval_context
+from gan.framework.context import get_eval_context
 
 
 def tool_info():

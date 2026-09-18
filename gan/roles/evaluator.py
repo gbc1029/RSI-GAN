@@ -4,9 +4,9 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from gan.access import reset_access_context, set_access_context
+from gan.framework.access import reset_access_context, set_access_context
 from gan.design import load_seed
-from gan.context import EvalContext, reset_eval_context, set_eval_context
+from gan.framework.context import EvalContext, reset_eval_context, set_eval_context
 from gan.roles.base_role import Role
 
 
@@ -88,7 +88,7 @@ class Evaluator(Role):
         return ctx
 
     def self_improve(self, recent: Optional[Dict[str, Any]] = None):
-        from gan.context import DesignContext, reset_design_context, set_design_context
+        from gan.framework.context import DesignContext, reset_design_context, set_design_context
 
         digests = (recent or {}).get("digests") or []
         digest_text = "\n\n".join(str(d)[:2000] for d in digests[-3:]) or "(no digests yet)"
