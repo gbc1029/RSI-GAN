@@ -1,0 +1,23 @@
+# Single source of default models (FRAMEWORK, frozen).
+#
+# Resolution precedence (see gan/framework/models.py):
+#   explicit(arg) > env(GAN_MODEL_<KEY>) > models[<key>] > models.task
+#
+# Keys:
+#   task / planner / evaluator  - GAN roles
+#   meta                        - DGM-H meta agent (scripts/dgmh/run_meta_agent.py)
+#   polyglot_meta               - DGM-H polyglot meta override (scripts/dgmh/generate_loop.py)
+#   task_agent                  - DGM-H standalone task agent (scripts/dgmh/run_task_agent.py)
+models:
+  task: openai/gpt-4o-mini
+  planner: openai/gpt-4o-mini
+  evaluator: openai/gpt-4o-mini
+  meta: openai/claude-sonnet-4-5-20250929
+  polyglot_meta: openai/claude-3-5-sonnet-20241022
+  task_agent: openai/o3-mini
+
+# Optional fallback model used by agent/llm.py when the primary call fails.
+fallback: null
+
+# Optional per-domain task-model overrides (empty = use `models.task`).
+domain_task_overrides: {}

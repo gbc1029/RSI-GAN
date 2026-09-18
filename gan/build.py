@@ -5,6 +5,7 @@ import os
 from typing import List, Optional
 
 from gan.framework.access import AccessBroker
+from gan.framework import models as model_registry
 from gan.framework.frozen import deny_paths as frozen_deny_paths
 from gan.framework.loader import load_gan_loop_config
 from gan.design import load_seed
@@ -45,9 +46,12 @@ def build_gan_loop(
     cfg = load_gan_loop_config(cfg_overrides)
     domains = domains or [task_domain]
 
-    t_model = task_model or os.environ.get("GAN_TASK_MODEL") or cfg.get("models.task", "gpt-4o-mini")
-    p_model = planner_model or os.environ.get("GAN_MODEL_PLANNER") or cfg.get("models.planner", t_model)
-    e_model = evaluator_model or os.environ.get("GAN_MODEL_EVALUATOR") or cfg.get("models.evaluator", t_model)
+    # Unified model resolution (single source: gan/framework/models.py).
+    explicit = {"task": task_model, "planner": planner_model, "evaluator": evaluator_model}
+    resolved = model_registry.resolve_all(["task", "planner", "evaluator"], explicit=explicit, domain=task_domain)
+    t_model, p_model, e_model = resolved["task"], resolved["planner"], resolved["evaluator"]
+    if model_registry.fallback():
+        os.environ.setdefault("GAN_MODEL_FALLBACK", model_registry.fallback())
 
     os.makedirs(output_dir, exist_ok=True)
     _seed_self_designs(output_dir)
@@ -63,4 +67,7 @@ def build_gan_loop(
         default_model=t_model,
     )
     broker = AccessBroker(repo_root, output_dir, deny_paths=frozen_deny_paths())
-    return GanLoop(output_dir, domains, cfg, planner, evaluator, runner, broker=broker)
+    loop = GanLoop(output_dir, domains, cfg, planner, evaluator, runner, broker=broker)
+    loop.log_event({"type": "model_config", **model_registry.describe(
+        ["task", "planner", "evaluator"], explicit=explicit)})
+    return loop

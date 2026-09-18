@@ -21,7 +21,8 @@ live under `scripts/dgmh/`.
 ## `gan/` layout (nature × mutability)
 
 - `gan/framework/` — **frozen** (trust anchor): `loop.yaml` (hyperparams),
-  `domains.yaml` (incl. per-domain `output_contract`), `loader.py`, `frozen.py`
+  `domains.yaml` (incl. per-domain `output_contract`), `models.yaml` + `models.py`
+  (unified model config/resolution), `loader.py`, `frozen.py`
   (single source of the deny list), `task_execution.py` (design persistence +
   harness glue), `task_runner.py`, `checkpoint.py`, `context.py`, `access.py`,
   `loop.py`, `tree/`, `reward/`.
@@ -76,7 +77,14 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   shared substrate/measurement (`agent/llm.py`, `agent/llm_withtools.py`,
   `agent/base_agent.py`, `domains/harness.py`, `domains/report.py`) must NOT be
   modified during evolution (anti-hacking). `gan/build.py` builds the gate's deny
-  list from there; invariants are checked by `scripts/tests/test_frozen.py`.
+  list from there. A local-only layout check lives at `scripts/local/test_frozen.py`
+  (gitignored, one-off — not a maintained test).
+- **Model config**: defaults live in `gan/framework/models.yaml`; the ONLY resolver
+  is `gan/framework/models.py` (`resolve/resolve_all/fallback/describe`), precedence
+  `explicit > env(GAN_MODEL_<KEY>) > models[<key>] > models.task`. GAN roles and
+  DGM-H entry scripts (`scripts/dgmh/*`) all go through it; do not read
+  `models.yaml`/`GAN_MODEL_*` anywhere else. `models.task` is not part of the
+  evolvable design.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable.
 - **Work tools vs design operators**: evaluator scoring and planner
   `respond_issue` are work tools (`gan/tools/work/`); design operators are in

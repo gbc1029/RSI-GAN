@@ -105,9 +105,9 @@ class GanLoop:
         }
 
     def _initial_task_config(self) -> Dict[str, Any]:
-        cfg = default_config("task")
-        cfg.setdefault("params", {})["model"] = self.cfg.get("models.task", "gpt-4o-mini")
-        return cfg
+        # The model is NOT part of the evolvable design any more; it is resolved
+        # centrally by gan/framework/models.py and injected by the runner.
+        return default_config("task")
 
     def _parent_config(self, parent: Optional[Node]) -> Dict[str, Any]:
         cd = parent.meta.get("config_dict") if (parent is not None and parent.meta) else None

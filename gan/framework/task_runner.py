@@ -65,12 +65,9 @@ class DomainTaskRunner:
         self.log_path = os.path.join(self.output_dir, "task_runner.log")
 
     # -- helpers -----------------------------------------------------------
-    def _resolve_model(self, config: Any) -> str:
-        if isinstance(config, dict):
-            m = (config.get("params") or {}).get("model")
-            if m:
-                return m
-        return os.environ.get("GAN_TASK_MODEL") or self.default_model
+    # NOTE: the model is NOT read from the (evolvable) design config any more.
+    # It is resolved centrally by gan/framework/models.py and passed in as
+    # ``default_model`` (frozen model selection).
 
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None, genid: Any = None) -> Node:
@@ -86,7 +83,7 @@ class DomainTaskRunner:
 
         # framework: design persistence + env/toolset assembly + run dir
         design_path = tx.persist_design(self.design_store, config, genid)
-        model = self._resolve_model(config)
+        model = self.default_model
         env = tx.assemble_task_env(
             os.environ.copy(), model=model, design_path=design_path,
             node_dir=node_dir, config=config,

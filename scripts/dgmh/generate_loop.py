@@ -21,6 +21,7 @@ from analysis.visualize_archive import (
     visualize_archive_together,
 )
 
+from gan.framework import models as model_registry
 from utils.common import file_exist_and_not_empty, load_json_file
 from utils.constants import REPO_NAME
 from utils.docker_utils import (
@@ -593,7 +594,7 @@ def generate(
                     str(max_generation - current_genid),
                     *(
                         # If domain is polyglot, for a fair comparison with DGM
-                        ["--model", "claude-3-5-sonnet-20241022"] if domains == ["polyglot"] else []
+                        ["--model", model_registry.resolve("polyglot_meta").model] if domains == ["polyglot"] else []
                     ),
                 ]
 

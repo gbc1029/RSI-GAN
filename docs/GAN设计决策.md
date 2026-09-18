@@ -55,7 +55,7 @@
 - `gan/tools/design/set_param.py`（拒绝 `model`）、`set_config.py`（剥离 `params.model`）：模型选择冻结。
 - `agent/llm.py`：backoff 扩到 `RateLimitError/ServiceUnavailableError/Timeout/APIConnectionError`（+ openai SDK 错误）；`GAN_MODEL_FALLBACK`。
 - `domains/harness.py`：逐题 `try/except`（失败写 `evals/eval_failures.jsonl`、留空预测）；resume 空预测重试。
-- `scripts/tests/test_frozen.py`（新）：冻结布局不变式。
+- `scripts/local/test_frozen.py`（新）：冻结布局不变式。
 
 ---
 
@@ -127,7 +127,7 @@
 - **布局迁移**：`git mv` `gan/loop.py→gan/framework/loop.py`、`gan/context.py→gan/framework/context.py`、
   `gan/access.py→gan/framework/access.py`、`gan/tree/→gan/framework/tree/`（连同此前 `task_runner.py`、`reward/`）。
 - `gan/framework/task_execution.py`（新）：design 落盘 + env/技能装配 + 仓库/patch + harness/report + `report_summary`。
-- `gan/framework/frozen.py`（新）+ `gan/build.py`（deny 来自 frozen）+ `scripts/tests/test_frozen.py`。
+- `gan/framework/frozen.py`（新）+ `gan/build.py`（deny 来自 frozen）+ `scripts/local/test_frozen.py`。
 - 文档：`AGENTS.md`、`docs/GAN实现记录.md`（迁移 banner）。
 
 ---
@@ -162,49 +162,46 @@
 - **对外实验协议 + 插桩 = 冻结框架/外部**；**evaluator 内部判据（评估点/阈值）= 自进化**；二者不混在同一可编辑面。
 
 **具体改动**
-- 无代码改动；`scripts/tests/test_frozen.py` 属框架插桩。
+- 无代码改动；`scripts/local/test_frozen.py` 属框架插桩。
 
 ---
 
-## 附：模型配置统一管理（方案，待实施）
-
-**现状（分散点）**
-| 位置 | 内容 |
-|---|---|
-| `agent/llm.py:13-30` | 常量 `CLAUDE_MODEL/OPENAI_MODEL/...` + `GAN_MODEL_DEFAULT` 覆盖 |
-| `gan/framework/loop.yaml:71-74` | `models: {task, planner, evaluator}` |
-| `gan/build.py:48-50` | `explicit > GAN_MODEL_* > loop.yaml` 解析 |
-| `gan/framework/loop.py:109` | 把 `models.task` 种进 task design 的 `params.model` |
-| `gan/framework/task_runner.py:68-73` | 再从 `params.model`/`GAN_TASK_MODEL` 解析 |
-| `domains/harness.py:81` | `GAN_TASK_MODEL or <domain>.utils.MODEL` |
-| `domains/*/utils.py:3` | 每域 `MODEL` 默认 |
-| 环境变量 | `GAN_MODEL_DEFAULT / GAN_TASK_MODEL / GAN_MODEL_PLANNER / GAN_MODEL_EVALUATOR / GAN_MODEL_FALLBACK` |
+## 附：模型配置统一管理（已实施）
 
 **问题**
-- 同一"当前用什么模型"有 4+ 个来源，优先级含义重复且易漂移（例如 `loop.py` 种子与 `task_runner` 再解析可能不一致）；
-- 模型名混进可进化 design 的 `params`（虽已禁用写入，但读取仍在）；
-- fallback/preflight/成本记账没有统一入口。
+- 同一"当前用什么模型"有 4+ 个来源（agent 常量 / `loop.yaml` / `build` / `loop.params` / `task_runner` / domain utils / env），优先级重复且易漂移；
+- 模型名混进**可进化** design 的 `params`；
+- `scripts/dgmh` 的模型默认硬编码在各自脚本（meta / polyglot / task agent）；
+- fallback/preflight/审计无统一入口。
 
-**方案**
-1. 新增 **`gan/framework/models.yaml`**（冻结）：唯一默认来源
-   ```
-   models: {task: ..., planner: ..., evaluator: ..., fallback: ...}
-   domain_task_overrides: {paper_review: ..., ...}   # 可选
-   ```
-2. 新增 **`gan/framework/models.py`**（冻结）：统一解析器
-   `resolve(role, explicit=None) -> (model, source)`，优先级固定为
-   `explicit > env(GAN_MODEL_<ROLE>) > models.yaml[role] > models.yaml.task`；
-   并提供 `fallback()`、`preflight()`（启动前探测）、`describe()`（审计用）。
-3. 改造调用点：
-   - `gan/build.py` 改用 `models.resolve("task"/"planner"/"evaluator")`；
-   - `gan/framework/loop.py` 不再把模型种进 `params.model`；
-   - `gan/framework/task_runner.py` 删除 `params.model` 读取，模型由 `build` 显式传入；
-   - `agent/llm.py` 常量与 `domains/*/utils.py` 的 `MODEL` 降级为 **legacy 只读默认**（GAN 侧不再读取，仅 DGM-H 兼容）；
-   - `GAN_TASK_MODEL` 保留为**运行时注入通道**（`task_execution` 设置、`domains/harness` 读取），但值来自 `models.py`。
-4. 审计：每次运行把最终 `{task,planner,evaluator,fallback,source}` 写入 `events.jsonl`（`model_config` 事件）。
-5. 守卫：扩展 `scripts/tests/test_frozen.py`——业务代码不得直接读 `GAN_MODEL_*`/`models.`，只能经 `models.py`。
+**原设计**
+- `agent/llm.py` 常量 + `GAN_MODEL_DEFAULT`；
+- `gan/framework/loop.yaml` 有 `models:` 块；`gan/build.py` 各自解析；
+- `gan/framework/loop.py` 把 `models.task` 种进 `params.model`；`task_runner` 再解析；
+- `domains/harness.py` 读 `GAN_TASK_MODEL or <domain>.utils.MODEL`；
+- `scripts/dgmh/{run_meta_agent,run_task_agent,generate_loop}.py` 各自硬编码默认模型。
+
+**新设计**
+- **单一数据** `gan/framework/models.yaml`；**单一解析器** `gan/framework/models.py`（冻结，唯一读 yaml/env 的地方）。
+- 固定优先级：`explicit > env(GAN_MODEL_<KEY>) > models[<key>] > models.task`；`fallback` 独立项。
+- 所有调用方只经 `models.py`；模型不再进入可进化 design。
+
+**具体改动**
+- 新增 `gan/framework/models.yaml`：keys = `task / planner / evaluator / meta / polyglot_meta / task_agent` + `fallback` + `domain_task_overrides`。
+- 新增 `gan/framework/models.py`：`resolve / resolve_all / fallback / env_name / describe`；env 别名兼容 `GAN_TASK_MODEL`、`GAN_MODEL_PLANNER/EVALUATOR`、`GAN_META_MODEL`。
+- `gan/build.py`：三角色用 `resolve_all(...)`；`fallback` 写入 `GAN_MODEL_FALLBACK`；写 `model_config` 审计事件到 `events.jsonl`。
+- `gan/framework/loop.py`：删除把模型种进 `params.model`。
+- `gan/framework/task_runner.py`：删除 `_resolve_model`（不再读 design 的 `params.model`），模型由构造参数显式传入。
+- `scripts/dgmh/run_meta_agent.py`：默认 `models.resolve("meta")`（移除 `CLAUDE_MODEL` 导入）。
+- `scripts/dgmh/run_task_agent.py`：默认 `models.resolve("task_agent")`。
+- `scripts/dgmh/generate_loop.py`：polyglot 的 `--model` 用 `models.resolve("polyglot_meta")`。
+- `gan/framework/loop.yaml`：移除 `models:` 块。
+- 兼容：`domains/harness.py` 的 `GAN_TASK_MODEL` 注入通道保留（值来自 `models.py`）；`agent/llm.py` 常量与 `domains/*/utils.py:MODEL` 降级为 **legacy 只读默认**（仅 DGM-H 直用时生效）。
 
 **待定**
-- `models.yaml` 按域拆分还是单文件；
-- 是否彻底废弃 `params.model`（当前只禁写、未禁读）；
-- `domains/*/utils.py:MODEL` 是否保留为 DGM-H 兼容默认。
+- `models.yaml` 单文件 vs 按域拆分；
+- 是否彻底废弃 `params.model`（现仅禁写、未禁读）及 domain `MODEL` 常量的去留；
+- `preflight()`（模型可用性探测）尚未接入。
+
+**关于 `scripts/local/test_frozen.py`**
+- 冻结布局检查已从 `scripts/tests/` 移到 **`scripts/local/`（gitignored）**，作为**本地一次性检查**，不作为需要持续维护的仓库测试。

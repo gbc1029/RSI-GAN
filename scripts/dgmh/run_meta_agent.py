@@ -9,7 +9,7 @@ for _p in (_ROOT, _HERE):
 import argparse
 import os
 
-from agent.llm import CLAUDE_MODEL
+from gan.framework import models as model_registry
 from meta_agent import MetaAgent
 from utils.git_utils import diff_versus_commit, reset_paths_to_commit
 
@@ -20,7 +20,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default=CLAUDE_MODEL,
+        default=model_registry.resolve("meta").model,
         help="Model to use for the agent",
     )
     parser.add_argument(

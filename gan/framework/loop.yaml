@@ -66,9 +66,5 @@ feedback:
   evaluator_sees_prev_feedback: true
 
 # ---------------------------------------------------------------------------
-# 模型（可被 .env 的 GAN_MODEL_* 覆盖）
+# 模型：统一由 gan/framework/models.yaml + models.py 管理（本文件不再配置模型）
 # ---------------------------------------------------------------------------
-models:
-  task: gpt-4o-mini
-  planner: gpt-4o-mini
-  evaluator: gpt-4o-mini
