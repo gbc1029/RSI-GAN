@@ -59,13 +59,14 @@ def resolve(key: str, explicit: Optional[str] = None, domain: Optional[str] = No
     """Resolve the model for ``key`` with a fixed precedence."""
     if explicit:
         return ModelChoice(key, explicit, "explicit")
-    if domain:
-        override = _config().get(f"domain_task_overrides.{domain}")
-        if override and key == "task":
-            return ModelChoice(key, override, "domain_override")
     env_name, env_val = _env_value(key)
     if env_val:
         return ModelChoice(key, env_val, f"env:{env_name}")
+    # per-domain default (task only), applied before the generic task default
+    if key == "task" and domain:
+        domain_override = _config().get(f"domains.{domain}")
+        if domain_override:
+            return ModelChoice(key, domain_override, f"domains.{domain}")
     raw = _raw(key)
     if raw:
         source = "models.yaml" if _config().get(f"models.{key}") is not None else "models.task"

@@ -19,5 +19,11 @@ models:
 # Optional fallback model used by agent/llm.py when the primary call fails.
 fallback: null
 
-# Optional per-domain task-model overrides (empty = use `models.task`).
-domain_task_overrides: {}
+# Per-domain default task model (was domains/<d>/utils.py: MODEL).
+# Used when no explicit/env task model is given; overridden by GAN_TASK_MODEL.
+domains:
+  paper_review: openai/gpt-4o
+  search_arena: openai/gpt-4o
+  imo_grading: openai/o4-mini
+  imo_proof: openai/o4-mini
+  imo_proof_grading: openai/o4-mini

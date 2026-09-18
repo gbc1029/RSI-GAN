@@ -77,8 +77,16 @@ def harness(
     utils_module = importlib.import_module(utils_module_path)
     format_input_dict = utils_module.format_input_dict
     question_id_col = utils_module.QUESTION_ID
-    # GAN extension: allow the task model to be injected (e.g. per-node config)
-    model = os.environ.get("GAN_TASK_MODEL") or utils_module.MODEL
+    # Model: injected at runtime (GAN_TASK_MODEL) or resolved centrally from
+    # gan/framework/models.yaml (per-domain default). Falls back to the legacy
+    # domains/<d>/utils.py:MODEL only for standalone use.
+    model = os.environ.get("GAN_TASK_MODEL")
+    if not model:
+        try:
+            from gan.framework import models as _model_registry
+            model = _model_registry.resolve("task", domain=domain).model
+        except Exception:
+            model = getattr(utils_module, "MODEL", None)
 
     # Load TaskAgent either from a file path or an importable module path
     TaskAgent = load_task_agent(agent_path)

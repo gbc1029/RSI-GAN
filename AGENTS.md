@@ -81,10 +81,12 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   (gitignored, one-off — not a maintained test).
 - **Model config**: defaults live in `gan/framework/models.yaml`; the ONLY resolver
   is `gan/framework/models.py` (`resolve/resolve_all/fallback/describe`), precedence
-  `explicit > env(GAN_MODEL_<KEY>) > models[<key>] > models.task`. GAN roles and
-  DGM-H entry scripts (`scripts/dgmh/*`) all go through it; do not read
-  `models.yaml`/`GAN_MODEL_*` anywhere else. `models.task` is not part of the
-  evolvable design.
+  `explicit > env(GAN_MODEL_<KEY>) > domains[<domain>] (task only) > models[<key>] > models.task`.
+  GAN roles, DGM-H entry scripts (`scripts/dgmh/*`) and the domain harness all go
+  through it; do not read `models.yaml`/`GAN_MODEL_*` anywhere else. `domains/harness.py`
+  resolves `GAN_TASK_MODEL` -> `models.resolve("task", domain=...)`; per-domain
+  `MODEL` constants were removed from `domains/*/utils.py`. `models.task` is not part
+  of the evolvable design.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable.
 - **Work tools vs design operators**: evaluator scoring and planner
   `respond_issue` are work tools (`gan/tools/work/`); design operators are in

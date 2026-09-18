@@ -193,15 +193,19 @@
 - `gan/framework/loop.py`：删除把模型种进 `params.model`。
 - `gan/framework/task_runner.py`：删除 `_resolve_model`（不再读 design 的 `params.model`），模型由构造参数显式传入。
 - `scripts/dgmh/run_meta_agent.py`：默认 `models.resolve("meta")`（移除 `CLAUDE_MODEL` 导入）。
-- `scripts/dgmh/run_task_agent.py`：默认 `models.resolve("task_agent")`。
+- `scripts/dgmh/run_task_agent.py`：默认 `models.resolve("task_agent")`；**保留 `--model` 仅作显式覆盖**，不再有硬编码默认。
 - `scripts/dgmh/generate_loop.py`：polyglot 的 `--model` 用 `models.resolve("polyglot_meta")`。
+- **domains 整合**：`domains/{paper_review,search_arena}/utils.py` 与 `domains/imo/{grading,proof,proof_grading}_utils.py` 的 `MODEL` 常量**移除**，改由 `models.yaml: domains.<domain>` 配置；`domains/harness.py` 解析顺序为
+  `GAN_TASK_MODEL(env 注入) → models.resolve("task", domain=domain) → legacy utils.MODEL`。
+- **polyglot 整合**：`domains/polyglot/harness.py` 删除硬编码 `--model o3-mini`，交由 `run_task_agent` 用 `models.resolve("task_agent")` 解析。
 - `gan/framework/loop.yaml`：移除 `models:` 块。
-- 兼容：`domains/harness.py` 的 `GAN_TASK_MODEL` 注入通道保留（值来自 `models.py`）；`agent/llm.py` 常量与 `domains/*/utils.py:MODEL` 降级为 **legacy 只读默认**（仅 DGM-H 直用时生效）。
+- 兼容/例外：`agent/llm.py` 常量降级为 legacy 只读默认；`domains/polyglot/benchmark.py` 的 aider 风格 CLI `--model`（默认 `gpt-3.5-turbo`）属 benchmark 工具链，**保留为显式例外**（非我们的 agent 配置）。
 
 **待定**
 - `models.yaml` 单文件 vs 按域拆分；
-- 是否彻底废弃 `params.model`（现仅禁写、未禁读）及 domain `MODEL` 常量的去留；
-- `preflight()`（模型可用性探测）尚未接入。
+- 是否彻底废弃 `params.model`（现仅禁写、未禁读）；
+- `preflight()`（模型可用性探测）尚未接入；
+- `domains/polyglot/benchmark.py` 的 CLI `--model` 是否也纳入（当前作为工具链例外）。
 
 **关于 `scripts/local/test_frozen.py`**
 - 冻结布局检查已从 `scripts/tests/` 移到 **`scripts/local/`（gitignored）**，作为**本地一次性检查**，不作为需要持续维护的仓库测试。

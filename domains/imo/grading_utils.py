@@ -1,6 +1,5 @@
 QUESTION_ID = "Grading ID"
 GROUND_TRUTH_KEY = "Reward"
-MODEL = "gpt-o4-mini-genai"
 
 def format_input_dict(row):
     # Extract the inputs for the task from the row
