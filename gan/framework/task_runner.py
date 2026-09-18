@@ -85,7 +85,7 @@ class DomainTaskRunner:
         design_path = tx.persist_design(self.design_store, config, genid)
         model = self.default_model
         env = tx.assemble_task_env(
-            os.environ.copy(), model=model, design_path=design_path,
+            os.environ.copy(), design_path=design_path,
             node_dir=node_dir, config=config,
         )
         run_dir, patch_applied = tx.prepare_run_dir(self.repo_root, node_dir, patch_str)
@@ -95,10 +95,10 @@ class DomainTaskRunner:
         if os.path.exists(report_path):
             os.remove(report_path)
 
-        # framework: harness + report invocation (frozen measurement path)
+        # framework: harness + report invocation (frozen measurement path); model passed explicitly
         rc, _out = tx.run_harness_and_report(
             self.python, run_dir, self.domain, run_id, self.subset,
-            self.num_samples, env, self.timeout, log_path=self.log_path,
+            self.num_samples, model, env, self.timeout, log_path=self.log_path,
         )
         report = tx.read_report(report_path)
         score = tx.extract_score(report, self.score_key)

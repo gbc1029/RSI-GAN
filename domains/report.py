@@ -136,7 +136,7 @@ def report(
 
     return report, report_path
 
-def report_imo_proof(dname):
+def report_imo_proof(dname, model=None):
     # Grade the generated proofs
     from domains.harness import harness
     output_folder = harness(
@@ -145,6 +145,7 @@ def report_imo_proof(dname):
         proofs_dname=dname,
         output_dir=dname,
         run_id="gradings",
+        model=model,
     )
     # Get report of grading
     from domains.imo.proof_eval import report_proof_grading
@@ -179,6 +180,10 @@ if __name__ == "__main__":
         help="Domain to evaluate",
     )
     # parser.add_argument("--proofgrader_repo", default="./proofgrader_repo", help="Path to repository containing the proof grader that we want to use for imo_proof domain")
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Model id for proof grading (imo_proof); resolved from models.yaml by the driver.",
+    )
     args = parser.parse_args()
 
     domain = args.domain
@@ -188,7 +193,7 @@ if __name__ == "__main__":
         report(dname=args.dname, domain=args.domain)
 
     elif domain == "imo_proof":
-        report_imo_proof(dname=args.dname)
+        report_imo_proof(dname=args.dname, model=args.model)
 
     # Balrog game domains
     elif "balrog" in domain:

@@ -166,46 +166,59 @@
 
 ---
 
-## 附：模型配置统一管理（已实施）
+## 附：模型配置统一管理（已实施，v2：三部分 + 纯查表）
 
 **问题**
-- 同一"当前用什么模型"有 4+ 个来源（agent 常量 / `loop.yaml` / `build` / `loop.params` / `task_runner` / domain utils / env），优先级重复且易漂移；
-- 模型名混进**可进化** design 的 `params`；
-- `scripts/dgmh` 的模型默认硬编码在各自脚本（meta / polyglot / task agent）；
-- fallback/preflight/审计无统一入口。
+- 模型配置散落 4+ 处（`agent/llm.py` 常量 / `loop.yaml` / `build` / `loop.params` / `task_runner` / domain utils / 多处 env），存在优先级语义重复、漂移、不可追踪；
+- 模型名混进**可进化** design 的 `params.model`；
+- `scripts/dgmh`、`domains/*/utils.py`、balrog/genesis 工厂各写各的默认。
 
-**原设计**
-- `agent/llm.py` 常量 + `GAN_MODEL_DEFAULT`；
-- `gan/framework/loop.yaml` 有 `models:` 块；`gan/build.py` 各自解析；
-- `gan/framework/loop.py` 把 `models.task` 种进 `params.model`；`task_runner` 再解析；
-- `domains/harness.py` 读 `GAN_TASK_MODEL or <domain>.utils.MODEL`；
-- `scripts/dgmh/{run_meta_agent,run_task_agent,generate_loop}.py` 各自硬编码默认模型。
+**原设计（v1）**
+- 优先级链 `explicit > env > domain > models[key] > models.task` + `fallback`；
+- 域 task 默认放在 `models.yaml: domains.<domain>`。
 
-**新设计**
-- **单一数据** `gan/framework/models.yaml`；**单一解析器** `gan/framework/models.py`（冻结，唯一读 yaml/env 的地方）。
-- 固定优先级：`explicit > env(GAN_MODEL_<KEY>) > models[<key>] > models.task`；`fallback` 独立项。
-- 所有调用方只经 `models.py`；模型不再进入可进化 design。
+**新设计（v2，最终）**
+- `gan/framework/models.yaml` 分三部分，**唯一解释**：
+  - `gan.{task,planner,evaluator}`；
+  - `dgmh.{meta,task}`；
+  - `domains.<role>`（仅**非 task** 的域专属角色）。
+- `gan/framework/models.py` = **纯查表**（`resolve`/`resolve_section`/`describe`），**无 env、无 fallback、无优先级链**。
+- 所有 **domain 的 task agent 共用驱动的 task 配置**，由驱动方解析后 **运行时显式传递**（不再是域属性、不再读 env）。
+- 角色归并：**proof grader、balrog 策略 agent、genesis reward 合成 → 全部并入 task agent**；polyglot 的 aider CLI 为**独立**域角色（`domains.polyglot_aider`）。
+
+**角色盘点（归并后）**
+
+| 角色 key | 覆盖的 agent | 运行方式 |
+|---|---|---|
+| `gan.task` | GAN 的 task agent（paper_review/search_arena/imo/polyglot/balrog/genesis 的通用 task） | 驱动解析 → `--model` 显式传给 `domains.harness` |
+| `gan.planner` / `gan.evaluator` | GAN 两角色 | GAN build 直接构造 |
+| `dgmh.task` | DGM-H 的 task agent（含 polyglot run_task_agent） | 显式传参 |
+| `dgmh.meta` | DGM-H meta agent（含原 polyglot meta、DGM baseline coding/diagnose） | 显式传参 |
+| `domains.polyglot_aider` | polyglot benchmark 的 aider CLI（外部工具） | CLI 默认值 |
 
 **具体改动**
-- 新增 `gan/framework/models.yaml`：keys = `task / planner / evaluator / meta / polyglot_meta / task_agent` + `fallback` + `domain_task_overrides`。
-- 新增 `gan/framework/models.py`：`resolve / resolve_all / fallback / env_name / describe`；env 别名兼容 `GAN_TASK_MODEL`、`GAN_MODEL_PLANNER/EVALUATOR`、`GAN_META_MODEL`。
-- `gan/build.py`：三角色用 `resolve_all(...)`；`fallback` 写入 `GAN_MODEL_FALLBACK`；写 `model_config` 审计事件到 `events.jsonl`。
-- `gan/framework/loop.py`：删除把模型种进 `params.model`。
-- `gan/framework/task_runner.py`：删除 `_resolve_model`（不再读 design 的 `params.model`），模型由构造参数显式传入。
-- `scripts/dgmh/run_meta_agent.py`：默认 `models.resolve("meta")`（移除 `CLAUDE_MODEL` 导入）。
-- `scripts/dgmh/run_task_agent.py`：默认 `models.resolve("task_agent")`；**保留 `--model` 仅作显式覆盖**，不再有硬编码默认。
-- `scripts/dgmh/generate_loop.py`：polyglot 的 `--model` 用 `models.resolve("polyglot_meta")`。
-- **domains 整合**：`domains/{paper_review,search_arena}/utils.py` 与 `domains/imo/{grading,proof,proof_grading}_utils.py` 的 `MODEL` 常量**移除**，改由 `models.yaml: domains.<domain>` 配置；`domains/harness.py` 解析顺序为
-  `GAN_TASK_MODEL(env 注入) → models.resolve("task", domain=domain) → legacy utils.MODEL`。
-- **polyglot 整合**：`domains/polyglot/harness.py` 删除硬编码 `--model o3-mini`，交由 `run_task_agent` 用 `models.resolve("task_agent")` 解析。
-- `gan/framework/loop.yaml`：移除 `models:` 块。
-- 兼容/例外：`agent/llm.py` 常量降级为 legacy 只读默认；`domains/polyglot/benchmark.py` 的 aider 风格 CLI `--model`（默认 `gpt-3.5-turbo`）属 benchmark 工具链，**保留为显式例外**（非我们的 agent 配置）。
+- `gan/framework/models.yaml`：三部分结构；删除 `fallback`、`domains.<domain>` 的 task 默认。
+- `gan/framework/models.py`：重写为纯查表（删除 env 别名 / fallback / 优先级）。
+- `gan/build.py`：`resolve("gan.task"/"gan.planner"/"gan.evaluator")`；**删除 explicit 覆盖参数**（`task_model/…`）；写 `model_config` 事件。
+- `gan/framework/{task_execution,task_runner}.py`：**不再设 `GAN_TASK_MODEL`**；改为把模型作为 `--model` 传给 `domains.harness`。
+- `domains/harness.py`：新增 **必需的 `--model`**；`harness(..., model=)` 无 model 直接报错；删除 env/legacy 解析。
+- `domains/report.py`：`report_imo_proof(..., model)` 与 `--model`（proof grader 现为 task 角色，仍显式传模型）。
+- `domains/polyglot/harness.py`：`harness(..., model=)` → `process_entry` → `run_task_agent --model`。
+- `scripts/dgmh/{run_meta_agent,run_task_agent}.py`：`resolve("dgmh.meta")` / `resolve("dgmh.task")`。
+- `scripts/dgmh/generate_loop.py`：eval/report 传 `--model resolve("dgmh.task")`；meta 传 `resolve("dgmh.meta")`；启动写 `[model_config]` 日志。
+- `scripts/run_gan.py`：删除 `--task/planner/evaluator-model`（不再有显式覆盖）。
+- `domains/balrog/agents`、`domains/genesis/agents`：`AgentFactory` 改用 `config.model`；两份 `config.yaml` 增顶层 `model: null`，由 `domains/harness.py` 注入 `model=<id>`。
+- `domains/polyglot/benchmark.py`：aider CLI `--model` 默认取 `resolve("domains.polyglot_aider")`。
+- **`agent/llm.py` 清理**：删除全部 `*_MODEL` 常量、`GAN_MODEL_DEFAULT` 覆盖与 fallback 逻辑；`get_response_from_llm(msg, model, ...)` 的 `model` 变为**必填**，仅保留重试（不换模型）。`agent/base_agent.py`、`agent/llm_withtools.py` 同步去掉默认模型；`baselines/dgm/{utils,coding_agent}.py` 改用 `resolve("dgmh.meta")`。
+
+**运行时的模型配置显式记录**
+- GAN：`gan/build.py` 每次 build 写 `events.jsonl` 的 `model_config` 事件；每个 `Node.meta["model"]` 记录当次使用的模型。
+- DGM-H：`generate_loop()` 启动写 `[model_config] {...}` 到 `generate_loop.log`。
+- 域：`domains/harness.py` 收到的 `--model` 即最终值（显式传参，可追踪）。
 
 **待定**
-- `models.yaml` 单文件 vs 按域拆分；
-- 是否彻底废弃 `params.model`（现仅禁写、未禁读）；
-- `preflight()`（模型可用性探测）尚未接入；
-- `domains/polyglot/benchmark.py` 的 CLI `--model` 是否也纳入（当前作为工具链例外）。
+- `preflight()`（启动前模型可用性探测）尚未接入；
+- 多域运行统一用单一 task 模型（已定）；若未来某域确需不同 task 模型，需在驱动方显式增加，而不是回到域/环境配置。
 
 **关于 `scripts/local/test_frozen.py`**
 - 冻结布局检查已从 `scripts/tests/` 移到 **`scripts/local/`（gitignored）**，作为**本地一次性检查**，不作为需要持续维护的仓库测试。

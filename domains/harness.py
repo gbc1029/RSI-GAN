@@ -69,6 +69,7 @@ def harness(
     resume_from=None,
     subset="",
     proofs_dname=None,
+    model=None,
 ):
     # Dynamically import functions based on the domain
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
@@ -77,16 +78,13 @@ def harness(
     utils_module = importlib.import_module(utils_module_path)
     format_input_dict = utils_module.format_input_dict
     question_id_col = utils_module.QUESTION_ID
-    # Model: injected at runtime (GAN_TASK_MODEL) or resolved centrally from
-    # gan/framework/models.yaml (per-domain default). Falls back to the legacy
-    # domains/<d>/utils.py:MODEL only for standalone use.
-    model = os.environ.get("GAN_TASK_MODEL")
+    # Model is passed explicitly by the driver (from gan/framework/models.yaml).
+    # No environment lookup, no fallback.
     if not model:
-        try:
-            from gan.framework import models as _model_registry
-            model = _model_registry.resolve("task", domain=domain).model
-        except Exception:
-            model = getattr(utils_module, "MODEL", None)
+        raise ValueError(
+            "domains.harness requires an explicit --model (resolved from "
+            "gan/framework/models.yaml by the driver)."
+        )
 
     # Load TaskAgent either from a file path or an importable module path
     TaskAgent = load_task_agent(agent_path)
@@ -249,6 +247,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--proofs_dname", type=str, default="", help="Path to the directory containing proofs to grade (for imo_proof_grading)"
     )
+    parser.add_argument(
+        "--model", type=str, required=True,
+        help="Model id, resolved from gan/framework/models.yaml by the driver (passed explicitly; no env/fallback).",
+    )
     args = parser.parse_args()
 
     domain = args.domain
@@ -269,6 +271,7 @@ if __name__ == "__main__":
             resume_from=args.resume_from,
             subset=args.subset,
             proofs_dname=args.proofs_dname,
+            model=args.model,
         )
 
     # Balrog game domains
@@ -285,6 +288,7 @@ if __name__ == "__main__":
                     f"eval.num_workers={args.num_workers}",
                     f"envs.names={env_name}",
                     f"eval.run_id={args.run_id if args.run_id is not None else 'null'}",
+                    f"model={args.model}",
                 ]
                 + (
                     [f"eval.num_episodes.{env_name}={args.num_samples}"]
@@ -319,6 +323,7 @@ if __name__ == "__main__":
                     f"envs.names={env_name}",
                     f"eval.run_id={args.run_id if args.run_id is not None else 'null'}",
                     f"utils.root_dir={root_dir}",
+                    f"model={args.model}",
                 ]
                 + (
                     [f"eval.num_episodes.{env_name}={args.num_samples}"]

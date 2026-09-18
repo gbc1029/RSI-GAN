@@ -80,6 +80,7 @@ def run_harness_polyglot(root_dir, output_dir, genid, skip_staged_eval=False, nu
             pred_dname=eval_output_dir,
             output_dir=eval_output_dir,
             root_dir=root_dir,
+            model=model_registry.resolve("dgmh.task"),
         )
         report_polyglot(output_dir=eval_output_dir, run_keyword=model_name_or_path, expected_num_tasks=len(test_task_list))
         stagedeval_score = get_score("polyglot", output_dir, genid)
@@ -99,6 +100,7 @@ def run_harness_polyglot(root_dir, output_dir, genid, skip_staged_eval=False, nu
             pred_dname=eval_output_dir,
             output_dir=eval_output_dir,
             root_dir=root_dir,
+            model=model_registry.resolve("dgmh.task"),
         )
         report_polyglot(output_dir=eval_output_dir, run_keyword=model_name_or_path, expected_num_tasks=len(test_task_list + test_task_list_more))
 
@@ -344,6 +346,8 @@ def eval_produced_agent(
             str(eval_workers),
             "--subset",
             eval_subset.replace("_train", f"_{split}"),
+            "--model",
+            model_registry.resolve("dgmh.task"),
         ]
         exec_result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
         log_container_output(exec_result)
@@ -357,6 +361,8 @@ def eval_produced_agent(
             domain,
             "--dname",
             os.path.join(container_output_folder, eval_run_id),
+            "--model",
+            model_registry.resolve("dgmh.task"),
         ]
         exec_result = container.exec_run(cmd=command, workdir=f"/{REPO_NAME}")
         log_container_output(exec_result)
@@ -592,10 +598,8 @@ def generate(
                     container_agentoutput_folder,
                     "--iterations_left",
                     str(max_generation - current_genid),
-                    *(
-                        # If domain is polyglot, for a fair comparison with DGM
-                        ["--model", model_registry.resolve("polyglot_meta").model] if domains == ["polyglot"] else []
-                    ),
+                    "--model",
+                    model_registry.resolve("dgmh.meta"),
                 ]
 
             run_workdir = (
@@ -748,6 +752,8 @@ def generate_loop(
 ):
     # Initialization
     docker_client = docker.DockerClient()
+    # explicit runtime record of the model configuration (single source: models.yaml)
+    safe_log(f"[model_config] {json.dumps(model_registry.describe(), ensure_ascii=False)}")
     parent_selection = "latest" if run_baseline == "no_archive" else parent_selection
     if resume_from:
         output_dir = os.path.normpath(os.path.abspath(resume_from))

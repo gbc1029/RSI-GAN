@@ -38,20 +38,15 @@ def build_gan_loop(
     task_domain: str = "paper_review",
     subset: str = "_filtered_100_train",
     num_samples: int = 2,
-    task_model: Optional[str] = None,
-    planner_model: Optional[str] = None,
-    evaluator_model: Optional[str] = None,
     cfg_overrides: Optional[dict] = None,
 ) -> GanLoop:
     cfg = load_gan_loop_config(cfg_overrides)
     domains = domains or [task_domain]
 
-    # Unified model resolution (single source: gan/framework/models.py).
-    explicit = {"task": task_model, "planner": planner_model, "evaluator": evaluator_model}
-    resolved = model_registry.resolve_all(["task", "planner", "evaluator"], explicit=explicit, domain=task_domain)
-    t_model, p_model, e_model = resolved["task"], resolved["planner"], resolved["evaluator"]
-    if model_registry.fallback():
-        os.environ.setdefault("GAN_MODEL_FALLBACK", model_registry.fallback())
+    # Single source: gan/framework/models.yaml (no env, no fallback, no overrides).
+    t_model = model_registry.resolve("gan.task")
+    p_model = model_registry.resolve("gan.planner")
+    e_model = model_registry.resolve("gan.evaluator")
 
     os.makedirs(output_dir, exist_ok=True)
     _seed_self_designs(output_dir)
@@ -68,6 +63,7 @@ def build_gan_loop(
     )
     broker = AccessBroker(repo_root, output_dir, deny_paths=frozen_deny_paths())
     loop = GanLoop(output_dir, domains, cfg, planner, evaluator, runner, broker=broker)
-    loop.log_event({"type": "model_config", **model_registry.describe(
-        ["task", "planner", "evaluator"], explicit=explicit)})
+    # explicit runtime record of the model configuration actually used
+    loop.log_event({"type": "model_config",
+                    **model_registry.describe(["gan.task", "gan.planner", "gan.evaluator"])})
     return loop

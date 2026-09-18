@@ -5,7 +5,6 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../.."))
 
 from task_agent import TaskAgent
-from agent.llm import CLAUDE_MODEL
 
 
 class AgentFactory:
@@ -29,6 +28,6 @@ class AgentFactory:
         Create an agent instance with output to the chat history file.
         """
         return TaskAgent(
-            model=CLAUDE_MODEL,
+            model=self.config.model,
             chat_history_file=chat_history_file,
         )

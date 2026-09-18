@@ -1,37 +1,17 @@
 import backoff
-import os
+import json
 from typing import Tuple
+
 import requests
 import litellm
 from dotenv import load_dotenv
-import json
 
 load_dotenv()
 
 MAX_TOKENS = 16384
 
-CLAUDE_MODEL = "anthropic/claude-sonnet-4-5-20250929"
-CLAUDE_HAIKU_MODEL = "anthropic/claude-3-haiku-20240307"
-CLAUDE_35NEW_MODEL = "anthropic/claude-3-5-sonnet-20241022"
-OPENAI_MODEL = "openai/gpt-4o"
-OPENAI_MINI_MODEL = "openai/gpt-4o-mini"
-OPENAI_O3_MODEL = "openai/o3"
-OPENAI_O3MINI_MODEL = "openai/o3-mini"
-OPENAI_O4MINI_MODEL = "openai/o4-mini"
-OPENAI_GPT52_MODEL = "openai/gpt-5.2"
-OPENAI_GPT5_MODEL = "openai/gpt-5"
-OPENAI_GPT5MINI_MODEL = "openai/gpt-5-mini"
-GEMINI_3_MODEL = "gemini/gemini-3-pro-preview"
-GEMINI_MODEL = "gemini/gemini-2.5-pro"
-GEMINI_FLASH_MODEL = "gemini/gemini-2.5-flash"
-
-# --- GAN extensions -------------------------------------------------------
-# Allow overriding the default model via env (e.g. GAN_MODEL_DEFAULT=openai/glm-4.7-flash).
-OPENAI_MODEL = os.environ.get("GAN_MODEL_DEFAULT", OPENAI_MODEL)
-
 # Usage/cost hooks: registered callbacks receive (model, usage_dict) after every
-# successful LLM call. The GAN reward layer uses this to attach token cost to
-# the RewardPacket.
+# successful LLM call. The GAN reward layer uses this to attach token cost.
 USAGE_HOOKS: list = []
 
 
@@ -54,6 +34,8 @@ def _run_usage_hooks(model, response):
 
 
 # Retry on transient provider failures (rate limit / 5xx / timeout / conn drops).
+# NOTE: there is NO fallback model — a model is chosen solely from
+# gan/framework/models.yaml and passed in explicitly by the caller.
 _BACKOFF_EXCEPTIONS = [requests.exceptions.RequestException, json.JSONDecodeError, KeyError]
 for _name in ("RateLimitError", "ServiceUnavailableError", "Timeout", "APIConnectionError"):
     _exc = getattr(getattr(litellm, "exceptions", None), _name, None)
@@ -69,7 +51,7 @@ except Exception:
     pass
 _BACKOFF_EXCEPTIONS = tuple(_BACKOFF_EXCEPTIONS)
 
-litellm.drop_params=True
+litellm.drop_params = True
 
 
 def _completion_kwargs(model, messages, temperature, max_tokens):
@@ -96,7 +78,7 @@ def _completion_kwargs(model, messages, temperature, max_tokens):
 )
 def get_response_from_llm(
     msg: str,
-    model: str = OPENAI_MODEL,
+    model: str,
     temperature: float = 0.0,
     max_tokens: int = MAX_TOKENS,
     msg_history=None,
@@ -112,21 +94,10 @@ def get_response_from_llm(
 
     new_msg_history = msg_history + [{"role": "user", "content": msg}]
 
-    # Primary call; on failure fall back once to GAN_MODEL_FALLBACK (if configured).
-    effective_model = model
-    try:
-        response = litellm.completion(
-            **_completion_kwargs(model, new_msg_history, temperature, max_tokens)
-        )
-    except Exception:
-        fallback = os.environ.get("GAN_MODEL_FALLBACK")
-        if not fallback or fallback == model:
-            raise
-        effective_model = fallback
-        response = litellm.completion(
-            **_completion_kwargs(fallback, new_msg_history, temperature, max_tokens)
-        )
-    _run_usage_hooks(effective_model, response)
+    response = litellm.completion(
+        **_completion_kwargs(model, new_msg_history, temperature, max_tokens)
+    )
+    _run_usage_hooks(model, response)
     response_text = response['choices'][0]['message']['content']  # pyright: ignore
     new_msg_history.append({"role": "assistant", "content": response['choices'][0]['message']['content']})
 
@@ -137,32 +108,3 @@ def get_response_from_llm(
     ]
 
     return response_text, new_msg_history, {}
-
-
-if __name__ == "__main__":
-    msg = 'Hello there!'
-    models = [
-        ("CLAUDE_MODEL", CLAUDE_MODEL),
-        ("CLAUDE_HAIKU_MODEL", CLAUDE_HAIKU_MODEL),
-        ("CLAUDE_35NEW_MODEL", CLAUDE_35NEW_MODEL),
-        ("OPENAI_MODEL", OPENAI_MODEL),
-        ("OPENAI_MINI_MODEL", OPENAI_MINI_MODEL),
-        ("OPENAI_O3_MODEL", OPENAI_O3_MODEL),
-        ("OPENAI_O3MINI_MODEL", OPENAI_O3MINI_MODEL),
-        ("OPENAI_O4MINI_MODEL", OPENAI_O4MINI_MODEL),
-        ("OPENAI_GPT52_MODEL", OPENAI_GPT52_MODEL),
-        ("OPENAI_GPT5_MODEL", OPENAI_GPT5_MODEL),
-        ("OPENAI_GPT5MINI_MODEL", OPENAI_GPT5MINI_MODEL),
-        ("GEMINI_3_MODEL", GEMINI_3_MODEL),
-        ("GEMINI_MODEL", GEMINI_MODEL),
-        ("GEMINI_FLASH_MODEL", GEMINI_FLASH_MODEL),
-    ]
-    for name, model in models:
-        print(f"\n{'='*50}")
-        print(f"Testing {name}: {model}")
-        print('='*50)
-        try:
-            output_msg, msg_history, info = get_response_from_llm(msg, model=model)
-            print(f"OK: {output_msg[:100]}...")
-        except Exception as e:
-            print(f"FAIL: {str(e)[:200]}")

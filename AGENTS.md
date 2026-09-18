@@ -56,8 +56,9 @@ OPENAI_API_KEY=<key>
 python scripts/run_gan.py --task-domain paper_review --subset _filtered_100_train \
   --num_samples 2 --outer 1 --inner 2 --output_dir outputs/gan_paper_review
 
-# original HyperAgents domain eval
-python -m domains.harness --domain paper_review --run_id demo --subset _filtered_100_train --num_samples 2
+# original HyperAgents domain eval (model is explicit; resolved from models.yaml)
+python -m domains.harness --domain paper_review --model openai/gpt-4o \
+  --run_id demo --subset _filtered_100_train --num_samples 2
 python -m domains.report  --domain paper_review --dname ./outputs/demo
 ```
 
@@ -79,14 +80,15 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   modified during evolution (anti-hacking). `gan/build.py` builds the gate's deny
   list from there. A local-only layout check lives at `scripts/local/test_frozen.py`
   (gitignored, one-off — not a maintained test).
-- **Model config**: defaults live in `gan/framework/models.yaml`; the ONLY resolver
-  is `gan/framework/models.py` (`resolve/resolve_all/fallback/describe`), precedence
-  `explicit > env(GAN_MODEL_<KEY>) > domains[<domain>] (task only) > models[<key>] > models.task`.
-  GAN roles, DGM-H entry scripts (`scripts/dgmh/*`) and the domain harness all go
-  through it; do not read `models.yaml`/`GAN_MODEL_*` anywhere else. `domains/harness.py`
-  resolves `GAN_TASK_MODEL` -> `models.resolve("task", domain=...)`; per-domain
-  `MODEL` constants were removed from `domains/*/utils.py`. `models.task` is not part
-  of the evolvable design.
+- **Model config**: the single source is `gan/framework/models.yaml`, read only by
+  `gan/framework/models.py` (`resolve/resolve_section/describe`) — a **pure lookup**
+  with NO env, NO fallback and NO precedence chain. Sections: `gan.{task,planner,evaluator}`,
+  `dgmh.{meta,task}`, `domains.<role>` (non-task domain roles only, e.g. the polyglot
+  aider CLI). The **domain task agent shares the driver's task model** and receives it
+  at runtime via an explicit `domains.harness --model ...` argument (never env). The
+  effective model is recorded at runtime (`events.jsonl: model_config` for GAN;
+  `[model_config]` log line for DGM-H; `Node.meta["model"]` per generation). Do not
+  read `models.yaml` anywhere else.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable.
 - **Work tools vs design operators**: evaluator scoring and planner
   `respond_issue` are work tools (`gan/tools/work/`); design operators are in

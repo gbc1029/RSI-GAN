@@ -26,9 +26,6 @@ def main():
     p.add_argument("--num_samples", type=int, default=2)
     p.add_argument("--outer", type=int, default=None)
     p.add_argument("--inner", type=int, default=None)
-    p.add_argument("--task-model", dest="task_model", default=None)
-    p.add_argument("--planner-model", dest="planner_model", default=None)
-    p.add_argument("--evaluator-model", dest="evaluator_model", default=None)
     args = p.parse_args()
 
     from gan.build import build_gan_loop
@@ -46,9 +43,6 @@ def main():
         task_domain=args.task_domain,
         subset=args.subset,
         num_samples=args.num_samples,
-        task_model=args.task_model,
-        planner_model=args.planner_model,
-        evaluator_model=args.evaluator_model,
         cfg_overrides=overrides or None,
     )
     tree = loop.run()

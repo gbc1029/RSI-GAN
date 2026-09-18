@@ -8,7 +8,7 @@ import os
 import threading
 
 from agent.llm_withtools import chat_with_agent
-from agent.llm import CLAUDE_MODEL
+from gan.framework import models as model_registry
 from utils.git_utils import diff_versus_commit, reset_to_commit, apply_patch, reset_paths_to_commit
 
 # Thread-local storage for logger instances
@@ -79,7 +79,7 @@ class CodingAgent:
         self.base_commit = base_commit
         self.chat_history_file = chat_history_file
         self.self_improve = self_improve
-        self.code_model = CLAUDE_MODEL
+        self.code_model = model_registry.resolve("dgmh.meta")
 
         # Initialize logger and store it in thread-local storage
         self.logger = setup_logger(chat_history_file)

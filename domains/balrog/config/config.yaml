@@ -1,3 +1,7 @@
+# LLM model for the task agent; the driver sets this from gan/framework/models.yaml
+# (domains/harness.py injects `model=<id>`). No env/fallback.
+model: null
+
 # agent: 
 #   type: naive            # Type of agent to use (e.g., 'naive', 'cot', etc.)
 #   remember_cot: True     # Whether the agent should remember its reasoning across turns

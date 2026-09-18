@@ -1,29 +1,21 @@
-# Single source of default models (FRAMEWORK, frozen).
+# Single source of truth for model selection (FRAMEWORK, frozen).
 #
-# Resolution precedence (see gan/framework/models.py):
-#   explicit(arg) > env(GAN_MODEL_<KEY>) > models[<key>] > models.task
+# There is NO precedence chain, NO environment overrides and NO fallback model.
+# A model is selected by its ROLE KEY only, and the resolved value is passed
+# explicitly at runtime (e.g. domains/harness `--model`).
 #
-# Keys:
-#   task / planner / evaluator  - GAN roles
-#   meta                        - DGM-H meta agent (scripts/dgmh/run_meta_agent.py)
-#   polyglot_meta               - DGM-H polyglot meta override (scripts/dgmh/generate_loop.py)
-#   task_agent                  - DGM-H standalone task agent (scripts/dgmh/run_task_agent.py)
-models:
+# Part 1 - GAN roles
+# Part 2 - DGM-H roles
+# Part 3 - domain-specific (non-task) roles
+gan:
   task: openai/gpt-4o-mini
   planner: openai/gpt-4o-mini
   evaluator: openai/gpt-4o-mini
+
+dgmh:
   meta: openai/claude-sonnet-4-5-20250929
-  polyglot_meta: openai/claude-3-5-sonnet-20241022
-  task_agent: openai/o3-mini
+  task: openai/gpt-4o-mini
 
-# Optional fallback model used by agent/llm.py when the primary call fails.
-fallback: null
-
-# Per-domain default task model (was domains/<d>/utils.py: MODEL).
-# Used when no explicit/env task model is given; overridden by GAN_TASK_MODEL.
 domains:
-  paper_review: openai/gpt-4o
-  search_arena: openai/gpt-4o
-  imo_grading: openai/o4-mini
-  imo_proof: openai/o4-mini
-  imo_proof_grading: openai/o4-mini
+  # external aider CLI used by the polyglot benchmark tooling (not our agent)
+  polyglot_aider: gpt-3.5-turbo

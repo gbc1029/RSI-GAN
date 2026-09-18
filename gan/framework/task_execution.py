@@ -40,13 +40,12 @@ def persist_design(design_store: DesignStore, config: Dict[str, Any], genid: Any
 def assemble_task_env(
     base_env: Dict[str, str],
     *,
-    model: str,
     design_path: str,
     node_dir: str,
     config: Dict[str, Any],
 ) -> Dict[str, str]:
+    """Runtime env for the task agent (design/skills only; model is a CLI arg)."""
     env = dict(base_env)
-    env["GAN_TASK_MODEL"] = model
     env["GAN_TASK_DESIGN"] = design_path
     skills_dir = os.path.join(node_dir, "skills")
     assemble_tools_dir("task", skills_dir, config=config, include_always_on=False)
@@ -74,6 +73,7 @@ def run_harness_and_report(
     run_id: str,
     subset: str,
     num_samples: int,
+    model: str,
     env: Dict[str, str],
     timeout: int,
     log_path: Optional[str] = None,
@@ -82,6 +82,7 @@ def run_harness_and_report(
     harness_cmd = [
         python, "-m", "domains.harness",
         "--domain", domain,
+        "--model", model,
         "--run_id", run_id,
         "--subset", subset,
         "--num_samples", str(num_samples),

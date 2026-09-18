@@ -20,7 +20,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default=model_registry.resolve("meta").model,
+        default=model_registry.resolve("dgmh.meta"),
         help="Model to use for the agent",
     )
     parser.add_argument(

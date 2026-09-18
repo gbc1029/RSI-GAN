@@ -30,7 +30,7 @@ from domains.polyglot.utils import (
 def get_eval_script(commands):
     return "\n".join(["#!/bin/bash", "set -uxo pipefail"] + commands) + "\n"
 
-def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_dir):
+def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_dir, model=None):
     """
     Process a single dataset entry. This function encapsulates the main processing logic
     for each entry to make it suitable for parallel execution.
@@ -117,6 +117,7 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
             "--outdir", f"/{REPO_NAME}/",
             "--test_description", test_description,
             "--language", entry['language'],
+            *(["--model", model] if model else []),
         ]
         exec_result = container.exec_run(cmd, environment=env_vars, workdir='/testbed/')
         log_container_output(exec_result)
@@ -244,6 +245,7 @@ def harness(
         pred_dname='./outputs',
         output_dir='./outputs',
         root_dir=None,
+        model=None,
     ):
     """
     Parallel processing harness using ThreadPoolExecutor.
@@ -307,7 +309,7 @@ def harness(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
             future_to_entry = {
-                executor.submit(process_entry, entry, out_dname, model_name_or_path_inst, model_patch_paths, root_dir): entry
+                executor.submit(process_entry, entry, out_dname, model_name_or_path_inst, model_patch_paths, root_dir, model): entry
                 for entry in entries
             }
             

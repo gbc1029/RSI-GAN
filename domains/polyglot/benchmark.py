@@ -25,6 +25,8 @@ from dotenv import load_dotenv
 from plots import plot_refactoring
 from rich.console import Console
 
+from gan.framework import models as gan_models
+
 from aider import models, sendchat
 from aider.coders import Coder, base_coder
 from aider.dump import dump  # noqa: F401
@@ -162,7 +164,7 @@ def resolve_dirname(dirname, use_single_prior, make_new):
 def main(
     dirnames: Optional[List[str]] = typer.Argument(None, help="Directory names"),
     graphs: bool = typer.Option(False, "--graphs", help="Generate graphs"),
-    model: str = typer.Option("gpt-3.5-turbo", "--model", "-m", help="Model name"),
+    model: str = typer.Option(gan_models.resolve("domains.polyglot_aider"), "--model", "-m", help="Model name"),
     sleep: float = typer.Option(
         0, "--sleep", help="Sleep seconds between tests when single threaded"
     ),

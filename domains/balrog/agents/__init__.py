@@ -1,5 +1,4 @@
 from task_agent import TaskAgent
-from agent.llm import OPENAI_MODEL, OPENAI_MINI_MODEL
 
 
 class AgentFactory:
@@ -22,4 +21,4 @@ class AgentFactory:
         """
         Create an agent instance with output to the chat history file.
         """
-        return TaskAgent(model=OPENAI_MINI_MODEL, chat_history_file=chat_history_file)
+        return TaskAgent(model=self.config.model, chat_history_file=chat_history_file)

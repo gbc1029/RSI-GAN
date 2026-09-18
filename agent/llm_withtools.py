@@ -90,7 +90,7 @@ def process_tool_call(tools_dict, tool_name, tool_input):
 
 def chat_with_agent(
     msg,
-    model="claude-4-sonnet-genai",
+    model,
     msg_history=None,
     logging=print,
     tools_available=[],  # Empty list means no tools, 'all' means all tools
@@ -175,5 +175,6 @@ def chat_with_agent(
     return new_msg_history
 
 if __name__ == "__main__":
-    msg = """hello"""
-    new_msg_history = chat_with_agent(msg)
+    import sys
+    model = sys.argv[1] if len(sys.argv) > 1 else "openai/gpt-4o-mini"
+    new_msg_history = chat_with_agent(msg="hello", model=model)
