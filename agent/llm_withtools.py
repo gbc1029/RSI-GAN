@@ -3,6 +3,7 @@ import json
 
 from agent.llm import get_response_from_llm
 from agent.tools import load_tools
+from utils import trajectory_log
 
 def get_tooluse_prompt(tool_infos=[]):
     """
@@ -67,7 +68,6 @@ def check_for_tool_uses(response):
     pattern = r'<json>\s*(\{.*?\})\s*</json>'
     matches = re.findall(pattern, response, re.DOTALL)
     tool_uses = []
-
     for match in matches:
         try:
             tool_use = json.loads(match)
@@ -76,7 +76,6 @@ def check_for_tool_uses(response):
             tool_uses.append(tool_use)
         except json.JSONDecodeError:
             continue  # Skip malformed JSON blocks
-
     return tool_uses if tool_uses else None
 
 def process_tool_call(tools_dict, tool_name, tool_input):
@@ -88,6 +87,13 @@ def process_tool_call(tools_dict, tool_name, tool_input):
     except Exception as e:
         return f"Error executing tool '{tool_name}': {str(e)}"
 
+def _emit(logging, trajectory_file, kind, **fields):
+    """Emit one structured record (or fall back to plain logging)."""
+    if trajectory_file:
+        trajectory_log.append(trajectory_file, {"kind": kind, **fields})
+    else:
+        logging(f"{kind}: {json.dumps(fields, ensure_ascii=False, default=str)[:4000]}")
+
 def chat_with_agent(
     msg,
     model,
@@ -97,29 +103,31 @@ def chat_with_agent(
     multiple_tool_calls=False,  # Whether to allow multiple tool calls in a single response
     max_tool_calls=40,  # Maximum number of tool calls allowed in a single response, -1 for unlimited
     tools_dir=None,  # Optional custom tools directory (GAN roles use their own toolsets)
+    trajectory_file=None,  # Optional structured JSONL trajectory sink
+    return_info=False,  # If True, also return {"truncated", "tool_calls"}
 ):
     get_response_fn = get_response_from_llm
     # Construct message
     if msg_history is None:
         msg_history = []
     new_msg_history = msg_history
+    num_tool_calls = 0
+    truncated = False
 
     try:
         # Load all tools
         all_tools = load_tools(logging=logging, names=tools_available, tools_dir=tools_dir)
         tools_dict = {tool['info']['name']: tool for tool in all_tools}
         system_msg = f"{get_tooluse_prompt([tool['info'] for tool in all_tools])}\n\n"
-        num_tool_calls = 0
 
         # Call API
-        logging(f"Input: {repr(msg)}")
+        _emit(logging, trajectory_file, "input", text=msg)
         response, new_msg_history, info = get_response_fn(
             msg=system_msg + msg,
             model=model,
             msg_history=new_msg_history,
         )
-        logging(f"Output: {repr(response)}")
-        # logging(f"Info: {repr(info)}")
+        _emit(logging, trajectory_file, "output", text=response)
 
         # Tool use
         tool_uses = check_for_tool_uses(response)
@@ -127,7 +135,20 @@ def chat_with_agent(
         while tool_uses or retry_tool_use:
             # Check for max tool calls
             if max_tool_calls > 0 and num_tool_calls >= max_tool_calls:
-                logging("Error: Maximum number of tool calls reached.")
+                # Do NOT end on a half-executed tool call: give the model one
+                # final turn (no tools) to summarise what it learned.
+                logging("Error: Maximum number of tool calls reached; requesting final summary.")
+                truncated = True
+                try:
+                    response, new_msg_history, info = get_response_fn(
+                        msg=(system_msg + "\n\n# Tool budget exhausted\n"
+                             "Do NOT call any tool. Provide your final answer/summary now."),
+                        model=model,
+                        msg_history=new_msg_history,
+                    )
+                    _emit(logging, trajectory_file, "output", text=response)
+                except Exception as e:
+                    logging(f"Error during final summary turn: {e}")
                 break
 
             tool_msgs = []
@@ -138,8 +159,11 @@ def chat_with_agent(
                 for tool_use in tool_uses:
                     tool_name = tool_use['tool_name']
                     tool_input = tool_use['tool_input']
+                    _emit(logging, trajectory_file, "tool_call", tool=tool_name, input=tool_input)
                     tool_output = process_tool_call(tools_dict, tool_name, tool_input)
                     num_tool_calls += 1
+                    _emit(logging, trajectory_file, "tool_output", tool=tool_name,
+                          output=str(tool_output))
                     tool_msg = f'''<json>
     {{
         "tool_name": "{tool_name}",
@@ -147,7 +171,6 @@ def chat_with_agent(
         "tool_output": "{tool_output}"
     }}
     </json>'''.strip()
-                    logging(f"Tool output: {repr(tool_msg)}")
                     tool_msgs.append(tool_msg)
 
             # Check for retry
@@ -161,8 +184,7 @@ def chat_with_agent(
                 model=model,
                 msg_history=new_msg_history,
             )
-            logging(f"Output: {repr(response)}")
-            # logging(f"Info: {repr(info)}")
+            _emit(logging, trajectory_file, "output", text=response)
 
             # Check for next tool use
             tool_uses = check_for_tool_uses(response)
@@ -172,6 +194,8 @@ def chat_with_agent(
         logging(f"Error: {str(e)}")
         raise e
 
+    if return_info:
+        return new_msg_history, {"truncated": truncated, "tool_calls": num_tool_calls}
     return new_msg_history
 
 if __name__ == "__main__":

@@ -19,20 +19,30 @@ Failure semantics (v4):
   (else the parent's score); imputed scores are NOT used as the evaluator's anchor.
 - partial coverage => score kept, ``score_status="partial"``, ``coverage`` recorded.
 
-Checkpointing (v4): an outer-loop checkpoint is written after every inner round
-and after every outer generation; ``resume=True`` continues and
-``rollback_to_outer()`` reverts to the last outer boundary.
+Checkpointing (v5): ``checkpoint.json`` is the latest snapshot; outer boundaries
+additionally write an immutable numbered ``checkpoints/outer_<N>.json``. An outer
+checkpoint is written after that outer's self-improvement, so it carries the design
+used by the next outer. ``resume=True`` continues and ``rollback_to_outer()`` reverts
+to the last outer boundary (append-only ``op=reset`` marker, no log truncation).
+
+Instances (v5): planner/evaluator are refreshed every outer generation
+(``_refresh_roles``) from the active design, with a cleared source workspace; task
+agents are refreshed every inner generation. Scheduling is a **single chain** — no
+accept/reject and no parent selection for roles; ``outer_improved`` is logged only.
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import statistics
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
 from gan.design.schema import default_config
 from gan.framework import checkpoint as ckpt
+from gan.framework import paths, scores, trajectory
+from gan.framework.loader import load_registry, resolve_domain
 from gan.framework.reward.evaluator_reward import build_feedback_digest
 from gan.framework.reward.packet import RewardPacket
 from gan.summary import build_diff_summary, make_feedback
@@ -47,12 +57,15 @@ class GanLoop:
         output_dir: str,
         domains: List[str],
         cfg: Any,
-        planner: Any,
-        evaluator: Any,
-        task_runner: Callable[..., Node],
+        planner: Any = None,
+        evaluator: Any = None,
+        task_runner: Callable[..., Node] = None,
         broker: Any = None,
         resume: bool = False,
         enable_checkpoint: bool = True,
+        planner_factory: Optional[Callable[[int], Any]] = None,
+        evaluator_factory: Optional[Callable[[int], Any]] = None,
+        code_root: Optional[str] = None,
     ):
         self.output_dir = os.path.abspath(output_dir)
         self.domains = list(domains)
@@ -63,6 +76,16 @@ class GanLoop:
         self.broker = broker
         self.resume = bool(resume)
         self.enable_checkpoint = bool(enable_checkpoint)
+        self.planner_factory = planner_factory
+        self.evaluator_factory = evaluator_factory
+        self.keep_workdirs = bool(cfg.get("loop.keep_workdirs", False))
+        self.self_improve_max_tool_calls = int(cfg.get("loop.self_improve_max_tool_calls", 30))
+        self.plan_max_tool_calls = int(cfg.get("loop.plan_max_tool_calls", 40))
+        self.patch_retry_k = int(cfg.get("loop.patch_retry_k", 2))
+        self.code_root = os.path.abspath(code_root) if code_root else None
+        # last round receipt (injected into the next round's plan/evaluate/self_improve)
+        self._last_receipt: Optional[Dict[str, Any]] = None
+        self._last_self_receipt: Optional[Dict[str, Any]] = None
         os.makedirs(self.output_dir, exist_ok=True)
         self.task_tree = TreeStore(self.output_dir, "task").load()
         self.planner_tree = TreeStore(self.output_dir, "planner").load()
@@ -78,6 +101,14 @@ class GanLoop:
         self._seed = int(os.environ.get("GAN_SEED", "0") or 0)
         self._start_outer = 1
         self._start_inner = 1
+        # Human-readable task description for the task domain (framework-injected;
+        # NOT part of the evolvable design). Used by planner/evaluator prompts.
+        self.task_brief = ""
+        if self.domains:
+            try:
+                self.task_brief = resolve_domain(load_registry(), self.domains[0]).get("task_brief") or ""
+            except Exception:
+                self.task_brief = ""
 
     # -- helpers -----------------------------------------------------------
     def _max_int_genid(self) -> int:
@@ -90,8 +121,8 @@ class GanLoop:
         return mx
 
     def log_event(self, event: Dict[str, Any]) -> None:
-        with open(os.path.join(self.output_dir, "events.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        from utils import trajectory_log
+        trajectory_log.append(paths.events_path(self.output_dir), event)
 
     def _parent_summary(self, parent: Node) -> Dict[str, Any]:
         return {
@@ -152,7 +183,7 @@ class GanLoop:
             benchmark_score=self._prev_benchmark,
             diff_summary=diff_summary,
         )
-        run_dir = os.path.join(self.output_dir, "runs", str(genid))
+        run_dir = paths.runs_dir(self.output_dir, genid)
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "feedback_digest.md"), "w", encoding="utf-8") as f:
             f.write(digest)
@@ -199,7 +230,8 @@ class GanLoop:
         child.meta["imputed_score"] = imputed
 
     def _archive_invalid(
-        self, reason: str, parent: Optional[Node], parents: List[Node], genid: Any, detail: str = ""
+        self, reason: str, parent: Optional[Node], parents: List[Node], genid: Any,
+        detail: str = "", outer: Optional[int] = None, inner: Optional[int] = None,
     ) -> Node:
         node = Node(
             genid=genid,
@@ -211,8 +243,25 @@ class GanLoop:
             meta={"invalid": True, "invalid_reason": reason, "invalid_detail": detail[:500]},
         )
         self.task_tree.add_node(node)
+        try:
+            shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
+        except Exception:
+            pass
+        self._write_invalid(genid, reason, detail, outer, inner)
         self.log_event({"type": "inner_invalid", "genid": genid, "reason": reason, "detail": detail[:300]})
         return node
+
+    def _write_invalid(self, genid: Any, reason: str, detail: str = "",
+                       outer: Optional[int] = None, inner: Optional[int] = None) -> None:
+        """Persist a minimal record so a missing ``runs/<genid>`` is explainable."""
+        try:
+            d = paths.runs_dir(self.output_dir, genid)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "invalid.json"), "w", encoding="utf-8") as f:
+                json.dump({"genid": str(genid), "reason": reason, "detail": detail[:1000],
+                           "outer": outer, "inner": inner}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     # -- checkpoints -------------------------------------------------------
     def _state_dict(self, outer: int, inner: int) -> Dict[str, Any]:
@@ -248,7 +297,198 @@ class GanLoop:
             state=self._state_dict(outer, inner),
             trees=ckpt.capture_trees(self.task_tree, self.planner_tree, self.evaluator_tree),
             designs=ckpt.snapshot_designs(self.output_dir, ["planner", "evaluator"]),
+            index=(outer if boundary == "outer" else None),
         )
+
+    def _refresh_roles(self, outer: int) -> None:
+        """Rebuild planner/evaluator for a new outer generation (instance refresh).
+
+        Each outer generation is a fresh role *instance*: fresh design load,
+        fresh toolset (so selections take effect), fresh chat history, and a
+        cleared source workspace. The active design on disk is the one saved
+        after the previous outer's self-improvement (single chain, no revert).
+        Without a factory the injected instances are reused (offline/smoke mode).
+        """
+        if self.planner_factory is not None:
+            self.planner = self.planner_factory(outer)
+        if self.evaluator_factory is not None:
+            self.evaluator = self.evaluator_factory(outer)
+        if self.broker is not None:
+            for role in ("planner", "evaluator"):
+                try:
+                    self.broker.clear_workspace(role)
+                except Exception:
+                    pass
+        self.log_event({"type": "role_refresh", "outer": outer})
+
+    def _source_access_log(self, outer: Any) -> List[Dict[str, Any]]:
+        """Audit of source paths granted to roles for this outer instance."""
+        if self.broker is None:
+            return []
+        akey = f"outer_{outer}"
+        out: List[Dict[str, Any]] = []
+        for role in ("planner", "evaluator"):
+            out.extend(self.broker.grants.get((role, akey), []))
+            out.extend(self.broker.grants.get((role, str(akey)), []))
+        return out
+
+    def _append_score(self, child: Node) -> None:
+        if not self.enable_checkpoint:
+            return
+        try:
+            scores.append_score(self.output_dir, {
+                "genid": str(child.genid),
+                "domain": (self.domains[0] if self.domains else None),
+                "score": child.value.score,
+                "score_status": child.value.score_status,
+                "coverage": child.value.coverage,
+                "report_sha": child.meta.get("report_sha"),
+                "valid_parent": child.valid_parent,
+            })
+        except Exception:
+            pass
+
+    def _apply_self_patch(self, role: str, outer: int, res: Any) -> None:
+        """Apply a role self-edit patch directly to the code tree (option B).
+
+        The durable record is the code commit; no separate patch file is kept.
+        Validation failure rolls back to the previous commit.
+        """
+        patch = (res or {}).get("patch") if isinstance(res, dict) else None
+        if not patch:
+            rejected = (res or {}).get("patch_rejection") if isinstance(res, dict) else None
+            if rejected:
+                self.log_event({"type": "self_improve_rejected", "role": role,
+                                "outer": outer, "reason": str(rejected)[:300]})
+            return
+        if not self.code_root:
+            return
+        from gan.framework import code_repo
+        prev = code_repo.current_commit(self.code_root)
+        try:
+            sha = code_repo.apply_self_patch(self.code_root, role, patch)
+            self.log_event({"type": "self_improve_commit", "role": role,
+                            "outer": outer, "commit": sha})
+        except Exception as e:
+            code_repo.checkout(self.code_root, prev)
+            self.log_event({"type": "self_improve_apply_failed", "role": role,
+                            "outer": outer, "error": str(e)[:300]})
+
+    def _resync_workspace(self, outer: Any, files: List[str]) -> None:
+        """Keep granted workspace copies in sync with the code baseline.
+
+        After a task patch is applied to the code tree, the planner/evaluator
+        workspaces (per outer) may hold stale copies; refresh only the files that
+        were already granted, so subsequent diffs are incremental.
+        """
+        code_root = getattr(self.broker, "repo_root", None)
+        if not code_root:
+            return
+        akey = f"outer_{outer}"
+        for role in ("planner", "evaluator"):
+            try:
+                src = self.broker.src_dir(role, akey)
+            except Exception:
+                continue
+            for rel in files or []:
+                s = os.path.join(code_root, rel)
+                d = os.path.join(src, rel)
+                if os.path.isfile(s) and os.path.isfile(d):
+                    try:
+                        shutil.copy2(s, d)
+                    except OSError:
+                        pass
+
+    def _make_receipt(self, genid: Any, plan_result: Dict[str, Any],
+                      parent_cfg: Dict[str, Any], child: Node, outer: Any) -> Dict[str, Any]:
+        from gan.framework.receipt import build_receipt
+        rejected = plan_result.get("patch_rejection") or child.meta.get("task_patch_rejected")
+        exhausted = bool(plan_result.get("budget_exhausted"))
+        truncated = bool(plan_result.get("truncated"))
+        budget = {
+            "exhausted": exhausted or truncated,
+            "kind": "retries" if exhausted else ("max_tool_calls" if truncated else None),
+            "attempts": plan_result.get("attempts", 0),
+            "truncated": truncated,
+        }
+        refs = [
+            paths.session_traj_file(self.output_dir, outer, genid, "planner"),
+            paths.session_traj_file(self.output_dir, outer, genid, "task"),
+            paths.session_traj_file(self.output_dir, outer, genid, "evaluator"),
+        ]
+        rec = build_receipt(
+            genid=genid, role="planner", stage="plan",
+            records=plan_result.get("records"),
+            config=child.meta.get("config_dict"), parent_config=parent_cfg,
+            patch=plan_result.get("patch_proposed", ""),
+            patch_applied=bool(child.meta.get("patch_applied")),
+            commit=child.meta.get("task_code_commit"),
+            rejected_reason=rejected, budget=budget,
+            grants=self._source_access_log(outer), trajectory_refs=refs,
+        )
+        try:
+            d = paths.runs_dir(self.output_dir, genid)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "patch_receipt.json"), "w", encoding="utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+            if rejected and plan_result.get("patch_proposed"):
+                with open(os.path.join(d, "patch_proposed.diff"), "w", encoding="utf-8") as f:
+                    f.write(plan_result.get("patch_proposed") or "")
+        except Exception:
+            pass
+        self.log_event({"type": "receipt", "genid": genid, "outer": outer,
+                        "design_applied": rec["design"]["applied"],
+                        "code_applied": rec["code_patch"]["applied"],
+                        "rejected": bool(rejected), "budget": rec["budget"]})
+        return rec
+
+    def _make_self_receipt(self, role: str, outer: int, res: Any) -> Dict[str, Any]:
+        from gan.framework.receipt import build_receipt
+        r = res or {}
+        rejected = r.get("patch_rejection")
+        budget = {
+            "exhausted": bool(r.get("budget_exhausted")) or bool(r.get("truncated")),
+            "kind": "retries" if r.get("budget_exhausted") else ("max_tool_calls" if r.get("truncated") else None),
+            "attempts": r.get("attempts", 0), "truncated": bool(r.get("truncated")),
+        }
+        rec = build_receipt(
+            genid=f"outer_{outer}", role=role, stage="self_improve",
+            records=r.get("records"), patch=r.get("patch_proposed", ""),
+            patch_applied=bool(r.get("patch")), rejected_reason=rejected, budget=budget,
+        )
+        try:
+            d = paths.runs_dir(self.output_dir, f"self_outer_{outer}_{role}")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "patch_receipt.json"), "w", encoding="utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        self._last_self_receipt = rec
+        self.log_event({"type": "self_receipt", "role": role, "outer": outer,
+                        "code_applied": rec["code_patch"]["applied"], "rejected": bool(rejected)})
+        return rec
+
+    def _write_eval(self, child: Node, ctx: Any, packet: RewardPacket) -> None:
+        """Persist the refined evaluator schema (issues/verdicts/prediction)."""
+        try:
+            rec = {
+                "genid": str(child.genid),
+                "score": child.value.score,
+                "score_status": child.value.score_status,
+                "predicted_score": getattr(ctx, "predicted_score", None),
+                "issues": getattr(ctx, "issues", []),
+                "fix_verdicts": getattr(ctx, "fix_verdicts", []),
+                "penalties": dict(getattr(packet, "penalties", {}) or {}),
+                "summary": getattr(ctx, "summary", ""),
+                "weaknesses": list(getattr(ctx, "weaknesses", []) or []),
+                "suggestions": list(getattr(ctx, "suggestions", []) or []),
+            }
+            d = paths.runs_dir(self.output_dir, child.genid)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "eval.json"), "w", encoding="utf-8") as f:
+                json.dump(rec, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _restore(self, boundary: str = "latest") -> bool:
         payload = ckpt.load_checkpoint(self.output_dir, boundary)
@@ -270,7 +510,7 @@ class GanLoop:
         return ok
 
     # -- main loop ---------------------------------------------------------
-    def run(self) -> TreeStore:
+    def run(self, only_outer: Optional[int] = None) -> TreeStore:
         cfg = self.cfg
         G = int(cfg.get("loop.outer_generations", 2))
         I_max = int(cfg.get("loop.inner_max", 3))
@@ -300,14 +540,23 @@ class GanLoop:
             self.task_tree.add_node(Node(genid="initial", value=NodeValue(score=None)))
             self.log_event({"type": "init", "task_tree": "initial"})
 
-        for outer in range(self._start_outer, G + 1):
+        # only_outer: run exactly one outer generation (used by the per-outer worker)
+        if only_outer is not None:
+            start_outer = int(only_outer)
+            end_outer = int(only_outer)
+        else:
+            start_outer = self._start_outer
+            end_outer = G
+
+        for outer in range(start_outer, end_outer + 1):
             no_improve = 0
             outer_improved = False
+            outer_genids: List[Any] = []
             self.log_event({"type": "outer_start", "outer": outer})
-            # snapshot role designs so a non-improving self-improvement can be reverted
-            designs_before = ckpt.snapshot_designs(self.output_dir, ["planner", "evaluator"])
+            # fresh role instances (design + tools + chat + workspace) for this outer
+            self._refresh_roles(outer)
 
-            inner_start = self._start_inner if outer == self._start_outer else 1
+            inner_start = self._start_inner if (only_outer is None and outer == self._start_outer) else 1
             for inner in range(inner_start, I_max + 1):
                 parents = self.task_tree.select_parents(
                     k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
@@ -320,8 +569,10 @@ class GanLoop:
 
                 genid = self._gen_counter
                 self._gen_counter += 1
+                outer_genids.append(genid)
                 parent_cfg = self._parent_config(parent)
                 evaluator_issues = (self._last_feedback or {}).get("issues")
+                parent_ref = [] if str(parent.genid) == "initial" else [parent.genid]
 
                 try:
                     plan_result = self.planner.plan(
@@ -332,20 +583,25 @@ class GanLoop:
                         config=parent_cfg,
                         node_id=genid,
                         broker=self.broker,
+                        task_brief=self.task_brief,
+                        trajectory_genids=parent_ref,
+                        receipt=self._last_receipt,
+                        patch_retry_k=self.patch_retry_k,
+                        max_tool_calls=self.plan_max_tool_calls,
                     ) or {}
                 except Exception as e:
-                    self._archive_invalid("planner_failed", parent, parents, genid, str(e))
+                    self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
 
                 try:
                     child = self.task_runner(plan=plan_result, parent=parent, genid=genid)
                 except Exception as e:
-                    self._archive_invalid("task_runner_failed", parent, parents, genid, str(e))
+                    self._archive_invalid("task_runner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
                 if child is None:
-                    self._archive_invalid("task_runner_none", parent, parents, genid)
+                    self._archive_invalid("task_runner_none", parent, parents, genid, outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
 
@@ -358,22 +614,38 @@ class GanLoop:
                 # score / imputation / validity
                 self._finalize_child(child, parent)
 
+                # archive the current generation's task trajectory BEFORE evaluation,
+                # so the evaluator can read it (current generation).
+                try:
+                    trajectory.collect(child.meta.get("run_dir", ""), f"gan_{genid}",
+                                       self.output_dir, outer, genid)
+                except Exception:
+                    pass
+
                 # evaluator (execute even for missing bench; pass imputed info, not as anchor)
                 benchmark_for_eval = None if child.meta.get("imputed") else child.value.score
+                # BLIND hygiene: never expose the objective score/accuracy in the
+                # blind-phase run summary (score is revealed separately).
+                meta_view = {k: v for k, v in (child.meta or {}).items()
+                             if k not in ("report_summary", "delta_vs_parent")}
+                report_view = {k: v for k, v in (child.meta.get("report_summary") or {}).items()
+                               if k not in ("overall_accuracy", "random_guess_accuracy")}
                 try:
                     ctx = self.evaluator.evaluate(
                         run_summary={
                             "genid": genid,
-                            "score": child.value.score,
-                            "meta": child.meta,
-                            "report_summary": child.meta.get("report_summary"),
+                            "meta": meta_view,
+                            "report_summary": report_view,
                             "score_status": child.value.score_status,
                             "imputed": bool(child.meta.get("imputed")),
+                            "receipt": self._last_receipt,
                         },
                         prev_feedback={**(self._last_feedback or {}), "digest": self._last_digest},
                         benchmark_score=benchmark_for_eval,
                         node_id=genid,
                         broker=self.broker,
+                        task_brief=self.task_brief,
+                        trajectory_genids=[genid] + parent_ref,
                     )
                 except Exception as e:
                     child.valid_parent = False
@@ -381,6 +653,11 @@ class GanLoop:
                     child.meta["invalid_reason"] = "evaluator_failed"
                     child.meta["invalid_detail"] = str(e)[:500]
                     self.task_tree.add_node(child)
+                    try:
+                        shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
+                    except Exception:
+                        pass
+                    self._write_invalid(genid, "evaluator_failed", str(e), outer, inner)
                     self.log_event({"type": "inner_invalid", "genid": genid,
                                     "reason": "evaluator_failed", "detail": str(e)[:300]})
                     self._save_checkpoint("inner", outer, inner)
@@ -389,12 +666,21 @@ class GanLoop:
                 packet = self._build_packet(child, ctx)
                 if getattr(ctx, "predicted_score", None) is not None:
                     child.value.potential = ctx.predicted_score
-                run_dir = os.path.join(self.output_dir, "runs", str(genid))
+                run_dir = paths.runs_dir(self.output_dir, genid)
                 os.makedirs(run_dir, exist_ok=True)
                 packet.save(os.path.join(run_dir, "packet.json"))
                 child.meta["packet_path"] = os.path.join(run_dir, "packet.json")
 
+                child.source_access_log = self._source_access_log(outer)
                 self.task_tree.add_node(child)
+                self._append_score(child)
+                self._write_eval(child, ctx, packet)
+                self._last_receipt = self._make_receipt(genid, plan_result, parent_cfg, child, outer)
+                child.meta["receipt"] = self._last_receipt
+                if child.meta.get("task_patch_files") and self.broker is not None:
+                    self._resync_workspace(outer, child.meta["task_patch_files"])
+                if not self.keep_workdirs:
+                    shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
 
                 # sanitized diff summary + text digest for the previous round
                 diff_summary = build_diff_summary(
@@ -442,19 +728,40 @@ class GanLoop:
             recent_eval = {"digests": self._digests[-I_max:], "last_feedback": self._last_feedback}
             recent_plan = {"advantages": self._advantages[-I_max:],
                            "task_tree_size": len(self.task_tree)}
+            # visible task trajectories for self-improvement: this outer's gens
+            # + the direct parent of the last generation (read-only).
+            si_refs = list(outer_genids)
+            if outer_genids:
+                last = self.task_tree.get(outer_genids[-1])
+                p = getattr(last, "parent_genid", None) if last is not None else None
+                if p is not None and str(p) != "initial" and p not in si_refs:
+                    si_refs.append(p)
             try:
-                self.evaluator.self_improve(recent=recent_eval)
+                res = self.evaluator.self_improve(recent={**recent_eval, "receipt": self._last_self_receipt},
+                                                  broker=self.broker,
+                                                  max_tool_calls=self.self_improve_max_tool_calls,
+                                                  trajectory_genids=si_refs,
+                                                  patch_retry_k=self.patch_retry_k)
+                self._apply_self_patch("evaluator", outer, res)
+                self._make_self_receipt("evaluator", outer, res)
             except Exception as e:
                 self.log_event({"type": "self_improve_error", "role": "evaluator", "error": str(e)})
             try:
-                self.planner.self_improve(recent=recent_plan)
+                res = self.planner.self_improve(recent={**recent_plan, "receipt": self._last_self_receipt},
+                                                broker=self.broker,
+                                                max_tool_calls=self.self_improve_max_tool_calls,
+                                                trajectory_genids=si_refs,
+                                                patch_retry_k=self.patch_retry_k)
+                self._apply_self_patch("planner", outer, res)
+                self._make_self_receipt("planner", outer, res)
             except Exception as e:
                 self.log_event({"type": "self_improve_error", "role": "planner", "error": str(e)})
 
-            # acceptance: revert role self-improvement if this outer did not improve
-            if designs_before and not outer_improved:
-                ckpt.restore_designs(self.output_dir, designs_before)
-                self.log_event({"type": "self_improve_reverted", "outer": outer})
+            # Acceptance: none. Single chain — the self-improved design is kept and
+            # becomes the active design for the next outer's fresh instances.
+            # `outer_improved` is recorded for analysis only (no revert).
+            self.log_event({"type": "self_improve_kept", "outer": outer,
+                            "improved": outer_improved})
 
             self.evaluator_tree.add_node(Node(genid=f"eval_{outer}", meta={"num_digests": len(self._digests)}))
             self.planner_tree.add_node(Node(genid=f"plan_{outer}", meta={"advantages": self._advantages[-I_max:]}))

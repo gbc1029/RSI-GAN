@@ -38,7 +38,7 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
     instance_id = entry['instance_id']
     problem_statement = entry['problem_statement']
     base_commit = entry['base_commit']
-    chat_history_file = out_dname / (instance_id + ".md")
+    chat_history_file = out_dname / (instance_id + ".jsonl")
     out_fname = out_dname / (instance_id + ".json")
     eval_file = out_dname / f"{instance_id}_eval.sh"
     eval_result_file = out_dname / f"{instance_id}_eval.md"
@@ -126,7 +126,7 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
         logger.info("Copying output files back to host")
         copy_from_container(container, chat_history_file_container, chat_history_file)
         # Additional chat history files
-        exec_result = container.exec_run(f"find /{REPO_NAME}/ -name '{instance_id}_*.md'", workdir='/')
+        exec_result = container.exec_run(f"find /{REPO_NAME}/ -name '{instance_id}_*.jsonl'", workdir='/')
         chat_history_files_container = exec_result.output.decode().split()
         for chat_history_file_container in chat_history_files_container:
             chat_history_file = out_dname / Path(chat_history_file_container).name

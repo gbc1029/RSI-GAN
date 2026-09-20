@@ -37,12 +37,8 @@ class Node:
     genid: Any
     parent_genid: Any = None                 # primary parent (kept for compatibility)
     parents: List[Any] = field(default_factory=list)  # full parent list (DAG)
-    planner_genid: Any = None
-    evaluator_genid: Any = None
-    prev_patch_files: List[str] = field(default_factory=list)
     curr_patch_files: List[str] = field(default_factory=list)
     valid_parent: bool = True
-    run_full_eval: bool = False
     depth: int = 0
     children: int = 0
     status: str = "alive"               # alive | stagnant | pruned
@@ -79,9 +75,10 @@ def _key(genid: Any) -> str:
 
 class TreeStore:
     def __init__(self, output_dir: str | os.PathLike, name: str):
+        from gan.framework import paths
         self.output_dir = os.path.abspath(str(output_dir))
         self.name = name
-        self.path = os.path.join(self.output_dir, f"{name}_tree.jsonl")
+        self.path = paths.tree_path(self.output_dir, name)
         self.nodes: Dict[str, Node] = {}
         self.order: List[str] = []
 
@@ -115,9 +112,19 @@ class TreeStore:
                         node.value = NodeValue(**val)
                     else:
                         setattr(node, name, val)
+        elif op == "reset":
+            # Rollback marker: rebuild the node set without truncating the log.
+            self.nodes = {}
+            self.order = []
+            for nd in evt.get("nodes", []) or []:
+                node = Node.from_dict(nd)
+                k = _key(node.genid)
+                if k not in self.nodes:
+                    self.order.append(k)
+                self.nodes[k] = node
 
     def _append(self, evt: Dict[str, Any]) -> None:
-        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(evt, ensure_ascii=False) + "\n")
 

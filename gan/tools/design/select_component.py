@@ -47,6 +47,9 @@ def tool_function(slot, name, **kwargs):
         return f"Error: slot '{slot}' not in {ctx.role} design schema"
     if not reg.has(kind, name):
         return f"Error: {kind} '{name}' not registered for role {ctx.role}"
+    if not reg.is_valid(kind, name):
+        return (f"Error: {kind} '{name}' is registered but INVALID "
+                f"({reg.reason(kind, name)}); fix the registry/component first")
     cur = list(ctx.config.get(slot) or [])
     if name not in cur:
         cur.append(name)

@@ -5,12 +5,16 @@
 
 ## 修改深度（默认面 + 门控面）
 1. **默认可用（浅层修改）**：
-   - **配置层**：修改节点配置（含 `custom:` 段）、提示词文件。优先用配置表达改进。
-   - **算子层**：调用预定义算子（见算子注册表），如 `set_prompt` / `tune_param` / `apply_config` / `add_config` / `set_tool_enabled` / `swap_module`。
-   - **原则**：能用配置/算子解决的，不要动源码。
-2. **源码层（需显式声明）**：仅当配置与算子无法表达你的改进时，调用
-   `request_source_access(paths=[...], intent="view|modify", reason="...")` 声明；
-   获批后源码才会被**传递**到你的工作区 `src/`。未声明的源码对你不可见（也不可用 bash 读取）。
+   - **配置层**：`set_prompt`（改提示词）、`set_config`（改已有配置键）、`set_param`（改参数）。
+   - **组件层**：`select_component`（把一个已注册组件选入配置）/ `deselect_component`（从配置移除）。
+   - **原则**：能用配置/组件表达改进的，不要动源码。
+2. **源码层（需显式声明，深层修改）**：
+   - **深层删**：把组件从注册表移除并删除其源文件（由算子/源码编辑完成）。
+   - **深层增/改**：添加新组件、修改组件实现、或新算子逻辑——**必须触及源码**。
+   - 调用 `request_source_access(paths=[...], intent="modify", reason="...")` 声明；
+     获批后源码才会被**传递**到你的工作区 `src/`。未声明的源码对你不可见。
+   - 用 `edit_source(command, path, ...)` 在工作区 `src/` 内查看/修改（**路径不得越出工作区**）。
+     你的改动会被 diff 成 patch，应用到下一代 task agent。
 
 ## 预算
 - 每代最多 `N_op` 个算子操作、最多 `max_code_edits_per_gen` 次源码修改。

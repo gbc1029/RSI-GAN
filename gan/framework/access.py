@@ -1,4 +1,4 @@
-"""On-demand source-code access gating (design v1.1).
+"""On-demand source-code access gating (design v1.2).
 
 Default surface for planner/evaluator is **config + operators**. Source code is
 only *transferred* into a role workspace after the agent explicitly calls the
@@ -6,17 +6,25 @@ only *transferred* into a role workspace after the agent explicitly calls the
 workspace until granted, a plain ``bash`` cannot read them (real isolation, not
 a prompt convention).
 
-Grants are audited to ``<output_dir>/events.jsonl`` and to the node metadata.
+v1.2 changes:
+- **Allowlist by role** (``gan/framework/frozen.py``): only paths inside the
+  role's read/write roots may be granted; everything else is denied by default.
+- **Anti-recursion / anti-blowup guard**: refuse the repo root, refuse any source
+  that contains its own destination, ignore the output tree, and cap file count
+  and total bytes per grant.
+- Grants are audited to ``logs/events.jsonl`` and to the node metadata.
 """
 from __future__ import annotations
 
 import fnmatch
+import glob
 import json
 import os
 import shutil
 import time
 from typing import Any, Dict, List, Optional
 
+from gan.framework import frozen, paths
 from gan.framework.context import (  # noqa: F401
     AccessContext,
     get_access_context,
@@ -33,15 +41,21 @@ class AccessBroker:
         workspaces_dir: Optional[str | os.PathLike] = None,
         deny_paths: Optional[List[str]] = None,
         auto_approve: bool = True,
+        max_files: int = 500,
+        max_bytes: int = 50 * 1024 * 1024,
     ):
         self.repo_root = os.path.abspath(str(repo_root))
+        self._repo_real = os.path.realpath(self.repo_root)
         self.output_dir = os.path.abspath(str(output_dir))
         self.workspaces_dir = os.path.abspath(
             str(workspaces_dir) if workspaces_dir is not None
-            else os.path.join(self.output_dir, "workspaces")
+            else paths.workspaces_dir(self.output_dir)
         )
+        # explicit extra denies (back-compat / tests); allowlist is authoritative
         self.deny_paths = list(deny_paths or [])
         self.auto_approve = auto_approve
+        self.max_files = int(max_files)
+        self.max_bytes = int(max_bytes)
         self.grants: Dict[tuple, List[Dict[str, Any]]] = {}
 
     # -- workspace ---------------------------------------------------------
@@ -55,6 +69,18 @@ class AccessBroker:
         os.makedirs(p, exist_ok=True)
         return p
 
+    def clear_workspace(self, role: str) -> None:
+        """Drop a role's granted-source workspace (called on instance refresh).
+
+        Granted source is copied into the workspace on demand, so clearing it is
+        safe: it is never the only copy.
+        """
+        p = os.path.join(self.workspaces_dir, role)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        for k in [k for k in self.grants if k[0] == role]:
+            self.grants.pop(k, None)
+
     # -- path safety -------------------------------------------------------
     def _safe_join(self, root: str, rel: str) -> str:
         rel = str(rel).replace("\\", "/").lstrip("/")
@@ -63,21 +89,83 @@ class AccessBroker:
             raise ValueError(f"unsafe path: {rel}")
         return os.path.join(root, *parts)
 
-    def _is_denied(self, rel: str) -> bool:
-        return any(fnmatch.fnmatch(rel, pat) for pat in self.deny_paths)
+    def _output_ignored(self, dirpath: str, names: List[str]) -> List[str]:
+        out_real = os.path.realpath(self.output_dir)
+        ws_real = os.path.realpath(self.workspaces_dir)
+        ign = []
+        for n in names:
+            full = os.path.realpath(os.path.join(dirpath, n))
+            if full == out_real or full.startswith(out_real + os.sep):
+                ign.append(n)
+            elif full == ws_real or full.startswith(ws_real + os.sep):
+                ign.append(n)
+        return ign
+
+    def _within_caps(self, source: str) -> bool:
+        if os.path.isfile(source):
+            try:
+                return os.path.getsize(source) <= self.max_bytes
+            except OSError:
+                return False
+        n = 0
+        total = 0
+        for dirpath, _dirs, files in os.walk(source):
+            for name in files:
+                n += 1
+                if n > self.max_files:
+                    return False
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, name))
+                except OSError:
+                    pass
+                if total > self.max_bytes:
+                    return False
+        return True
+
+    def _grant_concrete(self, rel: str, src_root: str, granted: List[str],
+                        denied_list: List[str], missing: List[str]) -> None:
+        """Copy one concrete repo-relative path into the workspace (with guards)."""
+        try:
+            s = self._safe_join(self.repo_root, rel)
+        except ValueError:
+            denied_list.append(rel)
+            return
+        if not os.path.exists(s):
+            missing.append(rel)
+            return
+        try:
+            d = self._safe_join(src_root, rel)
+        except ValueError:
+            denied_list.append(rel)
+            return
+        # anti-recursion: never copy a tree into itself / the repo into a subdir
+        rs, rd = os.path.realpath(s), os.path.realpath(d)
+        if rs == self._repo_real or rd == rs or rd.startswith(rs + os.sep) or rs.startswith(rd + os.sep):
+            denied_list.append(rel)
+            return
+        if not self._within_caps(s):
+            denied_list.append(rel)
+            return
+        os.makedirs(os.path.dirname(d) or src_root, exist_ok=True)
+        if os.path.isdir(s):
+            shutil.copytree(s, d, dirs_exist_ok=True, ignore=self._output_ignored)
+        else:
+            shutil.copy2(s, d)
+        granted.append(rel)
 
     # -- grant -------------------------------------------------------------
     def grant(
         self,
         role: str,
         node_id: Any,
-        paths: List[str],
+        paths_list: List[str],
         intent: str = "view",
         reason: str = "",
     ) -> List[str]:
         """Copy requested repo paths into the role workspace ``src/``.
 
-        Returns the list of actually granted (relative) paths.
+        Returns the list of actually granted (relative) paths. Denied paths are
+        audited but their reason is NOT surfaced to the agent.
         """
         if not self.auto_approve:
             raise PermissionError("source access requires approval (auto_approve=False)")
@@ -85,28 +173,33 @@ class AccessBroker:
         denied_list: List[str] = []
         missing: List[str] = []
         src_root = self.src_dir(role, node_id)
-        for rel in paths or []:
-            rel = str(rel).replace("\\", "/").lstrip("/")
-            if not rel:
+        for raw in paths_list or []:
+            rel = str(raw).replace("\\", "/").lstrip("/")
+            if not rel or rel == ".":
+                denied_list.append(rel or ".")
                 continue
-            if self._is_denied(rel):
+            if self.deny_paths and any(fnmatch.fnmatch(rel, pat) for pat in self.deny_paths):
                 denied_list.append(rel)
                 continue
-            try:
-                s = self._safe_join(self.repo_root, rel)
-            except ValueError:
+            if not frozen.is_allowed(role, rel, intent):
                 denied_list.append(rel)
                 continue
-            if not os.path.exists(s):
-                missing.append(rel)
-                continue
-            d = self._safe_join(src_root, rel)
-            os.makedirs(os.path.dirname(d) or src_root, exist_ok=True)
-            if os.path.isdir(s):
-                shutil.copytree(s, d, dirs_exist_ok=True)
+            if frozen.has_glob(rel):
+                # expand a glob pattern (e.g. from list_editable) to concrete files
+                matches = sorted({
+                    os.path.relpath(m, self.repo_root).replace(os.sep, "/")
+                    for m in glob.glob(os.path.join(self.repo_root, rel), recursive=True)
+                })
+                if not matches:
+                    missing.append(rel)
+                    continue
+                for m in matches:
+                    if not frozen.is_allowed(role, m, intent):
+                        denied_list.append(m)
+                        continue
+                    self._grant_concrete(m, src_root, granted, denied_list, missing)
             else:
-                shutil.copy2(s, d)
-            granted.append(rel)
+                self._grant_concrete(rel, src_root, granted, denied_list, missing)
 
         rec = {
             "type": "source_access_grant",
@@ -122,7 +215,6 @@ class AccessBroker:
         }
         self.grants.setdefault((role, str(node_id)), []).append(rec)
         self.log_event(rec)
-        # expose last result for the calling tool to report
         self.last_result = {"granted": granted, "denied": denied_list, "missing": missing}
         return granted
 
@@ -134,6 +226,5 @@ class AccessBroker:
 
     # -- audit -------------------------------------------------------------
     def log_event(self, event: Dict[str, Any]) -> None:
-        os.makedirs(self.output_dir, exist_ok=True)
-        with open(os.path.join(self.output_dir, "events.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        from utils import trajectory_log
+        trajectory_log.append(paths.events_path(self.output_dir), event)

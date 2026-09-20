@@ -26,9 +26,11 @@ def main():
     p.add_argument("--num_samples", type=int, default=2)
     p.add_argument("--outer", type=int, default=None)
     p.add_argument("--inner", type=int, default=None)
+    p.add_argument("--preflight", action="store_true",
+                   help="Probe configured models once before running (fail-fast).")
+    p.add_argument("--in-process", action="store_true",
+                   help="Run all outers in one process WITHOUT the per-run code repo (legacy).")
     args = p.parse_args()
-
-    from gan.build import build_gan_loop
 
     overrides = {}
     if args.outer is not None:
@@ -36,17 +38,35 @@ def main():
     if args.inner is not None:
         overrides.setdefault("loop", {})["inner_max"] = args.inner
 
-    loop = build_gan_loop(
-        repo_root=args.repo_root,
-        output_dir=args.output_dir,
-        domains=(args.domains.split(",") if args.domains else None),
-        task_domain=args.task_domain,
-        subset=args.subset,
-        num_samples=args.num_samples,
-        cfg_overrides=overrides or None,
-    )
-    tree = loop.run()
-    print(f"GAN loop done. task tree size={len(tree)}; output_dir={os.path.abspath(args.output_dir)}")
+    if args.in_process:
+        from gan.build import build_gan_loop
+        loop = build_gan_loop(
+            repo_root=args.repo_root,
+            output_dir=args.output_dir,
+            domains=(args.domains.split(",") if args.domains else None),
+            task_domain=args.task_domain,
+            subset=args.subset,
+            num_samples=args.num_samples,
+            cfg_overrides=overrides or None,
+            preflight=args.preflight,
+            code_repo=False,
+        )
+        tree = loop.run()
+        print(f"GAN loop done (in-process). task tree size={len(tree)}; "
+              f"output_dir={os.path.abspath(args.output_dir)}")
+    else:
+        from gan.driver import run_gan_driver
+        code_root = run_gan_driver(
+            repo_root=args.repo_root,
+            output_dir=args.output_dir,
+            task_domain=args.task_domain,
+            subset=args.subset,
+            num_samples=args.num_samples,
+            cfg_overrides=overrides or None,
+            preflight=args.preflight,
+        )
+        print(f"GAN driver done. code_root={code_root}; "
+              f"output_dir={os.path.abspath(args.output_dir)}")
 
 
 if __name__ == "__main__":

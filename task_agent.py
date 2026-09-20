@@ -38,10 +38,12 @@ class TaskAgent(AgentSystem):
         prompt = design.get("prompt") or "You are an agent."
         skills = list(design.get("skills") or [])
         tools_dir = os.environ.get("GAN_TASK_SKILLS_DIR")
+        task_brief = os.environ.get("GAN_TASK_BRIEF") or ""
 
+        brief_block = f"{task_brief}\n\n" if task_brief else ""
         instruction = f"""{prompt}
 
-Task input:
+{brief_block}Task input:
 ```
 {inputs}
 ```
@@ -60,6 +62,7 @@ Respond in JSON format with the following schema:
             logging=self.log,
             tools_available=(skills if skills else []),
             tools_dir=(tools_dir if skills else None),
+            trajectory_file=getattr(self, "trajectory_file", None),
         )
 
         # Extract the response

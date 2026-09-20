@@ -100,7 +100,7 @@ class EvaluatorManager:
                 evaluator = self.env_evaluators[env_name]
 
                 # Create agent
-                chat_history_file = os.path.join(self.output_dir, env_name, task, f"{task}_run_{episode_idx:02d}_chat_history.md")
+                chat_history_file = os.path.join(self.output_dir, env_name, task, f"{task}_run_{episode_idx:02d}_chat_history.jsonl")
                 Path(chat_history_file).parent.mkdir(exist_ok=True, parents=True)
                 agent = agent_factory.create_agent(chat_history_file=chat_history_file)
 
@@ -203,7 +203,7 @@ class EvaluatorManager:
                 evaluator = self.env_evaluators[env_name]
 
                 # Create a fresh agent per episode so files don't collide across parallel runs
-                chat_history_file = os.path.join(self.output_dir, env_name, task, f"{task}_run_{episode_idx:02d}_chat_history.md")
+                chat_history_file = os.path.join(self.output_dir, env_name, task, f"{task}_run_{episode_idx:02d}_chat_history.jsonl")
                 Path(chat_history_file).parent.mkdir(exist_ok=True, parents=True)
                 agent = agent_factory.create_agent(chat_history_file=chat_history_file)
 

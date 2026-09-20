@@ -44,7 +44,18 @@ def tool_function(paths=None, intent="view", reason="", **kwargs):
     # it toward the trust anchor / the gate itself (see DGM-H drift analysis). The agent
     # only learns what it actually received.
     if granted:
-        return f"Granted {intent} access to: {granted} (copied to workspace src/)."
+        try:
+            src_root = actx.broker.src_dir(actx.role, actx.node_id)
+        except Exception:
+            src_root = None
+        where = f" (workspace src: {src_root})" if src_root else ""
+        if intent == "modify":
+            return (f"Granted {intent} access to: {granted}{where}. "
+                    f"Edit these copies with `edit_source`.")
+        return f"Granted {intent} access to: {granted}{where}."
+    if paths:
+        return ("No accessible paths (denied / not in your editable set). "
+                "Call `list_editable` to see which paths you may request.")
     return "No source paths were provided for this request."
 
 

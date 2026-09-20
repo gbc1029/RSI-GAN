@@ -6,6 +6,13 @@
 # Each entry is merged over `default`.
 #
 # Placeholders in numeric fractions are written as decimals.
+#
+# `task_brief`: a short, human-readable description of the task + the required
+# answer interface, injected into planner/task/evaluator prompts. It states the
+# task semantics and the answer vocabulary ONLY -- never the grading mechanics
+# (exact match / case-insensitive / no partial credit) and never the ground-truth
+# labels or scores. Marked "可解冻" (unfreezable): deliberately NOT part of the
+# evolvable design for now, but a future axis.
 
 default:
   score_key: null
@@ -16,6 +23,7 @@ default:
   stagedeval_samples: 10
   stagedeval_frac: 0.1
   has_val_subset: false
+  task_brief: null
   # Objective output contract of the task agent's answer. Used by the framework
   # (NOT by an evaluator eval point) to compute report_summary.contract_ok /
   # invalid_rate. kind: label | freeform | numeric.
@@ -35,6 +43,10 @@ domains:
     stagedeval_samples: 10
     stagedeval_frac: 0.1
     has_val_subset: true
+    task_brief: >-
+      This is peer review: read the paper and decide whether it should be
+      accepted or rejected. Your final answer must be exactly one word:
+      accept or reject.
     output_contract:
       kind: label
       allowed_labels: [accept, reject]
@@ -60,6 +72,9 @@ domains:
     stagedeval_samples: 10
     stagedeval_frac: 0.1
     has_val_subset: true
+    task_brief: >-
+      Grade a student's solution to a math problem. Your final answer must be
+      exactly one of: incorrect, partial, almost, correct.
     output_contract:
       kind: label
       allowed_labels: [incorrect, partial, almost, correct]
@@ -72,6 +87,9 @@ domains:
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
+    task_brief: >-
+      Resolve the software issue described in the problem statement by editing
+      the repository. Produce a code patch (unified diff) that fixes it.
 
   imo_proof:
     score_key: points_percentage
@@ -79,6 +97,24 @@ domains:
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
+    task_brief: >-
+      Write a rigorous proof for the given math problem. Your final answer is
+      the proof itself.
+
+  imo_proof_grading:
+    score_key: overall_accuracy
+    splits: [train]
+    ensembled: false
+    stagedeval_samples: 10
+    stagedeval_frac: 0.16666666666666666
+    task_brief: >-
+      Grade a candidate proof against the official solution. Your final answer
+      must be exactly one of: incorrect, partial, almost, correct.
+    output_contract:
+      kind: label
+      allowed_labels: [incorrect, partial, almost, correct]
+      case_insensitive: true
+      strip: true
 
 # family prefixes (longest match wins)
 families:

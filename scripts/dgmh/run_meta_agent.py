@@ -26,7 +26,7 @@ def main():
     parser.add_argument(
         "--chat_history_file",
         type=str,
-        default="./outputs/chat_history.md",
+        default="./outputs/chat_history.jsonl",
         help="Path to chat history file",
     )
     parser.add_argument(

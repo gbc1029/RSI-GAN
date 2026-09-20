@@ -26,10 +26,17 @@ from gan.design.store import DesignStore
 from gan.patch import apply_patch
 from gan.tools.assembly import assemble_tools_dir
 
-_COPY_IGNORE = shutil.ignore_patterns(
-    "venv_nat", "outputs", ".git", "__pycache__", "*.pyc",
-    "polyglot-benchmark", "SWE-bench", "logs",
+_PY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
+# Benchmark labels / heavy assets must NOT be present in a task run (leakage
+# isolation). The harness reads labels from GAN_DATASET_ROOT (outside the copy).
+_DOMAIN_IGNORE = shutil.ignore_patterns(
+    "dataset*.csv", "*bench*.csv", "polyglot-benchmark", "SWE-bench",
+    "saved", "predictions", "logs", "__pycache__", "*.pyc",
 )
+# Allowlist of what a task run actually needs (never copy the whole repo).
+_RUNTIME_FILES = ["task_agent.py"]
+_RUNTIME_DIRS = ["agent", "utils"]
+_HARNESS_FILES = ["domains/__init__.py", "domains/harness.py", "domains/report.py"]
 
 
 # -- design persistence -----------------------------------------------------
@@ -43,26 +50,64 @@ def assemble_task_env(
     design_path: str,
     node_dir: str,
     config: Dict[str, Any],
+    dataset_root: Optional[str] = None,
+    code_root: Optional[str] = None,
+    task_brief: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Runtime env for the task agent (design/skills only; model is a CLI arg)."""
+    """Runtime env for the task agent (design/skills only; model is a CLI arg).
+
+    ``dataset_root`` points the harness at benchmark labels OUTSIDE the run copy;
+    ``code_root`` (per-run code tree) supplies the task skills/components;
+    ``task_brief`` is the domain's human-readable task description.
+    """
     env = dict(base_env)
     env["GAN_TASK_DESIGN"] = design_path
     skills_dir = os.path.join(node_dir, "skills")
-    assemble_tools_dir("task", skills_dir, config=config, include_always_on=False)
+    assemble_tools_dir("task", skills_dir, config=config, include_always_on=False,
+                       code_root=code_root)
     env["GAN_TASK_SKILLS_DIR"] = skills_dir
+    if dataset_root:
+        env["GAN_DATASET_ROOT"] = os.path.abspath(dataset_root)
+    if task_brief:
+        env["GAN_TASK_BRIEF"] = task_brief
     return env
 
 
 # -- run dir ----------------------------------------------------------------
-def prepare_run_dir(repo_root: str, node_dir: str, patch_str: str) -> Tuple[str, bool]:
-    """Return (run_dir, patch_applied). A patch uses a throwaway repo copy."""
-    if not (patch_str or "").strip():
-        return repo_root, False
+def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Optional[str] = None) -> Tuple[str, bool]:
+    """Return (run_dir, patch_applied).
+
+    Builds a **minimal allowlist copy** of the code (agent runtime + the domain
+    package, minus datasets) from ``source_root`` (the per-run code tree), so a
+    task run cannot see benchmark labels and is far smaller than a full repo
+    copy. A deep patch, if any, is applied inside the copy only.
+    """
     run_dir = os.path.join(node_dir, "repo")
     if os.path.exists(run_dir):
         shutil.rmtree(run_dir)
-    shutil.copytree(repo_root, run_dir, ignore=_COPY_IGNORE)
-    return run_dir, bool(apply_patch(run_dir, patch_str))
+    os.makedirs(run_dir, exist_ok=True)
+
+    for name in _RUNTIME_FILES + _HARNESS_FILES:
+        src = os.path.join(source_root, name)
+        if os.path.isfile(src):
+            dst = os.path.join(run_dir, name)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+    for name in _RUNTIME_DIRS:
+        src = os.path.join(source_root, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(run_dir, name), ignore=_PY_IGNORE)
+    if domain:
+        dom = domain.split("_")[0] if "imo_" in domain else domain
+        src = os.path.join(source_root, "domains", dom)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(run_dir, "domains", dom), ignore=_DOMAIN_IGNORE)
+    envf = os.path.join(source_root, ".env")
+    if os.path.isfile(envf):
+        shutil.copy2(envf, os.path.join(run_dir, ".env"))
+
+    applied = bool(apply_patch(run_dir, patch_str)) if (patch_str or "").strip() else False
+    return run_dir, applied
 
 
 # -- harness / report -------------------------------------------------------

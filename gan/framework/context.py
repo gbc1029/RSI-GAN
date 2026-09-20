@@ -126,10 +126,14 @@ class AccessContext:
     broker: Any
     role: str
     node_id: Any
+    # Explicit set of task generations whose trajectory this session may read
+    # (resolved by the loop; avoids relying on the node already being in the tree).
+    trajectory_genids: List[Any] = field(default_factory=list)
 
 
-def set_access_context(broker, role: str, node_id: Any):
-    return _ACCESS_CTX.set(AccessContext(broker, role, node_id))
+def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None):
+    return _ACCESS_CTX.set(AccessContext(broker, role, node_id,
+                                         list(trajectory_genids or [])))
 
 
 def get_access_context() -> Optional[AccessContext]:

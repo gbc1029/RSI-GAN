@@ -29,8 +29,19 @@ def _iter_files(root: str):
                 yield os.path.join(dirpath, name)
 
 
+def _deletion_diff(repo_root: str, rel_file: str) -> str:
+    a_lines = _read_lines(os.path.join(repo_root, rel_file))
+    if not a_lines:
+        return ""
+    return "".join(difflib.unified_diff(a_lines, [], fromfile=f"a/{rel_file}", tofile="/dev/null"))
+
+
 def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[List[str]] = None) -> str:
-    """Unified diff of granted workspace copies vs the source repo."""
+    """Unified diff of granted workspace copies vs the source repo.
+
+    Handles modifications/additions AND deletions (files present in the repo but
+    removed from the workspace, e.g. by ``unregister_component``).
+    """
     src_root = broker.src_dir(role, node_id)
     granted = rel_paths if rel_paths is not None else broker.granted_paths(role, node_id)
     chunks: List[str] = []
@@ -42,12 +53,20 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
         seen.add(rel)
         a_root = os.path.join(broker.repo_root, rel)
         b_root = os.path.join(src_root, rel)
-        if not os.path.exists(a_root) or not os.path.exists(b_root):
+        if not os.path.exists(a_root):
             continue
+        if not os.path.exists(b_root):
+            # the whole granted file/dir was deleted in the workspace
+            for a_file in _iter_files(a_root):
+                rel_file = os.path.relpath(a_file, broker.repo_root).replace(os.sep, "/")
+                chunks.append(_deletion_diff(broker.repo_root, rel_file))
+            continue
+        # modifications/additions
+        b_files = set()
         for b_file in _iter_files(b_root):
             rel_file = os.path.relpath(b_file, src_root).replace(os.sep, "/")
-            a_file = os.path.join(broker.repo_root, rel_file)
-            a_lines = _read_lines(a_file)
+            b_files.add(rel_file)
+            a_lines = _read_lines(os.path.join(broker.repo_root, rel_file))
             b_lines = _read_lines(b_file)
             if a_lines == b_lines:
                 continue
@@ -56,6 +75,12 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
                 fromfile=f"a/{rel_file}", tofile=f"b/{rel_file}",
             )
             chunks.append("".join(diff))
+        # deletions inside a granted directory
+        if os.path.isdir(a_root):
+            for a_file in _iter_files(a_root):
+                rel_file = os.path.relpath(a_file, broker.repo_root).replace(os.sep, "/")
+                if rel_file not in b_files:
+                    chunks.append(_deletion_diff(broker.repo_root, rel_file))
     return "".join(chunks)
 
 

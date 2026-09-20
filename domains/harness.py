@@ -17,16 +17,22 @@ from types import ModuleType
 
 
 def get_dataset(domain, subset=""):
+    # Benchmark labels may live OUTSIDE the task run copy (leakage isolation):
+    # the driver sets GAN_DATASET_ROOT to the real repo root.
+    root = os.environ.get("GAN_DATASET_ROOT", "")
     df = None
     if "imo_" in domain:
-        df = pd.read_csv(f"./domains/imo/{domain.split('_')[-1]}bench{subset}.csv", dtype=str)
+        rel = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
     elif domain in ["search_arena", "paper_review"]:
-        df = pd.read_csv(f"./domains/{domain}/dataset{subset}.csv", dtype=str)
-    return df
+        rel = f"domains/{domain}/dataset{subset}.csv"
+    else:
+        return None
+    path = os.path.join(root, rel) if root else os.path.join(".", rel)
+    return pd.read_csv(path, dtype=str)
 
 def run_agent(TaskAgent, model, row, evals_folder, format_input_dict, question_id_col):
     question_id = row[question_id_col]
-    chat_history_path = os.path.join(evals_folder, f"chat_history_{question_id}.md")
+    chat_history_path = os.path.join(evals_folder, f"chat_history_{question_id}.jsonl")
     agent = TaskAgent(model=model, chat_history_file=chat_history_path)
     inputs = format_input_dict(row)
     prediction, _ = agent.forward(inputs)

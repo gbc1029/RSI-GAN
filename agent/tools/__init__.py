@@ -26,7 +26,7 @@ def load_tools(logging=print, names=[], tools_dir=None):
         sys.path.insert(0, str(tools_dir))
 
     for tool_file in tool_files:
-        # Import the module
+        # A malformed tool module must NOT break the whole toolset: log and skip.
         try:
             if use_file_spec:
                 module_name = f"gan_tool_{tools_dir.name}_{tool_file.stem}"
@@ -39,20 +39,18 @@ def load_tools(logging=print, names=[], tools_dir=None):
                 module_name = f"agent.tools.{tool_file.stem}"
                 module = importlib.import_module(module_name)
 
-            # Check if module has required functions
-            if hasattr(module, 'tool_info') and hasattr(module, 'tool_function'):
-                tool_name = tool_file.stem
-                if names and (names == 'all' or tool_name in names):
-                    tools.append({
-                        'info': module.tool_info(),
-                        'function': module.tool_function,
-                        'name': tool_name,
-                    })
-            else:
-                raise Exception(f"Tool module {module_name} does not have required functions.")
+            if not (hasattr(module, 'tool_info') and hasattr(module, 'tool_function')):
+                logging(f"Skipping tool {tool_file}: missing tool_info/tool_function")
+                continue
+            tool_name = tool_file.stem
+            if names and (names == 'all' or tool_name in names):
+                tools.append({
+                    'info': module.tool_info(),
+                    'function': module.tool_function,
+                    'name': tool_name,
+                })
         except Exception as e:
-            # Log the error and raise it
-            logging(f"Failed to import {tool_file}: {e}")
-            raise e
+            logging(f"Skipping tool {tool_file}: import failed: {e}")
+            continue
 
     return tools

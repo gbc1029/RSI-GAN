@@ -11,37 +11,34 @@ from typing import Any, Dict, List, Set
 
 # type markers are documentation only (not strictly enforced)
 ROLE_SCHEMAS: Dict[str, Dict[str, Any]] = {
-    # task agent: prompt + selected skills + memory strategy + free params + minted operators
+    # task agent: prompt + selected skills + memory strategy + free params
     "task": {
         "prompt": str,
         "skills": list,          # list[str]: names from the task component registry
         "memory": object,        # str | None
-        "operators": list,       # list of minted (composed) operators
         "params": dict,
     },
     # planner
     "planner": {
         "prompt": str,
         "memory": object,
-        "operators": list,
         "params": dict,
     },
-    # evaluator: prompt + selected eval points + memory + params + minted operators
+    # evaluator: prompt + selected eval points + memory + params
     "evaluator": {
         "prompt": str,
         "eval_points": list,     # list[str]: names from the evaluator registry
         "memory": object,
-        "operators": list,
         "params": dict,
     },
 }
 
 _DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "task": {"prompt": "You are an agent.", "skills": [], "memory": None, "operators": [], "params": {}},
+    "task": {"prompt": "You are an agent.", "skills": [], "memory": None, "params": {}},
     "planner": {"prompt": "You are a planner that improves a task agent.", "memory": None,
-                "operators": [], "params": {}},
+                "params": {}},
     "evaluator": {"prompt": "You are an evaluator that finds benchmark-invisible problems.",
-                  "eval_points": [], "memory": None, "operators": [], "params": {}},
+                  "eval_points": [], "memory": None, "params": {}},
 }
 
 

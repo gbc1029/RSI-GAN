@@ -37,7 +37,7 @@
 | 概念 | 目录 | 可变性 | 说明 |
 |---|---|---|---|
 | framework | `gan/framework/` | 冻结 | `loop.yaml`(超参)、`domains.yaml`(域注册表)、`loader.py` |
-| context | `gan/context.py` | 冻结 | 统一 Plan/Eval/Design/Access 四个 contextvar |
+| context | `gan/framework/context.py` | 冻结 | 统一 Plan/Eval/Design/Access 四个 contextvar |
 | tools（**总是启用**） | `gan/tools/` | 深改 | `work/{planner,evaluator}/`、`design/`(设计算子)、`deep/`(深度门控)、`assembly.py` |
 | components（**可选启用**） | `gan/components/` | 深改 | `shared/{skills,memory}/`、`task/skills/`、`evaluator/eval_points/` |
 | registries | `gan/registries/` | 深改 | `shared.json` + `<role>.json` + `loader.py` |
@@ -51,8 +51,8 @@
 - **evaluator 评估点拆两半**：核心 `report_issue/record_predicted_score/judge_fix` 在 `tools/work/evaluator`（总是）；可选 `trajectory_quality/hard_failure/reward_hacking/rule_violation` 在 `components/evaluator/eval_points`（注册+选择）。
 - **`common` 与 `code_edit` 合并**为唯一深度算子 `tools/deep/request_source_access.py`（view/modify + 记录）。
 - `eval_points.yaml` 与 doc-only `*.md` 已删除；评估点为**单一来源**（registry + 实现）。
-- schema 增加 `operators` 槽，`mint_operator` 写入该槽（去除隐藏键）。
-- **基底冻结（substrate）**：共享运行时 `agent/llm.py`、`agent/llm_withtools.py`、`agent/base_agent.py`、`gan/framework/*`、`gan/context.py` **不允许在进化中修改**（信任锚/防作弊），由 `gan/framework/loop.yaml: source_access.deny_paths` 在深度门控处强制拒绝（`AccessBroker._is_denied`），并在 `events.jsonl` 记录 `denied`。`agent/tools/` 基础手保持独立（不并入 `gan/tools`），以 `components/shared/skills/*` re-export 登记为可选技能。
+- schema 的 `operators` 槽与 `mint_operator` **已删除**（见 v4：工具增删改 = 浅层 `select/deselect_component` + 深层源码编辑）。
+- **访问边界（v4 改为按角色 allowlist）**：`gan/framework/frozen.py` 声明各角色可读/可写的路径白名单（task 无权限；planner 读写 t∪p；evaluator 读 t、读写 e），**默认其余全部冻结**；`AccessBroker` 按 `(role,intent)` 判定并拒绝 repo 根/自包含/超限授权。共享运行时（`agent/llm*.py`、`agent/base_agent.py`、`gan/framework/*`、`domains/{harness,report}.py`）与 plumbing 工具（`gan/tools/{design,deep,work/common}`）不在任何白名单内，因此不可修改；拒绝原因仅审计不外泄。
 
 > 下文 §0–§7 保留 v1 的框架性描述；目录与实现以本节、`v2` 节与代码为准。
 

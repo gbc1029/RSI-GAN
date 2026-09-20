@@ -10,6 +10,19 @@ loop:
   stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
   stagnation_epsilon: 0.005     # delta score threshold
   trigger_outer_on_hard_failure: true
+  keep_workdirs: false          # false: delete work/<genid> after each generation (space)
+  self_improve_max_tool_calls: 30  # tool-call budget for role self-improvement
+  plan_max_tool_calls: 40          # tool-call budget for plan/evaluate sessions
+  patch_retry_k: 2                 # in-session retries when a produced patch is rejected
+
+# ---------------------------------------------------------------------------
+# trajectory 可见范围（planner/evaluator 查询 task 的跨轮轨迹）
+#   v0: 仅允许读取"直接父代"的 trajectory（便于实现）；max_inner_generations
+#   控制最多可追溯的 inner 代，默认与 loop.inner_max 相同，可按需修改。
+# ---------------------------------------------------------------------------
+trajectory:
+  parent_only: true            # true: 仅直接父代；false: 允许按上限追溯祖先链
+  max_inner_generations: 3     # default = loop.inner_max
 
 # ---------------------------------------------------------------------------
 # task 树/DAG 约束与父代选择
@@ -38,12 +51,15 @@ source_access:
   require_declaration: true     # source code only after explicit request
   auto_approve: true            # v0: auto approve + full audit
   workspace_src_dir: src        # granted source is copied into <workspace>/src
-  # FROZEN trust anchor: the deny list is NOT configured here. It is derived from
-  # the physical layout by gan/framework/frozen.py (single source of truth):
-  #   - everything under gan/framework/*  (frozen by construction)
-  #   - external shared substrate/measurement (agent/llm*.py, agent/base_agent.py,
-  #     domains/harness.py, domains/report.py)
+  # ACCESS BOUNDARY is an allowlist by role, declared once in
+  # gan/framework/frozen.py (single source of truth):
+  #   - task      : no source access
+  #   - planner   : read+write task source (t) and its own source (p)
+  #   - evaluator : read task source (t, read-only) + read/write its own (e)
+  # Everything not listed is frozen by default; there is no persisted deny list.
   # Denied requests are audited but their reason is not surfaced to the agent.
+  max_files_per_grant: 500      # anti-blowup cap for a single grant
+  max_bytes_per_grant: 52428800 # 50 MiB
 
 # ---------------------------------------------------------------------------
 # 成本

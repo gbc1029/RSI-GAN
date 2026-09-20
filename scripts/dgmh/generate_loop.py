@@ -559,7 +559,7 @@ def generate(
                 container_output_folder, "agent_output"
             )
             container_chat_history_file = os.path.join(
-                container_agentoutput_folder, "meta_agent_chat_history.md"
+                container_agentoutput_folder, "meta_agent_chat_history.jsonl"
             )
             if run_baseline and "dgm" in run_baseline:
                 command = [

@@ -176,7 +176,7 @@ def get_failed_entry_info(output_dir, gen_id, domain):
         task_info = predictions[predictions[question_id_col] == entry_id].iloc[0].to_dict()
 
         # Get the chat history for the entry
-        entry_chat_history_path = os.path.join(eval_path, f"agent_evals/chat_history_{entry_id}.md")
+        entry_chat_history_path = os.path.join(eval_path, f"agent_evals/chat_history_{entry_id}.jsonl")
         md_log = read_file(entry_chat_history_path)
 
     elif 'balrog' in domain:
@@ -200,7 +200,7 @@ def get_failed_entry_info(output_dir, gen_id, domain):
         for json_file in json_files:
             episode_report = json.load(open(json_file, 'r'))
             if episode_report['progression'] < 1.0:
-                episode_chat_history = json_file.replace('.json', '_chat_history.md')
+                episode_chat_history = json_file.replace('.json', '_chat_history.jsonl')
                 md_log = read_file(episode_chat_history)
                 episode_csv = json_file.replace('.json', '.csv')
                 task_info = pd.read_csv(episode_csv).to_dict()
