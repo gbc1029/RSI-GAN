@@ -30,6 +30,9 @@ class Role(AgentSystem):
         # refreshed every outer generation: fresh design load, fresh toolset,
         # fresh chat history. None keeps the legacy single-instance layout.
         self.instance = instance
+        # Run-attempt id (set by GanLoop._refresh_roles); keys the OUTER-level
+        # trajectory file so re-running an outer never truncates a prior attempt.
+        self.attempt_id = None
         self.outer = None
         if instance and str(instance).startswith("outer_"):
             try:
@@ -69,7 +72,8 @@ class Role(AgentSystem):
 
     def session_trajectory(self, genid: Any = None) -> str:
         """JSONL trajectory file for one session (outer-level if genid is None)."""
-        return paths.session_traj_file(self.output_dir, self.outer, genid, self.role)
+        return paths.session_traj_file(self.output_dir, self.outer, genid, self.role,
+                                       attempt=getattr(self, "attempt_id", None))
 
     def tools_dir_for(self) -> str:
         base = os.path.join(self.output_dir, "toolsets", self.role)

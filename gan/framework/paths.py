@@ -5,8 +5,8 @@ Everything a run writes lives under ONE of the main buckets:
     <output_dir>/
       ckpt/        recovery + state
         checkpoint.json            latest snapshot (overwritten, atomic)
-        outer_<N>.json             immutable per-outer snapshot
-        inner_<N>_<i>.json         lightweight inner snapshot
+        outer_<N>.json             immutable per-outer snapshot (canonical; a RE-RUN
+                                   of the same outer archives outer_<N>_<ms>.json)
         design/                    role designs (the evolvable *state*)
           planner/config.json
           evaluator/config.json
@@ -60,10 +60,6 @@ def checkpoint_outer(output_dir: str, index: int) -> str:
     return os.path.join(ckpt_dir(output_dir), f"outer_{index}.json")
 
 
-def checkpoint_inner(output_dir: str, outer: int, inner: int) -> str:
-    return os.path.join(ckpt_dir(output_dir), f"inner_{outer}_{inner}.json")
-
-
 def design_root(output_dir: str) -> str:
     return os.path.join(ckpt_dir(output_dir), "design")
 
@@ -99,13 +95,27 @@ def outer_traj_dir(output_dir: str, outer) -> str:
     return os.path.join(trajectory_root(output_dir), f"outer_{outer}")
 
 
-def session_traj_file(output_dir: str, outer, genid: Optional[object], role: str) -> str:
-    """Path of one session's JSONL trajectory, creating its directory."""
+def session_traj_file(output_dir: str, outer, genid: Optional[object], role: str,
+                      attempt: Optional[str] = None) -> str:
+    """Path of one session's JSONL trajectory, creating its directory.
+
+    Per-generation files are keyed by ``genid`` (unique across re-runs because the
+    gen counter is restored from checkpoints). OUTER-level files (``genid=None``,
+    i.e. self-improvement sessions) are keyed by the run ``attempt`` id so that
+    re-running an outer never truncates or mixes a previous attempt's trace —
+    a sibling FILE (not a directory) so ``outer_session_index`` (which treats
+    every subdirectory of outer_<O> as a genid) is not polluted.
+    """
     base = outer_traj_dir(output_dir, outer)
     if genid is not None:
         base = os.path.join(base, str(genid))
+        name = f"{role}.jsonl"
+    elif attempt:
+        name = f"{role}__{attempt}.jsonl"
+    else:
+        name = f"{role}.jsonl"
     os.makedirs(base, exist_ok=True)
-    return os.path.join(base, f"{role}.jsonl")
+    return os.path.join(base, name)
 
 
 # -- other ------------------------------------------------------------------

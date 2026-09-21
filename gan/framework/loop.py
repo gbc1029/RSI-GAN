@@ -36,6 +36,7 @@ import json
 import os
 import shutil
 import statistics
+import uuid
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
@@ -86,6 +87,12 @@ class GanLoop:
         # last round receipt (injected into the next round's plan/evaluate/self_improve)
         self._last_receipt: Optional[Dict[str, Any]] = None
         self._last_self_receipt: Optional[Dict[str, Any]] = None
+        # run-attempt id: identifies THIS loop instantiation (one per outer worker /
+        # in-process run). Outer-level trajectory files are keyed by it so that
+        # re-running an outer never truncates or mixes a previous attempt's traces.
+        self._attempt = uuid.uuid4().hex[:8]
+        # role self-edit commits made by this run (audit; G2-lite)
+        self._role_commits: Dict[str, str] = {}
         os.makedirs(self.output_dir, exist_ok=True)
         self.task_tree = TreeStore(self.output_dir, "task").load()
         self.planner_tree = TreeStore(self.output_dir, "planner").load()
@@ -272,6 +279,8 @@ class GanLoop:
             "advantages": self._advantages,
             "prev_predicted": self._prev_predicted,
             "prev_benchmark": self._prev_benchmark,
+            "role_commits": dict(self._role_commits),
+            "attempt": self._attempt,
             "outer": outer,
             "inner": inner,
         }
@@ -284,10 +293,18 @@ class GanLoop:
         self._advantages = list(state.get("advantages") or [])
         self._prev_predicted = state.get("prev_predicted")
         self._prev_benchmark = state.get("prev_benchmark")
+        self._role_commits = dict(state.get("role_commits") or {})
 
     def _save_checkpoint(self, boundary: str, outer: int, inner: int) -> None:
         if not self.enable_checkpoint:
             return
+        code = None
+        if self.code_root:
+            from gan.framework import code_repo
+            try:
+                code = {"commit": code_repo.current_commit(self.code_root)}
+            except Exception:
+                code = None
         ckpt.save_checkpoint(
             self.output_dir,
             boundary=boundary,
@@ -295,6 +312,7 @@ class GanLoop:
             trees=ckpt.capture_trees(self.task_tree, self.planner_tree, self.evaluator_tree),
             designs=ckpt.snapshot_designs(self.output_dir, ["planner", "evaluator"]),
             index=(outer if boundary == "outer" else None),
+            code=code,
         )
 
     def _refresh_roles(self, outer: int) -> None:
@@ -310,6 +328,11 @@ class GanLoop:
             self.planner = self.planner_factory(outer)
         if self.evaluator_factory is not None:
             self.evaluator = self.evaluator_factory(outer)
+        for inst in (self.planner, self.evaluator):
+            try:
+                inst.attempt_id = self._attempt
+            except Exception:
+                pass
         if self.broker is not None:
             for role in ("planner", "evaluator"):
                 try:
@@ -364,6 +387,7 @@ class GanLoop:
         prev = code_repo.current_commit(self.code_root)
         try:
             sha = code_repo.apply_self_patch(self.code_root, role, patch)
+            self._role_commits[role] = sha
             self.log_event({"type": "self_improve_commit", "role": role,
                             "outer": outer, "commit": sha})
         except Exception as e:
@@ -522,8 +546,11 @@ class GanLoop:
         n_parents = int(cfg.get("tree.num_parents", 1))  # >1 enables crossover
 
         if self.resume and len(self.task_tree):
-            if self._restore("latest"):
-                st = ckpt.load_checkpoint(self.output_dir, "latest") or {}
+            # resume_boundary: "outer" (P1 — never resume from a crashed outer's
+            # partial inner checkpoint) or "latest" (legacy, --force re-runs).
+            boundary = getattr(self, "resume_boundary", "latest")
+            if self._restore(boundary):
+                st = ckpt.load_checkpoint(self.output_dir, boundary) or {}
                 s = st.get("state") or {}
                 if st.get("boundary") == "outer":
                     self._start_outer = int(s.get("outer", 0)) + 1
@@ -531,7 +558,9 @@ class GanLoop:
                 else:
                     self._start_outer = int(s.get("outer", 1))
                     self._start_inner = int(s.get("inner", 0)) + 1
-                self.log_event({"type": "resume", "outer": self._start_outer, "inner": self._start_inner})
+                self.log_event({"type": "resume", "boundary": boundary,
+                                "attempt": self._attempt,
+                                "outer": self._start_outer, "inner": self._start_inner})
 
         if len(self.task_tree) == 0:
             self.task_tree.add_node(Node(genid="initial", value=NodeValue(score=None)))

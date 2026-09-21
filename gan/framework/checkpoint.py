@@ -18,13 +18,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from gan.design.store import DesignStore
 from gan.framework import paths
 
 _TREE_NAMES = ("task", "planner", "evaluator")
-_OUTER_RE = re.compile(r"^outer_(\d+)\.json$")
+_OUTER_RE = re.compile(r"^outer_(\d+)\.json$")            # canonical (first write)
+_OUTER_ARCH_RE = re.compile(r"^outer_(\d+)_(\d+)\.json$")  # archival re-run snapshot (F5)
 
 
 def _ckpt_path(output_dir: str) -> str:
@@ -51,20 +53,58 @@ def _atomic_write_json(path: str, payload: Any) -> None:
     os.replace(tmp, path)
 
 
-def latest_outer_index(output_dir: str) -> Optional[int]:
+def _outer_snapshots(output_dir: str) -> List[Dict[str, Any]]:
+    """Every outer snapshot (canonical + archival re-run copies), orderable by time.
+
+    Each entry: ``{"path", "index", "ts"}`` where ``ts`` is the payload's
+    ``completed_ts`` when present (new format), else the file mtime (legacy).
+    Discovery covers BOTH name patterns so a re-run's snapshot is reachable.
+    """
     d = _checkpoints_dir(output_dir)
+    out: List[Dict[str, Any]] = []
     if not os.path.isdir(d):
-        return None
-    idxs = [int(m.group(1)) for m in (_OUTER_RE.match(n) for n in os.listdir(d)) if m]
-    return max(idxs) if idxs else None
+        return out
+    for name in sorted(os.listdir(d)):
+        m = _OUTER_RE.match(name)
+        a = None if m else _OUTER_ARCH_RE.match(name)
+        if not m and not a:
+            continue
+        path = os.path.join(d, name)
+        index = int((m or a).group(1))
+        ts = None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                ts = json.load(f).get("completed_ts")
+        except Exception:
+            ts = None
+        if ts is None:
+            try:
+                ts = os.path.getmtime(path)
+            except OSError:
+                ts = 0.0
+        out.append({"path": path, "index": index, "ts": float(ts)})
+    return out
+
+
+def newest_outer_snapshot(output_dir: str) -> Optional[Dict[str, Any]]:
+    """The chronologically newest outer snapshot (canonical or archival).
+
+    Ordering is by ``completed_ts``/mtime — NOT by outer index: a re-run that
+    starts from the middle produces a NEWER snapshot with a SMALLER index, and
+    the resume lineage must follow the newest attempt (start = its index + 1),
+    not the tail of the previous run.
+    """
+    snaps = _outer_snapshots(output_dir)
+    return max(snaps, key=lambda s: s["ts"]) if snaps else None
+
+
+def _max_outer_index(output_dir: str) -> Optional[int]:
+    snaps = _outer_snapshots(output_dir)
+    return max((s["index"] for s in snaps), default=None)
 
 
 def list_outer_checkpoints(output_dir: str) -> List[int]:
-    d = _checkpoints_dir(output_dir)
-    if not os.path.isdir(d):
-        return []
-    idxs = [int(m.group(1)) for m in (_OUTER_RE.match(n) for n in os.listdir(d)) if m]
-    return sorted(idxs)
+    return sorted({s["index"] for s in _outer_snapshots(output_dir)})
 
 
 def snapshot_designs(output_dir: str, roles: List[str]) -> Dict[str, Any]:
@@ -97,23 +137,40 @@ def save_checkpoint(
     trees: Dict[str, List[Dict[str, Any]]],
     designs: Dict[str, Any],
     index: Optional[int] = None,
+    code: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Persist a checkpoint.
 
     ``checkpoint.json`` is always the *latest* snapshot (overwritten). Outer
     boundaries additionally write an **immutable, numbered** file
-    ``ckpt/outer_<index>.json`` so per-generation history is never lost.
+    ``ckpt/outer_<index>.json`` so per-generation history is never lost:
+    the canonical name is written once (skip-if-exists); a RE-RUN of the same
+    outer writes an archival copy ``outer_<index>_<ms>.json`` instead, so no
+    snapshot is ever overwritten (F5).
+
+    ``code`` (optional, G2-lite) records the code baseline the state was
+    produced against — ``{"commit": <code_root HEAD>}`` — so a resume can
+    verify/restore the code tree to the checkpointed state.
     """
     payload = {"boundary": boundary, "state": state, "trees": trees, "designs": designs}
+    if code:
+        payload["code"] = dict(code)
     path = _ckpt_path(output_dir)
     _atomic_write_json(path, payload)
     if boundary == "outer":
         if index is None:
-            nxt = latest_outer_index(output_dir)
+            nxt = _max_outer_index(output_dir)
             index = (nxt or 0) + 1
         payload = dict(payload)
         payload["index"] = index
-        _atomic_write_json(_outer_path(output_dir, index), payload)
+        payload["completed_ts"] = time.time()
+        target = _outer_path(output_dir, index)
+        if os.path.exists(target):
+            # canonical snapshot is immutable: archive this re-run's snapshot instead
+            target = os.path.join(
+                _checkpoints_dir(output_dir), f"outer_{index}_{int(time.time() * 1000)}.json"
+            )
+        _atomic_write_json(target, payload)
     return path
 
 
@@ -121,9 +178,12 @@ def load_checkpoint(output_dir: str, boundary: str = "latest") -> Optional[Dict[
     if boundary == "latest":
         path = _ckpt_path(output_dir)
     elif boundary == "outer":
-        idx = latest_outer_index(output_dir)
-        # legacy fallback: pre-numbering runs wrote checkpoints/outer.json
-        path = _outer_path(output_dir, idx) if idx is not None else _boundary_path(output_dir, "outer")
+        newest = newest_outer_snapshot(output_dir)
+        if newest is not None:
+            path = newest["path"]
+        else:
+            # legacy fallback: pre-numbering runs wrote checkpoints/outer.json
+            path = _boundary_path(output_dir, "outer")
     else:
         path = _boundary_path(output_dir, boundary)
     if not os.path.exists(path):
