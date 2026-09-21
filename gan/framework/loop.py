@@ -98,7 +98,6 @@ class GanLoop:
         self._prev_benchmark: Optional[float] = None
         self._digests: List[str] = []
         self._advantages: List[float] = []
-        self._seed = int(os.environ.get("GAN_SEED", "0") or 0)
         self._start_outer = 1
         self._start_inner = 1
         # Human-readable task description for the task domain (framework-injected;
@@ -273,7 +272,6 @@ class GanLoop:
             "advantages": self._advantages,
             "prev_predicted": self._prev_predicted,
             "prev_benchmark": self._prev_benchmark,
-            "seed": self._seed,
             "outer": outer,
             "inner": inner,
         }
@@ -286,7 +284,6 @@ class GanLoop:
         self._advantages = list(state.get("advantages") or [])
         self._prev_predicted = state.get("prev_predicted")
         self._prev_benchmark = state.get("prev_benchmark")
-        self._seed = int(state.get("seed", self._seed) or 0)
 
     def _save_checkpoint(self, boundary: str, outer: int, inner: int) -> None:
         if not self.enable_checkpoint:

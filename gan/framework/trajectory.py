@@ -1,8 +1,11 @@
 """Task-trajectory archive (FRAMEWORK, frozen).
 
 Per-generation task-agent trajectories are archived out of the run dir into the
-per-instance JSONL layout, redacted, and indexed. planner/evaluator may read
-ONLY the direct parent generation (v0: ``loop.yaml`` ``trajectory.parent_only``).
+per-instance JSONL layout, redacted, and indexed. Which generations a role may
+read is decided by the loop and passed explicitly per session via
+``AccessContext.trajectory_genids`` (v4.20; planner = direct parent, evaluator =
+current + parent, self-improvement = this outer's generations + the last
+generation's direct parent).
 
 Redaction is deliberately part of the frozen trust anchor: evolvable agents must
 not be able to weaken it.
@@ -91,37 +94,6 @@ def collect(run_dir: str, run_id: str, output_dir: str, outer: Any, genid: Any) 
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     return dest
-
-
-def visible_genids(
-    tree: Any,
-    genid: Any,
-    parent_only: bool = True,
-    max_inner: int = 3,
-) -> List[Any]:
-    """Resolve which prior task generations a role may read.
-
-    v0 ``parent_only=True`` returns only the direct parent. Otherwise walk up the
-    ancestor chain for at most ``max_inner`` hops.
-    """
-    node = tree.get(genid)
-    if node is None:
-        return []
-    limit = 1 if parent_only else max(1, int(max_inner))
-    out: List[Any] = []
-    cur = node
-    hops = 0
-    while cur is not None and hops < limit:
-        p = getattr(cur, "parent_genid", None)
-        if p is None or str(p) == "initial":
-            break
-        pn = tree.get(p)
-        if pn is None:
-            break
-        out.append(p)
-        cur = pn
-        hops += 1
-    return out
 
 
 def _session_file(output_dir: str, genid: Any, role: str) -> str:

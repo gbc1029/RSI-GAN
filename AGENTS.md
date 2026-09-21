@@ -156,10 +156,11 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   effective model is recorded at runtime (`events.jsonl: model_config` for GAN;
   `[model_config]` log line for DGM-H; `Node.meta["model"]` per generation). Do not
   read `models.yaml` anywhere else.
-- `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable. It also
-  holds `trajectory.parent_only` / `trajectory.max_inner_generations` (v0: planner/evaluator
-  may read only the direct parent generation's task trajectory; the cap defaults to
-  `loop.inner_max`).
+- `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable. Task
+  trajectory visibility is NOT configured here: the loop passes an explicit
+  `AccessContext.trajectory_genids` set per session (v4.20) — planner = direct
+  parent; evaluator = current + parent; self-improvement = this outer's
+  generations + the last generation's direct parent.
 - **Work tools vs design operators**: evaluator scoring and planner
   `respond_issue` are work tools (`gan/tools/work/`); design operators are in
   `gan/tools/design/`.
