@@ -49,7 +49,7 @@
 - **基础手** `agent/tools/`（bash/editor）保持不动（框架基础）；`gan/components/shared/skills/` 以 re-export 方式将其登记为**通用可选技能**。
 - **task agent 无常驻工具**：能力全部是 `components`（skills），空种子起步，由设计 config 选择；不足时经 `tools/deep/request_source_access` 深层新增。
 - **evaluator 评估点拆两半**：核心 `report_issue/record_predicted_score/judge_fix` 在 `tools/work/evaluator`（总是）；可选 `trajectory_quality/hard_failure/reward_hacking/rule_violation` 在 `components/evaluator/eval_points`（注册+选择）。
-- **`common` 与 `code_edit` 合并**为唯一深度算子 `tools/deep/request_source_access.py`（view/modify + 记录）。
+- **`common` 与 `code_edit` 合并**为深度门控入口 `tools/deep/`：`request_source_access.py`（view/modify + 记录，增/改的唯一入口）与 `unregister_component.py`（深层删，v4.17，工作区操作随会话补丁提交）。
 - `eval_points.yaml` 与 doc-only `*.md` 已删除；评估点为**单一来源**（registry + 实现）。
 - schema 的 `operators` 槽与 `mint_operator` **已删除**（见 v4：工具增删改 = 浅层 `select/deselect_component` + 深层源码编辑）。
 - **访问边界（v4 改为按角色 allowlist）**：`gan/framework/frozen.py` 声明各角色可读/可写的路径白名单（task 无权限；planner 读写 t∪p；evaluator 读 t、读写 e），**默认其余全部冻结**；`AccessBroker` 按 `(role,intent)` 判定并拒绝 repo 根/自包含/超限授权。共享运行时（`agent/llm*.py`、`agent/base_agent.py`、`gan/framework/*`、`domains/{harness,report}.py`）与 plumbing 工具（`gan/tools/{design,deep,work/common}`）不在任何白名单内，因此不可修改；拒绝原因仅审计不外泄。

@@ -8,9 +8,9 @@ Everything a run writes lives under ONE of the main buckets:
         outer_<N>.json             immutable per-outer snapshot
         inner_<N>_<i>.json         lightweight inner snapshot
         design/                    role designs (the evolvable *state*)
-          planner/outer_<N>.json
-          evaluator/outer_<N>.json
-          task/<genid>.json
+          planner/config.json
+          evaluator/config.json
+          task/<genid>/config.json
       logs/        append-only logs
         events.jsonl
         task_tree.jsonl / planner_tree.jsonl / evaluator_tree.jsonl

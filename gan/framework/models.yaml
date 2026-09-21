@@ -8,9 +8,9 @@
 # Part 2 - DGM-H roles
 # Part 3 - domain-specific (non-task) roles
 gan:
-  task: openai/gpt-4o-mini
-  planner: openai/gpt-4o-mini
-  evaluator: openai/gpt-4o-mini
+  task: openai/gpt-4.1-mini
+  planner: openai/deepseek-v4.1-flash
+  evaluator: openai/deepseek-v4.1-flash
 
 dgmh:
   meta: openai/claude-sonnet-4-5-20250929

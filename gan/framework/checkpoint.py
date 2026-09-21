@@ -10,8 +10,8 @@ Snapshot contents:
 - ``designs``: ``{role: config}`` snapshots for planner/evaluator
 
 Layout:
-- ``checkpoint.json``                 : the latest snapshot (overwritten, atomic)
-- ``checkpoints/outer_<N>.json``      : immutable per-outer snapshots (never overwritten)
+- ``ckpt/checkpoint.json``             : the latest snapshot (overwritten, atomic)
+- ``ckpt/outer_<N>.json``              : immutable per-outer snapshots (never overwritten)
 """
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def save_checkpoint(
 
     ``checkpoint.json`` is always the *latest* snapshot (overwritten). Outer
     boundaries additionally write an **immutable, numbered** file
-    ``checkpoints/outer_<index>.json`` so per-generation history is never lost.
+    ``ckpt/outer_<index>.json`` so per-generation history is never lost.
     """
     payload = {"boundary": boundary, "state": state, "trees": trees, "designs": designs}
     path = _ckpt_path(output_dir)

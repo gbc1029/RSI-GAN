@@ -12,10 +12,11 @@ A **GAN-inspired three-role self-evolution framework** built on top of
 
 The design and rationale are documented in:
 
-- [`docs/深入设计说明.md`](docs/深入设计说明.md) — deep design (loops, config/operators, versioning, isolation) with code locations.
-- [`docs/plan.md`](docs/plan.md) — full design + implementation plan.
-- [`docs/GAN实现记录.md`](docs/GAN实现记录.md) — implementation record (files, problems, fixes, minimal run).
-- [`docs/部署记录.md`](docs/部署记录.md) — deployment / environment record.
+- [`docs/3_GAN深入设计说明.md`](docs/3_GAN深入设计说明.md) — deep design (loops, config/operators, versioning, isolation) with code locations.
+- [`docs/2_GAN_plan.md`](docs/2_GAN_plan.md) — full design + implementation plan.
+- [`docs/4_v1实现和v2改动.md`](docs/4_v1实现和v2改动.md) — implementation record (files, problems, fixes, minimal run).
+- [`docs/5_v3改动.md`](docs/5_v3改动.md) — modification decision record (v3/v4 changes).
+- [`docs/1_DGMH部署记录.md`](docs/1_DGMH部署记录.md) — deployment / environment record.
 - [`AGENTS.md`](AGENTS.md) — contributor/agent guide.
 
 > This repository also contains the original HyperAgents (DGM-H) codebase, which
@@ -28,15 +29,20 @@ The design and rationale are documented in:
 
 ```
 gan/                     # the GAN framework (new)
-  framework/             #   frozen: loop.yaml + domains.yaml + loader
-  context.py             #   all contextvars (plan/eval/design/access)
-  tools/                 #   always-on: work/ + design/ (operators) + deep/ (gate) + assembly.py
+  framework/             #   frozen trust anchor: loop.yaml, domains.yaml, models.yaml(+models.py),
+                         #   loader/frozen/paths/workspace/access/context/loop,
+                         #   task_execution/task_runner/checkpoint/scores/trajectory/preflight,
+                         #   code_repo/receipt, tree/, reward/
+  tools/                 #   always-on: work/{planner,evaluator,common} + design/ (operators)
+                         #   + deep/ (gated source access) + assembly.py
   components/            #   opt-in: shared/{skills,memory}, task/skills, evaluator/eval_points
   registries/            #   component catalog (json) + loader
   design/                #   shallow evolvable design (schema/store/composer/seeds)
-  roles/ tree/ reward/ access.py loop.py build.py task_runner.py patch.py summary.py
-scripts/run_gan.py       # GAN dual-loop CLI entry
+  roles/                 #   planner / evaluator (Role base in base_role.py)
+  build.py driver.py outer_worker.py patch.py summary.py
+scripts/run_gan.py       # GAN dual-loop CLI entry (driver mode default; --in-process = legacy)
 scripts/dgmh/            # DGM-H-only entry scripts (generate_loop/meta_agent/run_meta_agent/...)
+scripts/local/           # local-only verification scripts (gitignored)
 docs/                    # design / implementation / deployment docs
 agent/ domains/ utils/   # HyperAgents base code (reused)
 task_agent.py            # the (design-driven) task agent

@@ -29,9 +29,10 @@ live under `scripts/dgmh/`.
   `scores.py`, `trajectory.py`, `preflight.py`, `context.py`, `access.py`,
   `loop.py`, `tree/`, `reward/`.
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),
-  `work/common/` (frozen plumbing: `request_source_access` helper, `edit_source`,
-  `read_file`, `list_dir`, `grep`, `read_trajectory`), `design/` (shallow design
-  operators), `deep/` (gated deep gate), `assembly.py`.
+  `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
+  `read_trajectory`, `read_session_trajectory`, `list_editable`), `design/` (shallow design
+  operators), `deep/` (gated deep gate: `request_source_access` + `unregister_component`),
+  `assembly.py`.
 - `gan/components/` — **opt-in** implementations: `shared/{skills,memory}/`,
   `task/skills/`, `evaluator/eval_points/`.
 - `gan/registries/` — component catalog: `shared.json` + `<role>.json` + `loader.py`.
@@ -127,10 +128,13 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   tree `ckpt/code` (`gan/framework/code_repo.py`) and runs one `gan.outer_worker`
   subprocess per outer (`gan/driver.py`; cwd + `PYTHONPATH = code_root`), so role
   self-edits take effect for the **next outer**. Task (t) deep patches apply to the
-  code tree (validated + committed); role self-patches are applied by the driver
-  (`apply_self_patches`: allowlist + compile, rolled back on failure). Use
-  `--in-process` for the legacy single-process loop. Access grants/diffs are against
-  `code_root`; benchmark labels still come from `repo_root` via `GAN_DATASET_ROOT`.
+  code tree (validated + committed); role self-patches are likewise validated +
+  committed **by the worker itself** (option B, v4.22: `loop._apply_self_patch` →
+  `code_repo.apply_self_patch`, allowlist + compile, rolled back on failure; the
+  durable record is the code commit, events `self_improve_commit` /
+  `self_improve_apply_failed`). Use `--in-process` for the legacy single-process
+  loop. Access grants/diffs are against `code_root`; benchmark labels still come
+  from `repo_root` via `GAN_DATASET_ROOT`.
 - **Task brief**: each domain in `gan/framework/domains.yaml` has a `task_brief`
   (human-readable task + answer interface). It is **framework-injected** into the
   planner / task / evaluator prompts (via `GAN_TASK_BRIEF` for the task agent and
