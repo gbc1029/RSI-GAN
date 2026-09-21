@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import time
 from typing import List, Optional
 
 from gan.framework.access import AccessBroker
@@ -11,6 +13,7 @@ from gan.framework import paths
 from gan.framework.frozen import deny_paths as frozen_deny_paths
 from gan.framework.loader import load_gan_loop_config
 from gan.design import load_seed
+from gan.design.schema import default_config
 from gan.design.store import DesignStore
 from gan.framework.loop import GanLoop
 from gan.roles.evaluator import Evaluator
@@ -19,14 +22,28 @@ from gan.framework.task_runner import DomainTaskRunner
 
 
 def _seed_self_designs(output_dir: str) -> None:
-    """Seed planner/evaluator self-design prompts (and default eval points)."""
+    """First-time initialization of planner/evaluator self-designs.
+
+    An existing design file is AUTHORITATIVE — including deliberately empty
+    selections (``eval_points: []``) or an empty prompt — and is never rewritten.
+    Only a MISSING file is seeded. An UNPARSEABLE file is kept aside as
+    ``config.json.corrupt-<ts>`` (forensics) and then re-seeded (self-heal, so a
+    corrupt file cannot crash-loop the per-outer worker). Safe to call any number
+    of times (``build_gan_loop`` runs once per outer worker).
+    """
     store = DesignStore(paths.design_root(output_dir))
     for role in ("planner", "evaluator"):
-        cfg = store.load(role)
-        if not cfg.get("prompt"):
-            cfg["prompt"] = load_seed(role)
+        path = store.path(role)
+        if os.path.exists(path):
+            try:
+                store.load(role)
+                continue  # valid existing design: authoritative, do not touch
+            except Exception:
+                shutil.copy2(path, f"{path}.corrupt-{int(time.time())}")
+        cfg = default_config(role)
+        cfg["prompt"] = load_seed(role)
         # judgment eval points are optional but selected by default (evolvable later)
-        if role == "evaluator" and not cfg.get("eval_points"):
+        if role == "evaluator":
             from gan.registries.loader import load_registry_for_role
             reg = load_registry_for_role("evaluator")
             cfg["eval_points"] = reg.names("eval_point")
