@@ -23,7 +23,7 @@ from gan.framework.loader import config_dir
 _GAN_DIR = config_dir().parent
 REGISTRY_DIR = _GAN_DIR / "registries"
 COMPONENTS_DIR = _GAN_DIR / "components"
-KINDS = ("skill", "memory", "eval_point")
+KINDS = ("skill", "eval_point")
 _REQUIRED = ("name", "kind", "module")
 
 

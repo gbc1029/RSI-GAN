@@ -41,7 +41,7 @@
 以及 planner 的反馈文本。请据此调整：被 `rejected_with_feedback` 的问题说明 planner 有理有据地反驳了你，需反思是否误报；`rejected_no_feedback` 说明 planner 无反馈地忽略，你的发现被检查步骤确认。
 
 ## 评估点
-按评估点注册表逐项给出结论（`eval_points.yaml`）。涉及 `reward_hacking` / `rule_violation` 的检查点需要源码授权时，先通过 `request_source_access` 声明再判定，并在结论中附证据。
+按评估点注册表逐项给出结论（可选评估点登记于 `gan/registries/evaluator.json`，可用 `select_component` / `deselect_component` 增删）。涉及 `reward_hacking` / `rule_violation` 的检查点需要源码授权时，先通过 `request_source_access` 声明再判定，并在结论中附证据。
 
 ## 输出
 最终输出一个 RewardPacket 结构（见 reward schema）：

@@ -15,13 +15,12 @@ def tool_info():
         "name": "select_component",
         "description": (
             "Select a registered component into a design slot. Slots: 'skills' (task), "
-            "'eval_points' (evaluator), or 'memory' (single name). Only registered components "
-            "can be selected."
+            "'eval_points' (evaluator). Only registered components can be selected."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "slot": {"type": "string", "enum": ["skills", "eval_points", "memory"]},
+                "slot": {"type": "string", "enum": ["skills", "eval_points"]},
                 "name": {"type": "string"},
             },
             "required": ["slot", "name"],
@@ -34,12 +33,6 @@ def tool_function(slot, name, **kwargs):
     if ctx is None:
         return "Error: no design context"
     reg = load_registry_for_role(ctx.role)
-    if slot == "memory":
-        if not reg.has("memory", name):
-            return f"Error: memory '{name}' not registered for role {ctx.role}"
-        ctx.config["memory"] = name
-        ctx.record("select_component", slot=slot, name=name)
-        return f"memory = {name}"
     kind = _SLOT_KIND.get(slot)
     if kind is None:
         return f"Error: unknown slot '{slot}'"

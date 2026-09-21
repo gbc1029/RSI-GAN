@@ -35,9 +35,9 @@ gan/                     # the GAN framework (new)
                          #   code_repo/receipt, tree/, reward/
   tools/                 #   always-on: work/{planner,evaluator,common} + design/ (operators)
                          #   + deep/ (gated source access) + assembly.py
-  components/            #   opt-in: shared/{skills,memory}, task/skills, evaluator/eval_points
+  components/            #   opt-in: shared/skills, task/skills, evaluator/eval_points
   registries/            #   component catalog (json) + loader
-  design/                #   shallow evolvable design (schema/store/composer/seeds)
+  design/                #   shallow evolvable design (schema/store/seeds)
   roles/                 #   planner / evaluator (Role base in base_role.py)
   build.py driver.py outer_worker.py patch.py summary.py
 scripts/run_gan.py       # GAN dual-loop CLI entry (driver mode default; --in-process = legacy)

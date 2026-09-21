@@ -33,10 +33,10 @@ live under `scripts/dgmh/`.
   `read_trajectory`, `read_session_trajectory`, `list_editable`), `design/` (shallow design
   operators), `deep/` (gated deep gate: `request_source_access` + `unregister_component`),
   `assembly.py`.
-- `gan/components/` — **opt-in** implementations: `shared/{skills,memory}/`,
+- `gan/components/` — **opt-in** implementations: `shared/skills/`,
   `task/skills/`, `evaluator/eval_points/`.
 - `gan/registries/` — component catalog: `shared.json` + `<role>.json` + `loader.py`.
-- `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `composer.py`, `seeds/`.
+- `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `seeds/`.
 - `gan/roles/`, `gan/build.py`, `gan/summary.py` — evolvable orchestration/glue.
 
 ## Setup

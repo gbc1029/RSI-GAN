@@ -11,7 +11,7 @@ def tool_info():
     return {
         "name": "set_config",
         "description": (
-            "Set an existing design-config key (e.g. 'prompt', 'skills', 'memory', 'params'). "
+            "Set an existing design-config key (e.g. 'prompt', 'skills', 'params'). "
             "Adding a NEW key is not allowed here (requires a source-level change)."
         ),
         "input_schema": {

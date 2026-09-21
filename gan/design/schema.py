@@ -11,34 +11,30 @@ from typing import Any, Dict, List, Set
 
 # type markers are documentation only (not strictly enforced)
 ROLE_SCHEMAS: Dict[str, Dict[str, Any]] = {
-    # task agent: prompt + selected skills + memory strategy + free params
+    # task agent: prompt + selected skills + free params
     "task": {
         "prompt": str,
         "skills": list,          # list[str]: names from the task component registry
-        "memory": object,        # str | None
         "params": dict,
     },
     # planner
     "planner": {
         "prompt": str,
-        "memory": object,
         "params": dict,
     },
-    # evaluator: prompt + selected eval points + memory + params
+    # evaluator: prompt + selected eval points + params
     "evaluator": {
         "prompt": str,
         "eval_points": list,     # list[str]: names from the evaluator registry
-        "memory": object,
         "params": dict,
     },
 }
 
 _DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "task": {"prompt": "You are an agent.", "skills": [], "memory": None, "params": {}},
-    "planner": {"prompt": "You are a planner that improves a task agent.", "memory": None,
-                "params": {}},
+    "task": {"prompt": "You are an agent.", "skills": [], "params": {}},
+    "planner": {"prompt": "You are a planner that improves a task agent.", "params": {}},
     "evaluator": {"prompt": "You are an evaluator that finds benchmark-invisible problems.",
-                  "eval_points": [], "memory": None, "params": {}},
+                  "eval_points": [], "params": {}},
 }
 
 

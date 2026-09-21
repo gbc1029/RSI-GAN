@@ -2,7 +2,6 @@
 
 - ``schema.py``   : minimal per-role config schema (code-defined shape).
 - ``store.py``    : read/write ``design/<role|task-node>/config.json``.
-- ``composer.py`` : compose an effective spec from config + registry.
 - ``seeds/``      : seed prompts (initial design).
 
 The design layer holds **data** (config/selection/params), not implementations;
@@ -20,7 +19,6 @@ from gan.design.schema import (  # noqa: F401
     validate_config,
 )
 from gan.design.store import DesignStore  # noqa: F401
-from gan.design.composer import compose_role_design, compose_task_design  # noqa: F401
 
 _SEEDS_DIR = Path(__file__).resolve().parent / "seeds"
 

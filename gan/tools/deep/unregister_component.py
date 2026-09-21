@@ -24,12 +24,12 @@ def tool_info():
             "DEEP delete: remove a registered component from its registry and delete its "
             "source file. Applied to your workspace; committed with this session's patch "
             "after validation. Only components your role may edit can be removed. "
-            "kind: skill | eval_point | memory."
+            "kind: skill | eval_point."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "enum": ["skill", "eval_point", "memory"]},
+                "kind": {"type": "string", "enum": ["skill", "eval_point"]},
                 "name": {"type": "string"},
             },
             "required": ["kind", "name"],

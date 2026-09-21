@@ -10,22 +10,20 @@ component *logic* is also DEEP (source edit). See the design decision record.
 """
 from gan.framework.context import get_design_context
 
-_SLOT_KIND = {"skills": "skill", "eval_points": "eval_point"}
-
 
 def tool_info():
     return {
         "name": "deselect_component",
         "description": (
             "Remove a component from a design slot so it is no longer assembled into this "
-            "role's toolset. Slots: 'skills' (task), 'eval_points' (evaluator), or 'memory' "
-            "(single name). SHALLOW: only edits the design config; the component stays in the "
-            "registry and its source is untouched."
+            "role's toolset. Slots: 'skills' (task), 'eval_points' (evaluator). SHALLOW: only "
+            "edits the design config; the component stays in the registry and its source is "
+            "untouched."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "slot": {"type": "string", "enum": ["skills", "eval_points", "memory"]},
+                "slot": {"type": "string", "enum": ["skills", "eval_points"]},
                 "name": {"type": "string"},
             },
             "required": ["slot", "name"],
@@ -37,12 +35,6 @@ def tool_function(slot, name, **kwargs):
     ctx = get_design_context()
     if ctx is None:
         return "Error: no design context"
-    if slot == "memory":
-        if ctx.config.get("memory") == name:
-            ctx.config["memory"] = None
-            ctx.record("deselect_component", slot=slot, name=name)
-            return "memory = None"
-        return f"Error: memory is not '{name}'"
     if slot not in ctx.config:
         return f"Error: slot '{slot}' not in {ctx.role} design schema"
     cur = list(ctx.config.get(slot) or [])
