@@ -13,7 +13,8 @@ error-prone to declare only what MAY be read/written.
 The gate (``gan/framework/access.py``) enforces this; requested paths outside the
 role's roots are denied. The complement (the trust anchor, e.g. ``gan/framework``,
 ``agent/llm*.py``, ``agent/base_agent.py``, ``domains/harness.py``,
-``domains/report.py``, design operators/plumbing) is therefore frozen implicitly.
+``domains/task_worker.py``, ``domains/report.py``, design operators/plumbing) is
+therefore frozen implicitly.
 
 Plumbing tools (``gan/tools/design``, ``gan/tools/deep``, ``gan/tools/work/common``)
 and ``gan/framework/*`` are NOT in any role's roots -> not modifiable.
@@ -65,6 +66,7 @@ TRUST_ANCHOR: List[str] = [
     "agent/llm_withtools.py",
     "agent/base_agent.py",
     "domains/harness.py",
+    "domains/task_worker.py",
     "domains/report.py",
 ]
 

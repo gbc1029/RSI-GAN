@@ -571,21 +571,31 @@ class GanLoop:
                 self._gen_counter += 1
                 outer_genids.append(genid)
                 parent_cfg = self._parent_config(parent)
-                evaluator_issues = (self._last_feedback or {}).get("issues")
+                # Planner history follows the selected tree parent. The
+                # rolling fields are loop-local execution state and may belong
+                # to a different branch after parent selection.
+                parent_meta = parent.meta or {}
+                parent_feedback = parent_meta.get("feedback")
+                parent_receipt = parent_meta.get("receipt")
+                parent_predicted_score = parent_meta.get("predicted_score")
+                parent_benchmark_score = parent_meta.get("benchmark_score")
+                evaluator_issues = (parent_feedback or {}).get("issues")
                 parent_ref = [] if str(parent.genid) == "initial" else [parent.genid]
 
                 try:
                     plan_result = self.planner.plan(
                         parent_summary=self._parent_summary(parent),
                         parents=[self._parent_summary(p) for p in parents],
-                        last_feedback=self._last_feedback,
+                        last_feedback=parent_feedback,
                         evaluator_issues=evaluator_issues,
                         config=parent_cfg,
                         node_id=genid,
                         broker=self.broker,
                         task_brief=self.task_brief,
                         trajectory_genids=parent_ref,
-                        receipt=self._last_receipt,
+                        receipt=parent_receipt,
+                        parent_predicted_score=parent_predicted_score,
+                        parent_benchmark_score=parent_benchmark_score,
                         patch_retry_k=self.patch_retry_k,
                         max_tool_calls=self.plan_max_tool_calls,
                     ) or {}
@@ -666,6 +676,10 @@ class GanLoop:
                 packet = self._build_packet(child, ctx)
                 if getattr(ctx, "predicted_score", None) is not None:
                     child.value.potential = ctx.predicted_score
+                # Persist calibration values on the node so a later branch can
+                # use the selected parent's history rather than loop order.
+                child.meta["predicted_score"] = getattr(ctx, "predicted_score", None)
+                child.meta["benchmark_score"] = child.value.score
                 run_dir = paths.runs_dir(self.output_dir, genid)
                 os.makedirs(run_dir, exist_ok=True)
                 packet.save(os.path.join(run_dir, "packet.json"))
@@ -715,6 +729,11 @@ class GanLoop:
                     diff_summary=diff_summary,
                     penalties=packet.penalties,
                 )
+                child.meta["feedback"] = self._last_feedback
+                # The node was added before evaluator results and receipt were
+                # available; append a durable meta update so replayed trees
+                # retain all parent-context fields.
+                self.task_tree.update(child.genid, meta=child.meta)
                 self._prev_predicted = getattr(ctx, "predicted_score", None)
                 self._prev_benchmark = cs
 

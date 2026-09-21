@@ -8,33 +8,171 @@ import argparse
 import importlib
 import importlib.util
 import json
-import os
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
 from hydra import compose, initialize_config_dir
-from types import ModuleType
 
 
-def get_dataset(domain, subset=""):
-    # Benchmark labels may live OUTSIDE the task run copy (leakage isolation):
-    # the driver sets GAN_DATASET_ROOT to the real repo root.
-    root = os.environ.get("GAN_DATASET_ROOT", "")
-    df = None
+_TASK_RESULT_PREFIX = "__RSI_TASK_RESULT__"
+
+
+def get_dataset(domain, subset="", dataset_root=None):
+    # Only the parent harness receives this path. It is never placed in the
+    # environment or payload of the sandboxed TaskAgent worker.
+    root = os.path.abspath(dataset_root) if dataset_root else os.getcwd()
     if "imo_" in domain:
         rel = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
     elif domain in ["search_arena", "paper_review"]:
         rel = f"domains/{domain}/dataset{subset}.csv"
     else:
         return None
-    path = os.path.join(root, rel) if root else os.path.join(".", rel)
+    path = os.path.join(root, rel)
     return pd.read_csv(path, dtype=str)
 
-def run_agent(TaskAgent, model, row, evals_folder, format_input_dict, question_id_col):
+
+def _sandbox_path(run_root, host_path):
+    run_root = os.path.realpath(run_root)
+    host_path = os.path.realpath(host_path)
+    try:
+        contained = os.path.commonpath([run_root, host_path]) == run_root
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError(f"TaskAgent path must stay below the run directory: {host_path}")
+    return "/workspace/" + os.path.relpath(host_path, run_root).replace(os.sep, "/")
+
+
+def _add_empty_parents(command, path, created):
+    parent = os.path.dirname(path)
+    pending = []
+    while parent and parent != "/" and parent not in created:
+        pending.append(parent)
+        next_parent = os.path.dirname(parent)
+        if next_parent == parent:
+            break
+        parent = next_parent
+    for item in reversed(pending):
+        command.extend(["--dir", item])
+        created.add(item)
+
+
+def _sandbox_command(run_root, agent_path, trajectory_path):
+    """Create a fail-closed Bubblewrap command for one TaskAgent question."""
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise RuntimeError(
+            "TaskAgent sandbox is required, but 'bwrap' is not installed. "
+            "Refusing to run TaskAgent without benchmark isolation."
+        )
+
+    agent_host = os.path.realpath(os.path.join(run_root, agent_path))
+    _sandbox_path(run_root, agent_host)  # validates containment
+
+    command = [
+        bwrap,
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-all",
+        "--share-net",
+        "--cap-drop", "ALL",
+    ]
+
+    # System runtime is read-only. No repository/data parent is mounted.
+    created = {"/"}
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
+        if os.path.exists(path):
+            command.extend(["--ro-bind", path, path])
+            created.add(path)
+
+    # Support an interpreter installed in a venv/conda prefix outside /usr
+    # without exposing its parent directories.
+    python_prefix = os.path.realpath(sys.prefix)
+    if not any(
+        python_prefix == root or python_prefix.startswith(root + os.sep)
+        for root in ("/usr", "/bin", "/sbin", "/lib", "/lib64")
+    ):
+        _add_empty_parents(command, python_prefix, created)
+        command.extend(["--ro-bind", python_prefix, python_prefix])
+        created.add(python_prefix)
+
+    command.extend([
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--dir", "/workspace",
+        "--dir", "/workspace/domains",
+        "--ro-bind", agent_host, "/workspace/task_agent.py",
+        "--ro-bind", os.path.join(run_root, "agent"), "/workspace/agent",
+        "--ro-bind", os.path.join(run_root, "utils"), "/workspace/utils",
+        "--ro-bind", os.path.join(run_root, "domains", "__init__.py"),
+        "/workspace/domains/__init__.py",
+        "--ro-bind", os.path.join(run_root, "domains", "task_worker.py"),
+        "/workspace/domains/task_worker.py",
+        "--ro-bind", os.path.join(run_root, ".gan_runtime"),
+        "/workspace/.gan_runtime",
+        # Expose only this question's trajectory file, never outputs/ or other
+        # questions' trajectories, which may themselves contain benchmark data.
+        "--bind", trajectory_path, "/workspace/trajectory.jsonl",
+        "--tmpfs", "/workspace/scratch",
+        "--chdir", "/workspace/scratch",
+        "--setenv", "HOME", "/tmp",
+        "--setenv", "TMPDIR", "/tmp",
+        "--setenv", "PWD", "/workspace/scratch",
+        "--setenv", "PYTHONPATH", "/workspace",
+        sys.executable,
+        "-m", "domains.task_worker",
+    ])
+    return command
+
+
+def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
+    run_root = os.path.realpath(os.getcwd())
+    trajectory_path = os.path.realpath(trajectory_path)
+    _sandbox_path(run_root, trajectory_path)  # validates containment
+    os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
+    # A file bind must exist before Bubblewrap constructs the namespace.
+    with open(trajectory_path, "a", encoding="utf-8"):
+        pass
+
+    payload = {
+        "model": model,
+        "inputs": inputs,
+        "agent_path": "/workspace/task_agent.py",
+        "trajectory_path": "/workspace/trajectory.jsonl",
+    }
+    child_env = dict(os.environ)
+    for name in ("GAN_DATASET_ROOT", "PYTHONHOME", "PYTHONPATH", "OLDPWD"):
+        child_env.pop(name, None)
+
+    proc = subprocess.run(
+        _sandbox_command(run_root, agent_path, trajectory_path),
+        input=json.dumps(payload, ensure_ascii=False, default=str),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=child_env,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
+        raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
+    for line in reversed((proc.stdout or "").splitlines()):
+        if line.startswith(_TASK_RESULT_PREFIX):
+            result = json.loads(line[len(_TASK_RESULT_PREFIX):])
+            return result["prediction"]
+    raise RuntimeError("Sandboxed TaskAgent returned no result sentinel")
+
+
+def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
+              question_id_col, sandbox_task_agent=False, agent_path="./task_agent.py"):
     question_id = row[question_id_col]
     chat_history_path = os.path.join(evals_folder, f"chat_history_{question_id}.jsonl")
-    agent = TaskAgent(model=model, chat_history_file=chat_history_path)
     inputs = format_input_dict(row)
+    if sandbox_task_agent:
+        return _run_sandboxed_agent(model, inputs, agent_path, chat_history_path)
+    agent = TaskAgent(model=model, chat_history_file=chat_history_path)
     prediction, _ = agent.forward(inputs)
     return prediction
 
@@ -76,6 +214,7 @@ def harness(
     subset="",
     proofs_dname=None,
     model=None,
+    dataset_root=None,
 ):
     # Dynamically import functions based on the domain
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
@@ -92,8 +231,10 @@ def harness(
             "gan/framework/models.yaml by the driver)."
         )
 
-    # Load TaskAgent either from a file path or an importable module path
-    TaskAgent = load_task_agent(agent_path)
+    # GAN calls provide dataset_root and must always use the sandbox. Legacy
+    # direct harness calls retain their original same-process behavior.
+    sandbox_task_agent = dataset_root is not None
+    TaskAgent = None if sandbox_task_agent else load_task_agent(agent_path)
 
     # Specify output folder
     if resume_from:
@@ -128,7 +269,9 @@ def harness(
         dataset["Response"] = dataset["prediction"].copy()
         dataset.drop(columns=["prediction"], inplace=True)
     else:
-        dataset = get_dataset(domain=domain, subset=subset)
+        dataset = get_dataset(
+            domain=domain, subset=subset, dataset_root=dataset_root,
+        )
     if num_samples > 0:
         dataset = dataset[:num_samples]
 
@@ -156,6 +299,7 @@ def harness(
                         run_agent,
                         TaskAgent, model, row, evals_folder,
                         format_input_dict, question_id_col,
+                        sandbox_task_agent, agent_path,
                     ),
                 )
             )
@@ -257,6 +401,10 @@ if __name__ == "__main__":
         "--model", type=str, required=True,
         help="Model id, resolved from gan/framework/models.yaml by the driver (passed explicitly; no env/fallback).",
     )
+    parser.add_argument(
+        "--dataset_root", type=str, default=None,
+        help="Parent-only benchmark root. Providing it requires sandboxed TaskAgent execution.",
+    )
     args = parser.parse_args()
 
     domain = args.domain
@@ -278,6 +426,7 @@ if __name__ == "__main__":
             subset=args.subset,
             proofs_dname=args.proofs_dname,
             model=args.model,
+            dataset_root=args.dataset_root,
         )
 
     # Balrog game domains

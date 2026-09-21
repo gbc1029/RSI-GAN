@@ -28,7 +28,8 @@ from gan.tools.assembly import assemble_tools_dir
 
 _PY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
 # Benchmark labels / heavy assets must NOT be present in a task run (leakage
-# isolation). The harness reads labels from GAN_DATASET_ROOT (outside the copy).
+# isolation). The parent harness reads labels from an explicit CLI path that is
+# never forwarded to the sandboxed task worker.
 _DOMAIN_IGNORE = shutil.ignore_patterns(
     "dataset*.csv", "*bench*.csv", "polyglot-benchmark", "SWE-bench",
     "saved", "predictions", "logs", "__pycache__", "*.pyc",
@@ -36,7 +37,12 @@ _DOMAIN_IGNORE = shutil.ignore_patterns(
 # Allowlist of what a task run actually needs (never copy the whole repo).
 _RUNTIME_FILES = ["task_agent.py"]
 _RUNTIME_DIRS = ["agent", "utils"]
-_HARNESS_FILES = ["domains/__init__.py", "domains/harness.py", "domains/report.py"]
+_HARNESS_FILES = [
+    "domains/__init__.py",
+    "domains/harness.py",
+    "domains/report.py",
+    "domains/task_worker.py",
+]
 
 
 # -- design persistence -----------------------------------------------------
@@ -48,26 +54,29 @@ def assemble_task_env(
     base_env: Dict[str, str],
     *,
     design_path: str,
-    node_dir: str,
+    run_dir: str,
     config: Dict[str, Any],
-    dataset_root: Optional[str] = None,
     code_root: Optional[str] = None,
     task_brief: Optional[str] = None,
 ) -> Dict[str, str]:
-    """Runtime env for the task agent (design/skills only; model is a CLI arg).
+    """Build the environment and sandbox-visible runtime assets for TaskAgent.
 
-    ``dataset_root`` points the harness at benchmark labels OUTSIDE the run copy;
-    ``code_root`` (per-run code tree) supplies the task skills/components;
-    ``task_brief`` is the domain's human-readable task description.
+    The design and assembled skills are copied below ``run_dir`` and referenced
+    through their paths inside the task sandbox. Benchmark paths are explicitly
+    removed from the inherited environment.
     """
     env = dict(base_env)
-    env["GAN_TASK_DESIGN"] = design_path
-    skills_dir = os.path.join(node_dir, "skills")
+    env.pop("GAN_DATASET_ROOT", None)
+
+    runtime_dir = os.path.join(run_dir, ".gan_runtime")
+    os.makedirs(runtime_dir, exist_ok=True)
+    shutil.copy2(design_path, os.path.join(runtime_dir, "design.json"))
+
+    skills_dir = os.path.join(runtime_dir, "skills")
     assemble_tools_dir("task", skills_dir, config=config, include_always_on=False,
                        code_root=code_root)
-    env["GAN_TASK_SKILLS_DIR"] = skills_dir
-    if dataset_root:
-        env["GAN_DATASET_ROOT"] = os.path.abspath(dataset_root)
+    env["GAN_TASK_DESIGN"] = "/workspace/.gan_runtime/design.json"
+    env["GAN_TASK_SKILLS_DIR"] = "/workspace/.gan_runtime/skills"
     if task_brief:
         env["GAN_TASK_BRIEF"] = task_brief
     return env
@@ -121,6 +130,7 @@ def run_harness_and_report(
     model: str,
     env: Dict[str, str],
     timeout: int,
+    dataset_root: str,
     log_path: Optional[str] = None,
 ) -> Tuple[int, str]:
     """Run the (frozen) domain harness + report; return (harness_rc, output_tail)."""
@@ -131,6 +141,7 @@ def run_harness_and_report(
         "--run_id", run_id,
         "--subset", subset,
         "--num_samples", str(num_samples),
+        "--dataset_root", os.path.abspath(dataset_root),
     ]
     proc = subprocess.run(
         harness_cmd, cwd=run_dir, env=env, text=True,
