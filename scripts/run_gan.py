@@ -59,9 +59,11 @@ def main():
         code_root = run_gan_driver(
             repo_root=args.repo_root,
             output_dir=args.output_dir,
+            domains=(args.domains.split(",") if args.domains else None),
             task_domain=args.task_domain,
             subset=args.subset,
             num_samples=args.num_samples,
+            inner=args.inner,
             cfg_overrides=overrides or None,
             preflight=args.preflight,
         )

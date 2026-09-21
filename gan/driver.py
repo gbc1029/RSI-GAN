@@ -26,9 +26,11 @@ def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
 def run_gan_driver(
     repo_root: str,
     output_dir: str,
+    domains: Optional[List[str]] = None,
     task_domain: str = "paper_review",
     subset: str = "_filtered_100_train",
     num_samples: int = 2,
+    inner: Optional[int] = None,
     cfg_overrides: Optional[dict] = None,
     preflight: bool = False,
 ) -> str:
@@ -63,6 +65,10 @@ def run_gan_driver(
             "--outer", str(outer), "--task-domain", task_domain,
             "--subset", subset, "--num_samples", str(num_samples),
         ]
+        if domains:
+            cmd.extend(["--domains", ",".join(domains)])
+        if inner is not None:
+            cmd.extend(["--inner", str(inner)])
         proc = subprocess.run(cmd, cwd=code_root, env=env)
         if proc.returncode != 0:
             _log_event(output_dir, {"type": "outer_worker_failed", "outer": outer,
