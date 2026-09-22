@@ -125,15 +125,18 @@ class DomainTaskRunner:
                 task_patch_rejected = str(e)
             patch_str = ""  # applied to code_root (or rejected -> nothing to apply)
 
-        # framework: design persistence + env/toolset assembly + run dir
+        # Framework: persist the design, prepare the minimal code copy, then
+        # assemble sandbox-visible design/skills inside that copy.
         design_path = tx.persist_design(self.design_store, config, genid)
         model = self.default_model
+        run_dir, patch_applied_copy = tx.prepare_run_dir(
+            source_root, node_dir, patch_str, domain=self.domain,
+        )
         env = tx.assemble_task_env(
             os.environ.copy(), design_path=design_path,
-            node_dir=node_dir, config=config, dataset_root=self.repo_root,
+            run_dir=run_dir, config=config,
             code_root=self.code_root, task_brief=self.task_brief,
         )
-        run_dir, patch_applied_copy = tx.prepare_run_dir(source_root, node_dir, patch_str, domain=self.domain)
         patch_applied = patch_applied or patch_applied_copy
 
         run_id = f"gan_{genid}"
@@ -144,7 +147,8 @@ class DomainTaskRunner:
         # framework: harness + report invocation (frozen measurement path); model passed explicitly
         rc, _out = tx.run_harness_and_report(
             self.python, run_dir, self.domain, run_id, self.subset,
-            self.num_samples, model, env, self.timeout, log_path=self.log_path,
+            self.num_samples, model, env, self.timeout,
+            dataset_root=self.repo_root, log_path=self.log_path,
         )
         report = tx.read_report(report_path)
         score = tx.extract_score(report, self.score_key)

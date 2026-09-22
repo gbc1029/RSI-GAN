@@ -87,6 +87,7 @@ def main():
             domains=domains,
             subset=args.subset,
             num_samples=args.num_samples,
+            inner=args.inner,
             cfg_overrides=overrides or None,
             preflight=args.preflight,
             resume=args.resume,

@@ -114,7 +114,7 @@ def build_gan_loop(
         code_root=code_root,
     )
     # Grants/diffs are against the per-run code baseline when code_repo is on;
-    # benchmark labels still come from repo_root via GAN_DATASET_ROOT.
+    # only the parent harness receives repo_root for loading benchmark labels.
     broker = AccessBroker(
         code_root or repo_root, output_dir,
         deny_paths=frozen_deny_paths(),

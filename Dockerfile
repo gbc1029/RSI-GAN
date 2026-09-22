@@ -69,6 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libosmesa6-dev \
     libglfw3 \
     libglfw3-dev \
+    bubblewrap \
     xvfb \
     && rm -rf /var/lib/apt/lists/*
 

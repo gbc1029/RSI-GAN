@@ -24,6 +24,7 @@ def main() -> None:
                         "never resume from a crashed outer's partial inner state.")
     p.add_argument("--subset", default="_filtered_100_train")
     p.add_argument("--num_samples", type=int, default=2)
+    p.add_argument("--inner", type=int, default=None)
     args = p.parse_args()
 
     # Entry validation before building/running anything: empty and multi-value
@@ -37,12 +38,17 @@ def main() -> None:
 
     from gan.build import build_gan_loop
 
+    cfg_overrides = None
+    if args.inner is not None:
+        cfg_overrides = {"loop": {"inner_max": args.inner}}
+
     loop = build_gan_loop(
         repo_root=args.repo_root,
         output_dir=args.output_dir,
         domains=domains,
         subset=args.subset,
         num_samples=args.num_samples,
+        cfg_overrides=cfg_overrides,
         code_repo=True,
     )
     loop.resume = True  # load trees/state produced by previous outers

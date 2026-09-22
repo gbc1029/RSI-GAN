@@ -33,6 +33,8 @@ class Planner(Role):
         parents: Optional[List[Dict[str, Any]]] = None,
         task_brief: Optional[str] = None,
         receipt: Optional[Dict[str, Any]] = None,
+        parent_predicted_score: Optional[float] = None,
+        parent_benchmark_score: Optional[float] = None,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -69,6 +71,11 @@ class Planner(Role):
                 "\n## Diff summary (what changed last round, sanitized)\n"
                 f"```json\n{json.dumps(last_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
             )
+        if parent_predicted_score is not None or parent_benchmark_score is not None:
+            parts.append(
+                "\n## Selected parent calibration\n"
+                f"```json\n{json.dumps({'predicted_score': parent_predicted_score, 'benchmark_score': parent_benchmark_score}, ensure_ascii=False)}\n```"
+            )
         return "\n".join(parts)
 
     # -- API ---------------------------------------------------------------
@@ -84,6 +91,8 @@ class Planner(Role):
         task_brief: Optional[str] = None,
         trajectory_genids: Optional[List[Any]] = None,
         receipt: Optional[Dict[str, Any]] = None,
+        parent_predicted_score: Optional[float] = None,
+        parent_benchmark_score: Optional[float] = None,
         patch_retry_k: int = 2,
         max_tool_calls: int = 40,
     ) -> Dict[str, Any]:
@@ -106,7 +115,8 @@ class Planner(Role):
         try:
             hist = self.run(
                 self._plan_instruction(parent_summary or {}, last_feedback, evaluator_issues,
-                                       parents, task_brief, receipt),
+                                       parents, task_brief, receipt,
+                                       parent_predicted_score, parent_benchmark_score),
                 max_tool_calls=max_tool_calls, trajectory_file=traj)
 
             def _build_patch() -> str:

@@ -29,6 +29,7 @@ def run_gan_driver(
     domains: List[str],
     subset: str = "_filtered_100_train",
     num_samples: int = 2,
+    inner: Optional[int] = None,
     cfg_overrides: Optional[dict] = None,
     preflight: bool = False,
     resume: bool = False,
@@ -134,6 +135,8 @@ def run_gan_driver(
             "--outer", str(outer), "--domains", domain,
             "--subset", subset, "--num_samples", str(num_samples),
         ]
+        if inner is not None:
+            cmd.extend(["--inner", str(inner)])
         if resume:
             # P1: worker restores the latest OUTER-boundary checkpoint, never a
             # crashed outer's partial inner state.
