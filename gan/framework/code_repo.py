@@ -134,6 +134,88 @@ def checkout(code_root: str, sha: Optional[str]) -> None:
         pass
 
 
+# -- branch-per-node blood lineage (v5) ---------------------------------------
+def task_ref_name(genid: Any) -> str:
+    """Persistent lightweight branch ref for a task generation's code state."""
+    return f"task_{genid}"
+
+
+def outer_base_ref_name(outer: int) -> str:
+    """Anchor for the outer's entry HEAD (base for parent=initial children)."""
+    return f"outer_{outer}_base"
+
+
+def ensure_branch(code_root: str, ref_name: str, commit_sha: Optional[str] = None) -> Tuple[bool, str]:
+    """Create a lightweight branch ``ref_name`` at ``commit_sha`` (default HEAD).
+
+    Never overwrites: an existing ref pointing at the same commit is idempotent;
+    pointing elsewhere is a conflict. Returns (ok, mode) with mode in
+    {"created", "idempotent", "conflict"}.
+    """
+    target = (commit_sha or current_commit(code_root)).strip()
+    if not target:
+        return False, "conflict"
+    existing = _git(code_root, "rev-parse", "--verify", "--quiet", f"refs/heads/{ref_name}",
+                    check=False)
+    if existing.returncode == 0:
+        existing_sha = existing.stdout.strip()
+        return (existing_sha == target), ("idempotent" if existing_sha == target else "conflict")
+    try:
+        _git(code_root, "branch", ref_name, target)
+        return True, "created"
+    except RuntimeError:
+        return False, "conflict"
+
+
+def checkout_base(code_root: str, target: str) -> str:
+    """Put the working tree exactly at ``target`` (a ref name or full SHA).
+
+    The commit is resolved to a SHA first: checking out a branch NAME attaches
+    HEAD to it, so any later commit would move the anchor ref (e.g. destroy the
+    ``outer_<O>_base`` pin) — which must never happen. Returns the exact SHA.
+    """
+    r = _git(code_root, "rev-parse", "--verify", "--quiet", f"{target}^{{commit}}", check=False)
+    sha = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else str(target)
+    _git(code_root, "checkout", "-f", sha)
+    _git(code_root, "clean", "-fd")
+    return sha
+
+
+def lineage_of(code_root: str, ref_name_or_sha: str) -> List[str]:
+    """Ancestor chain (first-committed first) of a ref/SHA — the audit view."""
+    r = _git(code_root, "rev-list", "--reverse", ref_name_or_sha)
+    return [l for l in r.stdout.splitlines() if l.strip()]
+
+
+def branch_tips(code_root: str, prefix: str = "task_") -> Dict[str, str]:
+    """Map of ``task_*`` ref names to commit SHAs (ref-reconciliation + audit)."""
+    r = _git(code_root, "branch", "--list", f"{prefix}*", "--format=%(refname:short) %(objectname)")
+    out: Dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2:
+            out[parts[0]] = parts[1]
+    return out
+
+
+def reconcile_refs(code_root: str, code_commits: Dict[str, str]) -> Dict[str, Any]:
+    """Compare ``{genid: code_commit}`` against the ``task_*`` branch refs.
+
+    Pure report (audit): missing/conflicting refs are reported, never fixed or
+    blocking — legacy runs and externally cleaned branches must not break runs.
+    """
+    tips = branch_tips(code_root)
+    missing, drifted = [], []
+    for genid, sha in (code_commits or {}).items():
+        ref = task_ref_name(genid)
+        if ref not in tips:
+            missing.append(ref)
+        elif tips[ref] != sha:
+            drifted.append(ref)
+    extra = [r for r in tips if str(r)[len("task_"):] not in (code_commits or {})]
+    return {"missing": missing, "drifted": drifted, "extra": extra}
+
+
 def changed_files(patch: str) -> List[str]:
     """Target files of a unified diff, including deletions (``+++ /dev/null``)."""
     lines = (patch or "").splitlines()
@@ -294,4 +376,33 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
 def apply_self_patch(code_root: str, role: str, patch: str) -> str:
     """Validate and commit a role self-edit patch (thin wrapper over apply_code_patch)."""
     return apply_code_patch(code_root, role, patch, f"self-improve {role}")
+
+
+def apply_task_patch(code_root: str, role: str, patch: str, genid: Any,
+                     parent_genid: Any, base: str) -> Dict[str, Any]:
+    """Branch-per-node task patch: align to ``base``, validate+commit, pin the ref.
+
+    The code state of a generation is a git commit whose parent is its selected
+    parent's code commit — the DAG **is** the blood lineage. Every generation
+    gets a persistent lightweight ref ``task_<genid>`` (its code state anchor,
+    GC-protected auditable lookup); a generation with a rejected patch or no
+    patch aliases its parent's commit (no empty commits, no lineage gap).
+
+    Returns ``{"code_commit", "base_commit", "applied", "ref_ok", "ref_mode"}``.
+    """
+    base_commit = checkout_base(code_root, base)
+    applied = False
+    if (patch or "").strip():
+        try:
+            sha = apply_code_patch(code_root, role, patch,
+                                   f"task gen {genid} parent {parent_genid}")
+            applied = True
+        except PatchRejected:
+            _hard_rollback(code_root, base_commit)
+            sha = base_commit  # node's code state == parent's code (no lineage gap)
+    else:
+        sha = current_commit(code_root)
+    ref_ok, ref_mode = ensure_branch(code_root, task_ref_name(genid), sha)
+    return {"code_commit": sha, "base_commit": base_commit, "applied": applied,
+            "ref_ok": ref_ok, "ref_mode": ref_mode}
 

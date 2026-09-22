@@ -76,7 +76,8 @@ class DomainTaskRunner:
     # ``default_model`` (frozen model selection).
 
     # -- runner ------------------------------------------------------------
-    def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None, genid: Any = None) -> Node:
+    def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,
+                 genid: Any = None, base: Optional[str] = None) -> Node:
         plan = plan or {}
         records = plan.get("records", []) or []
         config = plan.get("config")
@@ -87,16 +88,34 @@ class DomainTaskRunner:
         node_dir = paths.work_dir(self.output_dir, genid)
         os.makedirs(node_dir, exist_ok=True)
 
-        # Apply a task (t) deep patch to the per-run code baseline BEFORE running,
-        # so this generation uses the evolved task code. Validate; roll back on
-        # failure. (When code_repo is off, fall back to patching the run copy.)
+        # Branch-per-node: the selected parent's code state (checked out by the
+        # loop BEFORE planning) is the base; the task patch is committed on top
+        # of it with a ``task_<genid>`` ref. A rejected/absent patch aliases the
+        # base itself — the per-node lineage never has a gap. (When code_repo is
+        # off, fall back to patching the run copy.)
         source_root = self.code_root or self.repo_root
         task_code_commit = None
+        base_commit: Optional[str] = None
+        code_ref_ok = True
+        code_ref_mode = ""
         task_patch_files = []
         patch_applied = False
         task_patch_rejected = None
-        if (patch_str or "").strip() and self.code_root:
-            # unified commit validation (allowlist + compile + registry); rollback on reject
+        if self.code_root and base:
+            res = code_repo.apply_task_patch(
+                self.code_root, "planner", patch_str, genid,
+                (parent.genid if parent is not None else "initial"), base)
+            task_code_commit = res["code_commit"]
+            base_commit = res["base_commit"]
+            code_ref_ok = bool(res["ref_ok"])
+            code_ref_mode = str(res["ref_mode"])
+            patch_applied = bool(res["applied"])
+            if patch_applied:
+                task_patch_files = code_repo.changed_files(patch_str)
+            if task_code_commit == base_commit and task_code_commit:
+                task_patch_rejected = "no new code commit (patch rejected or absent)"
+        elif (patch_str or "").strip() and self.code_root:
+            # legacy path (no base resolved): pre-branch time-line HEAD behaviour
             try:
                 task_code_commit = code_repo.apply_code_patch(
                     self.code_root, "planner", patch_str, f"task gen {genid}")
@@ -175,6 +194,10 @@ class DomainTaskRunner:
                 "delta_vs_parent": delta,
                 "patch_applied": patch_applied,
                 "task_code_commit": task_code_commit,
+                "code_commit": task_code_commit,
+                "base_commit": base_commit,
+                "code_ref_ok": code_ref_ok,
+                "code_ref_mode": code_ref_mode,
                 "task_patch_files": task_patch_files,
                 "task_patch_rejected": task_patch_rejected,
                 "records": records,

@@ -395,12 +395,14 @@ class GanLoop:
             self.log_event({"type": "self_improve_apply_failed", "role": role,
                             "outer": outer, "error": str(e)[:300]})
 
-    def _resync_workspace(self, outer: Any, files: List[str]) -> None:
+    def _resync_workspace(self, outer: Any, files: List[str], drop_missing: bool = False) -> None:
         """Keep granted workspace copies in sync with the code baseline.
 
-        After a task patch is applied to the code tree, the planner/evaluator
-        workspaces (per outer) may hold stale copies; refresh only the files that
-        were already granted, so subsequent diffs are incremental.
+        After a code-base switch or task patch is applied to the code tree, the
+        planner/evaluator workspaces (per outer) may hold stale copies; refresh
+        only the granted files. With ``drop_missing``, a file absent from the
+        (new) baseline is REMOVED from the workspace — a stale copy would fake a
+        deletion diff.
         """
         code_root = getattr(self.broker, "repo_root", None)
         if not code_root:
@@ -414,7 +416,14 @@ class GanLoop:
             for rel in files or []:
                 s = os.path.join(code_root, rel)
                 d = os.path.join(src, rel)
-                if os.path.isfile(s) and os.path.isfile(d):
+                if not os.path.isfile(s):
+                    if drop_missing and os.path.isfile(d):
+                        try:
+                            os.remove(d)
+                        except OSError:
+                            pass
+                    continue
+                if os.path.isfile(d):
                     try:
                         shutil.copy2(s, d)
                     except OSError:
@@ -530,6 +539,62 @@ class GanLoop:
             self.log_event({"type": "rollback", "boundary": "outer"})
         return ok
 
+    # -- branch-per-node blood lineage (v5) ---------------------------------
+    def _pin_outer_base(self, outer: int) -> None:
+        """Anchor the outer's entry HEAD as ``outer_<O>_base`` (once per outer).
+
+        HEAD drifts to the latest task-branch tip during the outer, so the base
+        for ``parent == "initial"`` generations must be pinned BEFORE any task
+        commit moves it. Idempotent (re-runs of the same outer).
+        """
+        if not self.code_root:
+            return
+        from gan.framework import code_repo
+        ref = code_repo.outer_base_ref_name(outer)
+        ok, mode = code_repo.ensure_branch(self.code_root, ref, code_repo.current_commit(self.code_root))
+        self.log_event({"type": "code_branch", "kind": "outer_base", "outer": outer,
+                        "ref": ref, "mode": mode, "ok": bool(ok)})
+
+    def _resolve_base(self, parent: Any, outer: int) -> str:
+        """Blood lineage: base = parent's code state (initial -> outer base).
+
+        Legacy fallback: a node without a recorded code commit falls back to
+        HEAD (behavior identical to the pre-branch time-line; audited).
+        """
+        from gan.framework import code_repo
+        head = code_repo.current_commit(self.code_root)
+        if str(parent.genid) == "initial":
+            return code_repo.outer_base_ref_name(outer)
+        sha = (parent.meta or {}).get("code_commit") or (parent.meta or {}).get("task_code_commit")
+        if not sha:
+            self.log_event({"type": "code_lineage_legacy", "outer": outer,
+                            "parent_genid": str(parent.genid), "fallback_base": head})
+            return head
+        return sha
+
+    def _align_code_base(self, parent: Any, outer: int, genid: Any) -> Optional[str]:
+        """Checkout the selected parent's code state before planning; resync workspace.
+
+        Returns the base (ref name or SHA) passed to the task patch application.
+        Logs nothing when code_repo is off (legacy in-process path).
+        """
+        if not self.code_root:
+            return None
+        from gan.framework import code_repo
+        base = self._resolve_base(parent, outer)
+        checked = code_repo.checkout_base(self.code_root, base)
+        self.log_event({"type": "code_lineage", "genid": str(genid),
+                        "parent_genid": str(parent.genid),
+                        "base": str(base), "checked": checked})
+        granted_files: List[str] = []
+        if self.broker is not None:
+            for rec in self._source_access_log(outer):
+                granted_files.extend(rec.get("paths", []) if isinstance(rec, dict) else [])
+            # stale copies must not survive a base switch (a file that existed on
+            # the previous tip but not on the new base would fake a deletion)
+        self._resync_workspace(outer, granted_files, drop_missing=True)
+        return str(base)
+
     # -- main loop ---------------------------------------------------------
     def run(self, only_outer: Optional[int] = None) -> TreeStore:
         cfg = self.cfg
@@ -561,6 +626,19 @@ class GanLoop:
                 self.log_event({"type": "resume", "boundary": boundary,
                                 "attempt": self._attempt,
                                 "outer": self._start_outer, "inner": self._start_inner})
+                # ref reconciliation (audit only): genid -> recorded code_commit
+                # vs task_* branch tips; missing refs never block a resume.
+                if self.code_root:
+                    from gan.framework import code_repo
+                    commits = {}
+                    for k, nd in self.task_tree.nodes.items():
+                        sha = (nd.meta or {}).get("code_commit")
+                        if sha:
+                            commits[str(k)] = str(sha)
+                    if commits:
+                        rep = code_repo.reconcile_refs(self.code_root, commits)
+                        if rep.get("missing") or rep.get("drifted"):
+                            self.log_event({"type": "code_ref_missing", "report": rep})
 
         if len(self.task_tree) == 0:
             self.task_tree.add_node(Node(genid="initial", value=NodeValue(score=None)))
@@ -581,6 +659,9 @@ class GanLoop:
             self.log_event({"type": "outer_start", "outer": outer})
             # fresh role instances (design + tools + chat + workspace) for this outer
             self._refresh_roles(outer)
+            # pin the outer's entry HEAD as the base for parent=initial children
+            # (HEAD drifts to task-branch tips during the outer)
+            self._pin_outer_base(outer)
 
             inner_start = self._start_inner if (only_outer is None and outer == self._start_outer) else 1
             for inner in range(inner_start, I_max + 1):
@@ -596,6 +677,10 @@ class GanLoop:
                 genid = self._gen_counter
                 self._gen_counter += 1
                 outer_genids.append(genid)
+                # branch-per-node: align the code tree to the selected parent's
+                # code state BEFORE planning (the planner diffs against the
+                # parent's code, not the time-line HEAD).
+                base = self._align_code_base(parent, outer, genid)
                 parent_cfg = self._parent_config(parent)
                 evaluator_issues = (self._last_feedback or {}).get("issues")
                 parent_ref = [] if str(parent.genid) == "initial" else [parent.genid]
@@ -621,7 +706,8 @@ class GanLoop:
                     continue
 
                 try:
-                    child = self.task_runner(plan=plan_result, parent=parent, genid=genid)
+                    child = self.task_runner(plan=plan_result, parent=parent, genid=genid,
+                                             base=base)
                 except Exception as e:
                     self._archive_invalid("task_runner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
@@ -636,6 +722,15 @@ class GanLoop:
                 child.parent_genid = parent.genid
                 plan_cfg = plan_result.get("config")
                 child.meta["config_dict"] = plan_cfg if isinstance(plan_cfg, dict) else parent_cfg
+                if base and self.code_root:
+                    # audit: per-generation ref pinned by the patch application
+                    self.log_event({"type": "code_branch", "genid": str(genid),
+                                    "ref": f"task_{genid}",
+                                    "commit": child.meta.get("code_commit"),
+                                    "base": child.meta.get("base_commit"),
+                                    "applied": bool(child.meta.get("patch_applied")),
+                                    "ref_ok": child.meta.get("code_ref_ok", True),
+                                    "ref_mode": child.meta.get("code_ref_mode", "")})
 
                 # score / imputation / validity
                 self._finalize_child(child, parent)
