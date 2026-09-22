@@ -300,7 +300,7 @@ GanLoop.run()  (gan/loop.py:149)
 
 ## 7. 一次运行的产物与自查
 
-运行：`python scripts/run_gan.py --task-domain paper_review --subset _filtered_100_train --num_samples 2 --outer 1 --inner 2`
+运行：`python scripts/run_gan.py --domains paper_review --subset _filtered_100_train --num_samples 2 --outer 1 --inner 2`
 
 产物：`task_tree.jsonl`（`initial→0→1`，含 `config_dict` 血统）、`planner_tree.jsonl`/`evaluator_tree.jsonl`、`runs/<genid>/packet.json`、`runs/<genid>/evaluator_reward.json`、`nodes/<genid>/config.json`、`events.jsonl`；子进程评测见 `outputs/gan_<genid>/report.json`。
 

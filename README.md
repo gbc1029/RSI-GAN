@@ -111,7 +111,7 @@ docker build --network=host -t hyperagents .
 
 ```bash
 python scripts/run_gan.py \
-  --task-domain paper_review \
+  --domains paper_review \
   --subset _filtered_100_train \
   --num_samples 2 \
   --outer 1 --inner 2 \

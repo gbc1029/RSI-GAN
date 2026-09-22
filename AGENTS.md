@@ -58,7 +58,7 @@ OPENAI_API_KEY=<key>
 
 ```bash
 # GAN dual-loop (paper_review minimal)
-python scripts/run_gan.py --task-domain paper_review --subset _filtered_100_train \
+python scripts/run_gan.py --domains paper_review --subset _filtered_100_train \
   --num_samples 2 --outer 1 --inner 2 --output_dir outputs/gan_paper_review
 
 # original HyperAgents domain eval (model is explicit; resolved from models.yaml)
@@ -135,6 +135,17 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   `self_improve_apply_failed`). Use `--in-process` for the legacy single-process
   loop. Access grants/diffs are against `code_root`; benchmark labels still come
   from `repo_root` via `GAN_DATASET_ROOT`.
+- **Code blood lineage (v5, branch-per-node)**: every task generation's code is
+  a git commit in the per-run code tree whose git parent is its **selected
+  parent's** code commit; each generation pins a persistent ref `task_<genid>`,
+  and the outer's entry HEAD is pinned as `outer_<O>_base` (the base for
+  `initial`-parent children and the per-outer ancestry anchor). The base for
+  planning/patching is resolved from the parent's ref, never from the moving
+  HEAD — cross-outer tree selection follows the same rule (方案 A: the task tree
+  is inherited intact across outers; invalid children become auditable dead
+  branches, and a rejected/missing patch aliases the parent's commit — no
+  lineage gaps). The outer boundary snapshot's `code.commit` remains the HEAD
+  at snapshot time.
 - **Task brief**: each domain in `gan/framework/domains.yaml` has a `task_brief`
   (human-readable task + answer interface). It is **framework-injected** into the
   planner / task / evaluator prompts (via `GAN_TASK_BRIEF` for the task agent and

@@ -26,8 +26,7 @@ def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
 def run_gan_driver(
     repo_root: str,
     output_dir: str,
-    task_domain: str = "paper_review",
-    domains: Optional[List[str]] = None,
+    domains: List[str],
     subset: str = "_filtered_100_train",
     num_samples: int = 2,
     cfg_overrides: Optional[dict] = None,
@@ -61,23 +60,26 @@ def run_gan_driver(
             f"or --force to re-run from outer 1 (legacy duplicate-prone behaviour, "
             f"explicit escape hatch).")
 
-    # --domains passthrough: exactly ONE value (multi-domain not implemented yet).
-    # The single value is authoritative for the task domain (enforced at the CLI);
-    # here we validate the shape again (programmatic callers) and warn on
-    # unregistered domain names.
-    if domains:
-        if len(domains) != 1:
-            raise ValueError(f"--domains accepts exactly one domain (got {domains}); "
-                             f"multi-domain evaluation is not implemented yet")
-        task_domain = domains[0]
-        reg = load_registry()
-        registered = set((reg.get("domains", {}) or {}).keys())
-        families = set((reg.get("families", {}) or {}).keys())
-        d0 = domains[0]
-        if d0 not in registered and not any(d0.startswith(f) for f in families):
-            _log_event(output_dir, {"type": "domain_unregistered", "domain": d0,
-                                    "hint": "not in domains.yaml domains/families; "
-                                            "task_brief/output_contract fall back to default"})
+    # Domain shape checks (the ONLY default lives in scripts/run_gan.py; here the
+    # value is required input). Empty/None and multi-value both fail fast before
+    # any task execution. Multi-domain evaluation is not implemented yet.
+    if not domains or not [d for d in domains if str(d).strip()]:
+        raise ValueError(f"--domains is required and must be non-empty (got {domains!r}); "
+                         f"refusing to run without an explicit task domain")
+    if len(domains) != 1:
+        raise ValueError(f"--domains accepts exactly one domain (got {domains}); "
+                         f"multi-domain evaluation is not implemented yet")
+    domain = domains[0].strip() if isinstance(domains[0], str) else domains[0]
+    if not domain:
+        raise ValueError(f"--domains parses to an empty domain (got {domains!r})")
+    domain = str(domain)
+    reg = load_registry()
+    registered = set((reg.get("domains", {}) or {}).keys())
+    families = set((reg.get("families", {}) or {}).keys())
+    if domain not in registered and not any(domain.startswith(f) for f in families):
+        _log_event(output_dir, {"type": "domain_unregistered", "domain": domain,
+                                "hint": "not in domains.yaml domains/families; "
+                                        "task_brief/output_contract fall back to default"})
 
     code_root = ensure_code_root(repo_root, output_dir)
 
@@ -87,8 +89,8 @@ def run_gan_driver(
     start = (int(newest["index"]) + 1) if (resume and newest) else 1
     _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
                             "outer_generations": G,
-                            "task_domain": task_domain,
-                            "domains": list(domains) if domains else [task_domain],
+                            "domain": domain,
+                            "domains": list(domains),
                             "resume": resume, "force": force,
                             "latest_completed_outer": (newest["index"] if newest else None),
                             "start_outer": start})
@@ -129,11 +131,9 @@ def run_gan_driver(
         cmd = [
             sys.executable, "-m", "gan.outer_worker",
             "--repo_root", repo_root, "--output_dir", output_dir,
-            "--outer", str(outer), "--task-domain", task_domain,
+            "--outer", str(outer), "--domains", domain,
             "--subset", subset, "--num_samples", str(num_samples),
         ]
-        if domains:
-            cmd += ["--domains", ",".join(domains)]
         if resume:
             # P1: worker restores the latest OUTER-boundary checkpoint, never a
             # crashed outer's partial inner state.

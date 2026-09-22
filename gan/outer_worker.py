@@ -14,10 +14,10 @@ def main() -> None:
     p.add_argument("--repo_root", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--outer", type=int, required=True)
-    p.add_argument("--task-domain", dest="task_domain", default="paper_review")
-    p.add_argument("--domains", default=None,
-                   help="comma-separated meta domains; exactly one value is supported "
-                        "(multi-domain evaluation is not implemented yet)")
+    p.add_argument("--domains", required=True,
+                   help="task domain; exactly one value (required, no default — the "
+                        "only default lives in scripts/run_gan.py; empty and "
+                        "multi-value inputs are rejected here before any work).")
     p.add_argument("--resume-boundary", dest="resume_boundary", default="latest",
                    choices=["latest", "outer"],
                    help="'outer' (P1): restore the latest OUTER-boundary checkpoint and "
@@ -26,19 +26,20 @@ def main() -> None:
     p.add_argument("--num_samples", type=int, default=2)
     args = p.parse_args()
 
-    domains = None
-    if args.domains:
-        domains = [d.strip() for d in args.domains.split(",") if d.strip()]
-        if len(domains) != 1:
-            p.error(f"--domains accepts exactly one domain (got {domains}); "
-                    f"multi-domain evaluation is not implemented yet")
+    # Entry validation before building/running anything: empty and multi-value
+    # fail fast; multi-domain evaluation is not implemented yet.
+    domains = [d.strip() for d in (args.domains or "").split(",") if d.strip()]
+    if not domains:
+        p.error("--domains 解析为空；请提供至少一个域名")
+    if len(domains) != 1:
+        p.error(f"--domains 目前仅支持单个域（收到 {len(domains)} 个：{domains}）；"
+                f"多域评测尚未实现，本次不执行任务")
 
     from gan.build import build_gan_loop
 
     loop = build_gan_loop(
         repo_root=args.repo_root,
         output_dir=args.output_dir,
-        task_domain=args.task_domain,
         domains=domains,
         subset=args.subset,
         num_samples=args.num_samples,

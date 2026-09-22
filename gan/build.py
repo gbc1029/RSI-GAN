@@ -65,8 +65,7 @@ def ensure_code_root(repo_root: str, output_dir: str) -> str:
 def build_gan_loop(
     repo_root: str,
     output_dir: str,
-    domains: Optional[List[str]] = None,
-    task_domain: str = "paper_review",
+    domains: List[str],
     subset: str = "_filtered_100_train",
     num_samples: int = 2,
     cfg_overrides: Optional[dict] = None,
@@ -74,7 +73,18 @@ def build_gan_loop(
     code_repo: bool = True,
 ) -> GanLoop:
     cfg = load_gan_loop_config(cfg_overrides)
-    domains = domains or [task_domain]
+    # Domain shape checks: `domains` is required input with NO default (the only
+    # default lives in scripts/run_gan.py). Empty/multi fail fast before anything
+    # is materialized; multi-domain evaluation is not implemented yet.
+    if not domains or not [d for d in domains if str(d).strip()]:
+        raise ValueError(f"domains is required and must be non-empty (got {domains!r}); "
+                         f"refusing to run without an explicit task domain")
+    if len(domains) != 1:
+        raise ValueError(f"domains accepts exactly one domain (got {domains}); "
+                         f"multi-domain evaluation is not implemented yet")
+    domain = str(domains[0]).strip()
+    if not domain:
+        raise ValueError(f"domains parses to an empty domain (got {domains!r})")
     repo_root = os.path.abspath(repo_root)
 
     # Single source: gan/framework/models.yaml (no env, no fallback, no overrides).
@@ -97,7 +107,7 @@ def build_gan_loop(
     runner = DomainTaskRunner(
         repo_root=repo_root,
         output_dir=output_dir,
-        domain=task_domain,
+        domain=domain,
         subset=subset,
         num_samples=num_samples,
         default_model=t_model,
