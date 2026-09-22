@@ -56,6 +56,16 @@
 
 > 下文 §0–§7 保留 v1 的框架性描述；目录与实现以本节、`v2` 节与代码为准。
 
+> **[已变] v5 勘误（原描述保留，仅标注）**：§0–§7 中的以下旧名/旧路径在当前代码中已不存在，请按此对照阅读——
+> - `gan/operators/…`（`common`/`planner_ops`/`evaluator_ops`/`work_tools`/`design_ops`/`registry.py`）→ 现行 `gan/tools/{work,design,deep}/` + `gan/registries/`；
+> - `code_edit` 算子（深层逃生口）→ 已并入 `gan/tools/deep/request_source_access.py`（深层删为 `unregister_component.py`）；
+> - `mint_operator` / `eval_points.yaml` / `gan/design/composer.py` / `gan/components/shared/memory/` → 均已删除；
+> - `gan/loop.py` / `gan/context.py` / `gan/access.py` / `gan/tree/` → 现行 `gan/framework/{loop,context,access}.py` 与 `gan/framework/tree/`；
+> - `gan/config/{gan_loop,registry,eval_points}.yaml`、`gan/config/prompts/*.md` → 现行 `gan/framework/{loop.yaml,domains.yaml,models.yaml}` + `gan/design/seeds/*.md`；
+> - `nodes/<genid>/config.json`、`nodes/<genid>/repo` → 现行 `ckpt/design/task/<genid>/config.json`、`work/<genid>/repo`；
+> - `runs/<genid>/evaluator_reward.json` → 该文件不存在（v3 起去数值奖励），现行 `runs/<genid>/{packet.json,eval.json,feedback_digest.md}`；
+> - `GAN_TASK_MODEL` / `config["models.task"]` / `*_MODEL` env → 现行模型仅由 `gan/framework/models.yaml` 解析并经 `--model` 显式传参（无 env、无 fallback）。
+
 ---
 
 ## 0. 代码地图

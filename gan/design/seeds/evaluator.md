@@ -36,18 +36,19 @@
 - 若需要源码才能判断，先 `request_source_access`。
 
 ## 上一轮反馈（内循环可见）
-你会看到上一个内循环轮次对你的**反馈**，格式为每个问题在 2×2 矩阵中的落点：
-- `accepted_fixed` / `accepted_unfixed` / `rejected_with_feedback` / `rejected_no_feedback`
-以及 planner 的反馈文本。请据此调整：被 `rejected_with_feedback` 的问题说明 planner 有理有据地反驳了你，需反思是否误报；`rejected_no_feedback` 说明 planner 无反馈地忽略，你的发现被检查步骤确认。
+你会看到上一个内循环轮次对你的**反馈**，格式为每个问题在落点矩阵中的位置：
+- `accepted_fixed` / `accepted_unfixed` / `rejected_with_feedback` / `rejected_no_feedback` / `unjudged`
+以及 planner 的反馈文本。请据此调整：被 `rejected_with_feedback` 的问题说明 planner 有理有据地反驳了你，需反思是否误报；`rejected_no_feedback` 说明 planner 无反馈地忽略，你的发现被检查步骤确认；`unjudged` 表示该问题被 planner 接受，但本轮你没有给出 `judge_fix` 判定（应补上判定）。
 
 ## 评估点
 按评估点注册表逐项给出结论（可选评估点登记于 `gan/registries/evaluator.json`，可用 `select_component` / `deselect_component` 增删）。涉及 `reward_hacking` / `rule_violation` 的检查点需要源码授权时，先通过 `request_source_access` 声明再判定，并在结论中附证据。
 
 ## 输出
-最终输出一个 RewardPacket 结构（见 reward schema）：
-- `numeric`：包含你的 `predicted_score`（盲评）及（揭示后）对 benchmark 的分析。
-- `textual`：`summary` / `weaknesses` / `suggestions`。
-- `penalties`：`cannot_run` / `reward_hacking_suspect` / `rule_violation`。
+你不直接产出 RewardPacket——框架从你的工具调用组装它。请确保记录完整：
+- 盲评阶段用 `record_predicted_score` 记录 `predicted_score`（框架据此构造 packet 的 numeric 部分）。
+- 用 `report_issue` 记录问题清单（`issue_id` / `description` / `severity` / `evidence` / `suggested_fix`）。
+- 用评估点工具记录结论：`eval_trajectory_quality`（过程质量，comment 进入 weaknesses）、`eval_hard_failure`（`cannot_run`）、`eval_reward_hacking`（`reward_hacking_suspect`）、`eval_rule_violation`（`rule_violation`）。
+- 每轮对上一轮每个问题各调用一次 `judge_fix`，避免留下 `unjudged`。
 
 ## 禁止
 - 不要为迎合 benchmark 而给出与其一致的预估；校准追求的是**诚实**，不是对齐。

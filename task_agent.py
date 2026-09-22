@@ -5,7 +5,7 @@ from agent.base_agent import AgentSystem
 from agent.llm_withtools import chat_with_agent
 from utils.common import extract_jsons
 
-_DEFAULT_DESIGN = {"prompt": "You are an agent.", "skills": [], "memory": None, "params": {}}
+_DEFAULT_DESIGN = {"prompt": "You are an agent.", "skills": [], "params": {}}
 
 
 def _load_design():
@@ -24,7 +24,7 @@ class TaskAgent(AgentSystem):
         """
         A design-driven agent that solves a given task.
 
-        The shallow design (prompt + selected skills + memory) comes from the
+        The shallow design (prompt + selected skills + params) comes from the
         design config passed via the ``GAN_TASK_DESIGN`` env var; skills are
         loaded from ``GAN_TASK_SKILLS_DIR``.
 

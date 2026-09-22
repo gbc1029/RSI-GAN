@@ -5,7 +5,7 @@ loop scalars live only in memory. This module persists a full snapshot so a run 
 be resumed or rolled back to an outer-generation boundary.
 
 Snapshot contents:
-- ``state``  : loop scalars (counters, digests, last feedback, seed, position)
+- ``state``  : loop scalars (counters, digests, last feedback, position)
 - ``trees``  : ``{name: [node_dict, ...]}`` for task/planner/evaluator
 - ``designs``: ``{role: config}`` snapshots for planner/evaluator
 

@@ -7,6 +7,8 @@ Everything a run writes lives under ONE of the main buckets:
         checkpoint.json            latest snapshot (overwritten, atomic)
         outer_<N>.json             immutable per-outer snapshot (canonical; a RE-RUN
                                    of the same outer archives outer_<N>_<ms>.json)
+        code/                      per-run git working tree holding the evolvable code
+        code.json                  code-tree manifest (see code_repo)
         design/                    role designs (the evolvable *state*)
           planner/config.json
           evaluator/config.json
@@ -17,15 +19,16 @@ Everything a run writes lives under ONE of the main buckets:
         task_runner.log
       trajectory/  conversation / execution traces (JSONL, per instance)
         outer_<O>/
-          planner.jsonl            (outer-level self-improvement)
-          evaluator.jsonl
+          planner.jsonl            (outer-level self-improvement; on a RE-RUN keyed
+          evaluator.jsonl           by attempt: <role>__<attempt>.jsonl)
           <inner_genid>/
             task.jsonl
             planner.jsonl
             evaluator.jsonl
       scores/      quick score index
         scores.jsonl
-      runs/<genid>/   small evidence (packet.json, feedback_digest.md)
+      runs/<genid>/   small evidence (packet.json, eval.json, feedback_digest.md,
+                      patch_receipt.json, patch_proposed.diff)
       work/<genid>/   EPHEMERAL run dir (repo copy, skills) -> pruned after run
       workspaces/<role>/...  granted source copies (cleared per outer)
 

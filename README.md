@@ -89,14 +89,12 @@ OPENAI_API_BASE=https://<your-openai-compatible-endpoint>/v1
 OPENAI_API_KEY=<your key>
 ```
 
-Optional model overrides for the GAN roles:
-
-```ini
-GAN_MODEL_DEFAULT=<model>      # fallback default model
-GAN_TASK_MODEL=<model>         # task agent model (also injected per node)
-GAN_MODEL_PLANNER=<model>
-GAN_MODEL_EVALUATOR=<model>
-```
+Model selection has **no environment variables and no fallback**: the single
+source is `gan/framework/models.yaml`, read only by `gan/framework/models.py`
+(sections `gan.{task,planner,evaluator}`, `dgmh.{meta,task}`, `domains.<role>`).
+The domain task agent receives its model via an explicit
+`domains.harness --model ...` argument, never via env. To change a model, edit
+`gan/framework/models.yaml`.
 
 ### 4) Docker (only needed for the original HyperAgents container flow)
 
@@ -118,8 +116,10 @@ python scripts/run_gan.py \
   --output_dir outputs/gan_paper_review
 ```
 
-Outputs: `task_tree.jsonl`, `planner_tree.jsonl`, `evaluator_tree.jsonl`,
-`runs/<genid>/packet.json`, `runs/<genid>/evaluator_reward.json`, `events.jsonl`.
+Outputs (under `--output_dir`): `logs/events.jsonl`,
+`logs/{task,planner,evaluator}_tree.jsonl`, `scores/scores.jsonl`,
+`runs/<genid>/{packet.json,eval.json,feedback_digest.md,patch_receipt.json}`,
+`trajectory/outer_<O>/...`, `ckpt/checkpoint.json` (+ immutable `ckpt/outer_<N>.json`).
 
 ### Original HyperAgents flow (base)
 

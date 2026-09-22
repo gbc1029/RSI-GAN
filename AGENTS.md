@@ -94,12 +94,17 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   planner/evaluator. Each outer saves a checkpoint; the next outer starts from the
   previous checkpoint's design. `outer_improved` is logged, not enforced.
 - **Output layout** (`gan/framework/paths.py`, the single source): `ckpt/`
-  (recovery + `design/`), `logs/` (`events.jsonl`, `*_tree.jsonl`, `*.log`),
-  `trajectory/outer_<O>/{planner,evaluator,<genid>/{task,planner,evaluator}}.jsonl`,
-  `scores/scores.jsonl`, `runs/<genid>/` (small evidence), `work/<genid>/`
-  (ephemeral, pruned), `workspaces/<role>/outer_<O>/`. `checkpoint.json` is the
-  latest; outer boundaries also write an immutable `ckpt/outer_<N>.json` (atomic);
-  `restore_trees` appends an `op=reset` event instead of truncating the log.
+  (recovery + `code/` per-run git tree + `code.json` manifest + `design/`), `logs/`
+  (`events.jsonl`, `*_tree.jsonl`, `*.log`),
+  `trajectory/outer_<O>/{planner,evaluator,<genid>/{task,planner,evaluator}}.jsonl`
+  (outer-level self-improvement files are attempt-keyed: `<role>__<attempt>.jsonl`
+  when an outer is re-run), `scores/scores.jsonl`, `runs/<genid>/` (small evidence:
+  `packet.json`, `eval.json`, `feedback_digest.md`, `patch_receipt.json`,
+  `patch_proposed.diff`), `work/<genid>/` (ephemeral, pruned),
+  `workspaces/<role>/outer_<O>/`. `checkpoint.json` is the latest; outer boundaries
+  also write an immutable `ckpt/outer_<N>.json` (atomic; archived as
+  `outer_<N>_<ms>.json` when the same outer is re-run); `restore_trees` appends an
+  `op=reset` event instead of truncating the log.
 - **Trajectory access**: every agent writes structured **JSONL** (one file per
   instance) via the shared `utils/trajectory_log.py`; GAN's
   `gan/framework/trajectory.py` (frozen; redaction is part of the trust anchor)
@@ -112,8 +117,9 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
 - **Task runs are isolated from `repo_root`**: each generation runs in a
   **minimal allowlist copy** `work/<genid>/repo` (agent runtime + domain package,
   datasets excluded; patched inside the copy when a deep patch exists). Benchmark
-  labels are read by the harness from `GAN_DATASET_ROOT` (the real repo), outside
-  the copy.
+  labels are read by the harness from `repo_root`, passed **only** via the CLI
+  `--dataset_root` argument to the parent harness (never written into the task
+  child's env/payload — v5/fix1); `GAN_DATASET_ROOT` is scrubbed from every child env.
 - **Activation rule**: `always-on → gan/tools/`, `opt-in → gan/components/`
   (registered in `gan/registries/` and selected by the design config). Plumbing
   tools (`deep/`, `design/`, `work/common/`) are frozen; only `work/<role>/` and
@@ -134,7 +140,7 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   durable record is the code commit, events `self_improve_commit` /
   `self_improve_apply_failed`). Use `--in-process` for the legacy single-process
   loop. Access grants/diffs are against `code_root`; benchmark labels still come
-  from `repo_root` via `GAN_DATASET_ROOT`.
+  from `repo_root`, passed only as the CLI `--dataset_root` argument (never env).
 - **Code blood lineage (v5, branch-per-node)**: every task generation's code is
   a git commit in the per-run code tree whose git parent is its **selected
   parent's** code commit; each generation pins a persistent ref `task_<genid>`,

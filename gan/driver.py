@@ -1,11 +1,14 @@
-"""Outer-loop driver (glue): one worker subprocess per outer + self-edit apply.
+"""Outer-loop driver (glue): one worker subprocess per outer.
 
 The driver runs on the real repo (labels live here) and only orchestrates:
 - materialize the per-run code tree once;
 - spawn ``gan.outer_worker`` for each outer (cwd/PYTHONPATH = code_root);
-- after each outer, apply that outer's role self-edit patches to the code tree
-  (allowlist + compile validated, rolled back on failure);
 - audit everything to ``logs/events.jsonl``.
+
+Role self-edit patches are NOT applied here: they are applied + committed **by the
+worker itself** (option B, v4.22 — ``loop._apply_self_patch`` ->
+``code_repo.apply_self_patch``, allowlist + compile validated, rolled back on
+failure; events ``self_improve_commit`` / ``self_improve_apply_failed``).
 """
 from __future__ import annotations
 
