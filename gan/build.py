@@ -12,8 +12,7 @@ from gan.framework import models as model_registry
 from gan.framework import paths
 from gan.framework.frozen import deny_paths as frozen_deny_paths
 from gan.framework.loader import load_gan_loop_config
-from gan.design import load_seed
-from gan.design.schema import default_config
+from gan.design import initial_config
 from gan.design.store import DesignStore
 from gan.framework.loop import GanLoop
 from gan.roles.evaluator import Evaluator
@@ -40,8 +39,9 @@ def _seed_self_designs(output_dir: str) -> None:
                 continue  # valid existing design: authoritative, do not touch
             except Exception:
                 shutil.copy2(path, f"{path}.corrupt-{int(time.time())}")
-        cfg = default_config(role)
-        cfg["prompt"] = load_seed(role)
+        # schema defaults + seed prompt; initial_config applies the non-empty
+        # guard, so a missing/blank seed can no longer blank the prompt.
+        cfg = initial_config(role)
         # judgment eval points are optional but selected by default (evolvable later)
         if role == "evaluator":
             from gan.registries.loader import load_registry_for_role

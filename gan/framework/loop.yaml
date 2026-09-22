@@ -33,7 +33,10 @@ tree:
 #   属"可做但暂不做"（见 docs/6_v5改动.md R2）；每代一个补丁由架构保证。
 # ---------------------------------------------------------------------------
 source_access:
-  auto_approve: true            # v0: auto approve + full audit (broker default; see doc)
+  deny_deep: false              # true = deny every deep source-access request (deep surface frozen; ablation)
+                                # [renamed from auto_approve, v5+] semantics: NO human approval path exists
+                                # (no TTY/IPC/queue) -> this is a hard deny switch. Wiring pending (code untouched);
+                                # see docs/7_遗留问题与待办.md §3.2.1.
   # ACCESS BOUNDARY is an allowlist by role, declared once in
   # gan/framework/frozen.py (single source of truth):
   #   - task      : no source access

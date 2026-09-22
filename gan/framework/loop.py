@@ -40,7 +40,7 @@ import uuid
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
-from gan.design.schema import default_config
+from gan.design import initial_config
 from gan.framework import checkpoint as ckpt
 from gan.framework import paths, scores, trajectory
 from gan.framework.loader import load_registry, resolve_domain
@@ -144,7 +144,9 @@ class GanLoop:
     def _initial_task_config(self) -> Dict[str, Any]:
         # The model is NOT part of the evolvable design any more; it is resolved
         # centrally by gan/framework/models.py and injected by the runner.
-        return default_config("task")
+        # Generation-0 prompt comes from gan/design/seeds/task.md, through the
+        # SAME helper the planner/evaluator self-designs use.
+        return initial_config("task")
 
     def _parent_config(self, parent: Optional[Node]) -> Dict[str, Any]:
         cd = parent.meta.get("config_dict") if (parent is not None and parent.meta) else None

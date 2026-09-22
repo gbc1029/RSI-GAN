@@ -160,6 +160,13 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   (case-insensitive / exact-match / no partial credit) or ground-truth labels/scores.
   The evaluator's blind-phase `run_summary` deliberately excludes the objective
   score/accuracy (revealed only via `benchmark_score`).
+- **Generation-0 prompts (seeds)**: every role's *initial* design prompt comes from
+  `gan/design/seeds/<role>.md` via `gan.design.initial_config` (schema defaults +
+  non-empty seed). The task agent's gen-0 config goes through the **same** helper
+  (`loop._initial_task_config`), so all three roles start from their seed; a blank
+  seed falls back to the schema default rather than an empty prompt. Editing a seed
+  only affects **new** runs — an existing design file under `ckpt/design/**` is
+  authoritative and never rewritten.
 - **Sandbox / bash (deferred)**: planner/evaluator are NOT given raw `bash`; they
   use the frozen, workspace-confined `edit_source` / `read_file` / `list_dir` /
   `grep`. A real sandbox (bubblewrap / container) is deferred until roles execute

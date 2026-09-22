@@ -53,6 +53,9 @@
 - `eval_points.yaml` 与 doc-only `*.md` 已删除；评估点为**单一来源**（registry + 实现）。
 - schema 的 `operators` 槽与 `mint_operator` **已删除**（见 v4：工具增删改 = 浅层 `select/deselect_component` + 深层源码编辑）。
 - **访问边界（v4 改为按角色 allowlist）**：`gan/framework/frozen.py` 声明各角色可读/可写的路径白名单（task 无权限；planner 读写 t∪p；evaluator 读 t、读写 e），**默认其余全部冻结**；`AccessBroker` 按 `(role,intent)` 判定并拒绝 repo 根/自包含/超限授权。共享运行时（`agent/llm*.py`、`agent/base_agent.py`、`gan/framework/*`、`domains/{harness,report}.py`）与 plumbing 工具（`gan/tools/{design,deep,work/common}`）不在任何白名单内，因此不可修改；拒绝原因仅审计不外泄。
+  **[已变] v5+**：`loop.yaml` 的 `source_access.auto_approve` 已改名 **`deny_deep`**（默认 `false`），语义为
+  "**禁止深层源码访问**"的消融开关（冻结 `gan/tools/deep/`），**不是**人工审批开关——本架构无审批通道
+  （无 TTY/IPC/队列）。**改名与文档已实施，代码接线待做**（见 `docs/6` §八、`docs/7` §3.2.1）。
 
 > 下文 §0–§7 保留 v1 的框架性描述；目录与实现以本节、`v2` 节与代码为准。
 
