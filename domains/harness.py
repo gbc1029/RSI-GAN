@@ -17,6 +17,7 @@ from hydra import compose, initialize_config_dir
 
 
 _TASK_RESULT_PREFIX = "__RSI_TASK_RESULT__"
+QUESTION_TIMEOUT = 300
 
 
 def get_dataset(domain, subset="", dataset_root=None):
@@ -163,6 +164,7 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=child_env,
+        timeout=QUESTION_TIMEOUT,
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
@@ -258,6 +260,7 @@ def harness(
     evals_folder = os.path.join(output_folder, "agent_evals")
     os.makedirs(evals_folder, exist_ok=True)
     output_path = os.path.join(output_folder, "predictions.csv")
+    failures_path = os.path.join(evals_folder, "eval_failures.jsonl")
 
     # Load existing predictions if available
     if os.path.exists(output_path):
@@ -334,6 +337,10 @@ def harness(
             if (idx + 1) % save_interval == 0:
                 dataset["prediction"] = predictions
                 dataset.to_csv(output_path, index=False)
+                if failures:
+                    with open(failures_path, "w", encoding="utf-8") as f:
+                        for rec in failures:
+                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 print(f"Checkpoint saved to {output_path}")
 
     # Final save
@@ -342,7 +349,7 @@ def harness(
     print(f"Final predictions saved to {output_path}")
 
     if failures:
-        with open(os.path.join(evals_folder, "eval_failures.jsonl"), "w", encoding="utf-8") as f:
+        with open(failures_path, "w", encoding="utf-8") as f:
             for rec in failures:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"{len(failures)} question(s) failed and were isolated (see eval_failures.jsonl)")
