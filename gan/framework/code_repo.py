@@ -115,10 +115,19 @@ def _lock_frozen(code_root: str) -> None:
 
 
 def current_commit(code_root: str) -> str:
+    """The current HEAD SHA of the code tree.
+
+    Raises :class:`RepoIntegrityError` instead of returning an empty string:
+    git-infra failure must not be conflated with "no commit" — every caller
+    treats that SHA as the code baseline, so an empty string here silently
+    disabled rollback/restore/checkpoint lineage (C1).
+    """
     try:
         return _git(code_root, "rev-parse", "HEAD").stdout.strip()
-    except Exception:
-        return ""
+    except Exception as e:
+        raise RepoIntegrityError(
+            f"cannot read HEAD of the code tree {code_root}: {e}"
+        ) from e
 
 
 def commit(code_root: str, message: str) -> str:
@@ -126,12 +135,20 @@ def commit(code_root: str, message: str) -> str:
 
 
 def checkout(code_root: str, sha: Optional[str]) -> None:
+    """Restore the code tree to ``sha`` (tracked files only).
+
+    Raises :class:`RepoIntegrityError` on failure: callers use this to restore a
+    pinned state (resume / self-patch recovery) — silently continuing after a
+    failed checkout would run on the wrong base (C1/E3).
+    """
     if not sha:
         return
     try:
         _git(code_root, "checkout", "-f", sha)
-    except Exception:
-        pass
+    except Exception as e:
+        raise RepoIntegrityError(
+            f"checkout {sha!r} failed in {code_root}: {e}"
+        ) from e
 
 
 # -- branch-per-node blood lineage (v5) ---------------------------------------
@@ -266,42 +283,107 @@ def validate_python(code_root: str, rel_files: Iterable[str]) -> Tuple[bool, str
 
 
 class PatchRejected(Exception):
-    """A patch was rejected by commit validation (allowlist/compile/registry)."""
+    """A patch was rejected by commit validation (allowlist/compile/registry).
+
+    This is an *agent-attributable* failure: the patch content was bad and the
+    session/patch-retry machinery may continue after it.
+    """
+
+
+class RepoIntegrityError(RuntimeError):
+    """The per-run code tree is in an undefined state (git layer broken).
+
+    Unlike :class:`PatchRejected` this is NOT agent-attributable: reading HEAD,
+    a checkout or a hard rollback has failed, so the code tree's state can no
+    longer be trusted. Every caller MUST let this propagate -- the outer worker
+    exits non-zero and ``gan.driver`` aborts the whole run. Downgrading it to a
+    per-generation "failed" event would let the loop continue on an unqualified
+    (possibly dirty / wrong-base) tree and poison all subsequent lineage.
+    """
 
 
 def _hard_rollback(code_root: str, sha: Optional[str]) -> None:
-    """Revert tracked files to ``sha`` and remove patch-introduced untracked files."""
+    """Revert tracked files to ``sha`` and remove patch-introduced untracked files.
+
+    Raises :class:`RepoIntegrityError` on failure: a failed rollback leaves the
+    tree holding partially applied patch content, so the run must abort instead
+    of continuing on an undefined baseline (C5).
+    """
     try:
         if sha:
             _git(code_root, "checkout", "-f", sha)
         _git(code_root, "clean", "-fd")
-    except Exception:
-        pass
+    except Exception as e:
+        raise RepoIntegrityError(
+            f"hard rollback to {sha!r} failed in {code_root}: {e} — the code tree "
+            f"is in an undefined state; the run cannot continue safely"
+        ) from e
 
 
 # -- registry validation (field-agnostic; keys are (file, kind, name)) --------
 def registry_report(code_root: str) -> Dict[str, Any]:
+    """Snapshot of registry health for a code tree (used for *differential* gating).
+
+    Reports four independent problem classes so the commit layer can refuse a patch
+    that makes any of them worse, while never blocking on pre-existing problems:
+
+    - ``unparseable``: registry files that are not valid JSON / not an object with
+      a ``components`` list;
+    - ``invalid``    : entries failing ``entry_reason`` (incl. the identity contract
+      name==stem, kind-vs-directory, and tool_info/tool_function exposure);
+    - ``duplicate``  : ``(role, kind, name)`` declared twice in a role's *merged*
+      registry (``shared.json`` silently shadowing ``<role>.json``);
+    - ``orphan``     : component files declared by NO registry file.
+    """
     from pathlib import Path
-    from gan.registries.loader import parse_registry_file, entry_reason
+    from gan.registries.loader import (
+        parse_registry_file, entry_reason, load_registry_for_role,
+        orphan_modules, _REGISTRY_FILES,
+    )
 
     reg_dir = os.path.join(code_root, "gan", "registries")
     comp_dir = Path(os.path.join(code_root, "gan", "components"))
     invalid = set()
     unparseable = set()
-    for fn in ("shared.json", "task.json", "planner.json", "evaluator.json"):
+    duplicate = set()
+    for fn in _REGISTRY_FILES:
         ents, err = parse_registry_file(Path(reg_dir) / fn)
         if err:
             unparseable.add(fn)
             continue
         for e in ents or []:
-            if entry_reason(e, comp_dir) is not None:
+            reason = entry_reason(e, comp_dir)
+            if reason is not None:
                 kind = e.get("kind") if isinstance(e, dict) else None
                 name = e.get("name") if isinstance(e, dict) else None
-                invalid.add((fn, str(kind), str(name)))
-    return {"invalid": invalid, "unparseable": unparseable}
+                # the reason is part of the key: an entry whose invalidity merely
+                # CHANGED cause is still a new problem, and a (fn, kind, name)-only
+                # key would miss it
+                invalid.add((fn, str(kind), str(name), str(reason)))
+    # merged-registry duplicates (per role, since shared.json merges into each)
+    for role in ("task", "planner", "evaluator"):
+        reg = load_registry_for_role(role, registry_dir=Path(reg_dir), components_dir=comp_dir)
+        seen = set()
+        for e in reg.entries:
+            if not isinstance(e, dict):
+                continue
+            key = (str(e.get("kind")), str(e.get("name")))
+            if key in seen:
+                duplicate.add((role, key[0], key[1]))
+            seen.add(key)
+    # orphan: reuse the loader's single definition (component-looking file declared
+    # by no registry) so the gate and selection-time validation cannot disagree
+    orphan = set(orphan_modules(Path(reg_dir), comp_dir))
+    return {"invalid": invalid, "unparseable": unparseable,
+            "duplicate": duplicate, "orphan": orphan}
 
 
 def _registry_worsened(before: Dict[str, Any], after: Dict[str, Any], strict: bool = True) -> str:
+    """Return a rejection reason if the patch made registry health worse, else "".
+
+    Differential by design: pre-existing problems never block (only *new* ones do),
+    so enabling this gate cannot deadlock an already-dirty tree.
+    """
     new_unp = after["unparseable"] - before["unparseable"]
     if new_unp:
         return f"registry became unparseable: {sorted(new_unp)}"
@@ -311,13 +393,36 @@ def _registry_worsened(before: Dict[str, Any], after: Dict[str, Any], strict: bo
                     "fully parseable and valid")
     new_inv = after["invalid"] - before["invalid"]
     if new_inv:
-        items = "; ".join(f"{f}:{k}:{n}" for (f, k, n) in sorted(new_inv))
+        items = "; ".join(f"{f}:{k}:{n} ({r})" for (f, k, n, r) in sorted(new_inv))
         return f"new invalid component(s): {items}"
+    new_dup = after["duplicate"] - before["duplicate"]
+    if new_dup:
+        items = "; ".join(f"{r}:{k}:{n}" for (r, k, n) in sorted(new_dup))
+        return f"new duplicate component(s) (merged registry): {items}"
+    new_orph = after["orphan"] - before["orphan"]
+    if new_orph:
+        items = "; ".join(sorted(new_orph))
+        return (f"component file(s) not registered in any registry: {items} "
+                f"(register them with register_component, or remove the files)")
     return ""
 
 
 def _patch_touches_registry(files: Iterable[str]) -> bool:
     return any(str(f).replace("\\", "/").startswith("gan/registries/") for f in files)
+
+
+def _patch_touches_components(files: Iterable[str]) -> bool:
+    """A patch that adds/edits component files must keep the registry consistent.
+
+    Without this, adding ``gan/components/**/foo.py`` and forgetting the registry
+    entry produced a silently-unselectable component (the gate only ran when the
+    patch itself touched ``gan/registries/``).
+    """
+    return any(str(f).replace("\\", "/").startswith("gan/components/") for f in files)
+
+
+def _needs_registry_check(files: Iterable[str]) -> bool:
+    return _patch_touches_registry(files) or _patch_touches_components(files)
 
 
 def check_patch(code_root: str, patch: str, strict_unparseable: bool = True) -> Tuple[bool, str]:
@@ -338,7 +443,7 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True) -> 
         _hard_rollback(code_root, prev)
         return False, f"compile failed: {err}"
     reason = ""
-    if _patch_touches_registry(files):
+    if _needs_registry_check(files):
         reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
     _hard_rollback(code_root, prev)
     return (reason == ""), reason
@@ -365,7 +470,7 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
     if not ok:
         _hard_rollback(code_root, prev)
         raise PatchRejected(f"compile failed: {err}")
-    if _patch_touches_registry(files):
+    if _needs_registry_check(files):
         reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
         if reason:
             _hard_rollback(code_root, prev)

@@ -9,13 +9,25 @@ _DEFAULT_DESIGN = {"prompt": "You are an agent.", "skills": [], "params": {}}
 
 
 def _load_design():
+    """Load the framework-injected task design (evolved prompt + skills).
+
+    A design file that EXISTS but is unparseable must abort the task run (C4):
+    silently falling back to ``_DEFAULT_DESIGN`` would run this generation on
+    the seed prompt while looking successful — the evolved design would be
+    silently lost with zero signal. A missing env/file still falls back to the
+    default (plain HyperAgents-style direct runs have no design file).
+    """
     path = os.environ.get("GAN_TASK_DESIGN")
     if path and os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(
+                f"GAN_TASK_DESIGN={path} exists but is unparseable ({e}); refusing "
+                f"to silently fall back to the default design (this generation "
+                f"would lose its evolved prompt invisibly)"
+            ) from e
     return dict(_DEFAULT_DESIGN)
 
 

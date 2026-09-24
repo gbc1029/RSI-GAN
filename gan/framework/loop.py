@@ -113,8 +113,19 @@ class GanLoop:
         if self.domains:
             try:
                 self.task_brief = resolve_domain(load_registry(), self.domains[0]).get("task_brief") or ""
-            except Exception:
-                self.task_brief = ""
+            except Exception as e:
+                # C3: a resolution failure (broken registry / schema) must abort the
+                # run — silently degrading the whole run to an empty task brief
+                # would strip every prompt of its task definition with zero signal.
+                # (Domains may legitimately declare no task_brief: an empty value
+                # stays allowed and is recorded below.)
+                raise RuntimeError(
+                    f"cannot resolve task_brief for domain {self.domains[0]!r}: {e} "
+                    f"— the framework-injected task definition is missing, the run "
+                    f"cannot proceed"
+                ) from e
+            if not self.task_brief:
+                self.log_event({"type": "task_brief_missing", "domain": self.domains[0]})
 
     # -- helpers -----------------------------------------------------------
     def _max_int_genid(self) -> int:
@@ -303,10 +314,10 @@ class GanLoop:
         code = None
         if self.code_root:
             from gan.framework import code_repo
-            try:
-                code = {"commit": code_repo.current_commit(self.code_root)}
-            except Exception:
-                code = None
+            # C1: a git-layer failure must NOT be recorded as "no code layer" —
+            # the resume path would then silently skip code-state restoration and
+            # run on an undefined baseline. Let RepoIntegrityError abort the run.
+            code = {"commit": code_repo.current_commit(self.code_root)}
         ckpt.save_checkpoint(
             self.output_dir,
             boundary=boundary,
@@ -392,10 +403,16 @@ class GanLoop:
             self._role_commits[role] = sha
             self.log_event({"type": "self_improve_commit", "role": role,
                             "outer": outer, "commit": sha})
-        except Exception as e:
+        except code_repo.PatchRejected as e:
+            # agent-attributable rejection: recover to the previous commit and
+            # keep the run going (B-level; the receipt carries the reason)
             code_repo.checkout(self.code_root, prev)
             self.log_event({"type": "self_improve_apply_failed", "role": role,
                             "outer": outer, "error": str(e)[:300]})
+        # RepoIntegrityError (git-layer failure during apply/rollback) and any
+        # other unexpected error propagate: the outer worker exits non-zero and
+        # the driver aborts the run — continuing on an undefined code tree would
+        # poison the lineage (C1/C5).
 
     def _resync_workspace(self, outer: Any, files: List[str], drop_missing: bool = False) -> None:
         """Keep granted workspace copies in sync with the code baseline.
@@ -600,6 +617,10 @@ class GanLoop:
     # -- main loop ---------------------------------------------------------
     def run(self, only_outer: Optional[int] = None) -> TreeStore:
         cfg = self.cfg
+        # code_repo is referenced by the integrity guards on the session-level
+        # exception handlers below (its failures must abort the run, not degrade
+        # to per-generation "failed" events).
+        from gan.framework import code_repo
         G = int(cfg.get("loop.outer_generations", 2))
         I_max = int(cfg.get("loop.inner_max", 3))
         patience = int(cfg.get("loop.stagnation_patience", 2))
@@ -712,6 +733,8 @@ class GanLoop:
                         patch_retry_k=self.patch_retry_k,
                         max_tool_calls=self.plan_max_tool_calls,
                     ) or {}
+                except code_repo.RepoIntegrityError:
+                    raise  # undefined code tree: never degrade to planner_failed
                 except Exception as e:
                     self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
@@ -720,6 +743,8 @@ class GanLoop:
                 try:
                     child = self.task_runner(plan=plan_result, parent=parent, genid=genid,
                                              base=base)
+                except code_repo.RepoIntegrityError:
+                    raise  # undefined code tree: never degrade to task_runner_failed
                 except Exception as e:
                     self._archive_invalid("task_runner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
@@ -780,6 +805,8 @@ class GanLoop:
                         task_brief=self.task_brief,
                         trajectory_genids=[genid] + parent_ref,
                     )
+                except code_repo.RepoIntegrityError:
+                    raise  # undefined code tree: never degrade to evaluator_failed
                 except Exception as e:
                     child.valid_parent = False
                     child.meta["invalid"] = True
@@ -886,6 +913,8 @@ class GanLoop:
                                                   patch_retry_k=self.patch_retry_k)
                 self._apply_self_patch("evaluator", outer, res)
                 self._make_self_receipt("evaluator", outer, res)
+            except code_repo.RepoIntegrityError:
+                raise  # undefined code tree: never degrade to self_improve_error
             except Exception as e:
                 self.log_event({"type": "self_improve_error", "role": "evaluator", "error": str(e)})
             try:
@@ -896,6 +925,8 @@ class GanLoop:
                                                 patch_retry_k=self.patch_retry_k)
                 self._apply_self_patch("planner", outer, res)
                 self._make_self_receipt("planner", outer, res)
+            except code_repo.RepoIntegrityError:
+                raise  # undefined code tree: never degrade to self_improve_error
             except Exception as e:
                 self.log_event({"type": "self_improve_error", "role": "planner", "error": str(e)})
 

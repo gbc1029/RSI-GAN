@@ -51,13 +51,29 @@ def _seed_self_designs(output_dir: str) -> None:
 
 
 def ensure_code_root(repo_root: str, output_dir: str) -> str:
-    """Materialize the per-run code tree once (idempotent across re-entry)."""
+    """Materialize the per-run code tree once (idempotent across re-entry).
+
+    Raises when the tree was deleted externally (``.git`` gone while the code
+    manifest is still present): silently re-materializing an initial tree would
+    lose every evolution commit and pin invisible dead refs; the resume checkout
+    would then fail silently and run on the wrong base (C1/E3). The operator must
+    either restore the tree or explicitly reset the run.
+    """
     from gan.framework import code_repo as code_repo_mod
     cr = paths.code_root(output_dir)
+    manifest = paths.code_manifest(output_dir)
     if not os.path.isdir(os.path.join(cr, ".git")):
+        if os.path.exists(manifest):
+            raise RuntimeError(
+                f"per-run code tree {cr} is missing (.git deleted) while {manifest} "
+                f"still exists — refusing to silently re-materialize an initial tree "
+                f"(evolution commits / task_* / outer_*_base refs would be lost and "
+                f"resume would silently run on the wrong base). Restore the code tree "
+                f"or delete the checkpoint + manifest to start over."
+            )
         commit = code_repo_mod.materialize(repo_root, cr)
-        os.makedirs(os.path.dirname(paths.code_manifest(output_dir)), exist_ok=True)
-        with open(paths.code_manifest(output_dir), "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(manifest), exist_ok=True)
+        with open(manifest, "w", encoding="utf-8") as f:
             json.dump({"commit": commit, "repo_root": os.path.abspath(repo_root)}, f, indent=2)
     return cr
 
@@ -134,8 +150,20 @@ def build_gan_loop(
                     **model_registry.describe(["gan.task", "gan.planner", "gan.evaluator"])})
     if code_root:
         loop.log_event({"type": "code_init", "code_root": code_root})
+    # Registry/toolset integrity. Pure local check (filesystem + AST, no model calls),
+    # so unlike the optional model probe it runs by default — a broken registry
+    # otherwise degrades silently: invalid/orphan components are skipped by
+    # selection/assembly/loading without any error. Set `loop.toolset_preflight: false`
+    # to log-only (escape hatch for an already-dirty code tree).
+    from gan.framework import preflight as preflight_mod
+    tool_results = preflight_mod.preflight_tools(code_root=code_root)
+    loop.log_event({"type": "preflight_tools", "results": tool_results})
+    if not preflight_mod.tools_ok(tool_results):
+        if cfg.get("loop.toolset_preflight", True):
+            raise RuntimeError(f"toolset preflight failed: {tool_results}")
+        loop.log_event({"type": "preflight_tools_warning",
+                        "hint": "loop.toolset_preflight=false; not failing fast"})
     if preflight:
-        from gan.framework import preflight as preflight_mod
         results = preflight_mod.preflight(["gan.task", "gan.planner", "gan.evaluator"])
         loop.log_event({"type": "preflight", "results": results})
         if not preflight_mod.all_ok(results):

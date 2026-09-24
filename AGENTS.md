@@ -30,8 +30,10 @@ live under `scripts/dgmh/`.
   `loop.py`, `tree/`, `reward/`.
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
-  `read_trajectory`, `read_session_trajectory`, `list_editable`), `design/` (shallow design
-  operators), `deep/` (gated deep gate: `request_source_access` + `unregister_component`),
+  `read_trajectory`, `read_session_trajectory`, `list_editable`, `list_components`),
+  `design/` (shallow design
+  operators), `deep/` (gated deep gate: `request_source_access` + `register_component` +
+  `unregister_component`),
   `assembly.py`.
 - `gan/components/` — **opt-in** implementations: `shared/skills/`,
   `task/skills/`, `evaluator/eval_points/`.
@@ -76,10 +78,11 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   `gan/tools/design/` and may only set **existing** keys or select/deselect
   **registered** components. Tool add/delete/modify is classified by what it
   touches: **shallow** = edit the design config list only (`select_component` /
-  `deselect_component`); **deep delete** = remove from the registry + source file;
-  **deep add/modify** = new component or logic, which **must** touch source via the
-  gated `gan/tools/deep/request_source_access`. There is no `mint_operator`. After a
-  `modify` grant, planner/evaluator edit the granted copies with `edit_source`
+  `deselect_component`); **deep delete** = remove from the registry + source file
+  (`unregister_component`); **deep add/modify** = new component or logic, which
+  **must** touch source via the gated `gan/tools/deep/request_source_access`.
+  There is no `mint_operator`. After a `modify` grant, planner/evaluator edit the
+  granted copies with `edit_source`
   (`gan/tools/work/common/`, confined to the instance workspace `src/`); roles are
   intentionally NOT given raw `bash` (it cannot be confined).
 - **Instances**: an *instance* = role + workspace + its trajectory. The task agent
@@ -189,6 +192,17 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   `respond_issue` are work tools (`gan/tools/work/`); design operators are in
   `gan/tools/design/`.
 - Operators are tools: a module exposing `tool_info()` + `tool_function(**kwargs)`.
+- **Identity contract (three names must agree)**: a component's registered `name`
+  (`gan/registries/*.json`), its module file **stem**, and its `tool_info()["name"]`
+  must be the same string. The tool loop keys tools by file stem
+  (`agent/tools/__init__.py`), so a mismatch assembles a component that silently
+  never loads. `gan/registries/loader.py:entry_reason` enforces this at selection
+  time; `gan/framework/code_repo.py` (differential gate on commits touching
+  `gan/registries/**` or `gan/components/**`) and
+  `gan/framework/preflight.py:preflight_tools` (startup, fail-fast) enforce it too.
+  Adding a component file without a registry entry is reported as an **orphan**
+  instead of failing silently; `list_components` lists such files as candidates and
+  `register_component` (deep, same gate as `unregister_component`) registers them.
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - Do not expose planner rationale/reason to the evaluator (use
   `gan/summary.py:build_diff_summary`).

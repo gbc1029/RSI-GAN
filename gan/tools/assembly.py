@@ -25,7 +25,7 @@ _GAN_DIR = config_dir().parent
 _TOOLS_DIR = _GAN_DIR / "tools"
 
 
-def _gan_roots(code_root: Optional[str]):
+def gan_roots(code_root: Optional[str]):
     """Return (tools_dir, registry_dir, components_dir) for a code tree."""
     if code_root:
         gan = os.path.join(code_root, "gan")
@@ -34,10 +34,26 @@ def _gan_roots(code_root: Optional[str]):
     return (str(_TOOLS_DIR), str(_GAN_DIR / "registries"), str(_GAN_DIR / "components"))
 
 
+def py_files_in(src_dir: str) -> List[str]:
+    """The ``*.py`` files an assembly copies from ``src_dir``.
+
+    The single definition of "which files does a source dir contribute": a top-level
+    ``*.py`` whose name does not start with ``__`` (``__init__.py`` and friends are
+    never tool modules). ``assemble_tools_dir`` and the startup collision check both
+    go through here, so the two cannot drift.
+    """
+    out: List[str] = []
+    for f in glob.glob(os.path.join(src_dir, "*.py")):
+        if os.path.basename(f).startswith("__"):
+            continue
+        out.append(f)
+    return out
+
+
 def always_on_dirs(role: str, code_root: Optional[str] = None) -> List[str]:
     if role == "task":
         return []  # task agent: no always-on tools
-    tools_dir, _rdir, _cdir = _gan_roots(code_root)
+    tools_dir, _rdir, _cdir = gan_roots(code_root)
     dirs = [
         os.path.join(tools_dir, "work", role),
         os.path.join(tools_dir, "work", "common"),  # role-shared work tools
@@ -49,7 +65,7 @@ def always_on_dirs(role: str, code_root: Optional[str] = None) -> List[str]:
 
 def selected_module_paths(role: str, config: Optional[Dict[str, Any]],
                           code_root: Optional[str] = None) -> List[str]:
-    _tools, rdir, cdir = _gan_roots(code_root)
+    _tools, rdir, cdir = gan_roots(code_root)
     reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
     cfg = config or {}
     out: List[str] = []
@@ -105,9 +121,7 @@ def assemble_tools_dir(
         _clear_tools_dir(dest_dir)
     if include_always_on:
         for src in always_on_dirs(role, code_root=code_root):
-            for f in glob.glob(os.path.join(src, "*.py")):
-                if os.path.basename(f).startswith("__"):
-                    continue
+            for f in py_files_in(src):
                 shutil.copy2(f, os.path.join(dest_dir, os.path.basename(f)))
     for p in selected_module_paths(role, config, code_root=code_root):
         if os.path.isfile(p):

@@ -1,10 +1,10 @@
-"""eval_reward_hacking - detect reward-hacking (may require source access)."""
+"""reward_hacking - detect reward-hacking (may require source access)."""
 from gan.framework.context import get_eval_context
 
 
 def tool_info():
     return {
-        "name": "eval_reward_hacking",
+        "name": "reward_hacking",
         "description": (
             "Report suspected reward hacking (e.g. special-casing tests, probing the "
             "eval harness). If you need the source to confirm, request_source_access "

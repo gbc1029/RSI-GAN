@@ -1,10 +1,10 @@
-"""eval_trajectory_quality - process-level judgement of the execution trajectory."""
+"""trajectory_quality - process-level judgement of the execution trajectory."""
 from gan.framework.context import get_eval_context
 
 
 def tool_info():
     return {
-        "name": "eval_trajectory_quality",
+        "name": "trajectory_quality",
         "description": "Judge the execution trajectory (process quality: efficiency, dead ends, reproducibility).",
         "input_schema": {
             "type": "object",

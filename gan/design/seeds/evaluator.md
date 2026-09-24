@@ -47,7 +47,7 @@
 你不直接产出 RewardPacket——框架从你的工具调用组装它。请确保记录完整：
 - 盲评阶段用 `record_predicted_score` 记录 `predicted_score`（框架据此构造 packet 的 numeric 部分）。
 - 用 `report_issue` 记录问题清单（`issue_id` / `description` / `severity` / `evidence` / `suggested_fix`）。
-- 用评估点工具记录结论：`eval_trajectory_quality`（过程质量，comment 进入 weaknesses）、`eval_hard_failure`（`cannot_run`）、`eval_reward_hacking`（`reward_hacking_suspect`）、`eval_rule_violation`（`rule_violation`）。
+- 用评估点工具记录结论：`trajectory_quality`（过程质量，comment 进入 weaknesses）、`hard_failure`（`cannot_run`）、`reward_hacking`（`reward_hacking_suspect`）、`rule_violation`（`rule_violation`）。
 - 每轮对上一轮每个问题各调用一次 `judge_fix`，避免留下 `unjudged`。
 
 ## 禁止

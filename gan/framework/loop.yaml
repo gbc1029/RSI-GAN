@@ -14,6 +14,8 @@ loop:
   self_improve_max_tool_calls: 30  # tool-call budget for role self-improvement
   plan_max_tool_calls: 40          # tool-call budget for plan/evaluate sessions
   patch_retry_k: 2                 # in-session retries when a produced patch is rejected
+  toolset_preflight: true          # validate registry/toolset integrity at startup (fail-fast;
+                                   # pure local check, no model calls). false = log-only.
 
 # ---------------------------------------------------------------------------
 # task 树/DAG 约束与父代选择

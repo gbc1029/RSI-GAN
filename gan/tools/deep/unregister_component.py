@@ -12,9 +12,7 @@ from pathlib import Path
 
 from gan.framework import frozen
 from gan.framework.context import get_access_context
-from gan.registries.loader import parse_registry_file
-
-_REGISTRY_FILES = ["shared.json", "task.json", "planner.json", "evaluator.json"]
+from gan.registries.loader import _REGISTRY_FILES, parse_registry_file
 
 
 def tool_info():

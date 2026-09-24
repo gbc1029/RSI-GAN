@@ -191,8 +191,14 @@ def load_checkpoint(output_dir: str, boundary: str = "latest") -> Optional[Dict[
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        return None
+    except Exception as e:
+        # C2: a checkpoint that EXISTS but cannot be parsed must abort the run.
+        # Returning None would let the resume path silently treat it as absent
+        # (restart from scratch / skip code-state restoration on a wrong base).
+        raise RuntimeError(
+            f"checkpoint exists but is unparseable: {path}: {e} — refusing to "
+            f"silently treat it as absent (resume would silently restart the run)"
+        ) from e
 
 
 def capture_trees(task_tree: Any, planner_tree: Any, evaluator_tree: Any) -> Dict[str, List[Dict[str, Any]]]:

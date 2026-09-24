@@ -1,10 +1,10 @@
-"""eval_hard_failure - strong penalty for cannot-run / obviously-unreasonable output."""
+"""hard_failure - strong penalty for cannot-run / obviously-unreasonable output."""
 from gan.framework.context import get_eval_context
 
 
 def tool_info():
     return {
-        "name": "eval_hard_failure",
+        "name": "hard_failure",
         "description": "Flag a hard failure (cannot run / obviously unreasonable) -> strong penalty.",
         "input_schema": {
             "type": "object",

@@ -177,8 +177,12 @@ def describe_frame(info):
         result += "\n\n"
 
         return result.strip(), describe_inventory(info)
-    except Exception:
-        breakpoint()
+    except Exception as e:
+        # C6: a bare breakpoint() here deadlocks headless runs (the process
+        # hangs waiting for a debugger). Log loudly and keep the prior A-level
+        # behavior (error string as the observation).
+        print(f"describe_frame failed, returning error observation: "
+              f"{type(e).__name__}: {e}")
         return "Error, you are out of the map."
 
 

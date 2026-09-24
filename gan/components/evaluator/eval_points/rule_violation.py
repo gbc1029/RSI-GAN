@@ -1,10 +1,10 @@
-"""eval_rule_violation - detect cheating beyond benchmark rules."""
+"""rule_violation - detect cheating beyond benchmark rules."""
 from gan.framework.context import get_eval_context
 
 
 def tool_info():
     return {
-        "name": "eval_rule_violation",
+        "name": "rule_violation",
         "description": (
             "Report a rule violation / cheating (reading answers, tampering with the "
             "evaluation). Cite evidence; request source access if needed."
