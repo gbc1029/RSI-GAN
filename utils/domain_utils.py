@@ -52,11 +52,40 @@ def _legacy_key(domain):
     return domain
 
 
+_REGISTRY_LOAD_WARNED = False
+
+
+def _warn_registry_unavailable(exc: Exception) -> None:
+    """B8: warn ONCE per process (stderr) when the gan registry is PRESENT but
+    broken -- every ``_field`` lookup would then silently serve legacy defaults
+    (old dataset paths / score keys) with zero signal. A standalone DGMH
+    deployment without the gan layer is the *intended* mode and stays silent."""
+    global _REGISTRY_LOAD_WARNED
+    if _REGISTRY_LOAD_WARNED:
+        return
+    _REGISTRY_LOAD_WARNED = True
+    print(f"[WARN] gan domain registry PRESENT but unusable "
+          f"({type(exc).__name__}: {exc}); every domain lookup silently falls back "
+          f"to legacy defaults — check gan/framework/loader (domains.yaml) integrity")
+
+
 def _load_registry():
+    # B8: fail-open with a LOUD first occurrence, split by cause --
+    #   ImportError  -> gan layer absent: standalone DGMH run; legacy fallback is
+    #                   the intended mode (silent, by design);
+    #   anything else-> registry exists but is broken (unparseable yaml, schema
+    #                   drift): warn once, then legacy fallback.
     try:
         from gan.framework.loader import load_registry, resolve_domain  # type: ignore
+    except ImportError:
+        return None, None
+    except Exception as e:
+        _warn_registry_unavailable(e)
+        return None, None
+    try:
         return load_registry(), resolve_domain
-    except Exception:
+    except Exception as e:
+        _warn_registry_unavailable(e)
         return None, None
 
 

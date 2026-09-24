@@ -73,6 +73,7 @@ def build_receipt(
     budget: Optional[Dict[str, Any]] = None,
     grants: Optional[List[Dict[str, Any]]] = None,
     trajectory_refs: Optional[List[str]] = None,
+    toolset: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     design = _design_diff(config, parent_config)
     design["applied"] = bool(records)
@@ -82,6 +83,7 @@ def build_receipt(
         "role": role,
         "stage": stage,
         "design": design,
+        "toolset": toolset or {},
         "code_patch": {
             "proposed": bool((patch or "").strip()),
             "applied": bool(patch_applied),
@@ -118,6 +120,16 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"code patch REJECTED: {cp.get('rejected_reason')}")
     if budget.get("exhausted"):
         parts.append(f"budget exhausted ({budget.get('kind')}, attempts={budget.get('attempts')})")
+    ts = receipt.get("toolset") or {}
+    skipped = ts.get("skipped") or []
+    if skipped:
+        # B7: the role must see the design-vs-assembly gap in the channel it
+        # consumes every decision round — the receipt.
+        names = ", ".join(f"'{s.get('name')}' ({str(s.get('reason'))[:60]})"
+                          for s in skipped)
+        parts.append(f"capability note: design-selected tools SKIPPED at assembly: {names} "
+                     f"— inspect with list_components; fix via register_component / "
+                     f"select_component / deselect_component")
     if receipt.get("next_hint"):
         parts.append(f"hint: {receipt['next_hint']}")
     if not parts:

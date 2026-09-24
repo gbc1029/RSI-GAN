@@ -12,12 +12,27 @@ import subprocess
 from typing import List, Optional
 
 
-def _read_lines(path: str) -> List[str]:
+def _read_lines(path: str, *, missing_ok: bool = False) -> List[str]:
+    """Read a file for diffing.
+
+    B6: "unreadable" must NEVER be silently translated into "empty file" —
+    that produced whole-file add/delete patches from plain read failures
+    (permission / disk hiccups), i.e. semantically wrong diffs handed to the
+    applier. Only a genuinely ABSENT file may read as empty, and only where the
+    caller's semantics say absence is meaningful (the repo side of a
+    modification diff: absent => the workspace file is an ADDITION).
+    Any other OSError propagates -> the session's patch build fails explicitly
+    (B6 containment chosen: the generation fails via the existing
+    planner_failed / evaluator_failed channel instead of a wrong patch).
+    """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return f.readlines()
-    except OSError:
-        return []
+    except FileNotFoundError:
+        if missing_ok:
+            return []
+        raise
+    # all other OSErrors (permission, disk, ...) propagate
 
 
 def _iter_files(root: str):
@@ -66,7 +81,9 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
         for b_file in _iter_files(b_root):
             rel_file = os.path.relpath(b_file, src_root).replace(os.sep, "/")
             b_files.add(rel_file)
-            a_lines = _read_lines(os.path.join(broker.repo_root, rel_file))
+            # repo side ABSENT => the workspace file is a genuine ADDITION;
+            # repo side PRESENT but unreadable => raise (B6)
+            a_lines = _read_lines(os.path.join(broker.repo_root, rel_file), missing_ok=True)
             b_lines = _read_lines(b_file)
             if a_lines == b_lines:
                 continue

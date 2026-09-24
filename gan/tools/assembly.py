@@ -16,7 +16,7 @@ from __future__ import annotations
 import glob
 import os
 import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gan.framework.loader import config_dir
 from gan.registries.loader import load_registry_for_role
@@ -63,24 +63,43 @@ def always_on_dirs(role: str, code_root: Optional[str] = None) -> List[str]:
     return [d for d in dirs if os.path.isdir(d)]
 
 
-def selected_module_paths(role: str, config: Optional[Dict[str, Any]],
-                          code_root: Optional[str] = None) -> List[str]:
+def selected_module_paths_reported(role: str, config: Optional[Dict[str, Any]],
+                                   code_root: Optional[str] = None
+                                   ) -> Tuple[List[str], List[Dict[str, str]]]:
+    """B7: resolve the design's selected components AND report every skip.
+
+    Returns ``(paths, skipped)``; ``skipped`` is a list of ``{"name", "reason"}``
+    for each selected component that would have been silently dropped here
+    (not registered / invalid entry / source file missing). The skip behavior of
+    :func:`selected_module_paths` is unchanged for assembling callers, but
+    reporting assembly sites can now surface the "design claims X, assembly
+    delivered Y" gap.
+    """
     _tools, rdir, cdir = gan_roots(code_root)
     reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
     cfg = config or {}
     out: List[str] = []
+    skipped: List[Dict[str, str]] = []
     if role == "task":
-        for name in cfg.get("skills") or []:
-            p = reg.module_path("skill", name)
-            if p:
-                out.append(p)
+        kind, names = "skill", list(cfg.get("skills") or [])
     elif role == "evaluator":
-        for name in cfg.get("eval_points") or []:
-            p = reg.module_path("eval_point", name)
-            if p:
-                out.append(p)
-    # planner has no opt-in work capabilities yet
-    return out
+        kind, names = "eval_point", list(cfg.get("eval_points") or [])
+    else:
+        kind, names = None, []  # planner has no opt-in work capabilities yet
+    for name in names:
+        p = reg.module_path(kind, name) if kind else None
+        if p:
+            out.append(p)
+        else:
+            skipped.append({"name": str(name),
+                            "reason": (reg.reason(kind, name) if kind else None)
+                                      or "not registered (or module missing/invalid)"})
+    return out, skipped
+
+
+def selected_module_paths(role: str, config: Optional[Dict[str, Any]],
+                          code_root: Optional[str] = None) -> List[str]:
+    return selected_module_paths_reported(role, config, code_root)[0]
 
 
 def _clear_tools_dir(dest_dir: str) -> None:
@@ -101,6 +120,57 @@ def _clear_tools_dir(dest_dir: str) -> None:
             os.remove(p)
 
 
+def assemble_tools_dir_reported(
+    role: str,
+    dest_dir: str,
+    config: Optional[Dict[str, Any]] = None,
+    include_always_on: bool = True,
+    clear: bool = False,
+    code_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Materialize a role's toolset AND return the assembly report (B7).
+
+    ``clear=True`` rebuilds the directory from scratch (removing previously
+    assembled ``*.py`` files) so that deselected components actually disappear.
+    ``code_root`` (per-run code tree) overrides where tools/components/registries
+    are read from, so evolved code takes effect.
+
+    Report: ``{"role", "dest", "always_on", "selected_requested",
+    "selected_assembled", "skipped": [{"name", "reason"}]}`` — the single point
+    of truth for "what the design selected vs what assembly actually delivered".
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    if clear:
+        _clear_tools_dir(dest_dir)
+    always_on: List[str] = []
+    if include_always_on:
+        for src in always_on_dirs(role, code_root=code_root):
+            for f in py_files_in(src):
+                name = shutil.copy2(f, os.path.join(dest_dir, os.path.basename(f)))
+                always_on.append(os.path.basename(name))
+    cfg = config or {}
+    slot = "skills" if role == "task" else ("eval_points" if role == "evaluator" else None)
+    selected_requested = [str(x) for x in (cfg.get(slot) or [])] if slot else []
+    paths, skipped = selected_module_paths_reported(role, config, code_root=code_root)
+    selected_assembled: List[str] = []
+    for p in paths:
+        if not os.path.isfile(p):
+            # defensive: registry resolved the path but the file vanished between
+            # resolution and copy — this MUST be a skip-with-reason, never silence
+            core = os.path.basename(p).rsplit(".", 1)[0]
+            skipped.append({"name": core, "reason": "module file missing at assembly"})
+            continue
+        bn = shutil.copy2(p, os.path.join(dest_dir, os.path.basename(p)))
+        selected_assembled.append(os.path.basename(bn))
+    return {
+        "role": role, "dest": dest_dir,
+        "always_on": sorted(os.path.basename(f) for f in always_on),
+        "selected_requested": selected_requested,
+        "selected_assembled": selected_assembled,
+        "skipped": skipped,
+    }
+
+
 def assemble_tools_dir(
     role: str,
     dest_dir: str,
@@ -109,21 +179,14 @@ def assemble_tools_dir(
     clear: bool = False,
     code_root: Optional[str] = None,
 ) -> str:
-    """Materialize a role's toolset.
+    """Materialize a role's toolset (bool-output compat wrapper).
 
     ``clear=True`` rebuilds the directory from scratch (removing previously
     assembled ``*.py`` files) so that deselected components actually disappear.
     ``code_root`` (per-run code tree) overrides where tools/components/registries
     are read from, so evolved code takes effect.
     """
-    os.makedirs(dest_dir, exist_ok=True)
-    if clear:
-        _clear_tools_dir(dest_dir)
-    if include_always_on:
-        for src in always_on_dirs(role, code_root=code_root):
-            for f in py_files_in(src):
-                shutil.copy2(f, os.path.join(dest_dir, os.path.basename(f)))
-    for p in selected_module_paths(role, config, code_root=code_root):
-        if os.path.isfile(p):
-            shutil.copy2(p, os.path.join(dest_dir, os.path.basename(p)))
+    assemble_tools_dir_reported(role, dest_dir, config=config,
+                                include_always_on=include_always_on,
+                                clear=clear, code_root=code_root)
     return dest_dir

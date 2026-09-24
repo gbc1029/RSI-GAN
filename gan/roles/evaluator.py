@@ -141,11 +141,11 @@ class Evaluator(Role):
                     for r in dctx.records
                 ):
                     return ""
-                try:
-                    from gan.patch import build_patch_from_workspace
-                    return build_patch_from_workspace(broker, "evaluator", self.access_key("self"))
-                except Exception:
-                    return ""
+                # B6: no catch — see the planner _build_patch comment; a patch
+                # build failure propagates (session -> evaluator_failed), never
+                # masquerades as a legitimate empty patch.
+                from gan.patch import build_patch_from_workspace
+                return build_patch_from_workspace(broker, "evaluator", self.access_key("self"))
 
             last_hash = None
             for attempt in range(patch_retry_k + 1):

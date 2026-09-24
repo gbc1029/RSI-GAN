@@ -40,6 +40,7 @@ def report(
 
     # Calculate Mean Absolute Error (MAE)
     if domain == "imo_grading":
+        mae_error = None
         try:
             max_error = 7
             df["prediction_points"] = (
@@ -57,9 +58,13 @@ def report(
             mae = df["error"].mean() / max_error
             print(f"Normalized Mean Absolute Error (MAE): {mae:.3f}")
         except Exception as e:
+            # B9 (explicit record, chosen over failing the whole report):
+            # accuracy / label breakdowns remain valid; MAE flows downstream as
+            # None (score=None -> score_status="failed", already visible), and
+            # the report now carries the CAUSE instead of stdout-only detail.
             mae = None
-            print("Error: Could not calculate MAE for IMO grading")
-            print(e)
+            mae_error = f"{type(e).__name__}: {e}"[:300]
+            print(f"[WARN] Could not calculate MAE for IMO grading: {mae_error}")
 
     # Accuracy by label
     label_accuracies = df.groupby(ground_truth_key)["match"].mean()
@@ -110,9 +115,14 @@ def report(
     )
 
     # Build the report dictionary
+    imo_extra: dict = {}
+    if domain == "imo_grading":
+        imo_extra["normalized_mean_absolute_error"] = mae
+        if mae is None and mae_error is not None:
+            imo_extra["normalized_mean_absolute_error_error"] = mae_error
     report = {
         "overall_accuracy": float(accuracy),
-        **({"normalized_mean_absolute_error": mae} if domain == "imo_grading" else {}),
+        **imo_extra,
         "total_correct": total_correct,
         "total": total,
         "accuracy_by_ground_truth": label_report,

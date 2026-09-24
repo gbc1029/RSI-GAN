@@ -126,10 +126,12 @@ class Planner(Role):
                            or (r.get("op") == "request_source_access" and r.get("intent") == "modify")
                            for r in (design_ctx.records + plan_ctx.records)):
                     return ""
-                try:
-                    return build_patch_from_workspace(broker, "planner", akey)
-                except Exception:
-                    return ""
+                # B6: no catch — a patch-BUILD failure must never masquerade as
+                # a legitimate empty patch. Any failure (unreadable workspace /
+                # repo file, a builder defect) propagates and fails the session;
+                # the loop then marks the generation planner_failed (B-level)
+                # instead of applying a semantically wrong diff.
+                return build_patch_from_workspace(broker, "planner", akey)
 
             patch_str = _build_patch()
             last_hash = None
@@ -210,10 +212,8 @@ class Planner(Role):
                     for r in dctx.records
                 ):
                     return ""
-                try:
-                    return build_patch_from_workspace(broker, "planner", self.access_key("self"))
-                except Exception:
-                    return ""
+                # B6: no catch — see the plan-session _build_patch comment.
+                return build_patch_from_workspace(broker, "planner", self.access_key("self"))
 
             last_hash = None
             for attempt in range(patch_retry_k + 1):

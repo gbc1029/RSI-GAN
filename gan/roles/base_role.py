@@ -9,7 +9,7 @@ from agent.llm_withtools import chat_with_agent
 from gan.design.store import DesignStore
 from gan.framework import paths
 from gan.registries.loader import load_registry_for_role
-from gan.tools.assembly import assemble_tools_dir
+from gan.tools.assembly import assemble_tools_dir_reported
 
 
 class Role(AgentSystem):
@@ -33,6 +33,7 @@ class Role(AgentSystem):
         # Run-attempt id (set by GanLoop._refresh_roles); keys the OUTER-level
         # trajectory file so re-running an outer never truncates a prior attempt.
         self.attempt_id = None
+        self.assembly_report: Optional[dict] = None  # B7: last assembly report
         self.outer = None
         if instance and str(instance).startswith("outer_"):
             try:
@@ -84,14 +85,28 @@ class Role(AgentSystem):
 
         Rebuilds from scratch so that deselected components actually disappear.
         This is the fix for "eval_points changed but tools_dir not synced".
+
+        B7: every assembly also produces a REPORT (design claims vs actual),
+        attached to the instance (``self.assembly_report`` — consumed by the
+        loop's self-improve receipts) and audited as a ``toolset_assembled``
+        event. An assembly gap is information for the role's NEXT design
+        decision, never silence.
         """
-        self.tools_dir = assemble_tools_dir(
+        rpt = assemble_tools_dir_reported(
             self.role,
             self.tools_dir_for(),
             config=self.design_store.load(self.role),
             clear=True,
             code_root=self.code_root,
         )
+        self.tools_dir = rpt["dest"]
+        self.assembly_report = rpt
+        try:
+            from utils import trajectory_log as _tlog
+            _tlog.append(paths.events_path(self.output_dir), dict(
+                {"type": "toolset_assembled", "instance": self.instance}, **rpt))
+        except Exception as e:  # noqa: BLE001 -- audit write must not break assembly
+            print(f"[WARN] toolset_assembled event write failed: {e}")
         return self.tools_dir
 
     def current_prompt(self) -> str:

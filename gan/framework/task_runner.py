@@ -139,6 +139,29 @@ class DomainTaskRunner:
         )
         patch_applied = patch_applied or patch_applied_copy
 
+        # B7: surface the per-inner task toolset assembly report (written by
+        # assemble_task_env into the runtime dir). Recorded as node meta (so the
+        # planner's next-round receipt and the evaluator's meta view carry it)
+        # and as a task_toolset_assembled event. Skill-assembly gaps merely
+        # degrade the child's capability — they must never silently vanish.
+        toolset_report: Dict[str, Any] = {}
+        toolset_report_path = os.path.join(run_dir, ".gan_runtime", "toolset_report.json")
+        if os.path.isfile(toolset_report_path):
+            try:
+                with open(toolset_report_path, "r", encoding="utf-8") as f:
+                    toolset_report = json.load(f)
+            except Exception as e:  # noqa: BLE001 -- report is advisory meta
+                toolset_report = {"error": f"unreadable toolset report: {e}"[:200]}
+        if toolset_report:
+            try:
+                from gan.framework import paths as _paths
+                from utils import trajectory_log as _tlog
+                _tlog.append(_paths.events_path(self.output_dir), dict(
+                    {"type": "task_toolset_assembled", "genid": str(genid)},
+                    **toolset_report))
+            except Exception as e:  # noqa: BLE001 -- audit write failure: stderr covers
+                print(f"[WARN] task_toolset_assembled event write failed: {e}")
+
         run_id = f"gan_{genid}"
         report_path = os.path.join(run_dir, "outputs", run_id, "report.json")
         if os.path.exists(report_path):
@@ -208,5 +231,6 @@ class DomainTaskRunner:
                 "report_summary": report_summary,
                 "score_status": score_status,
                 "invalid_reason": invalid_reason,
+                "toolset_report": toolset_report,
             },
         )

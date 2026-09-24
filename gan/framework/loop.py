@@ -474,6 +474,10 @@ class GanLoop:
             commit=child.meta.get("task_code_commit"),
             rejected_reason=rejected, budget=budget,
             grants=self._source_access_log(outer), trajectory_refs=refs,
+            # B7: the planner (the task agent's designer) sees the "design
+            # selected vs actually assembled" gap for the just-executed child in
+            # the receipt it consumes at its next plan session.
+            toolset=child.meta.get("toolset_report"),
         )
         try:
             d = paths.runs_dir(self.output_dir, genid)
@@ -504,6 +508,10 @@ class GanLoop:
             genid=f"outer_{outer}", role=role, stage="self_improve",
             records=r.get("records"), patch=r.get("patch_proposed", ""),
             patch_applied=bool(r.get("patch")), rejected_reason=rejected, budget=budget,
+            # B7: this outer's own instance assembly — carried into the NEXT
+            # outer's self-improve receipt (this outer already injects it via
+            # the self-improve `recent` payload).
+            toolset=getattr(getattr(self, role, None), "assembly_report", None),
         )
         try:
             d = paths.runs_dir(self.output_dir, f"self_outer_{outer}_{role}")
@@ -914,9 +922,14 @@ class GanLoop:
                     break
 
             # ---------------- outer self-improvement ----------------
-            recent_eval = {"digests": self._digests[-I_max:], "last_feedback": self._last_feedback}
+            # B7: each role's own instance assembly rides its self-improve
+            # payload — the CURRENT outer's assembly state is visible at the
+            # decision point (kept/adjusted eval_points / planner prompt).
+            recent_eval = {"digests": self._digests[-I_max:], "last_feedback": self._last_feedback,
+                           "toolset_report": getattr(self.evaluator, "assembly_report", None)}
             recent_plan = {"advantages": self._advantages[-I_max:],
-                           "task_tree_size": len(self.task_tree)}
+                           "task_tree_size": len(self.task_tree),
+                           "toolset_report": getattr(self.planner, "assembly_report", None)}
             # visible task trajectories for self-improvement: this outer's gens
             # + the direct parent of the last generation (read-only).
             si_refs = list(outer_genids)

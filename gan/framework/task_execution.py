@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from gan.design.store import DesignStore
 from gan.patch import apply_patch
-from gan.tools.assembly import assemble_tools_dir
+from gan.tools.assembly import assemble_tools_dir_reported
 
 _PY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
 # Benchmark labels / heavy assets must NOT be present in a task run (leakage
@@ -73,8 +73,18 @@ def assemble_task_env(
     shutil.copy2(design_path, os.path.join(runtime_dir, "design.json"))
 
     skills_dir = os.path.join(runtime_dir, "skills")
-    assemble_tools_dir("task", skills_dir, config=config, include_always_on=False,
-                       code_root=code_root)
+    # B7: report what the design selected vs what actually got assembled, PER
+    # inner generation (the task toolset is re-assembled here, not only at
+    # outer startup). The report rides the runtime dir; task_runner surfaces it
+    # into node meta + the task_toolset_assembled event. Assembly gaps in the
+    # task child are capability degradations to be RECORDED and passed to the
+    # planner, not fatal for the generation.
+    toolset_report = assemble_tools_dir_reported(
+        "task", skills_dir, config=config, include_always_on=False,
+        code_root=code_root)
+    with open(os.path.join(runtime_dir, "toolset_report.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(toolset_report, f, ensure_ascii=False, indent=2)
     env["GAN_TASK_DESIGN"] = "/workspace/.gan_runtime/design.json"
     env["GAN_TASK_SKILLS_DIR"] = "/workspace/.gan_runtime/skills"
     if task_brief:
