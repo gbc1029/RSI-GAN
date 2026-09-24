@@ -10,13 +10,13 @@ import importlib.util
 import json
 import shutil
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
 from hydra import compose, initialize_config_dir
 
 
-_TASK_RESULT_PREFIX = "__RSI_TASK_RESULT__"
 QUESTION_TIMEOUT = 300
 
 
@@ -157,23 +157,38 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
     for name in ("GAN_DATASET_ROOT", "PYTHONHOME", "PYTHONPATH", "OLDPWD"):
         child_env.pop(name, None)
 
-    proc = subprocess.run(
-        _sandbox_command(run_root, agent_path, trajectory_path),
-        input=json.dumps(payload, ensure_ascii=False, default=str),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=child_env,
-        timeout=QUESTION_TIMEOUT,
-    )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
-        raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
-    for line in reversed((proc.stdout or "").splitlines()):
-        if line.startswith(_TASK_RESULT_PREFIX):
-            result = json.loads(line[len(_TASK_RESULT_PREFIX):])
-            return result["prediction"]
-    raise RuntimeError("Sandboxed TaskAgent returned no result sentinel")
+    # The result channel is an anonymous temporary file. Only the trusted
+    # task_worker receives its fd; the TaskAgent child is spawned later with
+    # close_fds=True and a different, worker-local result fd.
+    with tempfile.TemporaryFile(mode="w+b") as result_file:
+        result_fd = result_file.fileno()
+        payload["result_fd"] = result_fd
+        proc = subprocess.run(
+            _sandbox_command(run_root, agent_path, trajectory_path),
+            input=json.dumps(payload, ensure_ascii=False, default=str),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+            timeout=QUESTION_TIMEOUT,
+            pass_fds=(result_fd,),
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
+            raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
+
+        result_file.seek(0)
+        raw_result = result_file.read()
+
+    if not raw_result:
+        raise RuntimeError("Trusted TaskAgent worker returned no result")
+    try:
+        result = json.loads(raw_result.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Trusted TaskAgent worker returned invalid result JSON") from exc
+    if not isinstance(result, dict) or set(result) != {"prediction"}:
+        raise RuntimeError("Trusted TaskAgent worker returned an invalid result object")
+    return result["prediction"]
 
 
 def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
