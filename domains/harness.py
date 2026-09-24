@@ -72,6 +72,29 @@ def _sandbox_command(run_root, agent_path, trajectory_path):
     agent_host = os.path.realpath(os.path.join(run_root, agent_path))
     _sandbox_path(run_root, agent_host)  # validates containment
 
+    required_binds = (
+        ("TaskAgent file", agent_host, os.path.isfile, "file"),
+        ("agent directory", os.path.join(run_root, "agent"), os.path.isdir, "directory"),
+        ("utils directory", os.path.join(run_root, "utils"), os.path.isdir, "directory"),
+        (
+            "domains/__init__.py",
+            os.path.join(run_root, "domains", "__init__.py"),
+            os.path.isfile,
+            "file",
+        ),
+        (
+            "domains/task_worker.py",
+            os.path.join(run_root, "domains", "task_worker.py"),
+            os.path.isfile,
+            "file",
+        ),
+    )
+    for label, source, predicate, expected_type in required_binds:
+        if not predicate(source):
+            raise RuntimeError(
+                f"Sandbox bind source for {label} is missing or not a {expected_type}: {source}"
+            )
+
     command = [
         bwrap,
         "--die-with-parent",
