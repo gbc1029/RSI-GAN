@@ -164,9 +164,10 @@ def _sandbox_command(run_root, agent_path, trajectory_path):
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
     run_root = os.path.realpath(os.getcwd())
     trajectory_path = os.path.realpath(trajectory_path)
-    _sandbox_path(run_root, trajectory_path)  # validates containment
     os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
-    # A file bind must exist before Bubblewrap constructs the namespace.
+    # A file bind must exist before Bubblewrap constructs the namespace. The
+    # trajectory may live outside run_root when resuming from an external
+    # output directory; only this single file is exposed to the sandbox.
     with open(trajectory_path, "a", encoding="utf-8"):
         pass
 
@@ -355,6 +356,23 @@ def harness(
             )
 
         failures = []
+        failures_written = 0
+
+        def append_pending_failures():
+            nonlocal failures_written
+            if failures_written >= len(failures):
+                return
+            pending = failures[failures_written:]
+            data = "".join(
+                json.dumps(rec, ensure_ascii=False) + "\n" for rec in pending
+            )
+            with open(failures_path, "a", encoding="utf-8") as f:
+                written = f.write(data)
+                if written != len(data):
+                    raise IOError("incomplete write to eval_failures.jsonl")
+            # Advance only after the append and file close both succeed.
+            failures_written = len(failures)
+
         for idx, future in futures:
             try:
                 prediction = future.result()
@@ -375,10 +393,7 @@ def harness(
             if (idx + 1) % save_interval == 0:
                 dataset["prediction"] = predictions
                 dataset.to_csv(output_path, index=False)
-                if failures:
-                    with open(failures_path, "w", encoding="utf-8") as f:
-                        for rec in failures:
-                            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                append_pending_failures()
                 print(f"Checkpoint saved to {output_path}")
 
     # Final save
@@ -387,9 +402,7 @@ def harness(
     print(f"Final predictions saved to {output_path}")
 
     if failures:
-        with open(failures_path, "w", encoding="utf-8") as f:
-            for rec in failures:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        append_pending_failures()
         print(f"{len(failures)} question(s) failed and were isolated (see eval_failures.jsonl)")
 
     return output_folder
