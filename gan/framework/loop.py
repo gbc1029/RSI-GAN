@@ -774,11 +774,31 @@ class GanLoop:
 
                 # archive the current generation's task trajectory BEFORE evaluation,
                 # so the evaluator can read it (current generation).
+                # B1: a failure here may NOT be swallowed — the trajectory is the
+                # evaluator's anti-reward-hacking evidence AND the durable audit
+                # record for this generation. Silently continuing would evaluate
+                # blind on missing evidence while looking identical to a normal
+                # run. Fail the generation explicitly (same channel as
+                # evaluator_failed) instead.
                 try:
                     trajectory.collect(child.meta.get("run_dir", ""), f"gan_{genid}",
                                        self.output_dir, outer, genid)
-                except Exception:
-                    pass
+                except Exception as e:
+                    child.valid_parent = False
+                    child.meta["invalid"] = True
+                    child.meta["invalid_reason"] = "trajectory_archive_failed"
+                    child.meta["invalid_detail"] = str(e)[:500]
+                    self.task_tree.add_node(child)
+                    try:
+                        shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
+                    except Exception:
+                        pass
+                    self._write_invalid(genid, "trajectory_archive_failed", str(e), outer, inner)
+                    self.log_event({"type": "inner_invalid", "genid": genid,
+                                    "reason": "trajectory_archive_failed",
+                                    "detail": str(e)[:300]})
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
 
                 # evaluator (execute even for missing bench; pass imputed info, not as anchor)
                 benchmark_for_eval = None if child.meta.get("imputed") else child.value.score

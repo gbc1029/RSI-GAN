@@ -108,7 +108,16 @@ def list_outer_checkpoints(output_dir: str) -> List[int]:
 
 
 def snapshot_designs(output_dir: str, roles: List[str]) -> Dict[str, Any]:
-    """Snapshot role designs, only for roles that already have a design file."""
+    """Snapshot role designs, only for roles that already have a design file.
+
+    B3 (outer-boundary atomicity): a design file that EXISTS but cannot be
+    parsed must abort the save. Silently omitting the role here would produce a
+    checkpoint that looks complete while missing that role's design -- a later
+    ``restore_designs`` would then silently drop / regress that role's evolved
+    design, corrupting exactly the inheritance the checkpoint exists to carry.
+    The failure propagates -> the outer does not reach its "completed" state and
+    the run aborts; a resume re-runs that outer from the previous boundary.
+    """
     store = DesignStore(paths.design_root(output_dir))
     out: Dict[str, Any] = {}
     for role in roles:
@@ -116,8 +125,12 @@ def snapshot_designs(output_dir: str, roles: List[str]) -> Dict[str, Any]:
         if os.path.exists(p):
             try:
                 out[role] = store.load(role)
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(
+                    f"design file for role '{role}' exists but is unparseable: {p}: "
+                    f"{e} — refusing to save an outer checkpoint that would silently "
+                    f"drop this role's design from inheritance"
+                ) from e
     return out
 
 

@@ -258,16 +258,59 @@ def changed_files(patch: str) -> List[str]:
     return [p for p in out if not (p in seen or seen.add(p))]
 
 
-def apply_patch(code_root: str, patch: str) -> bool:
+def _apply_infra_error(*stds: str) -> bool:
+    """True when a patch-applier stderr looks like an INFRASTRUCTURE failure
+    (repo bump/index lock/OS) rather than the patch CONTENT being unappliable.
+    Anything else keeps the historic agent-attributable classification."""
+    lowered = " | ".join(s.lower() for s in stds if s)
+    return any(sig in lowered for sig in (
+        "fatal:", "not a git repository", "index.lock", "permission denied",
+        "no space left", "os error", "disk quota",
+    ))
+
+
+def apply_patch_detail(code_root: str, patch: str) -> Tuple[bool, str]:
+    """Apply a unified diff to the code tree. Returns ``(ok, detail)``.
+
+    B4 — failure semantics are layered instead of one blurred ``False``:
+
+    - ``ok`` with empty detail            : applied;
+    - ``(False, <applier stderr>)``       : the patch CONTENT was refused (bad
+      diff format / context mismatch / empty input). This is agent-attributable:
+      the in-session retry should act on the concrete cause, which is why the
+      detail is carried instead of the old blur "patch failed to apply";
+    - :class:`RepoIntegrityError`         : infrastructure failure (broken git,
+      locks, disk) — the tree state is unknowable, the run must abort rather
+      than mislead the agent into editing a correct patch.
+    """
     if not (patch or "").strip():
-        return False
+        return False, "empty patch"
     r = subprocess.run(["git", "-C", code_root, "apply", "--whitespace=nowarn", "-"],
                        input=patch, text=True, capture_output=True)
     if r.returncode == 0:
-        return True
+        return True, ""
     r2 = subprocess.run(["patch", "-p1", "--no-backup-if-mismatch", "-d", code_root],
                         input=patch, text=True, capture_output=True)
-    return r2.returncode == 0
+    if r2.returncode == 0:
+        return True, ""
+    detail = (r.stderr.strip() + "|" + r2.stderr.strip()).strip("|")
+    if _apply_infra_error(r.stderr, r2.stderr):
+        raise RepoIntegrityError(
+            f"patch applier infrastructure failure in {code_root}: {detail[:300]} "
+            f"— the code tree state is unknowable; the run cannot safely continue"
+        )
+    return False, detail[:400]
+
+
+def apply_patch(code_root: str, patch: str) -> bool:
+    """Bool wrapper kept for the task-child run-dir applier (task_execution)."""
+    try:
+        return apply_patch_detail(code_root, patch)[0]
+    except RepoIntegrityError:
+        # the throwaway task run-dir has no .git tree to trust/restore: degrade
+        # to "patch not applied" exactly as before this change (the child run is
+        # then evaluated without the patch, still recorded as applied=False)
+        return False
 
 
 def validate_python(code_root: str, rel_files: Iterable[str]) -> Tuple[bool, str]:
@@ -435,9 +478,10 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True) -> 
     files = changed_files(patch)
     prev = current_commit(code_root)
     before = registry_report(code_root)
-    if not apply_patch(code_root, patch):
+    ok, apply_err = apply_patch_detail(code_root, patch)
+    if not ok:
         _hard_rollback(code_root, prev)
-        return False, "patch failed to apply"
+        return False, f"patch failed to apply: {apply_err}"
     ok, err = validate_python(code_root, files)
     if not ok:
         _hard_rollback(code_root, prev)
@@ -463,9 +507,10 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
             raise PatchRejected(f"patch touches non-editable path for {role}: {f}")
     prev = current_commit(code_root)
     before = registry_report(code_root)
-    if not apply_patch(code_root, patch):
+    ok, apply_err = apply_patch_detail(code_root, patch)
+    if not ok:
         _hard_rollback(code_root, prev)
-        raise PatchRejected("patch failed to apply")
+        raise PatchRejected(f"patch failed to apply: {apply_err}")
     ok, err = validate_python(code_root, files)
     if not ok:
         _hard_rollback(code_root, prev)

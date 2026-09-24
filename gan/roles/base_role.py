@@ -121,12 +121,40 @@ class Role(AgentSystem):
         )
         # expose the last run's outcome (truncated/tool_calls) to callers
         self.last_run_info = info
-        # redact the just-written session (frozen policy; consistent with task)
-        try:
+        # redact the just-written session (frozen policy; consistent with task).
+        # B2: a redaction failure must NEVER leave the raw session file servable.
+        # Semantics: one immediate retry (transient IO), then QUARANTINE -- the
+        # raw file is renamed out of every reader's exact-name reach -- plus an
+        # audit event and a stderr line. Deliberately NOT raised: the session's
+        # design/eval work is sound; what fails closed here is the exposure
+        # channel itself. (Switch to `raise` if the policy should bind the whole
+        # session to redaction success.)
+        if path:
             from gan.framework import trajectory as _traj
-            _traj.redact_file(path)
-        except Exception:
-            pass
+            last_err: Optional[Exception] = None
+            for _redact_try in range(2):
+                try:
+                    _traj.redact_file(path)
+                    break
+                except Exception as e:
+                    last_err = e
+            if last_err is not None:
+                quar = ""
+                try:
+                    quar = _traj.quarantine_unredacted(path, str(last_err))
+                except Exception as qe:  # noqa: BLE001 -- quarantine must not mask
+                    print(f"[ERROR] session quarantine failed for {path}: {qe}")
+                try:
+                    from gan.framework import paths as _paths
+                    from utils import trajectory_log as _tlog
+                    _tlog.append(_paths.events_path(self.output_dir), {
+                        "type": "session_redaction_failed",
+                        "path": os.path.abspath(path), "quarantined": quar,
+                        "error": str(last_err)[:300]})
+                except Exception:  # audit-log write failure: stderr covers it
+                    pass
+                print(f"[WARN] session redaction failed; quarantined={quar or 'FAILED'} "
+                      f"-> {path}: {last_err}")
         return hist
 
     # AgentSystem ABC requires forward(); roles expose richer plan()/evaluate().

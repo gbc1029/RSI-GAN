@@ -18,6 +18,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import time
 from typing import Any, Dict, List
 
 from gan.framework import paths
@@ -66,7 +67,17 @@ def redact_record(rec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def collect(run_dir: str, run_id: str, output_dir: str, outer: Any, genid: Any) -> str:
-    """Archive + redact the task trajectories of one generation into JSONL."""
+    """Archive + redact the task trajectories of one generation into JSONL.
+
+    B1 — "no evidence" is a PIPELINE failure, not an empty archive: a missing
+    ``agent_evals`` directory, no ``chat_history_*`` files or zero records all
+    raise (the task run necessarily produced per-question chat histories, so an
+    empty source means the run-dir handling/spotting drifted upstream and the
+    evaluator would silently lose its evidence). The loop turns the raise into
+    an explicit ``trajectory_archive_failed`` generation. The write is ATOMIC
+    (tmp + ``os.replace``): a crash mid-write can no longer leave a partial
+    file that looks like success.
+    """
     evals = os.path.join(run_dir, "outputs", str(run_id), "agent_evals")
     dest = paths.session_traj_file(output_dir, outer, genid, "task")
     records: List[Dict[str, Any]] = []
@@ -89,10 +100,27 @@ def collect(run_dir: str, run_id: str, output_dir: str, outer: Any, genid: Any) 
                 rec = redact_record(rec)
                 rec["qid"] = qid
                 records.append(rec)
-    if records:
-        with open(dest, "w", encoding="utf-8") as f:
+    if not records:
+        src = ("directory missing" if not os.path.isdir(evals)
+               else ("no chat_history_* files" if not bases else "no records parsed"))
+        raise RuntimeError(
+            f"no task trajectory sources archived for genid {genid} "
+            f"(run_dir={run_dir!r}, agent_evals={evals!r}: {src}) — the evaluator "
+            f"would silently lose its evidence for this generation"
+        )
+    tmp = f"{dest}.collect-tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return dest
 
 
@@ -132,15 +160,26 @@ def read(output_dir: str, genid: Any, max_chars: int = 6000, role: str = "task")
 
 
 def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: int = 6000) -> str:
-    """Read a role's own session trajectory for a given outer/genid."""
+    """Read a role's own session trajectory for a given outer/genid.
+
+    A quarantined (unredactable) session is NEVER served: an explicit refusal
+    replaces its content (B2, fail-closed)."""
     path = paths.session_traj_file(output_dir, outer, genid, role)
     if not os.path.isfile(path):
+        quarantined = sorted(glob.glob(path + ".unredacted-*"))
+        if quarantined:
+            return ("[unavailable] this session trajectory could not be redacted and was "
+                    "quarantined; the audit trail is in events.jsonl "
+                    "(session_redaction_failed).")
         return read(output_dir, genid, max_chars, role)
     return _render(trajectory_log.read_all(path), max_chars)
 
 
 def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str, Any]]:
-    """List this outer's per-inner session files for a role (genid + size)."""
+    """List this outer's per-inner session files for a role (genid + size).
+
+    Quarantined (unredactable) sessions are reported explicitly with
+    ``quarantined: True`` instead of silently vanishing from the list."""
     d = paths.outer_traj_dir(output_dir, outer)
     out: List[Dict[str, Any]] = []
     if os.path.isdir(d):
@@ -150,11 +189,20 @@ def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str
                 p = os.path.join(sub, f"{role}.jsonl")
                 if os.path.isfile(p):
                     out.append({"genid": name, "bytes": os.path.getsize(p)})
+                elif glob.glob(p + ".unredacted-*"):
+                    out.append({"genid": name, "quarantined": True})
     return out
 
 
 def redact_file(path: str) -> None:
-    """Redact a JSONL trajectory file in place (parts merged, then removed)."""
+    """Redact a JSONL trajectory file in place (parts merged, then removed).
+
+    B2: the replace is ATOMIC (tmp file + ``os.replace``) and the final write no
+    longer swallows ``OSError`` — previously a write failure could both silently
+    skip redaction AND destroy the original (in-place "w" truncate), the worst
+    combination. Failures now raise so the caller can quarantine the unredacted
+    file (fail-closed) instead of leaving it servable.
+    """
     if not path or not os.path.exists(path):
         return
     text = trajectory_log.read_all(path)
@@ -168,15 +216,46 @@ def redact_file(path: str) -> None:
         except json.JSONDecodeError:
             rec = {"kind": "text", "text": line}
         out.append(redact_record(rec))
+    tmp = f"{path}.redact-tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for rec in out:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        os.replace(tmp, path)
+    except Exception:
+        # never leave the truncated tmp behind; the ORIGINAL (unredacted) file is
+        # untouched -- the caller owns the quarantine / visibility decision
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    # rotated parts were merged in; drop them only after the replace succeeded
+    # (best-effort cleanup: leaving a part file cannot leak anything -- the
+    # readers always resolve the main file first)
     for p in glob.glob(path + ".*"):
         if p[len(path) + 1:].isdigit():
             try:
                 os.remove(p)
             except OSError:
                 pass
+
+
+def quarantine_unredacted(path: str, reason: str = "") -> str:
+    """Move an UNREDACTED trajectory file out of every consumer's reach (B2).
+
+    All readers judge by exact file-name existence (``read_session``, ``outer_session_index``,
+    ``_session_file``), so RENAMING is the fail-closed primitive: the raw file stays
+    on disk for human forensics but no LLM-facing path can resolve it.
+
+    Returns the quarantined file name.
+    """
+    if not path or not os.path.exists(path):
+        return path
+    dst = f"{path}.unredacted-{int(time.time() * 1000)}"
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            for rec in out:
-                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        os.replace(path, dst)
     except OSError:
-        pass
+        return path  # rename failed: the caller must NOT assume this is now closed
+    return dst
