@@ -1,6 +1,8 @@
 # 工具与组件体系：全量盘点、结构诊断与重构建议
 
 > 承接前两份：`工具与算子管理_漏洞梳理与修改建议.md`、`工具与算子管理_实现方案.md`。本轮把范围从"注册表相关工具"扩大到 **`gan/tools/**` 与 `gan/components/**` 全部**，并对**目录组织结构**本身给出重构建议。
+
+> **【状态指针 · 本会话追加，原文保留】** 本文档是**历史轮次记录**：其中的"现状"描述与**行号**可能已漂移（`#10`/`#11` 重构后 `assembly.py` / `loader.py` 等行号普遍偏移；`evaluator_reward.py` 已移至 `gan/framework/reward/`）。引用前请对照当前代码；**部分结论已被取代**——权威汇总见 `docs/gan_tools_deep_write_fix.md`（§0.1 逐项状态表），本轮更正以文内 `【复核更正·本会话】` 标注为准。
 > 仓库：`\\wsl.localhost\Ubuntu\root\HyperAgents`。三路并行只读调查（tools 全量 / components 全量 / 结构→加载机制）+ 自持取证。均附 `文件:行号`。
 
 ---
@@ -111,7 +113,7 @@
 
 ### S2 目录承载语义但装配丢弃语义 — `中`
 
-装配用 `basename` 落盘（`assembly.py:111,114`），源目录层级完全消失；加载用单层 `glob("*.py")`（`agent/tools/__init__.py:23`）。**推论**：`components/<role>/<kind>/` 的两级语义在装配后**不可观测**——目录既不是隔离手段，也不是校验依据。当前目录分类**纯属人类可读性**。
+装配用 `basename` 落盘（`assembly.py:111,114`），源目录层级完全消失；加载用单层 `glob("*.py")`（`agent/tools/__init__.py:23`）。**推论**：`components/<role>/<kind>/` 的两级语义在装配后**不可观测**——目录既不是隔离手段，也不是校验依据。当前目录分类**纯属人类可读性**。 **【行号漂移·本会话】** 文中 `assembly.py:111,114` 现为 `:149`（always-on 段）与 `:163`（opt-in 段）；`assembly.py:106-114` 现为 `:147-163`；`assembly.py:59`（`selected_module_paths`）现为 `:66`。
 
 ### S3 两套正交分类轴并存 — `中`
 
@@ -153,6 +155,8 @@
 ### S8 planner 拿到不可用算子，且提示词要求使用 — `中`
 
 `select_component`/`deselect_component` 是 always-on 给 planner 的，但 planner schema 无 slot（`schema.py:21-24`）→ 调用必然失败；而 planner 的 self-improve 提示词**要求**使用它们（`planner.py:127,197`）。这是"工具可见性"与"schema 能力"脱节。
+
+> **【复核更正·本会话】本条诊断不准确，原文保留。** `planner.plan` 的 design context 是 `DesignContext(role="task", config=task_design)`（`gan/roles/planner.py:104`），而 `select_component` 校验的是 **task 的槽位** ⇒ **plan 阶段完全可用**，不会"必然失败"。真实残留只有两处：① `self_improve` 会话（`role="planner"`，planner schema 无 `skills` 槽）调用必然报错；② 该会话的提示词仍列出 `select_component`/`deselect_component`。因此修法应从"给 planner 加 `roles` 限制"收敛为"**self_improve 提示词不再列出这两个算子**"。
 
 ### S9 `assembly.py` 位置不符语义 — `低`
 

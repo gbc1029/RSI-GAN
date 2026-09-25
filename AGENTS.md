@@ -84,7 +84,10 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   There is no `mint_operator`. After a `modify` grant, planner/evaluator edit the
   granted copies with `edit_source`
   (`gan/tools/work/common/`, confined to the instance workspace `src/`); roles are
-  intentionally NOT given raw `bash` (it cannot be confined).
+  intentionally NOT given raw `bash` (it cannot be confined). A repeated
+  `request_source_access` for a path that is already granted does **not** re-copy
+  from `code_root` — in-session workspace edits survive; pass `refresh=true` to
+  deliberately discard them and re-sync the workspace copy.
 - **Instances**: an *instance* = role + workspace + its trajectory. The task agent
   is refreshed every inner generation (per `genid`); planner/evaluator are refreshed
   every **outer** generation (`gan/framework/loop.py:_refresh_roles` + the
@@ -192,6 +195,12 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   `respond_issue` are work tools (`gan/tools/work/`); design operators are in
   `gan/tools/design/`.
 - Operators are tools: a module exposing `tool_info()` + `tool_function(**kwargs)`.
+- **Operators must self-record structurally**: any operator that changes design or
+  source must call `ctx.record(op, **structured_fields)` — **never** free-text
+  rationale. `records` is both the patch gate (`gan/patch.py:has_deep_write`) and
+  the input to the evaluator-visible summary (`gan/summary.py:build_diff_summary`,
+  which whitelists structured fields only), so an operator that records nothing is
+  invisible to the loop even when it changed the workspace.
 - **Identity contract (three names must agree)**: a component's registered `name`
   (`gan/registries/*.json`), its module file **stem**, and its `tool_info()["name"]`
   must be the same string. The tool loop keys tools by file stem
@@ -203,6 +212,16 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   Adding a component file without a registry entry is reported as an **orphan**
   instead of failing silently; `list_components` lists such files as candidates and
   `register_component` (deep, same gate as `unregister_component`) registers them.
+  Both deep tools only reach the code tree through the **patch channel**: their
+  changes are committed only in sessions that build a patch (`plan` / `self_improve`);
+  an `evaluate` session has no patch builder, so deep registry edits made there are
+  dropped. `register_component` registers source that **already exists** (in
+  `code_root` or in the workspace) and never creates, restores or deletes source
+  files — restoring a deleted component means re-granting it
+  (`request_source_access(..., refresh=true)`) and registering it again.
+  Patch visibility follows `granted_paths`: a file the agent created in the
+  workspace reaches the patch only when a grant covers it (grant the parent
+  **directory** to have new files inside it captured).
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - Do not expose planner rationale/reason to the evaluator (use
   `gan/summary.py:build_diff_summary`).

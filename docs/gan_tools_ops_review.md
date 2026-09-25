@@ -1,6 +1,8 @@
 # 工具与算子管理：漏洞梳理与修改建议
 
 > 出发点：`docs/7_遗留问题与待办.md` §3（流程分段：实现和注册 → 选配 → 装配 → 提示词注入 → 调用 → 返回 → 信息传递 → 继承）
+
+> **【状态指针 · 本会话追加，原文保留】** 本文档是**历史轮次记录**：其中的"现状"描述与**行号**可能已漂移（`#10`/`#11` 重构后 `assembly.py` / `loader.py` 等行号普遍偏移；`evaluator_reward.py` 已移至 `gan/framework/reward/`）。引用前请对照当前代码；**部分结论已被取代**——权威汇总见 `docs/gan_tools_deep_write_fix.md`（§0.1 逐项状态表），本轮更正以文内 `【复核更正·本会话】` 标注为准。
 > 方法：只读代码调查（仓库 `\\wsl.localhost\Ubuntu\root\HyperAgents`），逐环节给出 `文件:行号` 证据。未执行仓库代码。
 > 说明：本轮新增 9 项事实（编号 N1–N9），其中 5 项为 `docs/7` §3 未登记；已有条目（T1/T2/R4/F1/G5/B5）在末尾对照。
 
@@ -60,7 +62,7 @@
 
 **T1（已登记）+ N1（新发现，覆盖面修正）**
 
-- 装配按 `os.path.basename` 复制、直接 `shutil.copy2`，**无任何同名判断**（`gan/tools/assembly.py:111,114`）。`module_path` 返回**完整相对路径**（`loader.py:97-102`），装配时被压平为 basename。
+- 装配按 `os.path.basename` 复制、直接 `shutil.copy2`，**无任何同名判断**（`gan/tools/assembly.py:111,114`）。`module_path` 返回**完整相对路径**（`loader.py:97-102`），装配时被压平为 basename。 **【行号漂移·本会话】** `gan/tools/assembly.py:111,114` 现为 `:149`（always-on）/ `:163`（opt-in），`:106-111` → `:147-149`，`:59` → `:66`；文中 `evaluator_reward.py:197-200` 已移至 `gan/framework/reward/evaluator_reward.py:199`，`loop.py:762-763` → `:834`。
 - 复制顺序（后写覆盖先写）：
   ```
   work/<role> → work/common → design → deep → 选中的 opt-in 组件
@@ -212,6 +214,7 @@
 
 - 回填在 `llm_withtools.py:167-173`，`tool_output` **原样**进字符串。
 - 仅个别工具自带 char cap：`read_file`（`max_chars=8000`，`gan/tools/work/common/read_file.py:42-43`）、`read_session_trajectory`（6000，`:47,59`）。`grep`/`list_dir` 的 cap **未能确证**（读取被基础设施抖动阻断）。
+  > **【复核更正·本会话】已确证，原文保留。** `grep` **有** cap：`max_results=100`（`gan/tools/work/common/grep.py:28,40`）；只有 `list_dir` 确实**无** cap（已登记为待办 B19）。
 - **不可信内容原样回填**：`read_file` 读到的文件内容、`bash` 技能输出（`agent/tools/bash.py:139-148`）、`read_session_trajectory` 渲染的轨迹原文（`gan/framework/trajectory.py:117-123`）都会直接进入模型上下文。
 - 现有清洗只作用于**归档**而非回填：`trajectory.py:27-46` 的 `_SENSITIVE` 行级替换为 `[REDACTED:sensitive]`，`base_role.py:125-129` 对 session 文件 `redact_file`。**不改变** `process_tool_call` 的即时回填。
 

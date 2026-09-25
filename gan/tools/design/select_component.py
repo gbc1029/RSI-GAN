@@ -1,8 +1,9 @@
 """Design operator: select a registered component into a design slot.
 
 Shallow: only selects among components already present in the role's registry
-(``gan/design/registries/<role>_registry.json``). Registering a NEW component is
-a source-level (deep) change.
+(``gan/registries/shared.json`` plus ``gan/registries/<role>.json``, loaded by
+``gan/registries/loader.py:load_registry_for_role``). Registering a NEW component
+is a source-level (deep) change (``gan/tools/deep/register_component.py``).
 """
 from gan.framework.context import get_design_context
 from gan.registries.loader import load_registry_for_role

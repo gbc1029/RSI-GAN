@@ -1,6 +1,8 @@
 # 工具与算子管理：实现方案（合法性检验 + register_component + list_components）
 
 > 承接 `工具与算子管理_漏洞梳理与修改建议.md`。本轮新增三份只读调查（config 继承链、代码/注册表 git 继承链、实现模板），其中 config 继承链的结论**更正了上一份报告 N5 的措辞**，见 §1。
+
+> **【状态指针 · 本会话追加，原文保留】** 本文档是**历史轮次记录**：其中的"现状"描述与**行号**可能已漂移（`#10`/`#11` 重构后 `assembly.py` / `loader.py` 等行号普遍偏移；`evaluator_reward.py` 已移至 `gan/framework/reward/`）。引用前请对照当前代码；**部分结论已被取代**——权威汇总见 `docs/gan_tools_deep_write_fix.md`（§0.1 逐项状态表），本轮更正以文内 `【复核更正·本会话】` 标注为准。
 > 仓库：`\\wsl.localhost\Ubuntu\root\HyperAgents`。所有结论附 `文件:行号`。
 
 ---
@@ -452,6 +454,7 @@ op_function = tool_function
 - **与 `list_editable` 同形**：`get_access_context()` → 取 role/broker → `json.dumps(..., ensure_ascii=False, indent=2)`（`list_editable.py:27-44`）。
 - **一次调用回答四个问题**：有哪些组件、哪些可用（valid/reason）、哪些已选、哪些文件还没注册。最后一项直接喂给 `register_component`，形成闭环。
 - **不返回 description**：注册表的 `description`/`params_schema` **无消费者**（全仓仅 `loader.py:5` docstring 提及）。agent 需要的说明来自 `tool_info()`（由 `load_tools` 注入到 user message，`agent/llm_withtools.py:119-129`），不必从注册表读。这也顺带印证了"注册表实质是 `name→module` 索引"。
+  > **【复核更正·本会话】与实现不符，原文保留。** `list_components` **会**返回 `description`（`gan/tools/work/common/list_components.py:82`），故"不返回 description"应更正为"不返回 `params_schema`"。另：`description` 因此在会话内**有**消费者。
 - **`selected` 的语义需确认**：`get_design_context()` 在 planner 会话中承载的是**planner 所设计的 task config**（planner 产出 `plan_result["config"]`，`gan/roles/planner.py:102-104,167`）。因此 planner 看到的 `selected.skills` 是 task 的 skills 选择，这符合"planner 设计 task"的语义；但**实现时需确认** planner 会话的 design context 装配点，避免读成 planner 自身的 config。
 
 ---

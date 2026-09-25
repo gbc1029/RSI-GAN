@@ -2,6 +2,8 @@
 
 > 范围：本轮实现「身份统一 + 合法性检验 + `register_component` + `list_components`」四项工作，以及收尾的 #10/#11 两项重构。
 > 承接：`docs/7_遗留问题与待办.md` §3、`gan_tools_ops_review.md`（漏洞梳理）、`gan_tools_ops_impl.md`（实现方案）、`gan_tools_components_structure.md`（结构诊断）。
+
+> **【状态指针 · 本会话追加，原文保留】** 本文档是**历史轮次记录**：其中的"现状"描述与**行号**可能已漂移（`#10`/`#11` 重构后 `assembly.py` / `loader.py` 等行号普遍偏移；`evaluator_reward.py` 已移至 `gan/framework/reward/`）。引用前请对照当前代码；**部分结论已被取代**——权威汇总见 `docs/gan_tools_deep_write_fix.md`（§0.1 逐项状态表），本轮更正以文内 `【复核更正·本会话】` 标注为准。
 > 仓库：`/root/HyperAgents`（WSL Ubuntu）。所有改动**未提交**，见文末变更清单。
 
 ---
