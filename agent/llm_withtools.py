@@ -63,20 +63,26 @@ def should_retry_tool_use(response, tool_uses=None):
 def check_for_tool_uses(response):
     """
     Checks if the response contains one or more tool calls in json code blocks.
-    Returns a list of tool use dictionaries.
+
+    Returns ``(tool_uses_or_None, malformed_count)``. A-level sweep: malformed
+    blocks are no longer a fully silent skip — the caller feeds a bounded
+    structured error back to the model so it can self-correct instead of
+    burning turns unaware that its calls were ignored.
     """
     pattern = r'<json>\s*(\{.*?\})\s*</json>'
     matches = re.findall(pattern, response, re.DOTALL)
     tool_uses = []
+    malformed = 0
     for match in matches:
         try:
             tool_use = json.loads(match)
             if 'tool_name' not in tool_use or 'tool_input' not in tool_use:
-                continue  # Skip invalid tool use
+                malformed += 1  # invalid shape: treated like malformed
+                continue
             tool_uses.append(tool_use)
         except json.JSONDecodeError:
-            continue  # Skip malformed JSON blocks
-    return tool_uses if tool_uses else None
+            malformed += 1
+    return (tool_uses if tool_uses else None), malformed
 
 def process_tool_call(tools_dict, tool_name, tool_input):
     try:
@@ -130,9 +136,10 @@ def chat_with_agent(
         _emit(logging, trajectory_file, "output", text=response)
 
         # Tool use
-        tool_uses = check_for_tool_uses(response)
+        tool_uses, malformed = check_for_tool_uses(response)
         retry_tool_use = should_retry_tool_use(response, tool_uses)
-        while tool_uses or retry_tool_use:
+        malformed_feedback = 0
+        while tool_uses or retry_tool_use or malformed:
             # Check for max tool calls
             if max_tool_calls > 0 and num_tool_calls >= max_tool_calls:
                 # Do NOT end on a half-executed tool call: give the model one
@@ -149,6 +156,30 @@ def chat_with_agent(
                     _emit(logging, trajectory_file, "output", text=response)
                 except Exception as e:
                     logging(f"Error during final summary turn: {e}")
+                break
+
+            # A-level sweep: malformed tool-call JSON used to vanish silently;
+            # give the model one bounded structured feedback turn so it can
+            # self-correct (never unbounded: capped rounds, still subject to
+            # the tool budget check above).
+            if tool_uses is None and malformed and malformed_feedback < 2:
+                malformed_feedback += 1
+                logging(f"Error: {malformed} malformed tool-call JSON block(s) ignored.")
+                _emit(logging, trajectory_file, "tool_output", tool="<malformed_json>",
+                      output=f"{malformed} malformed tool-call JSON block(s) ignored")
+                response, new_msg_history, info = get_response_fn(
+                    msg=(system_msg + f"\n\nError: {malformed} tool-call JSON block(s) "
+                         f"in your last message were malformed (invalid JSON, or missing "
+                         f"tool_name/tool_input) and were IGNORED. Either re-issue the "
+                         f"call with valid JSON or stop calling tools and give your "
+                         f"final answer now."),
+                    model=model, msg_history=new_msg_history)
+                _emit(logging, trajectory_file, "output", text=response)
+                tool_uses, malformed = check_for_tool_uses(response)
+                retry_tool_use = should_retry_tool_use(response, tool_uses)
+                continue
+            if tool_uses is None and malformed:
+                logging("Error: repeated malformed tool-call JSON; ending tool loop.")
                 break
 
             tool_msgs = []
@@ -187,7 +218,7 @@ def chat_with_agent(
             _emit(logging, trajectory_file, "output", text=response)
 
             # Check for next tool use
-            tool_uses = check_for_tool_uses(response)
+            tool_uses, malformed = check_for_tool_uses(response)
             retry_tool_use = should_retry_tool_use(response, tool_uses)
 
     except Exception as e:

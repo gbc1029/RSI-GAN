@@ -174,6 +174,10 @@ class DomainTaskRunner:
             dataset_root=self.repo_root, log_path=self.log_path,
         )
         report = tx.read_report(report_path)
+        if report is None and os.path.isfile(report_path):
+            from utils.soft_fail import soft_fail
+            soft_fail(f"report.json exists but is unparseable for genid {genid} "
+                      f"(score will read None/failed): {report_path}")
         score = tx.extract_score(report, self.score_key)
         report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
 
@@ -186,8 +190,11 @@ class DomainTaskRunner:
                 src = os.path.join(os.path.dirname(report_path), name)
                 if os.path.isfile(src):
                     shutil.copy2(src, os.path.join(evid, name))
-        except Exception:
-            pass
+        except Exception as e:
+            from utils.soft_fail import soft_fail
+            soft_fail(f"evidence copy failed for genid {genid}: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="evidence_copy_failed", genid=str(genid))
 
         # score status (unscored taxonomy; imputation is decided by the loop)
         if score is None:

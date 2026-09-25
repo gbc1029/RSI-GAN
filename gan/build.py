@@ -37,8 +37,24 @@ def _seed_self_designs(output_dir: str) -> None:
             try:
                 store.load(role)
                 continue  # valid existing design: authoritative, do not touch
-            except Exception:
-                shutil.copy2(path, f"{path}.corrupt-{int(time.time())}")
+            except Exception as e:
+                # B5: the reseed is a deliberate availability trade-off (a
+                # corrupt config must not crash-loop the per-outer worker), but
+                # it silently RESETS this role's evolution -- that must be LOUD:
+                # one structured event + one stderr line, with the corrupt file
+                # kept aside as .corrupt-<ts> for forensics.
+                corrupt_backup = shutil.copy2(path, f"{path}.corrupt-{int(time.time())}")
+                try:
+                    from utils import trajectory_log as _tlog
+                    _tlog.append(paths.events_path(output_dir), {
+                        "type": "self_design_reseeded", "role": role,
+                        "path": os.path.abspath(path), "backup": corrupt_backup,
+                        "error": str(e)[:300]})
+                except Exception as le:  # noqa: BLE001 -- audit write: stderr covers
+                    print(f"[WARN] self_design_reseeded event write failed: {le}")
+                print(f"[WARN] {role} design file unparseable ({type(e).__name__}: {e}); "
+                      f"reseeded to gen-0 seed — this role's evolution was reset "
+                      f"(backup: {corrupt_backup})")
         # schema defaults + seed prompt; initial_config applies the non-empty
         # guard, so a missing/blank seed can no longer blank the prompt.
         cfg = initial_config(role)

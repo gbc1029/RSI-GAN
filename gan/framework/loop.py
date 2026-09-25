@@ -48,6 +48,7 @@ from gan.framework.reward.evaluator_reward import build_feedback_digest
 from gan.framework.reward.packet import RewardPacket
 from gan.summary import build_diff_summary, make_feedback
 from gan.framework.tree.store import Node, NodeValue, TreeStore
+from utils.soft_fail import soft_fail
 
 _MEASURED = ("ok", "partial")
 
@@ -264,8 +265,8 @@ class GanLoop:
         self.task_tree.add_node(node)
         try:
             shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
-        except Exception:
-            pass
+        except Exception as e:
+            soft_fail(f"work dir cleanup failed for genid {genid}: {e}")
         self._write_invalid(genid, reason, detail, outer, inner)
         self.log_event({"type": "inner_invalid", "genid": genid, "reason": reason, "detail": detail[:300]})
         return node
@@ -279,8 +280,11 @@ class GanLoop:
             with open(os.path.join(d, "invalid.json"), "w", encoding="utf-8") as f:
                 json.dump({"genid": str(genid), "reason": reason, "detail": detail[:1000],
                            "outer": outer, "inner": inner}, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            soft_fail(f"invalid.json write failed for genid {genid}: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="invalid_record_write_failed",
+                      genid=str(genid), reason=reason)
 
     # -- checkpoints -------------------------------------------------------
     def _state_dict(self, outer: int, inner: int) -> Dict[str, Any]:
@@ -344,14 +348,16 @@ class GanLoop:
         for inst in (self.planner, self.evaluator):
             try:
                 inst.attempt_id = self._attempt
-            except Exception:
-                pass
+            except Exception as e:
+                soft_fail(f"attempt_id assignment failed for "
+                          f"{getattr(inst, 'role', '?')}: {e}")
         if self.broker is not None:
             for role in ("planner", "evaluator"):
                 try:
                     self.broker.clear_workspace(role)
-                except Exception:
-                    pass
+                except Exception as e:
+                    soft_fail(f"clear_workspace failed for {role}: {e} — stale "
+                              f"copies may linger until the next resync")
         self.log_event({"type": "role_refresh", "outer": outer})
 
     def _source_access_log(self, outer: Any) -> List[Dict[str, Any]]:
@@ -378,8 +384,10 @@ class GanLoop:
                 "report_sha": child.meta.get("report_sha"),
                 "valid_parent": child.valid_parent,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            soft_fail(f"scores append failed for genid {child.genid}: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="scores_append_failed", genid=str(child.genid))
 
     def _apply_self_patch(self, role: str, outer: int, res: Any) -> None:
         """Apply a role self-edit patch directly to the code tree (option B).
@@ -427,10 +435,12 @@ class GanLoop:
         if not code_root:
             return
         akey = f"outer_{outer}"
+        sync_failures: List[str] = []
         for role in ("planner", "evaluator"):
             try:
                 src = self.broker.src_dir(role, akey)
-            except Exception:
+            except Exception as e:
+                sync_failures.append(f"src_dir({role}): {e}")
                 continue
             for rel in files or []:
                 s = os.path.join(code_root, rel)
@@ -439,14 +449,17 @@ class GanLoop:
                     if drop_missing and os.path.isfile(d):
                         try:
                             os.remove(d)
-                        except OSError:
-                            pass
+                        except OSError as e:
+                            sync_failures.append(f"drop {rel}: {e}")
                     continue
                 if os.path.isfile(d):
                     try:
                         shutil.copy2(s, d)
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        sync_failures.append(f"copy {rel}: {e}")
+        if sync_failures:
+            soft_fail(f"workspace resync had {len(sync_failures)} failure(s) "
+                      f"(outer_{outer}): " + "; ".join(sync_failures[:5]))
 
     def _make_receipt(self, genid: Any, plan_result: Dict[str, Any],
                       parent_cfg: Dict[str, Any], child: Node, outer: Any) -> Dict[str, Any]:
@@ -487,8 +500,10 @@ class GanLoop:
             if rejected and plan_result.get("patch_proposed"):
                 with open(os.path.join(d, "patch_proposed.diff"), "w", encoding="utf-8") as f:
                     f.write(plan_result.get("patch_proposed") or "")
-        except Exception:
-            pass
+        except Exception as e:
+            soft_fail(f"patch_receipt.json write failed for genid {genid}: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="receipt_write_failed", genid=str(genid), outer=outer)
         self.log_event({"type": "receipt", "genid": genid, "outer": outer,
                         "design_applied": rec["design"]["applied"],
                         "code_applied": rec["code_patch"]["applied"],
@@ -518,8 +533,10 @@ class GanLoop:
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, "patch_receipt.json"), "w", encoding="utf-8") as f:
                 json.dump(rec, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            soft_fail(f"self patch_receipt.json write failed ({role}, outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="receipt_write_failed", role=role, outer=outer)
         self._last_self_receipt = rec
         self.log_event({"type": "self_receipt", "role": role, "outer": outer,
                         "code_applied": rec["code_patch"]["applied"], "rejected": bool(rejected)})
@@ -544,8 +561,10 @@ class GanLoop:
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, "eval.json"), "w", encoding="utf-8") as f:
                 json.dump(rec, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            soft_fail(f"eval.json write failed for genid {child.genid}: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="eval_json_write_failed", genid=str(child.genid))
 
     def _restore(self, boundary: str = "latest") -> bool:
         payload = ckpt.load_checkpoint(self.output_dir, boundary)
@@ -799,8 +818,8 @@ class GanLoop:
                     self.task_tree.add_node(child)
                     try:
                         shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        soft_fail(f"work dir cleanup failed for genid {genid}: {e}")
                     self._write_invalid(genid, "trajectory_archive_failed", str(e), outer, inner)
                     self.log_event({"type": "inner_invalid", "genid": genid,
                                     "reason": "trajectory_archive_failed",
@@ -843,8 +862,8 @@ class GanLoop:
                     self.task_tree.add_node(child)
                     try:
                         shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        soft_fail(f"work dir cleanup failed for genid {genid}: {e}")
                     self._write_invalid(genid, "evaluator_failed", str(e), outer, inner)
                     self.log_event({"type": "inner_invalid", "genid": genid,
                                     "reason": "evaluator_failed", "detail": str(e)[:300]})

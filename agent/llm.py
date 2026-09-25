@@ -47,9 +47,15 @@ try:  # also cover raw openai SDK errors
         _exc = getattr(_openai, _name, None)
         if isinstance(_exc, type) and _exc not in _BACKOFF_EXCEPTIONS:
             _BACKOFF_EXCEPTIONS.append(_exc)
-except Exception:
-    pass
-_BACKOFF_EXCEPTIONS = tuple(_BACKOFF_EXCEPTIONS)
+except Exception as _openai_err:
+    # A-level sweep: the fallback silently shrinks the transient-retry class
+    # set; say so once instead of zero signal.
+    print(f"[WARN] openai SDK exception classes unavailable "
+          f"({type(_openai_err).__name__}: {str(_openai_err)[:120]}); "
+          f"transient-error retry coverage reduced")
+    _BACKOFF_EXCEPTIONS = tuple(_BACKOFF_EXCEPTIONS)
+else:
+    _BACKOFF_EXCEPTIONS = tuple(_BACKOFF_EXCEPTIONS)
 
 litellm.drop_params = True
 
