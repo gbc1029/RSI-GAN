@@ -48,6 +48,7 @@ _HARNESS_FILES = [
     "domains/task_worker.py",
 ]
 _PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
+_SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
 
 
 # -- design persistence -----------------------------------------------------
@@ -164,6 +165,45 @@ def prepare_questions(
     return questions_path, ground_truth_by_id
 
 
+def _sandbox_identity(run_dir: str, run_id: str) -> Tuple[str, int, int]:
+    """Prepare a dedicated host uid and return (setpriv, uid, gid)."""
+    if os.name != "posix" or not hasattr(os, "chown"):
+        raise RuntimeError("G6b requires a POSIX host with setpriv and chown")
+
+    username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
+    if not username:
+        raise RuntimeError(
+            f"{_SANDBOX_USER_ENV} must name the non-root TaskAgent system user"
+        )
+    try:
+        import pwd
+        account = pwd.getpwnam(username)
+    except (ImportError, KeyError) as exc:
+        raise RuntimeError(f"sandbox user {username!r} does not exist") from exc
+
+    uid, gid = int(account.pw_uid), int(account.pw_gid)
+    if uid == 0:
+        raise RuntimeError("G6b refuses to run TaskAgent as uid 0")
+    current_uid = int(os.geteuid())
+    if current_uid not in (0, uid):
+        raise RuntimeError(
+            "G6b requires root or the configured sandbox uid to chown the run copy"
+        )
+    setpriv = shutil.which("setpriv")
+    if not setpriv:
+        raise RuntimeError("G6b requires the util-linux setpriv executable")
+
+    output_dir = os.path.join(run_dir, "outputs", run_id)
+    os.makedirs(output_dir, exist_ok=True)
+    for root, dirs, files in os.walk(run_dir, followlinks=False):
+        os.chown(root, uid, gid)
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            if not os.path.islink(path):
+                os.chown(path, uid, gid)
+    return setpriv, uid, gid
+
+
 def run_harness_and_report(
     python: str,
     run_dir: str,
@@ -188,12 +228,33 @@ def run_harness_and_report(
         "--num_samples", str(num_samples),
     ]
     if questions_path:
+        setpriv, uid, gid = _sandbox_identity(run_dir, run_id)
+        python_executable = python if os.path.isabs(python) else shutil.which(python)
+        if not python_executable:
+            raise RuntimeError(f"G6b cannot resolve Python executable: {python}")
+        harness_cmd = [
+            setpriv,
+            "--reuid", str(uid),
+            "--regid", str(gid),
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+            python_executable,
+            "-m", "domains.harness",
+            "--domain", domain,
+            "--model", model,
+            "--run_id", run_id,
+            "--subset", subset,
+            "--num_samples", str(num_samples),
+        ]
         harness_cmd.extend(["--questions_path", os.path.abspath(questions_path)])
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
         harness_cmd.extend(["--dataset_root", os.path.abspath(dataset_root)])
+    child_env = dict(env)
+    child_env.pop(_SANDBOX_USER_ENV, None)
     proc = subprocess.run(
-        harness_cmd, cwd=run_dir, env=env, text=True,
+        harness_cmd, cwd=run_dir, env=child_env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
     )
     out = proc.stdout or ""
