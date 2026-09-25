@@ -26,15 +26,13 @@ from gan.design.store import DesignStore
 from gan.framework.tree.store import Node, NodeValue
 
 def _modify_depth(records: List[Dict[str, Any]]) -> int:
+    from gan.patch import has_deep_write
+
     records = records or []
-    if any(
-        r.get("op") == "code_edit"
-        or (r.get("op") == "request_source_access" and r.get("intent") == "modify")
-        for r in records
-    ):
-        return 2
+    if has_deep_write(records):
+        return 2          # code-level change (incl. register/unregister)
     if records:
-        return 1
+        return 1          # operator-level (shallow design)
     return 0
 
 

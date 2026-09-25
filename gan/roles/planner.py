@@ -15,8 +15,8 @@ from gan.framework.context import DesignContext, reset_design_context, set_desig
 from gan.framework.context import PlanContext, reset_plan_context, set_plan_context
 from gan.framework import code_repo
 from gan.framework.receipt import render_receipt
-from gan.patch import build_patch_from_workspace
-from gan.roles.base_role import Role
+from gan.patch import build_patch_from_workspace, has_deep_write
+from gan.roles.base_role import Role, warn_dropped_workspace_edits
 from gan.summary import validate_feedback
 
 
@@ -122,9 +122,7 @@ class Planner(Role):
             def _build_patch() -> str:
                 if broker is None:
                     return ""
-                if not any(r.get("op") == "code_edit"
-                           or (r.get("op") == "request_source_access" and r.get("intent") == "modify")
-                           for r in (design_ctx.records + plan_ctx.records)):
+                if not has_deep_write(design_ctx.records + plan_ctx.records):
                     return ""
                 # B6: no catch — a patch-BUILD failure must never masquerade as
                 # a legitimate empty patch. Any failure (unreadable workspace /
@@ -162,6 +160,8 @@ class Planner(Role):
                 reset_access_context(tok_access)
 
         records = design_ctx.records + plan_ctx.records
+        warn_dropped_workspace_edits(broker, "planner", akey, records,
+                                     self.output_dir, patch_str)
         info = getattr(self, "last_run_info", {}) or {}
         return {
             "records": records,
@@ -207,10 +207,7 @@ class Planner(Role):
             hist = self.run(instruction, max_tool_calls=max_tool_calls, trajectory_file=traj)
 
             def _build_patch() -> str:
-                if broker is None or not any(
-                    r.get("op") == "request_source_access" and r.get("intent") == "modify"
-                    for r in dctx.records
-                ):
+                if broker is None or not has_deep_write(dctx.records):
                     return ""
                 # B6: no catch — see the plan-session _build_patch comment.
                 return build_patch_from_workspace(broker, "planner", self.access_key("self"))
@@ -240,6 +237,8 @@ class Planner(Role):
             reset_design_context(tok)
             if tok_access is not None:
                 reset_access_context(tok_access)
+        warn_dropped_workspace_edits(broker, "planner", self.access_key("self"),
+                                     dctx.records, self.output_dir, patch_str)
         self.save_self_config(cfg)
         info = getattr(self, "last_run_info", {}) or {}
         return {"records": dctx.records, "self_design": self.self_design_path(),

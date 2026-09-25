@@ -12,6 +12,34 @@ from gan.registries.loader import load_registry_for_role
 from gan.tools.assembly import assemble_tools_dir_reported
 
 
+def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_dir: str,
+                                 patch_str: str) -> None:
+    """Loud safety net for the silent-drop class (R1).
+
+    A session that left edits in the workspace but built no patch has DROPPED them.
+    The known cause was a deep tool that forgot to record its op; ``has_deep_write``
+    now covers the tools we ship, and this probe makes any future omission visible
+    (one ``deep_edit_dropped`` event) instead of silent. Advisory only: a failure to
+    compute the diff must never fail the session.
+    """
+    from gan.patch import build_patch_from_workspace, has_deep_write
+    if broker is None or patch_str or has_deep_write(records):
+        return
+    try:
+        leftover = build_patch_from_workspace(broker, role, key)
+    except Exception:  # noqa: BLE001 -- advisory probe must not fail the session
+        return
+    if not leftover:
+        return
+    from utils.soft_fail import soft_fail
+    soft_fail(
+        f"{role}: workspace has {len(leftover)} bytes of uncommitted deep edits but "
+        f"the session recorded no deep-write op; the edits were dropped",
+        event_path=paths.events_path(output_dir),
+        event_type="deep_edit_dropped", role=role,
+    )
+
+
 class Role(AgentSystem):
     def __init__(
         self,

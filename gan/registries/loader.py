@@ -67,6 +67,27 @@ def parse_registry_file(path: Path) -> Tuple[Optional[List[Dict[str, Any]]], Opt
     return data["components"], None
 
 
+def write_registry_json(path, data: Dict[str, Any]) -> None:
+    """Rewrite a registry JSON, PRESERVING its trailing-newline convention.
+
+    Session patches are generated with ``difflib.unified_diff``, which cannot
+    express "no newline at end of file". A registry that loses its final newline
+    therefore produces a patch ``git apply`` rejects as corrupt, silently blocking
+    every register/unregister. Writing through this one helper keeps the invariant
+    in a single place.
+    """
+    p = str(path)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            had_nl = f.read().endswith("\n")
+    except OSError:
+        had_nl = True
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        if had_nl:
+            f.write("\n")
+
+
 def _exposes_tool_api(path: Path) -> bool:
     """True if the module binds both ``tool_info`` and ``tool_function``.
 

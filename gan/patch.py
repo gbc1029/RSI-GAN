@@ -9,6 +9,7 @@ from __future__ import annotations
 import difflib
 import os
 import subprocess
+from pathlib import Path
 from typing import List, Optional
 
 
@@ -99,6 +100,59 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
                 if rel_file not in b_files:
                     chunks.append(_deletion_diff(broker.repo_root, rel_file))
     return "".join(chunks)
+
+
+# -- deep-write detection -----------------------------------------------------
+# Which recorded ops force the session patch builder. Expressed as a SHALLOW
+# allowlist on purpose: any op that is not a shallow design operator defaults to
+# DEEP, so a new deep tool needs no registration here (fail-safe). The shallow
+# set is DERIVED from ``gan/tools/design/`` (frozen plumbing, identical in the
+# per-run code tree) so a new design operator is automatically shallow; the
+# literal fallback covers a packaging / layout failure.
+_DESIGN_DIR = Path(__file__).resolve().parent / "tools" / "design"
+_FALLBACK_SHALLOW = frozenset({
+    "set_prompt", "set_config", "set_param",
+    "select_component", "deselect_component",
+})
+
+
+def _shallow_design_ops() -> frozenset:
+    try:
+        stems = {p.stem for p in _DESIGN_DIR.glob("*.py") if p.stem != "__init__"}
+    except OSError:
+        stems = set()
+    return frozenset(stems) or _FALLBACK_SHALLOW
+
+
+_SHALLOW_DESIGN_OPS = _shallow_design_ops()
+
+
+def has_deep_write(records) -> bool:
+    """True if any recorded op is a source-level (deep) write.
+
+    Single source of truth for the session patch gates (planner plan /
+    self_improve, evaluator self_improve) and ``task_runner._modify_depth``:
+
+    - a **shallow** design operator never triggers a patch by itself;
+    - ``request_source_access`` counts only with ``intent == "modify"`` (a ``view``
+      grant copies a read-only file and must not schedule a patch);
+    - **everything else** (``register_component`` / ``unregister_component`` /
+      ``code_edit`` / future deep tools) counts.
+
+    Unknown ops defaulting to "deep" is deliberate: a deep tool that forgets to be
+    listed here still gets its workspace edits patched (the R1 bug class), while a
+    forgotten shallow operator only costs one empty diff.
+    """
+    for r in records or []:
+        if not isinstance(r, dict):
+            continue
+        op = r.get("op")
+        if op in _SHALLOW_DESIGN_OPS:
+            continue
+        if op == "request_source_access" and r.get("intent") != "modify":
+            continue
+        return True
+    return False
 
 
 def apply_patch(repo_dir: str, patch_str: str) -> bool:

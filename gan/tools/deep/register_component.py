@@ -13,8 +13,8 @@ import os
 from pathlib import Path
 
 from gan.framework import frozen
-from gan.framework.context import get_access_context
-from gan.registries.loader import _REGISTRY_FILES, entry_reason
+from gan.framework.context import get_access_context, get_design_context
+from gan.registries.loader import _REGISTRY_FILES, entry_reason, write_registry_json
 
 # registries a role may actually write (planner.json is in no role's write roots,
 # so it is deliberately not offered in the schema enum)
@@ -60,6 +60,15 @@ def tool_function(kind, name, module, registry=None, **kwargs):
     broker = actx.broker
     node = actx.node_id
     code_root = broker.repo_root
+
+    # A deep write is only meaningful in a session that has a patch channel. The
+    # design context is set exactly in the sessions that turn the workspace into a
+    # patch (plan / self_improve); without it the edit would land in the workspace
+    # and then be silently discarded (R1). Refuse loudly instead.
+    dctx = get_design_context()
+    if dctx is None:
+        return ("Error: deep registry changes are currently unavailable in this "
+                "session; use `request_source_access` to view source. Do not retry.")
 
     if registry:
         reg_name = str(registry).strip()
@@ -127,8 +136,9 @@ def tool_function(kind, name, module, registry=None, **kwargs):
             return (f"Error: {kind} '{name}' already registered in {reg_rel} with a "
                     f"different module ({c.get('module')})")
     comps.append({"name": name, "kind": kind, "module": mod})
-    with open(ws_reg, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    write_registry_json(ws_reg, data)
+    dctx.record("register_component", kind=kind, name=name,
+                module=mod, registry=reg_name)
     return (f"Registered {kind} '{name}' ({module_rel}) in {reg_rel}. It will be "
             f"committed with this session's patch after validation; then use "
             f"select_component to enable it.")

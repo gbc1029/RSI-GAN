@@ -11,8 +11,8 @@ import os
 from pathlib import Path
 
 from gan.framework import frozen
-from gan.framework.context import get_access_context
-from gan.registries.loader import _REGISTRY_FILES, parse_registry_file
+from gan.framework.context import get_access_context, get_design_context
+from gan.registries.loader import _REGISTRY_FILES, parse_registry_file, write_registry_json
 
 
 def tool_info():
@@ -43,6 +43,15 @@ def tool_function(kind, name, **kwargs):
     broker = actx.broker
     node = actx.node_id
     code_root = broker.repo_root
+
+    # A deep write is only meaningful in a session that has a patch channel. The
+    # design context is set exactly in the sessions that turn the workspace into a
+    # patch (plan / self_improve); without it the edit would land in the workspace
+    # and then be silently discarded (R1). Refuse loudly instead.
+    dctx = get_design_context()
+    if dctx is None:
+        return ("Error: deep registry changes are currently unavailable in this "
+                "session; use `request_source_access` to view source. Do not retry.")
 
     for fn in _REGISTRY_FILES:
         rel = f"gan/registries/{fn}"
@@ -77,10 +86,11 @@ def tool_function(kind, name, **kwargs):
             c for c in data.get("components", [])
             if not (isinstance(c, dict) and c.get("kind") == kind and c.get("name") == name)
         ]
-        with open(ws_reg, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        write_registry_json(ws_reg, data)
         if ws_mod and os.path.isfile(ws_mod):
             os.remove(ws_mod)
+        dctx.record("unregister_component", kind=kind, name=name,
+                    registry=fn, module=(mod or None))
         return (f"Scheduled removal of {kind} '{name}' ({rel}); it will be committed with "
                 f"this session's patch after validation.")
     return f"Error: component not found: {kind} {name}"
