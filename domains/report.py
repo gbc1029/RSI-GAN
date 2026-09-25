@@ -8,25 +8,22 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 import argparse
 import importlib.util
 import json
+from typing import Mapping
+
 import pandas as pd
 
 
-def report(
-    dname,
-    domain,
-    suffix="",  # suffix to the predictions{suffix}.csv filename
-):
-    # Dynamically import functions based on the domain
+def _report_columns(domain):
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
     domain_folder = domain.split('_')[0] if "imo_" in domain else domain
     utils_module_path = f"domains.{domain_folder}.{utils_prefix}utils"
     utils_module = importlib.import_module(utils_module_path)
-    ground_truth_key = utils_module.GROUND_TRUTH_KEY
-    question_id_col = utils_module.QUESTION_ID
+    return utils_module.GROUND_TRUTH_KEY, utils_module.QUESTION_ID
 
-    # Load and process the data
-    path = os.path.join(dname, f"predictions{suffix}.csv")
-    df = pd.read_csv(path, dtype=str)
+
+def compute_report(df, domain, ground_truth_key, question_id_col):
+    """Compute the legacy label report from an in-memory dataframe."""
+    df = df.copy()
     df = df[df["prediction"] != ""].copy()  # Filter out rows with NA predictions
     df["prediction"] = df["prediction"].str.strip().str.lower()
     df[ground_truth_key] = df[ground_truth_key].str.strip().str.lower()
@@ -36,7 +33,6 @@ def report(
     accuracy = df["match"].mean()
     total_correct = int(df["match"].sum())
     total = len(df)
-    print(f"Accuracy: {accuracy:.3f}, Total correct: {total_correct} / {total}")
 
     # Calculate Mean Absolute Error (MAE)
     if domain == "imo_grading":
@@ -55,17 +51,13 @@ def report(
             df["error"] = abs(df["prediction_points"] - df['reward_points'])
             df["error"] = df["error"].fillna(max_error)
             mae = df["error"].mean() / max_error
-            print(f"Normalized Mean Absolute Error (MAE): {mae:.3f}")
-        except Exception as e:
+        except Exception:
             mae = None
-            print("Error: Could not calculate MAE for IMO grading")
-            print(e)
 
     # Accuracy by label
     label_accuracies = df.groupby(ground_truth_key)["match"].mean()
     label_counts = df[ground_truth_key].value_counts()
 
-    print("\nAccuracy by label:")
     label_report = {}
     labels = set(df[ground_truth_key].unique())
     for label in labels:
@@ -81,9 +73,6 @@ def report(
         correct_label = tp
         total_label = int(label_counts.get(label, 0))
 
-        print(
-            f"  Label: {label} - Precision: {precision:.3f}, Recall: {recall:.3f}, Correct: {correct_label} / {total_label}"
-        )
         label_report[str(label)] = {
             "precision": float(precision),
             "recall": float(recall),
@@ -95,22 +84,11 @@ def report(
     winner_distribution = df[ground_truth_key].value_counts(normalize=True).to_dict()
     prediction_distribution = df["prediction"].value_counts(normalize=True).to_dict()
 
-    print("\nDistribution of ground truth labels:")
-    for label, freq in winner_distribution.items():
-        print(f"  {label}: {freq:.3f}")
-
-    print("\nDistribution of prediction labels:")
-    for label, freq in prediction_distribution.items():
-        print(f"  {label}: {freq:.3f}")
-
     # Compute expected random guess accuracy using winner label distribution
     random_guess_accuracy = sum(p**2 for p in winner_distribution.values())
-    print(
-        f"\nExpected random guess accuracy (based on ground_truth_key label distribution): {random_guess_accuracy:.3f}"
-    )
 
     # Build the report dictionary
-    report = {
+    return {
         "overall_accuracy": float(accuracy),
         **({"normalized_mean_absolute_error": mae} if domain == "imo_grading" else {}),
         "total_correct": total_correct,
@@ -129,12 +107,68 @@ def report(
         ],
     }
 
+
+def compute_report_from_predictions(predictions, domain, ground_truth_by_id: Mapping[str, str]):
+    """Score prediction-only rows using parent-owned ground truth."""
+    ground_truth_key, question_id_col = _report_columns(domain)
+    df = predictions.copy()
+    df[ground_truth_key] = df[question_id_col].map(ground_truth_by_id)
+    return compute_report(df, domain, ground_truth_key, question_id_col)
+
+
+def _print_report(report_data):
+    accuracy = report_data["overall_accuracy"]
+    print(
+        f"Accuracy: {accuracy:.3f}, Total correct: "
+        f"{report_data['total_correct']} / {report_data['total']}"
+    )
+    if "normalized_mean_absolute_error" in report_data:
+        mae = report_data["normalized_mean_absolute_error"]
+        if mae is None:
+            print("Error: Could not calculate MAE for IMO grading")
+        else:
+            print(f"Normalized Mean Absolute Error (MAE): {mae:.3f}")
+
+    print("\nAccuracy by label:")
+    for label, values in report_data["accuracy_by_ground_truth"].items():
+        print(
+            f"  Label: {label} - Precision: {values['precision']:.3f}, "
+            f"Recall: {values['recall']:.3f}, Correct: "
+            f"{values['correct']} / {values['total']}"
+        )
+
+    print("\nDistribution of ground truth labels:")
+    for label, freq in report_data["label_distribution"]["ground_truth"].items():
+        print(f"  {label}: {freq:.3f}")
+    print("\nDistribution of prediction labels:")
+    for label, freq in report_data["label_distribution"]["prediction"].items():
+        print(f"  {label}: {freq:.3f}")
+    print(
+        "\nExpected random guess accuracy "
+        "(based on ground_truth_key label distribution): "
+        f"{report_data['random_guess_accuracy']:.3f}"
+    )
+
+
+def report(
+    dname,
+    domain,
+    suffix="",  # suffix to the predictions{suffix}.csv filename
+):
+    ground_truth_key, question_id_col = _report_columns(domain)
+
+    # Legacy CLI input retains ground truth in predictions.csv.
+    path = os.path.join(dname, f"predictions{suffix}.csv")
+    df = pd.read_csv(path, dtype=str)
+    report_data = compute_report(df, domain, ground_truth_key, question_id_col)
+    _print_report(report_data)
+
     # Save the report as a JSON file
     report_path = os.path.join(dname, f"report{suffix}.json")
     with open(report_path, "w") as f:
-        json.dump(report, f, indent=4)
+        json.dump(report_data, f, indent=4)
 
-    return report, report_path
+    return report_data, report_path
 
 def report_imo_proof(dname, model=None):
     # Grade the generated proofs

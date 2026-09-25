@@ -9,18 +9,22 @@ Responsibilities:
 - persist the task design snapshot (``DesignStore``);
 - assemble the task toolset and runtime env (GAN_TASK_*);
 - prepare the run dir (copy repo + apply patch when a deep change was requested);
-- invoke ``domains.harness`` + ``domains.report``;
+- prepare questions-only input and parent-owned ground truth;
+- invoke ``domains.harness`` and score its predictions in the parent process;
 - read the report and compute the objective ``report_summary``
   (contract / coverage facts — NOT an evaluator eval point).
 """
 from __future__ import annotations
 
+import importlib
 import json
 import math
 import os
 import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
 
 from gan.design.store import DesignStore
 from gan.patch import apply_patch
@@ -43,6 +47,7 @@ _HARNESS_FILES = [
     "domains/report.py",
     "domains/task_worker.py",
 ]
+_PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
 
 
 # -- design persistence -----------------------------------------------------
@@ -119,7 +124,46 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
     return run_dir, applied
 
 
-# -- harness / report -------------------------------------------------------
+# -- dataset / harness / report --------------------------------------------
+def uses_parent_scoring(domain: str) -> bool:
+    return domain in _PARENT_SCORED_DOMAINS
+
+
+def prepare_questions(
+    dataset_root: str,
+    run_dir: str,
+    domain: str,
+    subset: str,
+    num_samples: int,
+) -> Tuple[str, Dict[str, Any]]:
+    """Write questions-only input and retain ground truth in parent memory."""
+    utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
+    domain_folder = domain.split("_")[0] if "imo_" in domain else domain
+    utils_module = importlib.import_module(
+        f"domains.{domain_folder}.{utils_prefix}utils"
+    )
+    question_id_col = utils_module.QUESTION_ID
+    ground_truth_key = utils_module.GROUND_TRUTH_KEY
+
+    if "imo_" in domain:
+        rel = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
+    else:
+        rel = f"domains/{domain}/dataset{subset}.csv"
+    dataset = pd.read_csv(os.path.join(os.path.abspath(dataset_root), rel), dtype=str)
+    if num_samples > 0:
+        dataset = dataset[:num_samples]
+
+    ground_truth_by_id = dict(
+        zip(dataset[question_id_col].tolist(), dataset[ground_truth_key].tolist())
+    )
+    questions = dataset.drop(columns=[ground_truth_key])
+    input_dir = os.path.join(run_dir, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    questions_path = os.path.join(input_dir, "questions.csv")
+    questions.to_csv(questions_path, index=False)
+    return questions_path, ground_truth_by_id
+
+
 def run_harness_and_report(
     python: str,
     run_dir: str,
@@ -130,10 +174,11 @@ def run_harness_and_report(
     model: str,
     env: Dict[str, str],
     timeout: int,
-    dataset_root: str,
+    questions_path: Optional[str] = None,
+    dataset_root: Optional[str] = None,
     log_path: Optional[str] = None,
 ) -> Tuple[int, str]:
-    """Run the (frozen) domain harness + report; return (harness_rc, output_tail)."""
+    """Run the frozen harness; parent-side reporting happens separately."""
     harness_cmd = [
         python, "-m", "domains.harness",
         "--domain", domain,
@@ -141,16 +186,14 @@ def run_harness_and_report(
         "--run_id", run_id,
         "--subset", subset,
         "--num_samples", str(num_samples),
-        "--dataset_root", os.path.abspath(dataset_root),
     ]
+    if questions_path:
+        harness_cmd.extend(["--questions_path", os.path.abspath(questions_path)])
+    elif dataset_root:
+        # Compatibility path for domains with their own evaluator/harness.
+        harness_cmd.extend(["--dataset_root", os.path.abspath(dataset_root)])
     proc = subprocess.run(
         harness_cmd, cwd=run_dir, env=env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
-    )
-    subprocess.run(
-        [python, "-m", "domains.report", "--domain", domain,
-         "--dname", os.path.join("./outputs", run_id)],
-        cwd=run_dir, env=env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
     )
     out = proc.stdout or ""
@@ -158,6 +201,38 @@ def run_harness_and_report(
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"\n$ {' '.join(harness_cmd)} (cwd={run_dir})\n{out[-4000:]}\n")
     return proc.returncode, out
+
+
+def write_parent_report(
+    predictions_path: str,
+    report_path: str,
+    domain: str,
+    ground_truth_by_id: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Score prediction-only output and persist the existing report schema."""
+    from domains.report import compute_report_from_predictions
+
+    predictions = pd.read_csv(predictions_path, dtype=str)
+    report = compute_report_from_predictions(
+        predictions, domain, ground_truth_by_id,
+    )
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=4)
+    return report
+
+
+def run_existing_domain_report(domain: str, dname: str, model: str) -> Optional[Dict[str, Any]]:
+    """Call the existing independent-domain report entry point in this parent."""
+    if domain == "imo_proof":
+        from domains.report import report_imo_proof
+        report_imo_proof(dname=dname, model=model)
+    elif "balrog" in domain:
+        from domains.balrog.eval import report_balrog
+        report_balrog(output_dir=dname)
+    elif "genesis" in domain:
+        from domains.genesis.eval import report_genesis
+        report_genesis(output_dir=dname)
+    return read_report(os.path.join(dname, "report.json"))
 
 
 def read_report(report_path: str) -> Optional[Dict[str, Any]]:

@@ -265,6 +265,7 @@ def harness(
     proofs_dname=None,
     model=None,
     dataset_root=None,
+    questions_path=None,
 ):
     # Dynamically import functions based on the domain
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
@@ -281,9 +282,9 @@ def harness(
             "gan/framework/models.yaml by the driver)."
         )
 
-    # GAN calls provide dataset_root and must always use the sandbox. Legacy
+    # GAN calls provide questions_path and must always use the sandbox. Legacy
     # direct harness calls retain their original same-process behavior.
-    sandbox_task_agent = dataset_root is not None
+    sandbox_task_agent = questions_path is not None or dataset_root is not None
     TaskAgent = None if sandbox_task_agent else load_task_agent(agent_path)
 
     # Specify output folder
@@ -315,7 +316,9 @@ def harness(
         completed_ids = set()
 
     # Get dataset
-    if proofs_dname:
+    if questions_path:
+        dataset = pd.read_csv(questions_path, dtype=str)
+    elif proofs_dname:
         dataset = pd.read_csv(os.path.join(proofs_dname, "predictions.csv"), dtype=str)
         dataset["Response"] = dataset["prediction"].copy()
         dataset.drop(columns=["prediction"], inplace=True)
@@ -392,13 +395,15 @@ def harness(
 
             if (idx + 1) % save_interval == 0:
                 dataset["prediction"] = predictions
-                dataset.to_csv(output_path, index=False)
+                output_columns = [question_id_col, "prediction"] if questions_path else None
+                dataset.to_csv(output_path, index=False, columns=output_columns)
                 append_pending_failures()
                 print(f"Checkpoint saved to {output_path}")
 
     # Final save
     dataset["prediction"] = predictions
-    dataset.to_csv(output_path, index=False)
+    output_columns = [question_id_col, "prediction"] if questions_path else None
+    dataset.to_csv(output_path, index=False, columns=output_columns)
     print(f"Final predictions saved to {output_path}")
 
     if failures:
@@ -470,7 +475,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dataset_root", type=str, default=None,
-        help="Parent-only benchmark root. Providing it requires sandboxed TaskAgent execution.",
+        help="Legacy benchmark root. Providing it requires sandboxed TaskAgent execution.",
+    )
+    parser.add_argument(
+        "--questions_path", type=str, default=None,
+        help="Questions-only CSV prepared by the GAN parent process.",
     )
     args = parser.parse_args()
 
@@ -494,6 +503,7 @@ if __name__ == "__main__":
             proofs_dname=args.proofs_dname,
             model=args.model,
             dataset_root=args.dataset_root,
+            questions_path=args.questions_path,
         )
 
     # Balrog game domains
