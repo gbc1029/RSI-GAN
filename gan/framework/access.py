@@ -123,8 +123,16 @@ class AccessBroker:
         return True
 
     def _grant_concrete(self, rel: str, src_root: str, granted: List[str],
-                        denied_list: List[str], missing: List[str]) -> None:
-        """Copy one concrete repo-relative path into the workspace (with guards)."""
+                        denied_list: List[str], missing: List[str],
+                        if_absent: bool = False,
+                        skipped: Optional[List[str]] = None) -> None:
+        """Copy one concrete repo-relative path into the workspace (with guards).
+
+        With ``if_absent``, an existing workspace copy is NEVER overwritten -- it may
+        hold this session's ``edit_source`` edits or ``unregister_component``
+        deletions. The path is still reported as granted (and listed in ``skipped``)
+        so the patch builder keeps tracking it.
+        """
         try:
             s = self._safe_join(self.repo_root, rel)
         except ValueError:
@@ -146,6 +154,13 @@ class AccessBroker:
         if not self._within_caps(s):
             denied_list.append(rel)
             return
+        if if_absent and os.path.exists(d):
+            # keep the workspace copy; report the path as available so the patch
+            # builder keeps tracking it (the caller learns it was skipped)
+            granted.append(rel)
+            if skipped is not None:
+                skipped.append(rel)
+            return
         os.makedirs(os.path.dirname(d) or src_root, exist_ok=True)
         if os.path.isdir(s):
             shutil.copytree(s, d, dirs_exist_ok=True, ignore=self._output_ignored)
@@ -161,17 +176,24 @@ class AccessBroker:
         paths_list: List[str],
         intent: str = "view",
         reason: str = "",
+        if_absent: bool = False,
     ) -> List[str]:
         """Copy requested repo paths into the role workspace ``src/``.
 
         Returns the list of actually granted (relative) paths. Denied paths are
         audited but their reason is NOT surfaced to the agent.
+
+        ``if_absent=True`` makes the grant non-destructive: a path whose workspace
+        copy already exists is left untouched (it may hold this session's edits or
+        deletions) and is reported in ``last_result["skipped"]`` / the audit record.
+        Callers that deliberately want a pristine re-copy must NOT pass it.
         """
         if not self.auto_approve:
             raise PermissionError("source access requires approval (auto_approve=False)")
         granted: List[str] = []
         denied_list: List[str] = []
         missing: List[str] = []
+        skipped: List[str] = []
         src_root = self.src_dir(role, node_id)
         for raw in paths_list or []:
             rel = str(raw).replace("\\", "/").lstrip("/")
@@ -197,15 +219,18 @@ class AccessBroker:
                     if not frozen.is_allowed(role, m, intent):
                         denied_list.append(m)
                         continue
-                    self._grant_concrete(m, src_root, granted, denied_list, missing)
+                    self._grant_concrete(m, src_root, granted, denied_list, missing,
+                                         if_absent=if_absent, skipped=skipped)
             else:
-                self._grant_concrete(rel, src_root, granted, denied_list, missing)
+                self._grant_concrete(rel, src_root, granted, denied_list, missing,
+                                     if_absent=if_absent, skipped=skipped)
 
         rec = {
             "type": "source_access_grant",
             "role": role,
             "node_id": str(node_id),
             "paths": granted,
+            "skipped": skipped,
             "denied": denied_list,
             "missing": missing,
             "intent": intent,
@@ -215,7 +240,8 @@ class AccessBroker:
         }
         self.grants.setdefault((role, str(node_id)), []).append(rec)
         self.log_event(rec)
-        self.last_result = {"granted": granted, "denied": denied_list, "missing": missing}
+        self.last_result = {"granted": granted, "denied": denied_list,
+                            "missing": missing, "skipped": skipped}
         return granted
 
     def granted_paths(self, role: str, node_id: Any) -> List[str]:

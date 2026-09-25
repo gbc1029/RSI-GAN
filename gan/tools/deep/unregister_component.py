@@ -53,10 +53,24 @@ def tool_function(kind, name, **kwargs):
         return ("Error: deep registry changes are currently unavailable in this "
                 "session; use `request_source_access` to view source. Do not retry.")
 
+    src = broker.src_dir(role, node)
     for fn in _REGISTRY_FILES:
         rel = f"gan/registries/{fn}"
-        ents, err = parse_registry_file(Path(os.path.join(code_root, rel)))
-        if err or not ents:
+        ws_reg = os.path.join(src, rel)
+        # The workspace copy is this session's source of truth. Scanning the repo copy
+        # would still match a component already removed earlier in this session, and
+        # would MISS one registered earlier in this session (so unregister could not
+        # undo a same-session register).
+        in_ws = os.path.isfile(ws_reg)
+        ents, err = parse_registry_file(
+            Path(ws_reg) if in_ws else Path(os.path.join(code_root, rel)))
+        if err:
+            if in_ws:
+                # we wrote this file in-session: an unparseable workspace registry is
+                # our own corruption, never "component not found"
+                return f"Error: workspace registry is not parseable: {rel} ({err})"
+            continue
+        if not ents:
             continue
         match = [e for e in ents
                  if isinstance(e, dict) and e.get("kind") == kind and e.get("name") == name]
@@ -64,19 +78,36 @@ def tool_function(kind, name, **kwargs):
             continue
         if not frozen.is_allowed(role, rel, "modify"):
             return f"Error: registry not editable for {role}: {rel}"
-        mod = str(match[0].get("module") or "")
+        mod = str(match[0].get("module") or "").replace("\\", "/").strip("/")
+        # A registry entry is DATA, and with the workspace-first scan above it can come
+        # from a file this session edited -- so never trust its path. Reject traversal
+        # outright: the allowlist matches prefix globs, so it would accept
+        # "gan/components/task/../../<outside>" and os.remove() would then delete a
+        # file outside the workspace.
+        if mod and (not mod.endswith(".py") or any(p == ".." for p in mod.split("/"))):
+            return f"Error: unsafe module path in registry entry: {mod!r}"
         module_rel = f"gan/components/{mod}" if mod else ""
         if module_rel and not frozen.is_allowed(role, module_rel, "modify"):
             return f"Error: component source not editable for {role}: {module_rel}"
 
-        # bring the registry (and module, if present) into the workspace
-        broker.grant(role, node, [rel], intent="modify", reason="unregister")
+        # bring the registry (and module, if present) into the workspace.
+        # ``if_absent`` never overwrites an existing workspace copy: re-granting the
+        # registry would discard the removals (and edit_source edits) already applied
+        # this session, and the resulting patch (entry restored, module still deleted)
+        # is rejected by the registry gate. The MODULE is granted even when it is
+        # absent from the workspace, so the deletion stays visible to the patch builder.
+        broker.grant(role, node, [rel], intent="modify", reason="unregister", if_absent=True)
         if module_rel:
-            broker.grant(role, node, [module_rel], intent="modify", reason="unregister")
+            broker.grant(role, node, [module_rel], intent="modify", reason="unregister",
+                         if_absent=True)
 
-        src = broker.src_dir(role, node)
-        ws_reg = os.path.join(src, rel)
         ws_mod = os.path.join(src, module_rel) if module_rel else ""
+        if ws_mod:
+            # defence in depth (covers symlinks/other tricks): never delete outside src/
+            src_real = os.path.realpath(src)
+            ws_real = os.path.realpath(ws_mod)
+            if ws_real != src_real and not ws_real.startswith(src_real + os.sep):
+                return f"Error: module path escapes the workspace: {mod!r}"
         try:
             with open(ws_reg, "r", encoding="utf-8") as f:
                 data = json.load(f)

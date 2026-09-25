@@ -15,7 +15,9 @@ def tool_info():
         "description": (
             "DEEP change: request source access to VIEW or MODIFY the given paths. Use only "
             "when shallow design/config operators cannot express the change (e.g. adding a new "
-            "config key, a new component implementation, or editing an implementation)."
+            "config key, a new component implementation, or editing an implementation). "
+            "Requesting a path you already hold KEEPS your local copy; pass refresh=true to "
+            "discard local edits and re-copy the pristine repo version."
         ),
         "input_schema": {
             "type": "object",
@@ -23,20 +25,31 @@ def tool_info():
                 "paths": {"type": "array", "items": {"type": "string"}},
                 "intent": {"type": "string", "enum": ["view", "modify"]},
                 "reason": {"type": "string"},
+                "refresh": {
+                    "type": "boolean",
+                    "description": ("Replace your workspace copies with the pristine repo "
+                                    "version, DISCARDING local edits made this session. "
+                                    "Default false (existing copies are kept as-is)."),
+                },
             },
             "required": ["paths", "reason"],
         },
     }
 
 
-def tool_function(paths=None, intent="view", reason="", **kwargs):
+def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs):
     actx = get_access_context()
     dctx = get_design_context()
     if actx is None:
         return "Error: no access context"
     if isinstance(paths, str):
         paths = [paths]
-    granted = actx.broker.grant(actx.role, actx.node_id, paths or [], intent=intent, reason=reason)
+    # Default (if_absent): never overwrite a workspace copy that already exists -- it may
+    # hold this session's edit_source edits or unregister_component deletions. refresh=True
+    # is the explicit escape hatch that discards them and re-copies the repo version.
+    granted = actx.broker.grant(actx.role, actx.node_id, paths or [], intent=intent,
+                                reason=reason, if_absent=not refresh)
+    kept = list((getattr(actx.broker, "last_result", None) or {}).get("skipped") or [])
     if dctx is not None:
         dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)
     # NOTE: denied/missing paths are audited (events.jsonl + broker.last_result) but are
@@ -49,10 +62,12 @@ def tool_function(paths=None, intent="view", reason="", **kwargs):
         except Exception:
             src_root = None
         where = f" (workspace src: {src_root})" if src_root else ""
+        kept_note = (f" Already in your workspace and kept as-is (not overwritten): {kept}."
+                     if kept else "")
         if intent == "modify":
             return (f"Granted {intent} access to: {granted}{where}. "
-                    f"Edit these copies with `edit_source`.")
-        return f"Granted {intent} access to: {granted}{where}."
+                    f"Edit these copies with `edit_source`.{kept_note}")
+        return f"Granted {intent} access to: {granted}{where}.{kept_note}"
     if paths:
         return ("No accessible paths (denied / not in your editable set). "
                 "Call `list_editable` to see which paths you may request.")

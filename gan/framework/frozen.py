@@ -95,9 +95,20 @@ def write_roots(role: str) -> List[str]:
 
 
 def is_allowed(role: str, rel: str, intent: str = "view") -> bool:
-    """Allowlist check. intent 'view' -> read roots; anything else -> write roots."""
+    """Allowlist check. intent 'view' -> read roots; anything else -> write roots.
+
+    Traversal is never legitimate: no allowlist rule contains ``..``, and because
+    the rules are matched as **prefix globs** (``fnmatch`` lets ``*`` cross ``/``)
+    a path like ``gan/components/task/../../../<outside>`` would otherwise satisfy
+    ``gan/components/task/**``. Rejecting it here closes the whole class at the one
+    gate every consumer (grant / register / unregister / commit) goes through.
+    """
     if not rel:
         return False
+    raw = str(rel).replace("\\", "/")
+    if raw.startswith("/") or any(part == ".." for part in raw.split("/")):
+        return False
+    rel = raw
     roots = read_roots(role) if intent == "view" else write_roots(role)
     if not _matches(rel, roots):
         return False
