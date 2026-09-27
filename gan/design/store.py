@@ -5,7 +5,7 @@ import json
 import os
 from typing import Any, Dict, Optional
 
-from gan.design.schema import default_config
+from gan.design.schema import default_config, normalize_config
 
 
 class DesignStore:
@@ -21,7 +21,10 @@ class DesignStore:
         p = self.path(role, node_id)
         if os.path.exists(p):
             with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
+                # fold legacy slot names (skills/eval_points) into ``tools`` so an
+                # older run's checkpoint cannot silently lose its selections
+                # after the batch-6 vocabulary unification
+                return normalize_config(json.load(f))
         return default_config(role)
 
     def save(self, config: Dict[str, Any], role: str, node_id: Any = None) -> str:

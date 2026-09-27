@@ -19,6 +19,7 @@
 | 第 3 批（A 批） | `docs(gan/tools): correct stale review conclusions, sync records, document deep-write constraints` | A1–A13：被审查文档的过时结论更正（只增不删）+ 约束写入 `AGENTS.md`/seeds + 汇总文档自洽。A14–A16 未做，见 §6.1 |
 | 第 4 批（读侧） | `fix(gan/tools): list_components workspace overlay, design-role catalog, unsafe registry module paths` | **B18 + H10 + H9**：读侧与两个 deep 工具口径统一（工作区优先、设计目标角色、增删/覆盖可见），注册表 `module` 路径净化。见 §8 |
 | 第 5 批（plan→task 应用） | `fix(gan/framework): heal task design before persist; overlay-validated selection; set_config slot validation` | **B24 + B25 + P-3**：task 设计持久化前自愈（H11/B24 关闭）、`select_component`/`set_config` 槽位同权校验（B25/H12 关闭）、同会话选择（推翻第 4 批决策，见 §9.1）。见 §9 |
+| 第 6 批（注册表统一） | `fix(gan/registries): per-role single-writer catalogs, role-directory binding, md knowledge base` | **A14 + B2 + H6/C6 关闭**：三注册表独立（无 shared）、name 主键、角色目录绑定、单一 `tools` 槽位（legacy 归一化）、kind 机械退役、md 知识库（pull 型 + p/e 同批启用）。见 §10 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -256,11 +257,11 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 
 **分类口径**：**A 文档/注释**（零行为风险）· **B 小范围代码**（单文件、少行、低风险）· **C 大范围修改**（跨文件 / 改语义 / 需设计决策）。编号与 `docs/7` §3.4 的"仍未修"清单一致；标 **需决策** 的项须先定口径再动手。**本节是本会话结束时的完整待办快照**——A1–A13 与 **B18** 已在本会话完成（见 §7.3 / §8），A14 起、B1–B17、B19 起为剩余项。
 
-### 6.1 A 类：文档或注释（剩余 3 项）
+### 6.1 A 类：文档或注释（剩余 2 项）
 
 | 编号 | 项 | 位置 | 说明 |
 |---|---|---|---|
-| **A14** | P5 措辞收敛 | `docs/工具管理审查.md` §四 P5 | "`shared.json` 让组件对所有角色可见"不准确：其 `skill` 只对 task 生效、`eval_point` 只对 evaluator 生效 |
+| ~~**A14**~~ | ~~P5 措辞收敛~~ —— **✅ 第 6 批结构性消解**：shared.json 已删除，问题对象不复存在（见 §10） | — | — |
 | **A15** | 防御层盲区记为已知限制 | 本文档 §5.3、`docs/7` §3.4 | `warn_dropped_workspace_edits`（`base_role.py:29`）用 `build_patch_from_workspace` 做检测 ⇒ 与补丁构建器**同一盲区**（只看 `granted_paths`），H8 类问题**构造性不可发现**；彻底修法见 C3 |
 | **A16** | `loop.yaml` 自洽说明 | `gan/framework/loop.yaml` 文件头 | 头声明 "every key below MUST have a code consumer" 与 `cost.token_budget_per_gen` / `cost.record_usage`（保留待 G3）冲突；补"保留键"说明，或接线（见 B21） |
 
@@ -269,11 +270,11 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | 编号 | 项 | 位置 | 规模 | 需决策 |
 |---|---|---|---|---|
 | **B1** | **H8**（原编号 A2）守卫下沉（静默丢弃，**最高优先**） | `register_component.py:166-167` | **1 行** | — |
-| **B2** | **H1** 跨注册表重复早检查 | `register_component.py` 追加前 | ~10 行 | — |
+| **B2** | ~~**H1** 跨注册表重复早检查~~ —— **✅ 第 6 批结构性消解**：单文件单写者 ⇒ 跨文件重复不可构造（见 §10） | ~~原位~~ | — | — |
 | **B3** | **H2** 复用 repo 原条目字段（`description`/`params_schema`） | `register_component.py` 追加前 | ~8 行 | — |
 | **B4** | **原子写** `write_registry_json` | `registries/loader.py:70` | ~5 行 | — |
-| **B5** | **H6** 默认注册表按模块前缀路由 | `register_component.py:_OWN_REGISTRY` | ~15 行 | **是** |
-| **B6** | 报告 R4：`unregister` 对"多注册表声明同一组件"只删第一个 | `unregister_component.py` 扫描循环 | ~10 行 | — |
+| **B5** | ~~**H6** 默认注册表按模块前缀路由~~ —— **✅ 第 6 批结构性消解**：角色目录绑定（见 §10） | ~~原位~~ | — | — |
+| **B6** | ~~报告 R4：`unregister` 对"多注册表声明同一组件"只删第一个~~ —— **✅ 第 6 批结构性消解**：每组件只可能声明在一个文件（见 §10） | ~~原位~~ | — | — |
 | **B7** | 报告 R5：always-on 工具（`gan/tools/**`）不参与 V3/AST 校验 | `preflight.py` | ~15 行 | — |
 | **B8** | 报告 R6：`load_tools` 每次把 `tools_dir` 插 `sys.path`（跨 outer 线性增长） | `agent/tools/__init__.py:27-28` | ~4 行 | — |
 | **B9** | 报告 R7：`build_diff_summary.files` 混用完整路径与 basename | `summary.py:37-42` | ~3 行 | — |
@@ -614,3 +615,68 @@ select_component(dctx.role=task) -> skills = ['foo']      # 选择器接受了
 **新增遗留**：
 - **角色设计的 heal**（`save_self_config` 无条件，同 H11 模式）：角色自设计现在 committed-only 所以**不会新造**悬空，但存量链上的悬空名未自愈——登记为 **B26**（~15 行，需决策：角色设计是否也开 overlay + heal）。
 - B14 其余死分支清理仍在（本批只做了 3 个现代 op 分支）。
+
+---
+
+## 10. 第 6 批：注册表统一 + knowledge 体系（"三注册表统一 + SKILL=md 知识"）
+
+> 起因：B2（跨注册表重复）讨论中用户先问了注册表分工（planner/evaluator 是否应共享 shared.json、skills 是否应仅限 task、task 的工具渠道），随后提出更彻底的设计——**不再有 shared，三注册表各自独立、源码按角色分开、全部视为 tools**；再修正词汇：**skills 应是 md 文本知识（经提示词/按需取阅），而非可调用工具**。用户决策：TOOL 统一 + knowledge（pull 型）+ p/e 知识库同批，**一批做完**。
+
+### 10.1 决策记录
+
+| 决策 | 结论 |
+|---|---|
+| 注册表模型 | **三文件独立、单写者**：`task.json`/`planner.json`/`evaluator.json`，无 shared.json；条目以 **name 为主键**；**角色目录绑定**（条目只能引用设计角色自己的 `gan/components/<role>/**`） |
+| kind 字段 | **机械退役**（内容保留为描述性标签）：skill/eval_point 不再参与任何路由；旧条目/旧配置不需要改字段 |
+| 设计槽位 | **每角色单一 `tools`**；旧键 `skills`/`eval_points` 作为别名被算子接受，并在载入时归一化（`schema.normalize_config`）——旧 checkpoint 不因改名静默丢选择 |
+| SKILL 语义 | **md 知识（DATA），pull 型**：不进注册表、无 name=stem 契约；planner 经 deep 补丁创作；提交后整库物化进 task 沙盒；task 经 **opt-in `knowledge` 工具**按需取阅；**无知识配置清单**（base 即 base） |
+| p/e 知识库 | **同批启用**：evaluator 知识库零代码（allowlist 已覆盖）；planner 知识库 = allowlist 加 `gan/components/planner/**` 一行；p/e 经**现有访问通道**读（grant+list_dir+read_file），不造第二条未审计读通道 |
+| planner/evaluator 侧 tools 槽位 | schema 三角色同构（planner 先留空）；deep 工具的目标注册表 = 本角色设计的那个文件 |
+
+**机制事实（为什么可行）**：eval_point 本来就是 `tool_info`/`tool_function` 形态的可调用工具（`hard_failure.py`），与 skill 走同一装配/装载链；差别只是词汇与目录。penalties 是活通道、`eval_point_results` 全仓无读者（死数据，处置留 B28），且**无任何"选中即必须调用"的强制**——统一不弱化现存治理。
+
+### 10.2 由此消解的待办
+
+- **A14（P5 措辞）**：shared 不存在了，"名不副实"问题**整体消失**；
+- **B2（H1 跨注册表重复）**：单文件单写者 ⇒ 跨文件重复**构造不出来**；提交门与 `validate_registry` 的 duplicate 收敛为**文件内重名**（同一检查，双端一致）；
+- **H6/C6（注册表作用域）**：角色目录绑定使"死条目"（evaluator 注册 skill 类）**不可构造**；
+- **Q2 的死条目/目录噪音类**：同上，结构性消失。
+
+**保留**：B1/B16/B17（碰撞面仍在 always-on）、身份契约（统一后更重要）、第 4/5 批 overlay+自愈机制（原样，槽位换 `tools`）。
+
+### 10.3 变更清单
+
+| 文件 | 内容 |
+|---|---|
+| `gan/registries/loader.py` | 单文件加载（去 shared 合并）、name 主键、`entry_reason(.., owning_role)` 角色目录绑定、duplicate=文件内重名、`_ROLE_OF_FILE`、`KINDS` 降级为 legacy 标签 |
+| `gan/framework/frozen.py` | 去 shared 两行；planner 加 `gan/components/planner/**` |
+| 内容迁移 | `shared/skills/{bash,editor}.py` → `task/skills/`；删 `gan/components/shared/**`；`shared.json` 删除；`task.json` 重写（bash/editor/knowledge，kind 留标签） |
+| `gan/components/task/tools/knowledge.py` | **新**：pull 型取阅工具（列目录/读单篇、`basename` 封目录、单篇 20k 封顶） |
+| `gan/framework/task_execution.py` | `GAN_TASK_TOOLS_DIR`（改名）+ `GAN_TASK_KNOWLEDGE_DIR` + 提交库整库物化（单篇/总量封顶、skip 入 toolset_report.knowledge）；`heal_design_slots` 槽位 `tools` |
+| `gan/design/schema.py` + `store.py` | `tools` 槽位统一 + `normalize_config`（legacy 折叠，载入/恢复路径全覆盖） |
+| `gan/tools/assembly.py` | 单槽位解析（兼容 legacy 键） |
+| `gan/tools/design/{select,deselect,set_config}.py` | slot 别名归一（`skills`/`eval_points`→`tools`）；set_config 的 slot 校验随 H12 保持 |
+| `gan/tools/deep/{register,unregister}_component.py` | 去 kind 参数、目标=设计角色注册表、角色目录绑定检查（register 中**最优先**报错）、unregister 按名扫描单文件 |
+| `gan/tools/work/common/list_components.py` | 单注册表简化（去跨文件 origin/pending 逻辑），保留 overlay/pending/H10/selectable 镜像/patch_covered |
+| `gan/framework/{preflight,code_repo}.py` | preflight 用 `resolve_module`；gate 的 duplicate=文件内重名（双端一致） |
+| `gan/framework/{receipt,task_runner,loop,build}.py` + `task_agent.py` | `tools_added/removed`、slot=tools、`_parent_config` 归一化、`tools` 键 + env 双读（兼容旧 env 名） |
+
+### 10.4 验证（/tmp/b6_verify.py，35/35）
+
+- V1 loader：task 目录=bash/editor/knowledge、evaluator 目录原样保留、legacy kind 标签通过校验、跨树条目被拒、文件内重名被检；
+- V2 assembly：`tools` 槽位装配 ✓、legacy `skills` 键仍装配 ✓；
+- V3 设计算子：select/deselect/set_config 的别名与原子拒绝、record 带 `selected`；
+- V4 归一化：`normalize_config` 折叠 + `DesignStore.load` 折叠（旧 checkpoint 安全）；
+- V5 knowledge：物化（超限 skip 入 report）+ env 改名 + 工具列/读/目录封顶；
+- V6 deep：无 kind 注册、同会话选择（P-3 不变）、跨树拒绝、record 无 kind、按名注销；patch 携带注册；
+- V8 heal：`tools` 槽位剥离 ghost（"补丁被拒→设计被治愈"在统一词汇下重建）；
+- V7 preflight/gate：真实仓库 0 问题 0 碰撞；文件内重复被门拒。
+- 另：深层 heal 回归（register→select→poison patch→strip）在统一词汇下重建通过。
+
+### 10.5 明确不做（第 6 批）
+
+- **R5/B28**：`eval_point_results`（全仓无读者）的接线或删除——统一时未动，待决策；
+- **B27**：子进程 `load_tools` skip 可见性（此前已拍板登记）；
+- **B29**：`set_prompt` 记录升级（hash+size）——放弃知识配置清单后，提示词是唯一"不透明"知识通道，此项价值上升；
+- **push 型知识清单**：被 pull 型替代，不实现；
+- **planner.json 启用**：schema 同构就绪，等真有 planner 组件需求时解锁（C 档）。

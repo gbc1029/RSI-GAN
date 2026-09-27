@@ -138,7 +138,7 @@ class DomainTaskRunner:
                 from utils import trajectory_log as _tlog
                 _tlog.append(_paths.events_path(self.output_dir), dict(
                     {"type": "design_dangling_stripped", "genid": str(genid),
-                     "role": "task", "slot": "skills"}, names=design_stripped))
+                     "role": "task", "slot": "tools"}, names=design_stripped))
             except Exception as e:  # noqa: BLE001 -- audit is advisory; stderr covers
                 print(f"[WARN] design_dangling_stripped event write failed: {e}")
 

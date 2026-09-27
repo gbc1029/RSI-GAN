@@ -84,8 +84,11 @@ def heal_design_slots(config: Dict[str, Any], role: str,
     """
     if not isinstance(config, dict):
         return []
-    slot = "skills" if role == "task" else ("eval_points" if role == "evaluator" else None)
-    if slot is None:
+    # batch 6: the single component slot is ``tools`` for every role; healing
+    # still applies ONLY to the task design (batch-5 scope: role self-designs
+    # select against the committed registry, so no new dangling name enters them)
+    slot = "tools"
+    if role != "task":
         return []
     names = config.get(slot)
     if not isinstance(names, (list, tuple)) or not names:
@@ -94,16 +97,15 @@ def heal_design_slots(config: Dict[str, Any], role: str,
     from gan.tools.assembly import gan_roots
     _tools, rdir, cdir = gan_roots(code_root)
     reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
-    kind = "skill" if slot == "skills" else "eval_point"
     kept: List[str] = []
     stripped: List[Dict[str, str]] = []
     for name in names:
         name = str(name)
-        if reg.module_path(kind, name) is not None:
+        if reg.module_path(name) is not None:
             kept.append(name)
         else:
             stripped.append({"name": name,
-                             "reason": reg.reason(kind, name) or "not resolvable"})
+                             "reason": reg.reason(name) or "not resolvable"})
     if stripped:
         config[slot] = kept
     return stripped
@@ -120,9 +122,9 @@ def assemble_task_env(
 ) -> Dict[str, str]:
     """Build the environment and sandbox-visible runtime assets for TaskAgent.
 
-    The design and assembled skills are copied below ``run_dir`` and referenced
-    through their paths inside the task sandbox. Benchmark paths are explicitly
-    removed from the inherited environment.
+    The design, the assembled toolset and the curated knowledge base are copied
+    below ``run_dir`` and referenced through their paths inside the task sandbox.
+    Benchmark paths are explicitly removed from the inherited environment.
     """
     env = dict(base_env)
     env.pop("GAN_DATASET_ROOT", None)
@@ -131,7 +133,7 @@ def assemble_task_env(
     os.makedirs(runtime_dir, exist_ok=True)
     shutil.copy2(design_path, os.path.join(runtime_dir, "design.json"))
 
-    skills_dir = os.path.join(runtime_dir, "skills")
+    tools_dir = os.path.join(runtime_dir, "tools")
     # B7: report what the design selected vs what actually got assembled, PER
     # inner generation (the task toolset is re-assembled here, not only at
     # outer startup). The report rides the runtime dir; task_runner surfaces it
@@ -139,13 +141,52 @@ def assemble_task_env(
     # task child are capability degradations to be RECORDED and passed to the
     # planner, not fatal for the generation.
     toolset_report = assemble_tools_dir_reported(
-        "task", skills_dir, config=config, include_always_on=False,
+        "task", tools_dir, config=config, include_always_on=False,
         code_root=code_root)
+
+    # knowledge base (batch 6): materialize the COMMITTED base whole -- the base
+    # is the base; the planner curates it by authoring/removing md files through
+    # the deep patch channel, not by toggling a config list. Text-only data,
+    # per-file and total caps, skips reported like assembly gaps.
+    knowledge_report = {"total": 0, "files": [], "skipped": []}
+    knowledge_src = os.path.join(str(code_root or ""), "gan", "components", "task",
+                                 "knowledge")
+    knowledge_dir = os.path.join(runtime_dir, "knowledge")
+    _KNOWLEDGE_MAX_FILE = 20_000          # chars per note (mirrors the tool's cap)
+    _KNOWLEDGE_MAX_TOTAL = 200_000        # chars per generation
+    if os.path.isdir(knowledge_src):
+        os.makedirs(knowledge_dir, exist_ok=True)
+        total = 0
+        for f in sorted(os.listdir(knowledge_src)):
+            if not f.endswith(".md") or f.startswith("."):
+                continue
+            src = os.path.join(knowledge_src, f)
+            try:
+                text = open(src, "r", encoding="utf-8").read(_KNOWLEDGE_MAX_FILE + 1)
+            except OSError as e:
+                knowledge_report["skipped"].append({"name": f, "reason": f"unreadable: {e}"})
+                continue
+            if len(text) > _KNOWLEDGE_MAX_FILE:
+                knowledge_report["skipped"].append({"name": f,
+                                                    "reason": "note exceeds per-note cap"})
+                continue
+            if total + len(text) > _KNOWLEDGE_MAX_TOTAL:
+                knowledge_report["skipped"].append({"name": f,
+                                                    "reason": "knowledge total cap reached"})
+                continue
+            with open(os.path.join(knowledge_dir, f), "w", encoding="utf-8") as out:
+                out.write(text)
+            total += len(text)
+            knowledge_report["total"] = total
+            knowledge_report["files"].append(f[:-3])
+
     with open(os.path.join(runtime_dir, "toolset_report.json"), "w",
               encoding="utf-8") as f:
-        json.dump(toolset_report, f, ensure_ascii=False, indent=2)
+        json.dump({**toolset_report, "knowledge": knowledge_report},
+                  f, ensure_ascii=False, indent=2)
     env["GAN_TASK_DESIGN"] = "/workspace/.gan_runtime/design.json"
-    env["GAN_TASK_SKILLS_DIR"] = "/workspace/.gan_runtime/skills"
+    env["GAN_TASK_TOOLS_DIR"] = "/workspace/.gan_runtime/tools"
+    env["GAN_TASK_KNOWLEDGE_DIR"] = "/workspace/.gan_runtime/knowledge"
     if task_brief:
         env["GAN_TASK_BRIEF"] = task_brief
     return env

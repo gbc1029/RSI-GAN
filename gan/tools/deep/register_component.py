@@ -1,9 +1,9 @@
-"""DEEP gate: register an existing component module in a registry.
+"""DEEP gate: register an existing tool module in the role's registry.
 
-Symmetric to ``unregister_component``. Edits the role's **workspace** copy of the
-registry (entry appended) rather than committing immediately -- the change is
-folded into the session's patch and goes through the normal commit validation
-(allowlist + compile + registry) together with the rest of the edits.
+Symmetric to ``unregister_component``. Edits the designed role's **workspace**
+copy of the registry (entry appended) rather than committing immediately -- the
+change is folded into the session's patch and goes through the normal commit
+validation (allowlist + compile + registry) together with the rest of the edits.
 
 Only an *existing* module can be registered: creating the file is a separate
 deep step (``request_source_access`` + ``edit_source``). "Existing" means the repo
@@ -11,6 +11,11 @@ copy **or** the workspace copy created this session -- this tool never creates,
 restores or deletes source, it only records an entry for source that already
 exists (so it is deliberately NOT the inverse of ``unregister_component``, which
 deletes the file).
+
+Batch 6: one registry per role (no shared file), name-keyed entries, and the
+role-directory binding -- a registry entry may only reference the designed role's
+own component tree, so the entry lands where its writer can write and its reader
+can read.
 """
 import json
 import os
@@ -18,14 +23,15 @@ from pathlib import Path
 
 from gan.framework import frozen
 from gan.framework.context import get_access_context, get_design_context
-from gan.registries.loader import _REGISTRY_FILES, entry_reason, write_registry_json
+from gan.registries.loader import entry_reason, write_registry_json
 
-# registries a role may actually write (planner.json is in no role's write roots,
-# so it is deliberately not offered in the schema enum)
-_WRITABLE_REGISTRY = [f for f in _REGISTRY_FILES if f != "planner.json"]
-# planner designs the TASK agent -> registers task components; evaluator designs
-# itself -> registers eval_points
+# batch 6: one registry per role, and each role designs exactly one --
+# planner designs the TASK agent -> registers task tools; evaluator designs
+# itself -> registers evaluator tools. planner.json has no writer (no slots).
 _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
+# role -> the component directory its registry may reference (role-directory
+# binding; the allowlist already enforces the same split, this is the message)
+_OWNING_DIR = {"planner": "task", "evaluator": "evaluator"}
 
 
 def _granted_coverage(broker, role, node, module_rel: str) -> bool:
@@ -46,33 +52,31 @@ def tool_info():
     return {
         "name": "register_component",
         "description": (
-            "DEEP add: register an EXISTING component module in a registry so it can be "
-            "selected. The module file must already exist and be editable by your role -- "
-            "either committed source, or a file you created this session with edit_source "
-            "(in that case its directory must be granted, otherwise it cannot be "
-            "committed). This tool never creates or restores source. Applied to your "
-            "workspace; committed with this session's patch after validation. "
-            "kind: skill | eval_point. registry defaults to your role's own "
-            "(planner -> task.json, evaluator -> evaluator.json)."
+            "DEEP add: register an EXISTING tool module in your role's registry so it "
+            "can be selected. The module file must already exist and be editable by "
+            "your role -- either committed source, or a file you created this session "
+            "with edit_source (in that case its directory must be granted, otherwise "
+            "it cannot be committed). This tool never creates or restores source. "
+            "Applied to your workspace; committed with this session's patch after "
+            "validation. The module must live under your designed role's component "
+            "tree (planner -> gan/components/task/** via task.json; evaluator -> "
+            "gan/components/evaluator/** via evaluator.json)."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "enum": ["skill", "eval_point"]},
                 "name": {"type": "string",
                          "description": "Must equal the module file stem (without .py)."},
                 "module": {"type": "string",
                            "description": "Path relative to gan/components, e.g. "
                                           "task/skills/foo.py"},
-                "registry": {"type": "string",
-                             "enum": _WRITABLE_REGISTRY},
             },
-            "required": ["kind", "name", "module"],
+            "required": ["name", "module"],
         },
     }
 
 
-def tool_function(kind, name, module, registry=None, **kwargs):
+def tool_function(name, module, **kwargs):
     actx = get_access_context()
     if actx is None or getattr(actx, "broker", None) is None:
         return "Error: no access context"
@@ -90,15 +94,10 @@ def tool_function(kind, name, module, registry=None, **kwargs):
         return ("Error: deep registry changes are currently unavailable in this "
                 "session; use `request_source_access` to view source. Do not retry.")
 
-    if registry:
-        reg_name = str(registry).strip()
-        if reg_name not in _WRITABLE_REGISTRY:
-            return (f"Error: unknown registry: {registry} "
-                    f"(one of: {', '.join(_WRITABLE_REGISTRY)})")
-    else:
-        reg_name = _OWN_REGISTRY.get(role)
-        if not reg_name:
-            return f"Error: no default registry for role '{role}'; pass registry= explicitly"
+    # batch 6: the registry is the one this role designs (single writer per file)
+    reg_name = _OWN_REGISTRY.get(role)
+    if not reg_name:
+        return f"Error: role '{role}' has no designable registry"
     reg_rel = f"gan/registries/{reg_name}"
 
     mod = str(module or "").replace("\\", "/").strip("/")
@@ -109,7 +108,15 @@ def tool_function(kind, name, module, registry=None, **kwargs):
         return "Error: module must be a .py path relative to gan/components"
     module_rel = f"gan/components/{mod}"
 
-    # 1) permission gate (same rule and order as unregister_component)
+    # 1) role-directory binding (batch 6, checked FIRST so the agent gets the most
+    #     specific error): a registry entry may only reference its own role's
+    #     component tree
+    if not mod.startswith(f"{_OWNING_DIR.get(role, role)}/"):
+        return (f"Error: module '{mod}' is outside the designed role's component tree "
+                f"({_OWNING_DIR.get(role, role)}/...); {reg_name} entries must "
+                f"reference gan/components/{_OWNING_DIR.get(role, role)}/**")
+
+    # 2) permission gate (same rule and order as unregister_component)
     if not frozen.is_allowed(role, reg_rel, "modify"):
         return f"Error: registry not editable for {role}: {reg_rel}"
     if not frozen.is_allowed(role, module_rel, "modify"):
@@ -140,17 +147,17 @@ def tool_function(kind, name, module, registry=None, **kwargs):
         return (f"Error: name '{name}' must equal the module file stem '{stem}' "
                 f"(tools are keyed by file stem; the component would never load)")
 
-    # 4) validate the entry as it would appear in the registry (kind/dir + tool API).
+    # 4) validate the entry as it would appear in the registry (role/dir + tool API).
     #    Validate the WORKSPACE copy whenever there is one: that is the version this
     #    session's patch commits, so validating the repo copy instead would reject a
     #    module the agent just extended with tool_info/tool_function (P3/H3a) and
     #    would accept one the agent just broke. ``entry_reason`` at commit time is the
     #    backstop for both directions.
-    candidate = {"name": name, "kind": kind, "module": mod}
+    candidate = {"name": name, "module": mod}
     comp_dir = Path(src) / "gan" / "components"
     if not (comp_dir / mod).is_file():
         comp_dir = Path(code_root) / "gan" / "components"
-    reason = entry_reason(candidate, comp_dir)
+    reason = entry_reason(candidate, comp_dir, _OWNING_DIR.get(role, role))
     if reason:
         return f"Error: invalid entry ({reason})"
 
@@ -173,16 +180,15 @@ def tool_function(kind, name, module, registry=None, **kwargs):
         return f"Error: registry is not an object with a 'components' list: {reg_rel}"
     comps = data.setdefault("components", [])
     for c in comps:
-        if isinstance(c, dict) and c.get("kind") == kind and c.get("name") == name:
+        if isinstance(c, dict) and c.get("name") == name:
             if str(c.get("module")).replace("\\", "/") == mod:
-                return f"Already registered: {kind} '{name}' in {reg_rel}"
-            return (f"Error: {kind} '{name}' already registered in {reg_rel} with a "
+                return f"Already registered: '{name}' in {reg_rel}"
+            return (f"Error: '{name}' already registered in {reg_rel} with a "
                     f"different module ({c.get('module')})")
-    comps.append({"name": name, "kind": kind, "module": mod})
+    comps.append({"name": name, "module": mod})
     write_registry_json(ws_reg, data)
-    dctx.record("register_component", kind=kind, name=name,
-                module=mod, registry=reg_name)
-    return (f"Registered {kind} '{name}' ({module_rel}) in {reg_rel}. It will be "
+    dctx.record("register_component", name=name, module=mod, registry=reg_name)
+    return (f"Registered tool '{name}' ({module_rel}) in {reg_rel}. It will be "
             f"committed with this session's patch after validation. You can "
             f"select_component it right away (task design); the task agent actually "
             f"gets it only once the patch commits -- a rejected patch strips the "

@@ -74,7 +74,7 @@ def assemble_collisions(
     Returns ``{basename: [source, ...]}`` for names produced by more than one source.
     """
     from gan.tools.assembly import always_on_dirs, gan_roots, py_files_in
-    from gan.registries.loader import load_registry_for_role
+    from gan.registries.loader import load_registry_for_role, resolve_module
 
     sources: List[str] = []
     if include_always_on:
@@ -85,13 +85,14 @@ def assemble_collisions(
     for e in reg.entries:
         if not isinstance(e, dict) or not e.get("module"):
             continue
-        p = os.path.join(str(cdir), str(e["module"]).replace("\\", "/"))
-        if os.path.isfile(p):
-            sources.append(p)
+        p = resolve_module(cdir, e.get("module"))
+        if p is not None:
+            sources.append(str(p))
 
     by_name: Dict[str, List[str]] = {}
-    # de-dup by realpath first: the SAME module declared twice (e.g. in shared.json
-    # and <role>.json) is one file, not a collision with itself
+    # de-dup by realpath first: the SAME module declared twice within a file is one
+    # file, not a collision with itself (cross-file duplicates are impossible since
+    # batch 6 -- one single-writer registry per role)
     for s in sorted({os.path.realpath(s) for s in sources}):
         by_name.setdefault(os.path.basename(s), []).append(s)
     return {k: v for k, v in by_name.items() if len(v) > 1}

@@ -58,11 +58,12 @@ def _seed_self_designs(output_dir: str) -> None:
         # schema defaults + seed prompt; initial_config applies the non-empty
         # guard, so a missing/blank seed can no longer blank the prompt.
         cfg = initial_config(role)
-        # judgment eval points are optional but selected by default (evolvable later)
+        # capability tools are optional but selected by default (evolvable later);
+        # batch 6: the single ``tools`` slot, name-keyed registry
         if role == "evaluator":
             from gan.registries.loader import load_registry_for_role
             reg = load_registry_for_role("evaluator")
-            cfg["eval_points"] = reg.names("eval_point")
+            cfg["tools"] = reg.names()
         store.save(cfg, role)
 
 

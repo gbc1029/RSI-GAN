@@ -373,15 +373,16 @@ def registry_report(code_root: str) -> Dict[str, Any]:
     - ``unparseable``: registry files that are not valid JSON / not an object with
       a ``components`` list;
     - ``invalid``    : entries failing ``entry_reason`` (incl. the identity contract
-      name==stem, kind-vs-directory, and tool_info/tool_function exposure);
-    - ``duplicate``  : ``(role, kind, name)`` declared twice in a role's *merged*
-      registry (``shared.json`` silently shadowing ``<role>.json``);
+      name==stem, the role-directory binding, and tool_info/tool_function exposure);
+    - ``duplicate``  : ``(role, name)`` declared twice **within one registry file**
+      (batch 6: one single-writer file per role -- cross-file duplicates are
+      structurally impossible, so there is no merged view to check);
     - ``orphan``     : component files declared by NO registry file.
     """
     from pathlib import Path
     from gan.registries.loader import (
-        parse_registry_file, entry_reason, load_registry_for_role,
-        orphan_modules, _REGISTRY_FILES,
+        parse_registry_file, entry_reason,
+        orphan_modules, _REGISTRY_FILES, _ROLE_OF_FILE,
     )
 
     reg_dir = os.path.join(code_root, "gan", "registries")
@@ -394,8 +395,10 @@ def registry_report(code_root: str) -> Dict[str, Any]:
         if err:
             unparseable.add(fn)
             continue
+        owning_role = _ROLE_OF_FILE.get(fn)
+        seen = set()
         for e in ents or []:
-            reason = entry_reason(e, comp_dir)
+            reason = entry_reason(e, comp_dir, owning_role)
             if reason is not None:
                 kind = e.get("kind") if isinstance(e, dict) else None
                 name = e.get("name") if isinstance(e, dict) else None
@@ -403,17 +406,13 @@ def registry_report(code_root: str) -> Dict[str, Any]:
                 # CHANGED cause is still a new problem, and a (fn, kind, name)-only
                 # key would miss it
                 invalid.add((fn, str(kind), str(name), str(reason)))
-    # merged-registry duplicates (per role, since shared.json merges into each)
-    for role in ("task", "planner", "evaluator"):
-        reg = load_registry_for_role(role, registry_dir=Path(reg_dir), components_dir=comp_dir)
-        seen = set()
-        for e in reg.entries:
-            if not isinstance(e, dict):
-                continue
-            key = (str(e.get("kind")), str(e.get("name")))
-            if key in seen:
-                duplicate.add((role, key[0], key[1]))
-            seen.add(key)
+            if isinstance(e, dict):
+                nm = str(e.get("name"))
+                if nm in seen:
+                    # tools are keyed by stem: the second declaration would shadow
+                    # the first at load time
+                    duplicate.add((owning_role or fn, str(e.get("kind") or ""), nm))
+                seen.add(nm)
     # orphan: reuse the loader's single definition (component-looking file declared
     # by no registry) so the gate and selection-time validation cannot disagree
     orphan = set(orphan_modules(Path(reg_dir), comp_dir))

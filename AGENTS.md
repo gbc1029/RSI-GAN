@@ -35,9 +35,14 @@ live under `scripts/dgmh/`.
   operators), `deep/` (gated deep gate: `request_source_access` + `register_component` +
   `unregister_component`),
   `assembly.py`.
-- `gan/components/` — **opt-in** implementations: `shared/skills/`,
-  `task/skills/`, `evaluator/eval_points/`.
-- `gan/registries/` — component catalog: `shared.json` + `<role>.json` + `loader.py`.
+- `gan/components/` — **opt-in** tool implementations, one tree per role (batch 6):
+  `task/` (tools + the curated `task/knowledge/*.md` base), `evaluator/`,
+  `planner/` (self-authored knowledge/tools).
+- `gan/registries/` — per-role tool catalog: **one single-writer `json` per role**
+  (`task.json` / `planner.json` / `evaluator.json`; no shared file) + `loader.py`.
+  Every entry is a TOOL (a callable `tool_info`/`tool_function` module); the legacy
+  `kind` field (`skill`/`eval_point`) may still appear in content and is a
+  descriptive tag only.
 - `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `seeds/`.
 - `gan/roles/`, `gan/build.py`, `gan/summary.py` — evolvable orchestration/glue.
 
@@ -74,12 +79,14 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
 ## Conventions
 
 - **Shallow vs deep**: each agent's *shallow design* is a single config JSON in
-  `gan/design/` (selection from per-role registries). Shallow operators live in
+  `gan/design/` (one component slot, `tools`, per role — batch 6; the legacy
+  `skills`/`eval_points` slot names are aliases). Shallow operators live in
   `gan/tools/design/` and may only set **existing** keys or select/deselect
-  **registered** components. Tool add/delete/modify is classified by what it
-  touches: **shallow** = edit the design config list only (`select_component` /
-  `deselect_component`); **deep delete** = remove from the registry + source file
-  (`unregister_component`); **deep add/modify** = new component or logic, which
+  **registered** tools (`select_component` / `deselect_component` / the `tools`
+  key of `set_config`). Tool add/delete/modify is classified by what it
+  touches: **shallow** = edit the design config list only; **deep delete** =
+  remove from the registry + source file (`unregister_component`); **deep
+  add/modify** = new tool or logic, which
   **must** touch source via the gated `gan/tools/deep/request_source_access`.
   There is no `mint_operator`. After a `modify` grant, planner/evaluator edit the
   granted copies with `edit_source`
@@ -88,6 +95,16 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   `request_source_access` for a path that is already granted does **not** re-copy
   from `code_root` — in-session workspace edits survive; pass `refresh=true` to
   deliberately discard them and re-sync the workspace copy.
+- **Knowledge base (batch 6, pull-based)**: markdown notes under
+  `gan/components/<role>/knowledge/*.md` are **DATA** — not registry entries, no
+  name=stem contract, never executed. The planner authors task-side notes with
+  the deep patch channel; the whole COMMITTED base is materialized into the task
+  sandbox each generation (`.gan_runtime/knowledge` + `GAN_TASK_KNOWLEDGE_DIR`,
+  per-note/total caps, skips reported) and the task agent reads it on demand via
+  the opt-in `knowledge` tool — the base is the base, and there is no knowledge
+  config list. planner/evaluator read their own (and task-side) notes through the
+  normal access channel (`request_source_access(view)` + `list_dir`/`read_file`),
+  never through an un-audited side door.
 - **Instances**: an *instance* = role + workspace + its trajectory. The task agent
   is refreshed every inner generation (per `genid`); planner/evaluator are refreshed
   every **outer** generation (`gan/framework/loop.py:_refresh_roles` + the
@@ -201,15 +218,17 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   the input to the evaluator-visible summary (`gan/summary.py:build_diff_summary`,
   which whitelists structured fields only), so an operator that records nothing is
   invisible to the loop even when it changed the workspace.
-- **Identity contract (three names must agree)**: a component's registered `name`
+- **Identity contract (three names must agree)**: a tool's registered `name`
   (`gan/registries/*.json`), its module file **stem**, and its `tool_info()["name"]`
   must be the same string. The tool loop keys tools by file stem
-  (`agent/tools/__init__.py`), so a mismatch assembles a component that silently
+  (`agent/tools/__init__.py`), so a mismatch assembles a tool that silently
   never loads. `gan/registries/loader.py:entry_reason` enforces this at selection
-  time; `gan/framework/code_repo.py` (differential gate on commits touching
+  time (plus the **role-directory binding**: a registry entry may only reference
+  its own role's component tree — one single-writer file per role since batch 6);
+  `gan/framework/code_repo.py` (differential gate on commits touching
   `gan/registries/**` or `gan/components/**`) and
   `gan/framework/preflight.py:preflight_tools` (startup, fail-fast) enforce it too.
-  Adding a component file without a registry entry is reported as an **orphan**
+  Adding a tool file without a registry entry is reported as an **orphan**
   instead of failing silently; `list_components` lists such files as candidates and
   `register_component` (deep, same gate as `unregister_component`) registers them.
   A registry entry's `module` is **data, not code** (the scan can read a registry the
@@ -255,7 +274,7 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   `gan/summary.py:build_diff_summary`).
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator
   must not fit the benchmark score (blind score first, then reveal).
-- The task agent has **no always-on tools**; its capabilities are opt-in skills.
+- The task agent has **no always-on tools**; its capabilities are all opt-in tools.
 
 ## Do NOT
 

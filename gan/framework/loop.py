@@ -162,7 +162,11 @@ class GanLoop:
 
     def _parent_config(self, parent: Optional[Node]) -> Dict[str, Any]:
         cd = parent.meta.get("config_dict") if (parent is not None and parent.meta) else None
-        return deepcopy(cd) if cd else self._initial_task_config()
+        cfg = deepcopy(cd) if cd else self._initial_task_config()
+        # batch 6: fold legacy slot names so a resumed pre-unification checkpoint
+        # cannot pass ``skills``/``eval_points`` down the inheritance chain
+        from gan.design.schema import normalize_config
+        return normalize_config(cfg)
 
     def _build_packet(self, child: Node, ctx: Any) -> RewardPacket:
         return RewardPacket(

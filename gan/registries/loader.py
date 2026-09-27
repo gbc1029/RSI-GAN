@@ -1,17 +1,25 @@
-"""Per-role component registries (code + registry.json).
+"""Per-role component registries (one file per role, single tool catalog).
 
-A **valid** component entry is a dict with required fields per kind:
-``name`` (non-empty str), ``kind`` in ``KINDS``, ``module`` (path relative to
-``gan/components`` that exists). ``description`` / ``params_schema`` are optional.
+A **valid** component entry is a dict with required fields ``name`` (non-empty
+str) and ``module`` (path relative to ``gan/components`` that exists).
+``description`` / ``params_schema`` are optional; a legacy ``kind`` field
+(``skill`` / ``eval_point``) may still be present and is kept as a **descriptive
+tag only** -- since the batch-6 unification every registry entry is a TOOL
+(``tool_info``/``tool_function`` module the role's LLM may call), and the former
+kind routing (slot selection, kind-vs-directory contract) is retired.
 
-Beyond presence, an entry must satisfy the **identity contract** (the three names
-must agree, otherwise a component assembles but silently never loads):
+Beyond presence, an entry must satisfy two contracts:
 
-- ``name`` == the module's file stem (``agent/tools/__init__.py`` keys tools by
-  ``tool_file.stem`` and filters by that name);
-- ``kind`` agrees with the module's parent directory (``skills/`` / ``eval_points/``);
-- the module actually exposes ``tool_info`` + ``tool_function`` (defined **or**
-  re-exported), which ``load_tools`` requires.
+- **identity contract** (the three names must agree, otherwise a component
+  assembles but silently never loads): ``name`` == the module's file stem
+  (``agent/tools/__init__.py`` keys tools by ``tool_file.stem`` and filters by
+  that name), and the module actually exposes ``tool_info`` + ``tool_function``
+  (defined **or** re-exported), which ``load_tools`` requires;
+- **role-directory binding** (batch 6): the module must live under
+  ``gan/components/<owning_role>/...``. Each registry file is owned by exactly
+  one role with exactly one writer, so a registry file cannot reference another
+  role's component tree -- cross-role dead declarations and shared-file shadowing
+  are structurally impossible.
 
 Robustness (field-agnostic): malformed entries are **tolerated** at load time --
 they are kept but marked invalid (with a reason) and are never usable
@@ -34,8 +42,8 @@ disagree about what the session currently declares. The workspace is only a
 the committed tree remains the fallback rather than a competing view.
 
 ``validate_registry`` additionally reports registry-level problems that a single
-entry cannot see: duplicate ``(kind, name)`` in the merged registry and **orphan**
-component files (present in ``gan/components`` but not registered).
+entry cannot see: duplicate names **within a file** and **orphan** component files
+(present in ``gan/components`` but not registered).
 
 Registering/modifying a component is a source-level ("deep") change.
 """
@@ -52,14 +60,13 @@ from gan.framework.loader import config_dir
 _GAN_DIR = config_dir().parent
 REGISTRY_DIR = _GAN_DIR / "registries"
 COMPONENTS_DIR = _GAN_DIR / "components"
-KINDS = ("skill", "eval_point")
-_REQUIRED = ("name", "kind", "module")
-# kind -> the component directory it must live under (identity contract, V2)
-_KIND_DIR = {"skill": "skills", "eval_point": "eval_points"}
-# every registry file that can declare a component (orphan detection is
-# registry-set-wide, not per-role: a file is only an orphan if NO registry
-# declares it)
-_REGISTRY_FILES = ("shared.json", "task.json", "planner.json", "evaluator.json")
+KINDS = ("skill", "eval_point")  # legacy descriptive tags only (see module docstring)
+_REQUIRED = ("name", "module")
+# the per-role registry files, one single-writer catalog each (batch 6: no
+# shared.json -- role-directory binding makes the merged view unnecessary)
+_REGISTRY_FILES = ("task.json", "planner.json", "evaluator.json")
+# registry file -> the owning role (also the role-directory binding root)
+_ROLE_OF_FILE = {"task.json": "task", "planner.json": "planner", "evaluator.json": "evaluator"}
 
 
 def parse_registry_file(path: Path) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
@@ -197,23 +204,31 @@ def resolve_module(components_dir, mod: Any) -> Optional[Path]:
     return None
 
 
-def entry_reason(entry: Any, components_dir) -> Optional[str]:
+def entry_reason(entry: Any, components_dir, owning_role: Optional[str] = None) -> Optional[str]:
     """Return None if valid, else a short reason string.
 
     ``components_dir`` is a single ``Path`` or an ordered search path (session
     workspace copy first, committed tree second) -- see :func:`_as_dirs`.
+    ``owning_role`` turns on the **role-directory binding** (batch 6): the module
+    must live under ``gan/components/<owning_role>/...``. The registry is per-role
+    with a single writer, so this replaces the old kind-vs-directory contract --
+    a registry file can only reference its own role's component tree, which makes
+    cross-role dead declarations structurally impossible.
     """
     if not isinstance(entry, dict):
         return "entry is not an object"
     for f in _REQUIRED:
         if f not in entry or entry[f] in (None, ""):
             return f"missing required field '{f}'"
-    if entry["kind"] not in KINDS:
-        return f"unknown kind '{entry['kind']}'"
     mod = safe_module_rel(entry["module"])
     if mod is None:
         return (f"unsafe module path: {entry['module']!r} (must be a relative path "
                 f"under gan/components, with no '..' or absolute prefix)")
+    parts = Path(mod).parts
+    if owning_role is not None and (len(parts) < 2 or parts[0] != owning_role):
+        return (f"module '{mod}' is outside the '{owning_role}/' component tree "
+                f"(a '{owning_role}.json' entry must reference its own role's "
+                f"components)")
     p = resolve_module(components_dir, mod)
     if p is None:
         return f"module file not found: {mod}"
@@ -222,11 +237,6 @@ def entry_reason(entry: Any, components_dir) -> Optional[str]:
     if str(entry["name"]) != stem:
         return (f"name '{entry['name']}' != module file stem '{stem}' "
                 f"(tools are keyed by file stem; the component would never load)")
-    want_dir = _KIND_DIR.get(str(entry["kind"]))
-    parts = Path(mod).parts
-    if want_dir and (len(parts) < 2 or parts[-2] != want_dir):
-        return (f"kind '{entry['kind']}' requires the module directly under a "
-                f"'{want_dir}/' directory, got: {mod}")
     if not _exposes_tool_api(p):
         return f"module does not expose tool_info/tool_function: {mod}"
     return None
@@ -240,39 +250,40 @@ class ComponentRegistry:
         # version this session's patch commits), committed tree second
         self.components_dir = _as_dirs(components_dir)
 
-    # -- queries -----------------------------------------------------------
-    def list(self, kind: Optional[str] = None) -> List[Dict[str, Any]]:
-        return [e for e in self.entries if isinstance(e, dict) and (kind is None or e.get("kind") == kind)]
+    # -- queries (name-keyed: the registry is a single per-role tool catalog;
+    #    a legacy ``kind`` field may still be present as a descriptive tag) ----
+    def list(self) -> List[Dict[str, Any]]:
+        return [e for e in self.entries if isinstance(e, dict)]
 
-    def names(self, kind: Optional[str] = None) -> List[str]:
-        return [e["name"] for e in self.list(kind)]
+    def names(self) -> List[str]:
+        return [e["name"] for e in self.list()]
 
-    def get(self, kind: str, name: str) -> Optional[Dict[str, Any]]:
+    def get(self, name: str) -> Optional[Dict[str, Any]]:
         for e in self.entries:
-            if isinstance(e, dict) and e.get("kind") == kind and e.get("name") == name:
+            if isinstance(e, dict) and e.get("name") == name:
                 return e
         return None
 
-    def has(self, kind: str, name: str) -> bool:
-        return self.get(kind, name) is not None
+    def has(self, name: str) -> bool:
+        return self.get(name) is not None
 
-    def reason(self, kind: str, name: str) -> Optional[str]:
-        e = self.get(kind, name)
+    def reason(self, name: str) -> Optional[str]:
+        e = self.get(name)
         if e is None:
             return "not registered"
-        return entry_reason(e, self.components_dir)
+        return entry_reason(e, self.components_dir, self.role)
 
-    def is_valid(self, kind: str, name: str) -> bool:
-        return self.reason(kind, name) is None
+    def is_valid(self, name: str) -> bool:
+        return self.reason(name) is None
 
-    def module_path(self, kind: str, name: str) -> Optional[str]:
+    def module_path(self, name: str) -> Optional[str]:
         """Path to the component module, or None if the entry is invalid/missing.
 
         Resolves across the search path (workspace copy first), so an assembly that
         was given a workspace overlay materialises the session's own version.
         """
-        e = self.get(kind, name)
-        if e is None or entry_reason(e, self.components_dir) is not None:
+        e = self.get(name)
+        if e is None or entry_reason(e, self.components_dir, self.role) is not None:
             return None
         p = resolve_module(self.components_dir, e.get("module"))
         return str(p) if p is not None else None
@@ -280,7 +291,7 @@ class ComponentRegistry:
     def invalid(self) -> List[Dict[str, str]]:
         out: List[Dict[str, str]] = []
         for e in self.entries:
-            r = entry_reason(e, self.components_dir)
+            r = entry_reason(e, self.components_dir, self.role)
             if r is not None:
                 nm = e.get("name") if isinstance(e, dict) else None
                 kd = e.get("kind") if isinstance(e, dict) else None
@@ -342,10 +353,14 @@ def load_registry_for_role(
     tolerant: bool = True,
     overlay_root=None,
 ) -> ComponentRegistry:
-    """Merge shared registry with the role-specific registry (tolerant by default).
+    """Load ONE role's registry (tolerant by default) -- no merging since batch 6.
+
+    Each role has exactly one registry file (``<role>.json``) with exactly one
+    writer, so there is no shared file to merge and no cross-file shadowing. The
+    registry's entries are that role's tool catalog.
 
     ``overlay_root`` is the session **workspace** root (``broker.src_dir(role,
-    node)``). When given, every registry file and every component module resolves
+    node)``). When given, the registry file and every component module resolve
     **workspace-first, committed-tree second** -- the same rule the deep tools use
     to scan (S1/P3), so the read side and the write side can never disagree about
     what the session currently declares. The workspace is only a *partial* copy
@@ -355,12 +370,10 @@ def load_registry_for_role(
     rdir = Path(registry_dir) if registry_dir is not None else REGISTRY_DIR
     cdir = Path(components_dir) if components_dir is not None else COMPONENTS_DIR
     ov_rdir = _overlay_registries(overlay_root)
-    shared, e1 = parse_registry_file(_pick_registry_file("shared.json", rdir, ov_rdir))
-    specific, e2 = parse_registry_file(_pick_registry_file(f"{role}.json", rdir, ov_rdir))
-    if not tolerant and (e1 or e2):
-        raise ValueError(f"unparseable registry: {e1 or e2}")
-    entries = (shared or []) + (specific or [])
-    return ComponentRegistry(role, entries, _component_dirs(cdir, overlay_root))
+    entries, err = parse_registry_file(_pick_registry_file(f"{role}.json", rdir, ov_rdir))
+    if not tolerant and err:
+        raise ValueError(f"unparseable registry: {err}")
+    return ComponentRegistry(role, entries or [], _component_dirs(cdir, overlay_root))
 
 
 def declared_modules(registry_dir: Optional[Path] = None, overlay_root=None) -> set:
@@ -433,14 +446,16 @@ def validate_registry(
     components_dir: Optional[Path] = None,
     overlay_root=None,
 ) -> List[Dict[str, str]]:
-    """All problems visible for ``role``'s merged registry (empty list = healthy).
+    """All problems visible for ``role``'s registry (empty list = healthy).
 
     Each problem is ``{"type", "kind", "name", "reason"}`` with ``type`` one of:
 
-    - ``invalid``     : a single entry fails ``entry_reason`` (incl. the identity contract);
-    - ``duplicate``   : ``(kind, name)`` appears twice after merging shared + role
+    - ``invalid``     : a single entry fails ``entry_reason`` (identity contract +
+      role-directory binding);
+    - ``duplicate``   : the same ``name`` appears twice **within the file**
       (``ComponentRegistry.get`` returns the first, so the later one is silently
-      shadowed);
+      shadowed; cross-file duplicates are impossible since batch 6 -- one file,
+      one role, one writer);
     - ``orphan``      : a component-looking file that NO registry file declares (see
       ``orphan_modules``) -- it can never be selected until it is registered;
     - ``unparseable`` : a registry file that is not valid JSON / not an object with a
@@ -462,16 +477,17 @@ def validate_registry(
                                  overlay_root=overlay_root)
     out: List[Dict[str, str]] = [{"type": "invalid", **p} for p in reg.invalid()]
 
-    # duplicate (kind, name) in the merged registry
+    # duplicate name within the file (tools are keyed by stem: the second
+    # declaration would shadow the first at load time)
     seen = set()
     for e in reg.entries:
         if not isinstance(e, dict):
             continue
-        key = (str(e.get("kind")), str(e.get("name")))
+        key = str(e.get("name"))
         if key in seen:
-            out.append({"type": "duplicate", "kind": key[0], "name": key[1],
-                        "reason": "duplicate (kind,name) after merging shared + role "
-                                  "registry; the first entry wins"})
+            out.append({"type": "duplicate", "kind": str(e.get("kind") or ""), "name": key,
+                        "reason": "duplicate name in this registry file; the first "
+                                  "entry wins"})
         seen.add(key)
 
     for rel in orphan_modules(rdir, cdir, overlay_root=overlay_root):

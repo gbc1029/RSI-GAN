@@ -5,7 +5,7 @@ from agent.base_agent import AgentSystem
 from agent.llm_withtools import chat_with_agent
 from utils.common import extract_jsons
 
-_DEFAULT_DESIGN = {"prompt": "You are an agent.", "skills": [], "params": {}}
+_DEFAULT_DESIGN = {"prompt": "You are an agent.", "tools": [], "params": {}}
 
 
 def _load_design():
@@ -37,8 +37,8 @@ class TaskAgent(AgentSystem):
         A design-driven agent that solves a given task.
 
         The shallow design (prompt + selected skills + params) comes from the
-        design config passed via the ``GAN_TASK_DESIGN`` env var; skills are
-        loaded from ``GAN_TASK_SKILLS_DIR``.
+        design config passed via the ``GAN_TASK_DESIGN`` env var; tools are
+        loaded from ``GAN_TASK_TOOLS_DIR``.
 
         Args:
             inputs (dict): input data for the task.
@@ -48,8 +48,10 @@ class TaskAgent(AgentSystem):
         """
         design = _load_design()
         prompt = design.get("prompt") or "You are an agent."
-        skills = list(design.get("skills") or [])
-        tools_dir = os.environ.get("GAN_TASK_SKILLS_DIR")
+        # batch 6: the design slot is ``tools``; accept the legacy ``skills`` key
+        # so a design file produced by an older run still assembles its tools
+        tools = list(design.get("tools") or design.get("skills") or [])
+        tools_dir = os.environ.get("GAN_TASK_TOOLS_DIR") or os.environ.get("GAN_TASK_SKILLS_DIR")
         task_brief = os.environ.get("GAN_TASK_BRIEF") or ""
 
         brief_block = f"{task_brief}\n\n" if task_brief else ""
@@ -72,8 +74,8 @@ Respond in JSON format with the following schema:
             model=self.model,
             msg_history=[],
             logging=self.log,
-            tools_available=(skills if skills else []),
-            tools_dir=(tools_dir if skills else None),
+            tools_available=(tools if tools else []),
+            tools_dir=(tools_dir if tools else None),
             trajectory_file=getattr(self, "trajectory_file", None),
         )
 

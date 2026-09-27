@@ -30,14 +30,13 @@ from typing import Dict, List
 TASK_SOURCE: List[str] = [
     "task_agent.py",
     "gan/components/task/**",
-    "gan/components/shared/**",
     "gan/registries/task.json",
-    "gan/registries/shared.json",
 ]
 
 PLANNER_SELF: List[str] = [
     "gan/roles/planner.py",
     "gan/tools/work/planner/**",
+    "gan/components/planner/**",
     "gan/design/seeds/planner.md",
 ]
 

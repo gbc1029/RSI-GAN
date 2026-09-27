@@ -3,9 +3,9 @@
 Two activation modes (agreed design):
   * **always-on** (``gan/tools/...``): work tools + design operators + deep gate,
     loaded for every session of a design-editing role;
-  * **opt-in** (``gan/components/...``): components selected by the role's design
-    config (task ``skills``; evaluator ``eval_points``), resolved via the
-    per-role registry.
+  * **opt-in** (``gan/components/...``): tools selected by the role's design config
+    (the single ``tools`` slot; batch 6 one per-role registry, name-keyed),
+    resolved via the per-role registry.
 
 The task agent has **no always-on tools** — its capabilities are all opt-in
 skills. Planner/evaluator get always-on work tools + design ops + deep gate,
@@ -80,19 +80,19 @@ def selected_module_paths_reported(role: str, config: Optional[Dict[str, Any]],
     cfg = config or {}
     out: List[str] = []
     skipped: List[Dict[str, str]] = []
-    if role == "task":
-        kind, names = "skill", list(cfg.get("skills") or [])
-    elif role == "evaluator":
-        kind, names = "eval_point", list(cfg.get("eval_points") or [])
-    else:
-        kind, names = None, []  # planner has no opt-in work capabilities yet
+    # batch 6: one ``tools`` slot per role; legacy keys are normalized upstream
+    # (schema.normalize_config), but accept them here too so a raw config dict
+    # from an older checkpoint still assembles its selections
+    names = list(cfg.get("tools") or [])
+    if not names:
+        names = list(cfg.get("skills") or []) + list(cfg.get("eval_points") or [])
     for name in names:
-        p = reg.module_path(kind, name) if kind else None
+        p = reg.module_path(str(name))
         if p:
             out.append(p)
         else:
             skipped.append({"name": str(name),
-                            "reason": (reg.reason(kind, name) if kind else None)
+                            "reason": reg.reason(str(name))
                                       or "not registered (or module missing/invalid)"})
     return out, skipped
 
@@ -149,8 +149,7 @@ def assemble_tools_dir_reported(
                 name = shutil.copy2(f, os.path.join(dest_dir, os.path.basename(f)))
                 always_on.append(os.path.basename(name))
     cfg = config or {}
-    slot = "skills" if role == "task" else ("eval_points" if role == "evaluator" else None)
-    selected_requested = [str(x) for x in (cfg.get(slot) or [])] if slot else []
+    selected_requested = [str(x) for x in (cfg.get("tools") or [])]
     paths, skipped = selected_module_paths_reported(role, config, code_root=code_root)
     selected_assembled: List[str] = []
     for p in paths:

@@ -1,3 +1,24 @@
 {
-  "components": []
+  "components": [
+    {
+      "name": "bash",
+      "kind": "skill",
+      "module": "task/skills/bash.py",
+      "description": "Run shell commands (re-export of agent/tools/bash).",
+      "params_schema": {}
+    },
+    {
+      "name": "editor",
+      "kind": "skill",
+      "module": "task/skills/editor.py",
+      "description": "View/create/edit files (re-export of agent/tools/edit).",
+      "params_schema": {}
+    },
+    {
+      "name": "knowledge",
+      "module": "task/tools/knowledge.py",
+      "description": "Read the curated knowledge base (md notes the planner authored): list with name='', read with a name.",
+      "params_schema": {}
+    }
+  ]
 }

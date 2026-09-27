@@ -27,16 +27,19 @@ def _ops_summary(records: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]
 def _design_diff(config: Optional[Dict[str, Any]], parent_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     cfg = config if isinstance(config, dict) else {}
     par = parent_config if isinstance(parent_config, dict) else {}
-    before_skills = set(par.get("skills") or [])
-    after_skills = set(cfg.get("skills") or [])
-    before_pts = set(par.get("eval_points") or [])
-    after_pts = set(cfg.get("eval_points") or [])
+    # batch 6: one ``tools`` slot per role; accept the legacy keys so a diff
+    # against an older run's parent config still reports its selections
+    def _tools(d):
+        v = d.get("tools")
+        if isinstance(v, (list, tuple)) and v:
+            return set(str(x) for x in v)
+        v = (d.get("skills") or []) + (d.get("eval_points") or [])
+        return set(str(x) for x in v)
+    before, after = _tools(par), _tools(cfg)
     return {
         "prompt_changed": (cfg.get("prompt") != par.get("prompt")),
-        "skills_added": sorted(after_skills - before_skills),
-        "skills_removed": sorted(before_skills - after_skills),
-        "eval_points_added": sorted(after_pts - before_pts),
-        "eval_points_removed": sorted(before_pts - after_pts),
+        "tools_added": sorted(after - before),
+        "tools_removed": sorted(before - after),
     }
 
 
@@ -115,10 +118,10 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"applied design changes: {ops or 'yes'}")
         if design.get("prompt_changed"):
             parts.append("prompt changed")
-        if design.get("skills_added"):
-            parts.append(f"skills added: {design['skills_added']}")
-        if design.get("skills_removed"):
-            parts.append(f"skills removed: {design['skills_removed']}")
+        if design.get("tools_added"):
+            parts.append(f"tools added: {design['tools_added']}")
+        if design.get("tools_removed"):
+            parts.append(f"tools removed: {design['tools_removed']}")
     if cp.get("applied"):
         parts.append(f"code patch applied (commit {str(cp.get('commit'))[:8]})")
     elif cp.get("proposed") and not cp.get("applied"):
