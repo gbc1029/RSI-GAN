@@ -307,12 +307,12 @@ def _component_dirs(components_dir: Path, overlay_root) -> List[Path]:
     return dirs
 
 
-def _pick_registry_file(fn: str, rdir: Path, ov_rdir: Optional[Path]) -> Path:
+def _pick_registry_file(fn: str, rdir, ov_rdir: Optional[Path]) -> Path:
     if ov_rdir is not None:
         p = ov_rdir / fn
         if p.is_file():
             return p
-    return rdir / fn
+    return Path(rdir) / fn
 
 
 def resolve_registry_file(
