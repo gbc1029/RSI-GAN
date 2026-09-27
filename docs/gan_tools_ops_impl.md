@@ -358,6 +358,8 @@ op_function = tool_function
 
 ## 5. ③ list_components 工具
 
+> **【第 4 批复核更正·追加，原文保留】** 本节 §5.3 的示例代码与 §5.4 的输出清单**只是历史记录**（行号与实现均已漂移）。第 4 批重写了该工具并修正其取注册表的角色：旧实现用**访问角色**（`actx.role`）取注册表，而 `select_component` 用**设计目标角色**（`dctx.role`）——planner 的 `plan` 会话设计的是 task agent，于是它列 `shared.json + planner.json`（`planner.json` 为空 ⇒ `registered: []`），而它真正能选的 task 组件**在任何清单里都不出现**（**H10**，deep-add 闭环阻塞项；实证：`list_components → registered: []` 而同会话 `select_component(skill,'foo')` 成功）。现输出：`design_role`/`access_role`、`patch_channel`、`roots`、`registry_sources`、`selected`、`registered`（每项含 `origin`/`pending`/`selectable`/`selectable_reason`/`note`）、`unregistered`（每项含 `origin`/`patch_covered`）、`problems`、`notes`；注册表与组件一律**工作区优先、已提交兜底**（**B18**）。权威汇总：`docs/gan_tools_deep_write_fix.md` §8。
+
 ### 5.1 为什么必需
 
 当前工具集里**没有任何枚举组件的手段**（`gan/tools/**` 全量清单已核对：design 5 个 + deep 2 个 + work 若干，无 list）。agent 只能"猜名字"调 `select_component`，失败得到 `"not registered"`。注册表作为**接口**因此完全失效。

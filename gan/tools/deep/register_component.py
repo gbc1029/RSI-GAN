@@ -31,16 +31,15 @@ _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
 def _granted_coverage(broker, role, node, module_rel: str) -> bool:
     """True if this session's patch can carry ``module_rel``.
 
-    ``build_patch_from_workspace`` walks ``granted_paths`` only, so a NEW file is
-    committable only when it -- or one of its ancestor directories -- was granted.
-    Without this check the entry would be written for a file that never reaches the
-    commit, and the failure would surface as a confusing "module file not found".
+    Thin alias for ``AccessBroker.covers`` -- the **single definition** of the
+    predicate, shared with ``list_components`` (which reports ``patch_covered`` per
+    orphan). ``build_patch_from_workspace`` walks ``granted_paths`` only, so a NEW
+    file is committable only when it -- or one of its ancestor directories -- was
+    granted. Without this check the entry would be written for a file that never
+    reaches the commit, and the failure would surface as a confusing "module file
+    not found".
     """
-    for g in broker.granted_paths(role, node) or []:
-        g = str(g).replace("\\", "/").rstrip("/")
-        if g and (module_rel == g or module_rel.startswith(g + "/")):
-            return True
-    return False
+    return broker.covers(role, node, module_rel)
 
 
 def tool_info():

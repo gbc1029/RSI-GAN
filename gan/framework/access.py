@@ -250,6 +250,26 @@ class AccessBroker:
             out.extend(rec.get("paths", []))
         return out
 
+    def covers(self, role: str, node_id: Any, rel: str) -> bool:
+        """True if this session's patch can carry the repo-relative path ``rel``.
+
+        ``build_patch_from_workspace`` (``gan/patch.py``) walks ``granted_paths``
+        only, so a NEW file is committable exactly when it -- or one of its ancestor
+        directories -- was granted. The **single definition** of that predicate:
+        ``register_component`` refuses to register an uncovered new module with it,
+        and ``list_components`` reports ``patch_covered`` per orphan so the agent
+        learns the same fact *before* the registration is attempted (H8's family:
+        "file exists in the workspace" is not "file reaches the commit").
+        """
+        rel = str(rel).replace("\\", "/").strip("/")
+        if not rel:
+            return False
+        for g in self.granted_paths(role, node_id) or []:
+            g = str(g).replace("\\", "/").rstrip("/")
+            if g and (rel == g or rel.startswith(g + "/")):
+                return True
+        return False
+
     # -- audit -------------------------------------------------------------
     def log_event(self, event: Dict[str, Any]) -> None:
         from utils import trajectory_log

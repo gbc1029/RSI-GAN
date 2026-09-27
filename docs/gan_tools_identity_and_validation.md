@@ -145,6 +145,12 @@
 
 **闭环**：`edit_source` 建文件 → `list_components` 看到 `unregistered` → `register_component` 登记 → 提交门控放行 → `select_component` 启用。若跳过第三步，提交时按"新增孤儿"打回并提示。
 
+> **【第 4 批复核更正·追加，原文保留】** 上表的五个键与 `role` 语义已过时，且 `role` 取错角色（**H10**，deep-add 闭环阻塞项）：
+> - 旧实现用 `actx.role`（**访问角色**）取注册表，而 `select_component` 用 `dctx.role`（**设计目标角色**）。planner 的 `plan` 会话设计的是 task agent ⇒ 它列的是 `shared.json + planner.json`（`planner.json` 为空 ⇒ `registered: []`），而它真正能选的 task 组件**在任何清单里都不出现**（`unregistered` 也不报——孤儿检测是全注册表集合级）。实证：`list_components → registered: []`，同会话 `select_component(slot='skills', name='foo') → skills = ['foo']`。
+> - 现输出新增 `design_role`/`access_role`（`role` 保留为 `design_role` 别名）、`patch_channel`、`roots`、`registry_sources`、`notes`；`registered[]` 每项增 `origin`（`workspace`/`code`）、`pending`（`added`/`removed`/`modified`/`none`）、`selectable`/`selectable_reason`、`note`；`unregistered[]` 每项增 `origin`、`patch_covered`（= `AccessBroker.covers`，与 `register_component` 同一谓词）。
+> - 解析规则：注册表文件与组件模块**工作区优先、已提交兜底**（与 `unregister_component` 扫描同一规则，**B18**）；`selectable` 严格镜像 `select_component`（仍只认已提交）。
+> - 详见 `docs/gan_tools_deep_write_fix.md` §8。
+
 ---
 
 ## 4. #10 / #11 重构

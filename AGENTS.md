@@ -212,6 +212,11 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   Adding a component file without a registry entry is reported as an **orphan**
   instead of failing silently; `list_components` lists such files as candidates and
   `register_component` (deep, same gate as `unregister_component`) registers them.
+  A registry entry's `module` is **data, not code** (the scan can read a registry the
+  agent edited this session), so it is sanitised before use: an absolute path or a
+  `..` segment is rejected by `loader.safe_module_rel` (else `module_path` would hand
+  `shutil.copy2` a file from outside `gan/components`, which `load_tools` would then
+  import and expose).
   Both deep tools only reach the code tree through the **patch channel**: their
   changes are committed only in sessions that build a patch (`plan` / `self_improve`);
   an `evaluate` session has no patch builder, so deep registry edits made there are
@@ -221,7 +226,19 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   (`request_source_access(..., refresh=true)`) and registering it again.
   Patch visibility follows `granted_paths`: a file the agent created in the
   workspace reaches the patch only when a grant covers it (grant the parent
-  **directory** to have new files inside it captured).
+  **directory** to have new files inside it captured). `AccessBroker.covers` is the
+  single definition of that predicate; `list_components` reports it per orphan as
+  `patch_covered`.
+- **`list_components` reads the design target, not the access role**: the catalog it
+  lists is the one `select_component` consults (`DesignContext.role`), which differs
+  from `AccessContext.role` in the planner's `plan` session (access `planner`,
+  design target `task`). It resolves each registry file and component module
+  **workspace-first, committed-tree second** (same rule the deep tools scan with),
+  and reports per entry `origin` (`workspace`/`code`), `pending`
+  (`added`/`removed`/`modified`/`none`) and `selectable` — the latter mirroring
+  exactly what `select_component` will accept **now** (the committed registry), so a
+  component registered this session becomes selectable only after the patch commits.
+  The tool is read-only: it never grants and never writes.
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - Do not expose planner rationale/reason to the evaluator (use
   `gan/summary.py:build_diff_summary`).

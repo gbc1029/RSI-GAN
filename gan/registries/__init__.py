@@ -6,4 +6,8 @@ from gan.registries.loader import (  # noqa: F401
     KINDS,
     REGISTRY_DIR,
     load_registry_for_role,
+    orphan_modules,
+    resolve_registry_file,
+    safe_module_rel,
+    validate_registry,
 )

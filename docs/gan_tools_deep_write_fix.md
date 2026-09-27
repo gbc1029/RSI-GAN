@@ -16,7 +16,8 @@
 |---|---|---|
 | 第 1 轮 | `e87fedc` | R1（单独调用丢失）+ P1（换行） |
 | 第 2 轮 | `fix(gan/tools): deep-write workspace-overwrite, registry scan, path traversal, new-component register` | R2 + S1 + P4 + V1（安全回归）+ P3/H3a |
-| 第 3 批（A 批） | `docs(gan/tools): correct stale review conclusions and sync records` + `docs+seeds: document deep-write constraints and operator record convention` | A1–A13：被审查文档的过时结论更正（只增不删）+ 约束写入 `AGENTS.md`/seeds + 汇总文档自洽。A14–A16 未做，见 §6.1 |
+| 第 3 批（A 批） | `docs(gan/tools): correct stale review conclusions, sync records, document deep-write constraints` | A1–A13：被审查文档的过时结论更正（只增不删）+ 约束写入 `AGENTS.md`/seeds + 汇总文档自洽。A14–A16 未做，见 §6.1 |
+| 第 4 批（读侧） | `fix(gan/tools): list_components workspace overlay, design-role catalog, unsafe registry module paths` | **B18 + H10 + H9**：读侧与两个 deep 工具口径统一（工作区优先、设计目标角色、增删/覆盖可见），注册表 `module` 路径净化。见 §8 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -37,6 +38,9 @@
 | **H2** | 重建条目丢 `description`/`params_schema` | 遗留（§6.2 B3） |
 | **H7** | 深删除打断 import 方，编译门不覆盖 | 遗留（§6.3 C1） |
 | **H6** | 默认注册表按角色而非模块前缀 | 遗留（§6.3 C6） |
+| **H9** | 注册表 `module` 路径未净化：绝对路径/`..` 可把 `gan/components` 外的文件装配进工具集并 import | **已修（第 4 批）**，`docs/**` 记录见 §8 |
+| **H10** | `list_components` 用访问角色而非设计目标角色 ⇒ planner 的 plan 会话列错目录（deep-add 闭环阻塞项） | 已修（第 4 批） |
+| **H11** | 任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件 | **遗留（§6.2 B24，需决策）** |
 
 ---
 
@@ -248,7 +252,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 
 ## 6. 未做 / 遗留（完整待办）
 
-**分类口径**：**A 文档/注释**（零行为风险）· **B 小范围代码**（单文件、少行、低风险）· **C 大范围修改**（跨文件 / 改语义 / 需设计决策）。编号与 `docs/7` §3.4 的"仍未修"清单一致；标 **需决策** 的项须先定口径再动手。**本节是本会话结束时的完整待办快照**——A1–A13 已在本会话完成（见 §7.3），A14 起为剩余项。
+**分类口径**：**A 文档/注释**（零行为风险）· **B 小范围代码**（单文件、少行、低风险）· **C 大范围修改**（跨文件 / 改语义 / 需设计决策）。编号与 `docs/7` §3.4 的"仍未修"清单一致；标 **需决策** 的项须先定口径再动手。**本节是本会话结束时的完整待办快照**——A1–A13 与 **B18** 已在本会话完成（见 §7.3 / §8），A14 起、B1–B17、B19 起为剩余项。
 
 ### 6.1 A 类：文档或注释（剩余 3 项）
 
@@ -258,7 +262,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **A15** | 防御层盲区记为已知限制 | 本文档 §5.3、`docs/7` §3.4 | `warn_dropped_workspace_edits`（`base_role.py:29`）用 `build_patch_from_workspace` 做检测 ⇒ 与补丁构建器**同一盲区**（只看 `granted_paths`），H8 类问题**构造性不可发现**；彻底修法见 C3 |
 | **A16** | `loop.yaml` 自洽说明 | `gan/framework/loop.yaml` 文件头 | 头声明 "every key below MUST have a code consumer" 与 `cost.token_budget_per_gen` / `cost.record_usage`（保留待 G3）冲突；补"保留键"说明，或接线（见 B21） |
 
-### 6.2 B 类：小范围代码（23 项）
+### 6.2 B 类：小范围代码（原 23 项 + 第 4 批新增 B24；**B18 已于第 4 批完成**，余 23 项）
 
 | 编号 | 项 | 位置 | 规模 | 需决策 |
 |---|---|---|---|---|
@@ -279,14 +283,15 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B15** | 选择静默降级**残余**：`preflight_tools` 校验"设计选中项是否仍存在/valid" | `preflight.py` | ~20 行 | — |
 | **B16** | T1/R3：注册期碰撞预检（复用 `validate_registry`/`assemble_collisions`） | `register_component.py` | ~15 行 | — |
 | **B17** | R3：把 `collisions` 纳入提交门控（`registry_report` + `_registry_worsened` 差分） | `code_repo.py` | ~15 行 | — |
-| **B18** | P3 残留：`list_components` 只扫 `broker.repo_root`，工作区新文件不可见 | `list_components.py:63,69-70` | ~15 行 | — |
+| **B18** | P3 残留：`list_components` 只扫 `broker.repo_root`，工作区新文件不可见 —— **✅ 已修（第 4 批，Tier 2）**，见 §8.5 | `list_components.py:63,69-70` | ~15 行 | — |
 | **B19** | `list_dir` 加输出上限（与 `grep` 的 `max_results=100` 对齐） | `list_dir.py` | ~5 行 | — |
 | **B20** | `deny_deep` 接线（**须含 `register_component`**，见 A13） | `access.py` / `build.py` / 3 个 deep 工具 | 跨 4 文件 | — |
 | **B21** | 预算/死键：`task_agent.py` 未传 `max_tool_calls`（默认 40）；`cost.*` 接线或移除 | `task_agent.py` + `loop.yaml` | ~5 行 | **是** |
 | **B22** | `patch.py` 支持 `\ No newline at end of file`（D1 备选） | `patch.py` | ~15 行 | 可选 |
 | **B23** | 回归断言固化（报告 §六 的 6 条真实链路 e2e） | 测试代码 | 6 例 | — |
+| **B24** | **H11**（第 4 批新发现）任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`；下一代装配时被 B7 记 skip，静默失能且留痕）。**本批只在 `list_components.notes` 做可见化** | `gan/framework/task_runner.py:103-128` | ~15 行 | **是** |
 
-**B 类详细写法**（B1–B4 为本文档已完整分析的四项；B5–B23 见上表与 `docs/工具管理审查.md` 对应编号）
+**B 类详细写法**（B1–B4 为本文档已完整分析的四项；B5–B24 见上表与 `docs/工具管理审查.md` 对应编号）
 
 #### B1 — H8（原编号 A2）：`register_component` 的本地守卫静默丢弃注册 —— **必修**
 
@@ -429,3 +434,92 @@ patch 0B                                    <-- 注册被静默丢弃
 
 - `docs/工具管理审查.md` — 上一轮复核结论；其中 **4 处**判断已过时/不成立（A1 已就地标注），见 §7.3。
 - `docs/7_遗留问题与待办.md` §3 — **已同步**（A2/A3：新增 §3.4 修复状态表 + T1 触发例更正；A13：§7 deny_deep 冻结面更正）。
+
+---
+
+## 8. 第 4 批：读侧口径统一（B18 + H10 + H9）
+
+> 起因：讨论 B18（`list_components` 只扫 `broker.repo_root`）。用户给出四个约束——"只列工作区，还是工作区与 code-root 分开列"、"过程中是否申请权限并将 tools 复制到工作区"、"是否增删了工具"、"以注册表为准还是以存在的代码为准"。讨论中**实测出两个比 B18 更重的问题**（H10、H9）。用户决策：**Tier 2 输出形态 + `select_component` 保持"只认已提交" + 同批修 B18/H10/H9，H11 记入待办**。
+
+### 8.1 决策记录（用户确认）
+
+| 决策点 | 结论 | 理由 |
+|---|---|---|
+| 输出形态 | **Tier 2**：单一合并视图（并集）+ 每项 `origin`/`pending`/`selectable`/`note` + 顶层 `patch_channel` | agent 的三个动作都是"对一个名字做一件事"，两份平行清单把 diff 推给 LLM；只列工作区则错误（工作区是**部分副本**、outer 起点为空、evaluate 会话改动不落地） |
+| `select_component` 的权威 | **保持"只认已提交"**（读进程内 `loader.REGISTRY_DIR` = worker 模式下的 code_root）；`selectable` 只是对它的忠实镜像 | 与"自改在下一个 outer 生效"一致；若改成工作区感知，**必须先修 H11**，否则补丁被拒时设计会永久引用不存在的组件 |
+| `selectable` 的定义 | **必须严格等于 `select_component` 的实际行为**（提交规则则存在性 + valid） | 避免再造一处"lister 与 selector 不一致"——那正是 H10 的类型 |
+
+**问题 4 的答案（以注册表为准还是以代码为准）**：分层，且两个方向都要——注册表 = 命名空间（谁能被 select）；代码存在性 + 身份契约 = 有效性（`entry_reason`）；代码扫描 = 未注册候选（`orphan_modules`）。B18 要改的是"扫哪些根 + 标出差异"，不是换权威。
+
+### 8.2 三个根 — 事实对齐
+
+| 名称 | 实际指向 | 生命周期 |
+|---|---|---|
+| `broker.repo_root`（`gan/build.py` 传入 `code_root or repo_root`） | **code_root**：per-run git 树，**已提交基线**（名字有误导性，它不是原仓库） | 整个 run |
+| 工作区 `broker.src_dir(role,node)` = `workspaces/<role>/outer_<O>/src` | 被 grant 过的路径的**部分副本**；同 outer 的 plan/evaluate/self_improve **共享** | **每个 outer 开始清空** |
+| 原仓库 `repo_root` | 只给父 harness 读 benchmark 标签 | 不变 |
+
+由此两点：`list_components` 原来并**没有读错树**（它读的是已提交基线，只缺工作区一层）；来源标注应是 **workspace (this outer)**，不能写成 "this session"（工作区跨会话共享，plan 会看到 evaluate 阶段 grant 进来的东西）。
+
+### 8.3 H10（最严重）：catalog 用了访问角色而非设计目标角色
+
+`list_components` 旧代码用 `actx.role` 取注册表，而 `select_component` 用 `dctx.role`。planner 的 plan 会话是 `DesignContext(role="task")`（`gan/roles/planner.py`）⇒ 列的是 `shared.json + planner.json`，可能选择的却是 `shared.json + task.json`。
+
+**实证**（模拟 worker 模式，`task.json` 含组件 `foo`）：
+
+```
+list_components(actx.role) -> registry role: planner
+  registered: [] | unregistered: [] | problems: []
+  'foo'（就在 task.json 里）对 planner 可见? False
+select_component(dctx.role=task) -> skills = ['foo']      # 选择器接受了
+```
+
+`foo` 在**任何**清单里都不出现（`registered` 用错注册表；`unregistered` 也不报——孤儿检测是全注册表集合级）。这正是 `list_components` 存在的理由被废掉：planner 只能"猜名字"。当前被掩盖是因为 `task.json` 为空 ⇒ planner 视图 == task 视图；**deep-add 闭环一旦跑通（往 task.json 注册一条）立刻朝最坏方向发作**。
+
+**修法**：catalog（registry/problems/valid/selectable）一律用 `dctx.role`（必须与 `select_component` 一致）；会话层（工作区 overlay、`granted_paths` 覆盖、patch 通道）用 `actx.role`/`actx.node_id`。输出新增 `design_role` / `access_role` 两个字段（`role` 保留为 `design_role` 的兼容别名）。
+
+### 8.4 H9：注册表 `module` 路径未净化（安全）
+
+`entry_reason` 原来只做 `components_dir / mod` 然后 `is_file()`，`module_path` 直接返回拼接结果——**不拒绝绝对路径与 `..`**（只有 `unregister_component` 的删除路径拒了，V1 修的）。实测：绝对路径条目被判 `entry_reason -> None`（合法），`module_path` 返回树外路径，`assemble_tools_dir_reported` 把该文件**装配进工具集**（`selected_assembled: ['evil.py']`，无 skip），随后 `load_tools` 会 import 并暴露其工具。身份契约的"父目录必须叫 `skills/`"只挡普通文件，挡不住 `/tmp/.../skills/x.py`。
+
+**修法**：`gan/registries/loader.py` 新增 `safe_module_rel`（拒绝绝对路径、盘符、任何 `..` 段，规范化为相对路径），在 `entry_reason` / `resolve_module` / `module_path` / `declared_modules` 统一使用——注册表条目是 DATA（不变量 2），**读路径同样不可信**。装配端现在 skip 且带该 reason。落在 `loader.py`（不在任何角色写权限内，冻结面）是刻意的。
+
+### 8.5 B18：工作区 overlay（与 deep 工具同一条解析规则）
+
+- `loader.py` 公共入口新增 `overlay_root=...`（会话工作区根）：注册表文件与组件模块一律**工作区优先、已提交兜底**（与 `unregister_component` 扫描同规则）；`components_dir` 内部化为**搜索路径**（`_as_dirs`；单 `Path` 仍兼容 ⇒ 提交门/装配/`register_component` 的既有调用不变）。
+- `resolve_registry_file` 公开：返回 `(path, origin)`，`origin ∈ {"workspace","code"}`；工作区注册表**不可解析时不静默回退**（`validate_registry` 的 `unparseable` 带 `origin`；`list_components` 另在 `notes` 里点明"它声明的条目不会列出"）。
+- `orphan_modules` 扫两边的并集（声明集也取并集；`safe_module_rel` 丢弃不安全声明）。
+- `unregistered[]` 每项加 `origin` + `patch_covered`（新谓词 **`AccessBroker.covers`**；`register_component._granted_coverage` 改为其别名 = 谓词的唯一实现；已提交树里的文件恒为 covered，因为无需补丁承载）。
+- `registered[]` = 有效视图 + 提交基线**并集**，每项报 `pending: added|removed|modified|none`（集合差 + 条目字段对比 + `filecmp` 逐字节比模块内容）；`valid` 描述 **agent 将要动手的那一份**（工作区副本优先；`removed` 描述仍存在的提交副本）；`selectable` 严格镜像 `select_component`；`selectable_reason`/`note` 说明张力。
+- 顶层 `patch_channel`（无 DesignContext = evaluate ⇒ 提示"deep 改动会被丢弃"）、`roots`、`registry_sources`、`notes`（注册表损坏 / 增删计数 / 未覆盖孤儿 / **selected 引用但注册表缺失**——H11 的可见化，不动 H11 本体）。
+
+### 8.6 证据与验证（第 4 批）
+
+| 验证 | 结果 |
+|---|---|
+| planner plan 会话（design=task, access=planner）→ `design_role: task`，`task.json` 条目**可见且 selectable=True** | ✅（修复前 `registered: []`，而同会话 `select_component` 却接受） |
+| planner self_improve（design=planner）/ evaluator 会话 → 仍列各自注册表 | ✅ |
+| 工作区 overlay：`beta` added（selectable=False + note）、`gamma` removed（selectable=True + 警告）、`alpha` modified（工作区副本有效） | ✅ |
+| 覆盖：已授权目录下的新文件 `patch_covered=True`；授权外 `foo.py` False + 提示先授权父目录 | ✅ |
+| 无 DesignContext（evaluate）→ `patch_channel: false` + 警告 | ✅ |
+| H9：绝对路径 / `..` 的 `module` → `entry_reason` 报 unsafe；`module_path` None；**装配 skip 并报 reason** | ✅ |
+| 深层工具回归 `/tmp/gan_verify/regress.py` 全部 11 例（含 `p3_uncovered`/`reg_traversal`，直接踩 `broker.covers` 新路） | ✅ 全 OK |
+| H8/A2 探针（`ws_reg_ungranted` → 232B 补丁、注册入 patch） | ✅ |
+| `preflight_tools`（真实仓库 3 角色）problems/collisions 全空 | ✅ 无回归 |
+| 无 overlay 的既有调用（旧签名）行为不变 | ✅ |
+
+### 8.7 变更清单（第 4 批）
+
+| 文件 | 内容 |
+|---|---|
+| `gan/registries/loader.py` | `safe_module_rel` + `resolve_module` + `_as_dirs`（搜索路径）+ `overlay_root`（`load_registry_for_role`/`validate_registry`/`orphan_modules`/`declared_modules`）+ `resolve_registry_file`（provenance）；模块 docstring 增"注册表条目是 DATA"+"Overlay"两节 |
+| `gan/tools/work/common/list_components.py` | **重写**：design_role/access_role 两角色；双视图并集 + `origin/pending/selectable/selectable_reason/note`；`patch_covered`；`patch_channel`；`registry_sources`；`notes`（含 selected 悬空检测） |
+| `gan/framework/access.py` | 新增 `AccessBroker.covers(...)`（"该路径能否进本会话补丁"的**单一定义**） |
+| `gan/tools/deep/register_component.py` | `_granted_coverage` 改为 `broker.covers` 的别名（消重，行为不变） |
+| `gan/registries/__init__.py` | 导出新增 helper |
+| `docs/**`（只增不删）、`AGENTS.md` | 同步记录；H11 登记为 §6.2 **B24（需决策）** |
+
+### 8.8 明确不做（第 4 批）
+
+- **`select_component` 工作区感知**：已决策保持"只认已提交"（见 §8.1）；将来若改，**前置条件是先修 H11**。
+- **H11 本体**（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`）：设计持久化与补丁结果解耦 ⇒ 悬空引用。记入 §6.2 **B24（需决策）**；本批只在 `list_components` 的 `notes` 里加"selected 但不在注册表"的可见化。
