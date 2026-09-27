@@ -144,6 +144,8 @@ def _exposes_tool_api(path: Path) -> bool:
 
 ### 3.4 三处复用点
 
+**【第 5 批追加，原文保留】本节 (a) 的"选择时唯一入口"断言已被第 5 批事实推翻并补齐**：`set_config` 的槽位键（`skills`/`eval_points`）当时可**绕过** `reg.has`/`reg.is_valid` 直写设计（只做 schema 键白名单，实证 `set_config("skills", ["未注册名"]) → updated`，装配报 not registered——**H12/B25**）。第 5 批已修：slot 键复用与 `select_component` **完全相同**的校验与**同一权威**（task 设计 = 有效注册表，角色自设计 = 已提交）+ `list[str]` 类型白名单 + 原子拒绝。"(a) 无需改"现针对两个算子都成立。汇总：`docs/gan_tools_deep_write_fix.md` §9。
+
 **(a) 选择时**（已有，无需改）：`select_component` 已调 `reg.has` + `reg.is_valid`（`select_component.py:41-45`）。V1–V4 生效后，`is_valid` 自动覆盖。
 
 **(b) 提交时**（需改：放宽触发条件 + 扩充判据）
@@ -359,6 +361,7 @@ op_function = tool_function
 ## 5. ③ list_components 工具
 
 > **【第 4 批复核更正·追加，原文保留】** 本节 §5.3 的示例代码与 §5.4 的输出清单**只是历史记录**（行号与实现均已漂移）。第 4 批重写了该工具并修正其取注册表的角色：旧实现用**访问角色**（`actx.role`）取注册表，而 `select_component` 用**设计目标角色**（`dctx.role`）——planner 的 `plan` 会话设计的是 task agent，于是它列 `shared.json + planner.json`（`planner.json` 为空 ⇒ `registered: []`），而它真正能选的 task 组件**在任何清单里都不出现**（**H10**，deep-add 闭环阻塞项；实证：`list_components → registered: []` 而同会话 `select_component(skill,'foo')` 成功）。现输出：`design_role`/`access_role`、`patch_channel`、`roots`、`registry_sources`、`selected`、`registered`（每项含 `origin`/`pending`/`selectable`/`selectable_reason`/`note`）、`unregistered`（每项含 `origin`/`patch_covered`）、`problems`、`notes`；注册表与组件一律**工作区优先、已提交兜底**（**B18**）。权威汇总：`docs/gan_tools_deep_write_fix.md` §8。
+> **【第 5 批追加】** `selectable` 的权威随 P-3 分叉：task 设计（有自愈兜底）= **有效注册表**（同会话注册的组件 `selectable=True`）；角色自设计 = 已提交。`pending:"added"` 的 `note` 与 `notes` 文案已同步（"补丁落地才真正生效；被拒则自愈剥离"）。详见 §9。
 
 ### 5.1 为什么必需
 

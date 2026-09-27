@@ -36,9 +36,12 @@ Per-entry fields (``registered``):
 - ``valid`` / ``reason`` : validity of the copy the agent will act on (workspace
   copy when one exists, else the committed copy); for ``pending:"removed"`` it
   describes the committed copy, which is the one that still exists;
-- ``selectable`` : **exactly what ``select_component`` will do now** (it reads the
-  committed registry), so a component registered this session is not selectable
-  until the patch lands, and a component scheduled for removal still is;
+- ``selectable`` : **exactly what ``select_component`` will do now** (batch 5:
+  the effective, workspace-first registry for the task design -- the design is
+  healed against the committed tree before persist, so same-session selection is
+  safe -- and the committed registry for role self-designs, which are not healed
+  yet), so a component registered this session IS selectable for the task design,
+  and a component scheduled for removal is no longer accepted;
 - ``note``       : the human-readable form of any tension between the above.
 
 ``patch_covered`` on an ``unregistered`` candidate is the same predicate
@@ -183,19 +186,31 @@ def tool_function(kind=None, **kwargs):
             return False
 
     _PENDING_NOTE = {
-        "added": ("registered in this outer's workspace; selectable after this "
-                  "session's patch commits"),
-        "removed": ("scheduled for removal in this outer's workspace; the committed "
-                    "copy is still selectable until the patch lands"),
+        "added": ("registered in this outer's workspace; selectable now -- the task "
+                  "agent actually gets it only when this session's patch commits "
+                  "(a rejected patch strips the selection before persist)"),
+        "removed": ("scheduled for removal in this outer's workspace; select_component "
+                    "no longer accepts it"),
         "modified": "this outer's workspace copy differs from the committed one",
     }
 
+    # Batch 5: `selectable` mirrors exactly what select_component accepts, and its
+    # authority changed with P-3: the task design is overlay-validated AND healed
+    # before persist (heal_design_slots), so its mirror is the effective view;
+    # role self-designs are not healed yet and keep the committed-only authority.
+    _sel_effective = (design_role == "task")
+
     def _selectable(k):
-        """Mirror `select_component`: committed registry presence + validity."""
-        e = code_by_key.get(k)
-        if e is None:
-            return False, "not in the committed registry (selectable after the patch commits)"
-        r = entry_reason(e, code_reg.components_dir)
+        if _sel_effective:
+            e = eff_by_key.get(k)
+            if e is None:
+                return False, "not in the effective registry (select_component would reject it)"
+            r = entry_reason(e, eff_reg.components_dir)
+        else:
+            e = code_by_key.get(k)
+            if e is None:
+                return False, "not in the committed registry (select_component would reject it)"
+            r = entry_reason(e, code_reg.components_dir)
         return (r is None), (r or "")
 
     # -- registered (union: effective first, then pending removals) ---------
@@ -294,22 +309,30 @@ def tool_function(kind=None, **kwargs):
     removed_n = sum(1 for r in registered if r["pending"] == "removed")
     if removed_n:
         notes.append(f"{removed_n} component(s) are scheduled for removal in this outer's "
-                     f"workspace; they stay selectable from the committed registry until "
-                     f"the patch lands")
+                     f"workspace; select_component no longer accepts them")
     added_n = sum(1 for r in registered if r["pending"] == "added")
     if added_n:
         notes.append(f"{added_n} component(s) are registered only in this outer's "
-                     f"workspace: the entry becomes selectable once the patch commits")
+                     f"workspace: selectable now, but the task agent gets them only "
+                     f"when the patch commits")
     uncovered = [u for u in unregistered if not u["patch_covered"]]
     if uncovered:
         notes.append(f"{len(uncovered)} unregistered file(s) lie outside every granted "
                      f"path: registering them cannot reach the commit until their parent "
                      f"directory is granted")
+    slot_kind = {"skills": "skill", "eval_points": "eval_point"}
+    sel_by_key = eff_by_key if _sel_effective else code_by_key
     dangling = [f"{slot}:{n}" for slot, names in selected.items() for n in names
-                if ({"skills": "skill", "eval_points": "eval_point"}[slot], n) not in eff_by_key]
+                if (slot_kind[slot], n) not in sel_by_key]
     if dangling:
-        notes.append("selected but NOT in the registry (assembly will skip them): "
-                     + ", ".join(sorted(dangling)))
+        if _sel_effective:
+            notes.append("selected but NOT resolvable from the effective registry -- the "
+                         "framework strips these from the design before persisting "
+                         "(design_dangling_stripped): " + ", ".join(sorted(dangling)))
+        else:
+            notes.append("selected but NOT in the committed registry (assembly will skip "
+                         "them; role designs are not healed yet): "
+                         + ", ".join(sorted(dangling)))
     if not patch_channel:
         notes.append("no patch channel in this session (evaluate): deep registry/source "
                      "changes made now would be discarded -- do not attempt them")

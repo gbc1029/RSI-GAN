@@ -74,6 +74,7 @@ def build_receipt(
     grants: Optional[List[Dict[str, Any]]] = None,
     trajectory_refs: Optional[List[str]] = None,
     toolset: Optional[Dict[str, Any]] = None,
+    design_stripped: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     design = _design_diff(config, parent_config)
     design["applied"] = bool(records)
@@ -84,6 +85,10 @@ def build_receipt(
         "stage": stage,
         "design": design,
         "toolset": toolset or {},
+        # H11/B24 (batch 5): slot names the framework removed from the design
+        # right before persisting, because the committed tree cannot deliver them
+        # (a patch that was rejected, or an inherited dangling reference).
+        "design_stripped": design_stripped or [],
         "code_patch": {
             "proposed": bool((patch or "").strip()),
             "applied": bool(patch_applied),
@@ -130,6 +135,15 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"capability note: design-selected tools SKIPPED at assembly: {names} "
                      f"— inspect with list_components; fix via register_component / "
                      f"select_component / deselect_component")
+    stripped = receipt.get("design_stripped") or []
+    if stripped:
+        # H11/B24: the design must never keep claiming what the tree cannot
+        # deliver; the role sees exactly what was dropped and why.
+        snames = ", ".join(f"'{s.get('name')}' ({str(s.get('reason'))[:60]})"
+                           for s in stripped)
+        parts.append(f"design note: dangling slot names STRIPPED before persist: {snames} "
+                     f"— re-add only after the component is committed "
+                     f"(register_component + patch)")
     if receipt.get("next_hint"):
         parts.append(f"hint: {receipt['next_hint']}")
     if not parts:

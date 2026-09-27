@@ -18,6 +18,7 @@
 | 第 2 轮 | `fix(gan/tools): deep-write workspace-overwrite, registry scan, path traversal, new-component register` | R2 + S1 + P4 + V1（安全回归）+ P3/H3a |
 | 第 3 批（A 批） | `docs(gan/tools): correct stale review conclusions, sync records, document deep-write constraints` | A1–A13：被审查文档的过时结论更正（只增不删）+ 约束写入 `AGENTS.md`/seeds + 汇总文档自洽。A14–A16 未做，见 §6.1 |
 | 第 4 批（读侧） | `fix(gan/tools): list_components workspace overlay, design-role catalog, unsafe registry module paths` | **B18 + H10 + H9**：读侧与两个 deep 工具口径统一（工作区优先、设计目标角色、增删/覆盖可见），注册表 `module` 路径净化。见 §8 |
+| 第 5 批（plan→task 应用） | `fix(gan/framework): heal task design before persist; overlay-validated selection; set_config slot validation` | **B24 + B25 + P-3**：task 设计持久化前自愈（H11/B24 关闭）、`select_component`/`set_config` 槽位同权校验（B25/H12 关闭）、同会话选择（推翻第 4 批决策，见 §9.1）。见 §9 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -40,7 +41,8 @@
 | **H6** | 默认注册表按角色而非模块前缀 | 遗留（§6.3 C6） |
 | **H9** | 注册表 `module` 路径未净化：绝对路径/`..` 可把 `gan/components` 外的文件装配进工具集并 import | **已修（第 4 批）**，`docs/**` 记录见 §8 |
 | **H10** | `list_components` 用访问角色而非设计目标角色 ⇒ planner 的 plan 会话列错目录（deep-add 闭环阻塞项） | 已修（第 4 批） |
-| **H11** | 任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件 | **遗留（§6.2 B24，需决策）** |
+| **H11** | 任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件 | **已修（第 5 批，A2 自愈）**，见 §9 |
+| **H12** | `set_config("skills", [...])` 只做 schema 键白名单 ⇒ 未注册组件不经拒绝直接进设计（=B25） | **已修（第 5 批）**，见 §9 |
 
 ---
 
@@ -262,7 +264,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **A15** | 防御层盲区记为已知限制 | 本文档 §5.3、`docs/7` §3.4 | `warn_dropped_workspace_edits`（`base_role.py:29`）用 `build_patch_from_workspace` 做检测 ⇒ 与补丁构建器**同一盲区**（只看 `granted_paths`），H8 类问题**构造性不可发现**；彻底修法见 C3 |
 | **A16** | `loop.yaml` 自洽说明 | `gan/framework/loop.yaml` 文件头 | 头声明 "every key below MUST have a code consumer" 与 `cost.token_budget_per_gen` / `cost.record_usage`（保留待 G3）冲突；补"保留键"说明，或接线（见 B21） |
 
-### 6.2 B 类：小范围代码（原 23 项 + 第 4 批新增 B24；**B18 已于第 4 批完成**，余 23 项）
+### 6.2 B 类：小范围代码（原 23 项 + 第 4 批 B24 + 第 5 批 B26；**B18、B24、B25(=H12) 已完成**，余 23 项）
 
 | 编号 | 项 | 位置 | 规模 | 需决策 |
 |---|---|---|---|---|
@@ -289,9 +291,11 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B21** | 预算/死键：`task_agent.py` 未传 `max_tool_calls`（默认 40）；`cost.*` 接线或移除 | `task_agent.py` + `loop.yaml` | ~5 行 | **是** |
 | **B22** | `patch.py` 支持 `\ No newline at end of file`（D1 备选） | `patch.py` | ~15 行 | 可选 |
 | **B23** | 回归断言固化（报告 §六 的 6 条真实链路 e2e） | 测试代码 | 6 例 | — |
-| **B24** | **H11**（第 4 批新发现）任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`；下一代装配时被 B7 记 skip，静默失能且留痕）。**本批只在 `list_components.notes` 做可见化** | `gan/framework/task_runner.py:103-128` | ~15 行 | **是** |
+| **B24** | **H11**（第 4 批新发现）任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`；下一代装配时被 B7 记 skip，静默失能且留痕） —— **✅ 已修（第 5 批，A2 自愈）**，见 §9.3 | `gan/framework/task_runner.py:103-128` | ~15 行 | **是** |
+| **B25** | **H12**（第 5 批新发现）`set_config("skills", [...])` 只做 schema 键白名单，未注册组件不经拒绝直接进设计（实证：装配报 `not registered`） —— **✅ 已修（第 5 批，Option 1）**，见 §9.4 | `gan/tools/design/set_config.py` | ~15 行 | **是** |
+| **B26** | **角色设计的 heal**（第 5 批新发现）：`evaluator/planner.self_improve` 在补丁重试循环后**无条件** `save_self_config(cfg)`（`gan/roles/evaluator.py:194`），与 H11 同模式；角色设计现在 committed-only 故**不会新造**悬空，但存量链上的悬空名未自愈。修法 = 角色设计也开 overlay + 自愈（需决策） | `gan/roles/base_role.py:215` + 两个 `self_improve` | ~15 行 | **是** |
 
-**B 类详细写法**（B1–B4 为本文档已完整分析的四项；B5–B24 见上表与 `docs/工具管理审查.md` 对应编号）
+**B 类详细写法**（B1–B4 为本文档已完整分析的四项；B5–B26 见上表与 `docs/工具管理审查.md` 对应编号）
 
 #### B1 — H8（原编号 A2）：`register_component` 的本地守卫静默丢弃注册 —— **必修**
 
@@ -523,3 +527,90 @@ select_component(dctx.role=task) -> skills = ['foo']      # 选择器接受了
 
 - **`select_component` 工作区感知**：已决策保持"只认已提交"（见 §8.1）；将来若改，**前置条件是先修 H11**。
 - **H11 本体**（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`）：设计持久化与补丁结果解耦 ⇒ 悬空引用。记入 §6.2 **B24（需决策）**；本批只在 `list_components` 的 `notes` 里加"selected 但不在注册表"的可见化。
+
+> **§8.8 的两项在第 5 批都有了结论**：H11 已修（A2 自愈），"select 工作区感知"随 P-3 启动（前置条件恰好被本批满足）——见 §9.1，**第 4 批决策被正式推翻并记录原因**。
+
+---
+
+## 9. 第 5 批：plan → task agent 正确应用（B24 + B25 + P-3）
+
+> 起因：用户问"planner plan 之后，task agent 能否正确应用 plan"，并要求解释"select 只认已提交"的代码路径。核实中实证出 **H12**（`set_config` 槽位绕过），与 B24 同族（悬空注入的第二条路径）。用户决策：**A2（每次持久化前自愈）+ P-3（同会话选择）+ set_config Option 1（slot 复用 select 校验）**。
+
+### 9.1 决策记录（用户确认，含对 §8.1 的推翻）
+
+| 决策点 | 结论 | 说明 |
+|---|---|---|
+| 自愈口径 | **A2**：每次持久化前都剥离 | 同时掐断"补丁被拒"与"父代继承旧悬空"两条链；"持久化设计 == 子代可交付"成为不变式。A1（仅拒时）不收敛存量链 |
+| 同会话选择 | **P-3 启动** | "闭环快一个 inner"；前提 = A2 自愈存在（补丁被拒时设计被治愈，不留悬空）。**这推翻了 §8.1 的"select 只认已提交"决策**——当时的理由是"若改必须先修 H11"，本批修了 H11，前置条件满足 |
+| set_config | **Option 1**：slot 键复用 select 校验 | 保留批量重写能力；Option 2（禁掉）会让 agent 逐名调用 |
+| P-3 适用面 | **仅 task 设计** | 角色自改（`evaluator.self_improve:194` / `planner.self_improve`）在重试循环后**无条件** `save_self_config(cfg)`、无 heal——若给角色设计开 overlay，补丁被拒会留下悬空。角色设计的 heal 是后续项（§9.7） |
+
+### 9.2 目标拆解与现状（"正确应用"的含义）
+
+| 编号 | 含义 | 现状 |
+|---|---|---|
+| G1 | 设计引用的组件全被装配进子代 | ✅（B7 toolset_report，可观察） |
+| G2 | plan 的 deep 源码改动到达子代运行副本 | ✅（`apply_task_patch` 先于 `prepare_run_dir`/`assemble_task_env`，`task_runner.py:103-137`） |
+| G3 | 补丁被拒 ⇒ 设计不声称子代不具备的能力 | ❌（H11：无条件 persist + `config_dict` 同对象继承）→ **本批修** |
+| G4 | 失配对 planner 可见 | ✅（拒绝原因已回传 `loop.py:467`；本批增 `design_stripped`） |
+| G5 | 设计面校验无旁路 | ❌（H12）→ **本批修** |
+
+**核实过且无需改**：`prepare_run_dir` 对副本再跑一次 `apply_patch`，已应用补丁再 apply 失败时 `gan/patch.py:apply_patch` 返回 False 不抛错，副本内容由 code_root 拷贝保证 → 无害（记录备查，不做）。
+
+### 9.3 H11/B24 机理与修法（A2 自愈）
+
+**机理**：`task_runner.run` 的 `config = plan.get("config")`（`task_runner.py:81`）**无深拷贝**——与 `plan_result["config"]`、`loop.py:788` 的 `child.meta["config_dict"]` 是**同一对象**；`persist_design`（`:128`）无条件执行。补丁被拒时 `apply_task_patch` 已 `_hard_rollback` 到父代 code，设计里的新组件名却照样进持久化文件与继承链 ⇒ 逐代传播（B7 每代重复报同一 skip，历史污染）。
+
+**修法**（`task_execution.heal_design_slots` + `task_runner` 接线）：
+
+- 插入点：`apply_task_patch` 之后、`persist_design` 之前；用**与装配完全同根同解析器**（`gan_roots(code_root)` + `load_registry_for_role` + `module_path`）逐名解析，失败即剥离；
+- **就地改 `config`**（一个动作同时治愈持久化文件、`config_dict`、继承链——这是利用同一对象这一事实，不是副作用侥幸）；
+- **只删不加**（不恢复源码、不重放补丁，与 S2 契约一致）；
+- 审计：事件 `design_dangling_stripped {genid, role, slot, names:[{name, reason}]}` + `child.meta["design_stripped"]` + receipt `design_stripped` + 渲染行 `design note: dangling slot names STRIPPED before persist`。
+
+### 9.4 H12/B25 机理与修法
+
+**机理**：`set_config.py` 旧代码只做 `key in allowed_keys(ctx.role)`（schema **键**集合），`"skills"` 是合法键 ⇒ `ctx.config["skills"] = value` 直写，无 `reg.has`/`reg.is_valid`，也不查类型（`"abc"` 会被装配端拆成单字符名）。实证：`set_config("skills", ["created_this_session"]) → "task.skills updated"`，装配报 `not registered`。
+
+**修法**（Option 1）：slot 键（`skills`/`eval_points`）必须 `list[str]`；逐名 `has` + `is_valid`（**同一权威** = select_component 用的视图，见 §9.5）；**原子拒绝**（任一名字非法整批失败，设计不动）；错误信息指路（list_components / register_component / select_component）；`record("set_config", key, selected=[...])`。`params.model` 过滤与未知键拒绝不变。
+
+### 9.5 权威矩阵（P-3 之后）
+
+| 会话 | select_component / set_config(slot) | 理由 |
+|---|---|---|
+| task 设计（planner 的 plan） | **有效视图**（工作区优先） | 持久化前有 A2 自愈兜底 ⇒ 同会话选择安全 |
+| 角色自设计（self_improve） | **只认已提交** | 无自愈（见 §9.1 决策行）⇒ 不能开 overlay |
+| deep 工具扫描 | 有效视图（第 2 批起） | 不变 |
+| list_components `selectable` | **严格镜像 select**（I-3） | 跟随上两行分叉 |
+
+三条时间线语义（写进 seed/AGENTS 的话）：选择在 plan 时刻对有效注册表校验；子代是否真拿到由"补丁是否落地"决定；落地失败由自愈剥离并记录——**设计永远不悬空**。
+
+### 9.6 验证（第 5 批，`/tmp/gan_b5/verify.py`，51/51）
+
+| 组 | 结果 |
+|---|---|
+| V3 set_config（12）：未注册名 / 非法类型×2 / 原子拒绝 / 合法接受+record / params/prompt 不受影响 / 未知键 / eval_points 正反 | ✅ |
+| V4 镜像（13）：added→selectable=True 且 select 接受；removed→False 且 select 拒绝；evaluator 设计 committed-only；brand_new 对 evaluator 不可见不可选 | ✅ |
+| V1/V2 深层 e2e（17，真实 `materialize` git 树 + `DomainTaskRunner` + 打桩 harness）：**成功路径**——补丁提交、无剥离、持久化设计含新技能、装配解析到；**拒绝路径**——补丁被拒、`design_stripped=[ghost]`、设计/持久化/`config_dict` 三处干净、事件存在、receipt 渲染 STRIPPED 行、就地对象同一性 | ✅ |
+| batch-4 smoke（H10 catalog / H9 traversal） | ✅ |
+| V5 回归（preflight 三角色 clean；summary 三个新分支） | ✅ |
+
+### 9.7 变更清单（第 5 批）与遗留
+
+| 文件 | 内容 |
+|---|---|
+| `gan/framework/task_execution.py` | 新增 `heal_design_slots(config, role, code_root)`（只删不加；就地；返回剥离清单） |
+| `gan/framework/task_runner.py` | 接线（补丁应用后、persist 前）+ 事件 + `meta["design_stripped"]` |
+| `gan/framework/loop.py` | `_make_receipt` 传 `design_stripped` |
+| `gan/framework/receipt.py` | `build_receipt` 增字段 + 渲染行 |
+| `gan/framework/context.py` | 新增 `session_overlay_root()`（workspace 含 `gan/` 时返回根，供设计算子取有效视图） |
+| `gan/tools/design/select_component.py` | task 设计传 overlay（P-3）+ 返回语说明生效条件 |
+| `gan/tools/design/set_config.py` | slot 校验（H12）+ 类型白名单 + 原子拒绝 + record 加 `selected` |
+| `gan/summary.py` | `set_config`/`select_component`/`deselect_component` 分支（B14 最小子集） |
+| `gan/tools/work/common/list_components.py` | `selectable` 镜像分叉（task=有效视图 / 角色=已提交）+ notes 文案同步 |
+| `gan/tools/deep/register_component.py` | 成功消息同步（"可立即 select；补丁落地才真正生效"） |
+| `AGENTS.md`、`docs/**`（追加式） | 新约定 + 状态同步 |
+
+**新增遗留**：
+- **角色设计的 heal**（`save_self_config` 无条件，同 H11 模式）：角色自设计现在 committed-only 所以**不会新造**悬空，但存量链上的悬空名未自愈——登记为 **B26**（~15 行，需决策：角色设计是否也开 overlay + heal）。
+- B14 其余死分支清理仍在（本批只做了 3 个现代 op 分支）。

@@ -33,6 +33,14 @@ def build_diff_summary(
             entry["module_b"] = r.get("module_b")
         elif op == "add_config":
             entry["key"] = r.get("key")            # rationale intentionally stripped
+        elif op == "set_config":
+            # B14 minimal subset (batch 5): the live operator's structured fields.
+            entry["key"] = r.get("key")
+            if r.get("selected") is not None:
+                entry["selected"] = list(r.get("selected") or [])
+        elif op in ("select_component", "deselect_component"):
+            entry["slot"] = r.get("slot")
+            entry["name"] = r.get("name")
         elif op in ("code_edit", "request_source_access"):
             entry["paths"] = list(r.get("paths", []) or [])  # reason intentionally stripped
             for p in r.get("paths", []) or []:

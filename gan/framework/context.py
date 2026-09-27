@@ -11,6 +11,7 @@ explicit context argument, so per-session state travels via contextvars:
 from __future__ import annotations
 
 import contextvars
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -142,3 +143,32 @@ def get_access_context() -> Optional[AccessContext]:
 
 def reset_access_context(token) -> None:
     _ACCESS_CTX.reset(token)
+
+
+def session_overlay_root():
+    """The access session's workspace root when it carries a ``gan/`` overlay.
+
+    A session edits a **workspace copy** of the paths it granted; the deep tools
+    scan that copy workspace-first (S1/P3), so selection-time validation must see
+    the same effective registry or the read side and the write side disagree.
+    Returns the workspace root (``broker.src_dir``) when it exists and contains a
+    ``gan/`` directory, else ``None`` -- callers pass it to
+    ``load_registry_for_role(overlay_root=...)``.
+
+    Callers decide WHICH design may use the overlay: the task design is healed
+    against the committed tree before it is persisted
+    (``task_execution.heal_design_slots``), so it may validate against the
+    effective view; role self-designs are not healed yet and must keep the
+    committed-only authority.
+    """
+    actx = get_access_context()
+    if actx is None:
+        return None
+    broker = getattr(actx, "broker", None)
+    if broker is None:
+        return None
+    try:
+        src = broker.src_dir(actx.role, actx.node_id)
+    except Exception:  # noqa: BLE001 -- a stub broker: no overlay, never a crash
+        return None
+    return src if (src and os.path.isdir(os.path.join(src, "gan"))) else None

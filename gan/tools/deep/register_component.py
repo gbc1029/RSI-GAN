@@ -183,8 +183,10 @@ def tool_function(kind, name, module, registry=None, **kwargs):
     dctx.record("register_component", kind=kind, name=name,
                 module=mod, registry=reg_name)
     return (f"Registered {kind} '{name}' ({module_rel}) in {reg_rel}. It will be "
-            f"committed with this session's patch after validation; then use "
-            f"select_component to enable it.")
+            f"committed with this session's patch after validation. You can "
+            f"select_component it right away (task design); the task agent actually "
+            f"gets it only once the patch commits -- a rejected patch strips the "
+            f"selection from the design before persisting.")
 
 
 op_info = tool_info

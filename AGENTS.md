@@ -236,9 +236,20 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   **workspace-first, committed-tree second** (same rule the deep tools scan with),
   and reports per entry `origin` (`workspace`/`code`), `pending`
   (`added`/`removed`/`modified`/`none`) and `selectable` — the latter mirroring
-  exactly what `select_component` will accept **now** (the committed registry), so a
-  component registered this session becomes selectable only after the patch commits.
-  The tool is read-only: it never grants and never writes.
+  exactly what `select_component` will accept **now** (the effective,
+  workspace-first registry for the task design; the committed registry for role
+  self-designs). The tool is read-only: it never grants and never writes.
+- **Design authority and healing (batch 5)**: `select_component` and the component
+  slots of `set_config` validate against the same registry — for the **task**
+  design the effective (workspace-first) view, so a component registered this
+  session is selectable in the same session; for role self-designs (planner /
+  evaluator) the committed view only. The task design is **healed** right before
+  it is persisted (`gan/framework/task_execution.py:heal_design_slots`): slot
+  names the committed tree cannot deliver are removed and recorded (event
+  `design_dangling_stripped`, receipt `design_stripped`), so a rejected patch can
+  never leave a dangling reference in the design inheritance chain — the child
+  only ever runs with a design whose every component resolves. Healing removes
+  names only; it never adds, restores or rewrites source.
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - Do not expose planner rationale/reason to the evaluator (use
   `gan/summary.py:build_diff_summary`).

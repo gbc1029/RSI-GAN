@@ -491,6 +491,9 @@ class GanLoop:
             # selected vs actually assembled" gap for the just-executed child in
             # the receipt it consumes at its next plan session.
             toolset=child.meta.get("toolset_report"),
+            # H11/B24 (batch 5): the dangling slot names the framework stripped
+            # from the design right before persisting it.
+            design_stripped=child.meta.get("design_stripped"),
         )
         try:
             d = paths.runs_dir(self.output_dir, genid)

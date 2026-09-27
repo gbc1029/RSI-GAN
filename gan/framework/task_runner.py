@@ -123,6 +123,25 @@ class DomainTaskRunner:
                 task_patch_rejected = str(e)
             patch_str = ""  # applied to code_root (or rejected -> nothing to apply)
 
+        # H11/B24 (batch 5): heal the design BEFORE it is persisted. The patch has
+        # now either committed or rolled back to the parent's code, so
+        # ``source_root`` is the authority for what this generation can assemble.
+        # The design object is shared with the loop (``config_dict``), so healing
+        # in place strips a dangling slot name from the persisted design file, the
+        # node meta and the parent->child inheritance chain together; the stripped
+        # names are recorded (event + meta) so the planner's next receipt shows
+        # what was dropped and why.
+        design_stripped = tx.heal_design_slots(config, "task", source_root)
+        if design_stripped:
+            try:
+                from gan.framework import paths as _paths
+                from utils import trajectory_log as _tlog
+                _tlog.append(_paths.events_path(self.output_dir), dict(
+                    {"type": "design_dangling_stripped", "genid": str(genid),
+                     "role": "task", "slot": "skills"}, names=design_stripped))
+            except Exception as e:  # noqa: BLE001 -- audit is advisory; stderr covers
+                print(f"[WARN] design_dangling_stripped event write failed: {e}")
+
         # Framework: persist the design, prepare the minimal code copy, then
         # assemble sandbox-visible design/skills inside that copy.
         design_path = tx.persist_design(self.design_store, config, genid)
@@ -237,5 +256,6 @@ class DomainTaskRunner:
                 "score_status": score_status,
                 "invalid_reason": invalid_reason,
                 "toolset_report": toolset_report,
+                "design_stripped": design_stripped or None,
             },
         )

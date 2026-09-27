@@ -50,6 +50,59 @@ def persist_design(design_store: DesignStore, config: Dict[str, Any], genid: Any
     return design_store.save(config or {}, "task", node_id=genid)
 
 
+def heal_design_slots(config: Dict[str, Any], role: str,
+                      code_root: Optional[str]) -> List[Dict[str, str]]:
+    """Strip slot names the committed tree cannot deliver (H11/B24, batch 5).
+
+    A design can reference a component that only exists in the session workspace
+    (selected before the patch landed) or was inherited from a parent whose patch
+    was rejected. Assembly resolves names against the **committed** tree, so a
+    name that cannot resolve there is a dangling reference: the child silently
+    loses the capability while the design keeps claiming it, and the name
+    propagates down the design inheritance chain (``config_dict`` -> next plan).
+
+    This helper removes exactly those names -- **only removes**: it never adds
+    names, never rewrites code and never replays patches (restoring deleted
+    source is nobody's job, per the ``register_component`` contract). The caller
+    must run it AFTER the task patch has been applied or rolled back, so
+    ``code_root`` is then the authority for what this generation can assemble.
+
+    Mutates ``config`` in place on purpose: ``task_runner`` holds the same dict
+    object the loop stores as ``config_dict``, so one in-place heal fixes the
+    persisted design file, the node meta and the parent->child chain together.
+    Returns the stripped ``[{"name", "reason"}]`` (empty = untouched).
+
+    Only the task design is healed (batch 5): role self-designs select against
+    the committed registry only, so no new dangling name can enter them; healing
+    pre-existing ones is separate follow-up work.
+    """
+    if not isinstance(config, dict):
+        return []
+    slot = "skills" if role == "task" else ("eval_points" if role == "evaluator" else None)
+    if slot is None:
+        return []
+    names = config.get(slot)
+    if not isinstance(names, (list, tuple)) or not names:
+        return []
+    from gan.registries.loader import load_registry_for_role
+    from gan.tools.assembly import gan_roots
+    _tools, rdir, cdir = gan_roots(code_root)
+    reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
+    kind = "skill" if slot == "skills" else "eval_point"
+    kept: List[str] = []
+    stripped: List[Dict[str, str]] = []
+    for name in names:
+        name = str(name)
+        if reg.module_path(kind, name) is not None:
+            kept.append(name)
+        else:
+            stripped.append({"name": name,
+                             "reason": reg.reason(kind, name) or "not resolvable"})
+    if stripped:
+        config[slot] = kept
+    return stripped
+
+
 def assemble_task_env(
     base_env: Dict[str, str],
     *,

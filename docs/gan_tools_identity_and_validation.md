@@ -127,6 +127,8 @@
 
 > 注：`unregister_component` 有**同样**的框架属性（同会话两次注销，第一次的删除会被还原）。本轮未改它（超出 #10/#11 范围），已记录于此供后续决策。
 
+> **【第 5 批追加·语义更新，原文保留】** 上文"校验模块已存在"之后的流程在第 5 批增加了两处：①模块存在后、改 workspace 前，槽位权限门控不变，但成功消息改为"可立即 `select_component`（task 设计）；补丁真正落地才生效，失败由自愈剥离"——对应 **P-3**（task 设计的选择校验改对**有效注册表**，工作区优先）；②安全兜底在框架侧：`task_execution.heal_design_slots` 在 persist 前剥离 committed 树无法交付的槽位名（**B24/H11**，事件 `design_stripped`）。汇总见 `docs/gan_tools_deep_write_fix.md` §9。
+
 ### 3.2 `list_components`（work/common）
 
 `gan/tools/work/common/list_components.py`，与 `list_editable` 同形（角色无法预先枚举可选项）。
