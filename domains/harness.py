@@ -10,13 +10,14 @@ import importlib.util
 import json
 import shutil
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
 from hydra import compose, initialize_config_dir
 
 
-_TASK_RESULT_PREFIX = "__RSI_TASK_RESULT__"
+QUESTION_TIMEOUT = 300
 
 
 def get_dataset(domain, subset="", dataset_root=None):
@@ -70,6 +71,29 @@ def _sandbox_command(run_root, agent_path, trajectory_path):
 
     agent_host = os.path.realpath(os.path.join(run_root, agent_path))
     _sandbox_path(run_root, agent_host)  # validates containment
+
+    required_binds = (
+        ("TaskAgent file", agent_host, os.path.isfile, "file"),
+        ("agent directory", os.path.join(run_root, "agent"), os.path.isdir, "directory"),
+        ("utils directory", os.path.join(run_root, "utils"), os.path.isdir, "directory"),
+        (
+            "domains/__init__.py",
+            os.path.join(run_root, "domains", "__init__.py"),
+            os.path.isfile,
+            "file",
+        ),
+        (
+            "domains/task_worker.py",
+            os.path.join(run_root, "domains", "task_worker.py"),
+            os.path.isfile,
+            "file",
+        ),
+    )
+    for label, source, predicate, expected_type in required_binds:
+        if not predicate(source):
+            raise RuntimeError(
+                f"Sandbox bind source for {label} is missing or not a {expected_type}: {source}"
+            )
 
     command = [
         bwrap,
@@ -140,9 +164,10 @@ def _sandbox_command(run_root, agent_path, trajectory_path):
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
     run_root = os.path.realpath(os.getcwd())
     trajectory_path = os.path.realpath(trajectory_path)
-    _sandbox_path(run_root, trajectory_path)  # validates containment
     os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
-    # A file bind must exist before Bubblewrap constructs the namespace.
+    # A file bind must exist before Bubblewrap constructs the namespace. The
+    # trajectory may live outside run_root when resuming from an external
+    # output directory; only this single file is exposed to the sandbox.
     with open(trajectory_path, "a", encoding="utf-8"):
         pass
 
@@ -156,22 +181,38 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
     for name in ("GAN_DATASET_ROOT", "PYTHONHOME", "PYTHONPATH", "OLDPWD"):
         child_env.pop(name, None)
 
-    proc = subprocess.run(
-        _sandbox_command(run_root, agent_path, trajectory_path),
-        input=json.dumps(payload, ensure_ascii=False, default=str),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=child_env,
-    )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
-        raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
-    for line in reversed((proc.stdout or "").splitlines()):
-        if line.startswith(_TASK_RESULT_PREFIX):
-            result = json.loads(line[len(_TASK_RESULT_PREFIX):])
-            return result["prediction"]
-    raise RuntimeError("Sandboxed TaskAgent returned no result sentinel")
+    # The result channel is an anonymous temporary file. Only the trusted
+    # task_worker receives its fd; the TaskAgent child is spawned later with
+    # close_fds=True and a different, worker-local result fd.
+    with tempfile.TemporaryFile(mode="w+b") as result_file:
+        result_fd = result_file.fileno()
+        payload["result_fd"] = result_fd
+        proc = subprocess.run(
+            _sandbox_command(run_root, agent_path, trajectory_path),
+            input=json.dumps(payload, ensure_ascii=False, default=str),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+            timeout=QUESTION_TIMEOUT,
+            pass_fds=(result_fd,),
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
+            raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
+
+        result_file.seek(0)
+        raw_result = result_file.read()
+
+    if not raw_result:
+        raise RuntimeError("Trusted TaskAgent worker returned no result")
+    try:
+        result = json.loads(raw_result.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Trusted TaskAgent worker returned invalid result JSON") from exc
+    if not isinstance(result, dict) or set(result) != {"prediction"}:
+        raise RuntimeError("Trusted TaskAgent worker returned an invalid result object")
+    return result["prediction"]
 
 
 def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
@@ -224,6 +265,7 @@ def harness(
     proofs_dname=None,
     model=None,
     dataset_root=None,
+    questions_path=None,
 ):
     # Dynamically import functions based on the domain
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
@@ -240,9 +282,9 @@ def harness(
             "gan/framework/models.yaml by the driver)."
         )
 
-    # GAN calls provide dataset_root and must always use the sandbox. Legacy
+    # GAN calls provide questions_path and must always use the sandbox. Legacy
     # direct harness calls retain their original same-process behavior.
-    sandbox_task_agent = dataset_root is not None
+    sandbox_task_agent = questions_path is not None or dataset_root is not None
     TaskAgent = None if sandbox_task_agent else load_task_agent(agent_path)
 
     # Specify output folder
@@ -258,6 +300,7 @@ def harness(
     evals_folder = os.path.join(output_folder, "agent_evals")
     os.makedirs(evals_folder, exist_ok=True)
     output_path = os.path.join(output_folder, "predictions.csv")
+    failures_path = os.path.join(evals_folder, "eval_failures.jsonl")
 
     # Load existing predictions if available
     if os.path.exists(output_path):
@@ -273,7 +316,9 @@ def harness(
         completed_ids = set()
 
     # Get dataset
-    if proofs_dname:
+    if questions_path:
+        dataset = pd.read_csv(questions_path, dtype=str)
+    elif proofs_dname:
         dataset = pd.read_csv(os.path.join(proofs_dname, "predictions.csv"), dtype=str)
         dataset["Response"] = dataset["prediction"].copy()
         dataset.drop(columns=["prediction"], inplace=True)
@@ -314,6 +359,23 @@ def harness(
             )
 
         failures = []
+        failures_written = 0
+
+        def append_pending_failures():
+            nonlocal failures_written
+            if failures_written >= len(failures):
+                return
+            pending = failures[failures_written:]
+            data = "".join(
+                json.dumps(rec, ensure_ascii=False) + "\n" for rec in pending
+            )
+            with open(failures_path, "a", encoding="utf-8") as f:
+                written = f.write(data)
+                if written != len(data):
+                    raise IOError("incomplete write to eval_failures.jsonl")
+            # Advance only after the append and file close both succeed.
+            failures_written = len(failures)
+
         for idx, future in futures:
             try:
                 prediction = future.result()
@@ -333,18 +395,19 @@ def harness(
 
             if (idx + 1) % save_interval == 0:
                 dataset["prediction"] = predictions
-                dataset.to_csv(output_path, index=False)
+                output_columns = [question_id_col, "prediction"] if questions_path else None
+                dataset.to_csv(output_path, index=False, columns=output_columns)
+                append_pending_failures()
                 print(f"Checkpoint saved to {output_path}")
 
     # Final save
     dataset["prediction"] = predictions
-    dataset.to_csv(output_path, index=False)
+    output_columns = [question_id_col, "prediction"] if questions_path else None
+    dataset.to_csv(output_path, index=False, columns=output_columns)
     print(f"Final predictions saved to {output_path}")
 
     if failures:
-        with open(os.path.join(evals_folder, "eval_failures.jsonl"), "w", encoding="utf-8") as f:
-            for rec in failures:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        append_pending_failures()
         print(f"{len(failures)} question(s) failed and were isolated (see eval_failures.jsonl)")
 
     return output_folder
@@ -412,7 +475,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--dataset_root", type=str, default=None,
-        help="Parent-only benchmark root. Providing it requires sandboxed TaskAgent execution.",
+        help="Legacy benchmark root. Providing it requires sandboxed TaskAgent execution.",
+    )
+    parser.add_argument(
+        "--questions_path", type=str, default=None,
+        help="Questions-only CSV prepared by the GAN parent process.",
     )
     args = parser.parse_args()
 
@@ -436,6 +503,7 @@ if __name__ == "__main__":
             proofs_dname=args.proofs_dname,
             model=args.model,
             dataset_root=args.dataset_root,
+            questions_path=args.questions_path,
         )
 
     # Balrog game domains

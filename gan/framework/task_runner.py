@@ -4,9 +4,9 @@ Heavy lifting (design persistence, env assembly, repo copy/patch, harness/report
 invocation and the objective ``report_summary``) lives in the frozen framework:
 ``gan/framework/task_execution.py``.
 
-``DomainTaskRunner`` runs the ORIGINAL DGM-H per-domain harness
-(``domains.harness``) + ``domains.report`` for a generation and returns a
-task-tree ``Node``. The task agent is **design-driven**: its design config
+``DomainTaskRunner`` runs the original per-domain harness and performs shared
+label-domain scoring in the parent process before returning a task-tree
+``Node``. The task agent is **design-driven**: its design config
 (shallow, from the planner) is persisted by the framework and passed to the
 harness through ``GAN_TASK_DESIGN``; selected skills are exposed via
 ``GAN_TASK_SKILLS_DIR``. Deep changes (``code_edit``) are applied to a throwaway
@@ -184,13 +184,48 @@ class DomainTaskRunner:
         if os.path.exists(report_path):
             os.remove(report_path)
 
-        # framework: harness + report invocation (frozen measurement path); model passed explicitly
-        rc, _out = tx.run_harness_and_report(
-            self.python, run_dir, self.domain, run_id, self.subset,
-            self.num_samples, model, env, self.timeout,
-            dataset_root=self.repo_root, log_path=self.log_path,
-        )
-        report = tx.read_report(report_path)
+        output_path = os.path.dirname(report_path)
+        if tx.uses_parent_scoring(self.domain):
+            questions_path, ground_truth_by_id = tx.prepare_questions(
+                self.repo_root, run_dir, self.domain, self.subset, self.num_samples,
+            )
+            # The child sees questions only; scoring remains in this parent.
+            rc, _out = tx.run_harness_and_report(
+                self.python, run_dir, self.domain, run_id, self.subset,
+                self.num_samples, model, env, self.timeout,
+                questions_path=questions_path, log_path=self.log_path,
+            )
+            predictions_path = os.path.join(output_path, "predictions.csv")
+            report = None
+            if os.path.exists(predictions_path):
+                try:
+                    report = tx.write_parent_report(
+                        predictions_path, report_path, self.domain, ground_truth_by_id,
+                    )
+                except Exception as e:
+                    # B6 (adapted): a parent-scoring failure must not degrade
+                    # silently; score reads None -> score_status="failed".
+                    report = None
+                    from utils.soft_fail import soft_fail
+                    soft_fail(f"parent scoring failed for genid {genid}: {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="parent_scoring_failed", genid=str(genid))
+        else:
+            # Preserve independent harness/evaluator domains outside G6a's scope.
+            rc, _out = tx.run_harness_and_report(
+                self.python, run_dir, self.domain, run_id, self.subset,
+                self.num_samples, model, env, self.timeout,
+                dataset_root=self.repo_root, log_path=self.log_path,
+            )
+            try:
+                report = tx.run_existing_domain_report(self.domain, output_path, model)
+            except Exception as e:
+                # B6 (adapted): same visibility contract as the parent-scoring path.
+                report = None
+                from utils.soft_fail import soft_fail
+                soft_fail(f"existing-domain report failed for genid {genid}: {e}",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="existing_domain_report_failed", genid=str(genid))
         if report is None and os.path.isfile(report_path):
             from utils.soft_fail import soft_fail
             soft_fail(f"report.json exists but is unparseable for genid {genid} "
