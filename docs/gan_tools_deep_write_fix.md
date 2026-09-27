@@ -269,7 +269,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 
 | 编号 | 项 | 位置 | 规模 | 需决策 |
 |---|---|---|---|---|
-| **B1** | **H8**（原编号 A2）守卫下沉（静默丢弃，**最高优先**） | `register_component.py:166-167` | **1 行** | — |
+| **B1** | ~~**H8**（原编号 A2）守卫下沉（静默丢弃，**最高优先**）~~ —— **✅ 已修（第 7 批，甲′）**：grant 决策改由 `broker.covers` 引导三分支 + 不可写时响亮拒，见 §11 | `register_component.py` | ~15 行 | — |
 | **B2** | ~~**H1** 跨注册表重复早检查~~ —— **✅ 第 6 批结构性消解**：单文件单写者 ⇒ 跨文件重复不可构造（见 §10） | ~~原位~~ | — | — |
 | **B3** | **H2** 复用 repo 原条目字段（`description`/`params_schema`） | `register_component.py` 追加前 | ~8 行 | — |
 | **B4** | **原子写** `write_registry_json` | `registries/loader.py:70` | ~5 行 | — |
@@ -680,3 +680,54 @@ select_component(dctx.role=task) -> skills = ['foo']      # 选择器接受了
 - **B29**：`set_prompt` 记录升级（hash+size）——放弃知识配置清单后，提示词是唯一"不透明"知识通道，此项价值上升；
 - **push 型知识清单**：被 pull 型替代，不实现；
 - **planner.json 启用**：schema 同构就绪，等真有 planner 组件需求时解锁（C 档）。
+
+---
+
+## 11. 第 7 批：B1/H8 守卫下沉（甲′）
+
+> 决策回顾：B1 曾给出甲（grant-if-absent + 自救错误）/ 乙（`AccessBroker.register_workspace_path` 登记动词）两案，初推荐乙；用户追问后逐场景重推发现**当时权重给错**（乙的独占场景 S4 在第 6 批"删 `registry` 参数、只写本角色注册表"之后近乎不可构造），修正为**甲′**（covers 引导的三分支 grant），用户确认"按甲实现"。
+
+### 11.1 场景矩阵（全部在当前代码实测）
+
+| 场景 | ws 注册表副本 | code_root 原件 | 路径已授权 | 旧行为 | 甲′ 行为 |
+|---|---|---|---|---|---|
+| S1 常规首触 | 无 | 有 | 否 | grant 拷贝 ✓ | 相同 ✓（第二段 `if_absent` 幂等） |
+| S2 已注册重复 | 有 | 有 | 是 | Already registered ✓ | 相同 ✓ |
+| **S3 = 可达的 H8** | **有（edit_source scratch，从未授权）** | 有 | **否** | **静默丢弃**（工具成功、patch 丢注册表 diff、防御层跳过——本批前实测复现：251B patch 只有模块 diff） | **grant 覆盖 scratch**（无 `if_absent`）⇒ patch **纯增量**（@@ 只加新条目，既有条目保留） |
+| S3′ 已授权+会话编辑 | 有（真实编辑） | 有 | 是 | 保护 ✓（R2 语义） | `if_absent` 保护 ✓（marker 实测保留） |
+| S4 异常基线（设计的注册表不在已提交树且未授权） | 无 | **无** | 否 | 静默丢 | **响亮拒**：`covers` 仍 False ⇒ 报 `cannot write ... not patch-visible`，**零写入零登记** |
+
+**S3 的关键细节**：对"未 covered"的分支**故意不带** `if_absent` ——若带，`if_absent` 会保留 agent 的 scratch 作为基线，patch 表现为"删光既有条目 + 加一条"，提交门以 new-orphan 拒绝（响亮但难懂）。用已提交真相覆盖 scratch 后 patch 只含"加一条"。
+
+### 11.2 实现（`register_component.py` 步骤 5，~15 行）
+
+```
+covers? ──否──> plain grant（用已提交真相覆盖 scratch / 或常规首拷）
+   │是
+   └─ ws 副本缺失 ──> grant(if_absent=True)（常规首拷，保护既有编辑）
+两次 grant 后仍 !covers ──> 响亮拒（带 denied 原因；零写入）
+```
+
+- 谓词唯一来源 = `broker.covers`（第 4 批引入的单一定义），工具不再复刻授权语义；
+- S4 的错误信息明确"Nothing was registered"，并禁止 agent 手工重建文件绕行；
+- **乙的定位修正**：`register_workspace_path` 保留为 **C5**（"工作区新建文件"升一等公民）的伴随设计，不在本批引入——它今天保护的场景近乎不可构造。
+
+### 11.3 验证（实测）
+
+| 组 | 结果 |
+|---|---|
+| S3 修复：scratch 注册表 ⇒ patch 624B 携带 task.json 且**纯增量**（bash/editor/knowledge 保留）、路径进 granted_paths | ✅（修复前 251B 无注册表 diff） |
+| S3′ 编辑保护：已授权+marker 会话编辑 ⇒ 保留、条目恰一次、patch 双携带 | ✅ |
+| S1/S2：常规首触（registry+module 双 diff）、幂等 | ✅ |
+| S4：异常基线 ⇒ 响亮拒、工具零写入、granted_paths 无污染 | ✅ |
+| U 套件：unregister 按名、ws 移除、deletion 入 patch | ✅ |
+| preflight（真实仓库）0 问题 0 碰撞；batch-6 全套 35/35 重跑 | ✅ |
+
+### 11.4 变更清单（第 7 批）
+
+| 文件 | 内容 |
+|---|---|
+| `gan/tools/deep/register_component.py` | 步骤 5 重写：covers 三分支 + 响亮拒（H8 根因闭合，B1 关闭） |
+| `docs/**`（追加式）、汇总文档 | 本节；B1 待办行关闭 |
+
+**第 7 批之后**，B 类"机械项"从 7 项清到 6 项（B10/B4/B8/B11/B12/B13 仍在，建议作为批次 7.5 一起清）；B1 为全会话资历最老的活缺陷，至此全部批次审查过的静默丢弃类（R1/H8）均闭合。

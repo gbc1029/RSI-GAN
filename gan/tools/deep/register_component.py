@@ -163,14 +163,38 @@ def tool_function(name, module, **kwargs):
 
     # 5) bring the registry into the workspace and append the entry (read-modify-write
     #    on the workspace copy; the rest of the file is preserved).
-    #    Only grant when the workspace copy is absent. NOTE(known, deferred): this
-    #    local guard is NOT equivalent to ``grant(if_absent=True)`` -- a registry that
-    #    exists in the workspace but was never granted stays out of ``granted_paths``,
-    #    so the patch builder drops this registration silently. See
-    #    docs/gan_tools_deep_write_fix.md (A2).
+    #
+    #    H8/B1 (batch 7): the OLD local guard ``if not isfile(ws_reg): grant`` conflated
+    #    "file exists in the workspace" with "path is patch-visible"
+    #    (``build_patch_from_workspace`` walks ``granted_paths`` only) -- a workspace
+    #    copy that was never granted (an ``edit_source`` scratch) made the tool report
+    #    success while the patch builder silently dropped the whole registration.
+    #    The grant decision now follows ``broker.covers`` (the single definition of
+    #    patch visibility) and distinguishes three cases:
+    #
+    #    - covered AND the workspace copy exists: nothing to do (keep the session's
+    #      edits -- this is what ``if_absent`` protects);
+    #    - covered but the workspace copy is absent: ``grant(if_absent=True)`` copies
+    #      the committed version in and keeps it patch-visible (normal first-touch);
+    #    - NOT covered: the registry exists in the committed tree (batch 6 guarantees
+    #      the designed registry is part of the repo skeleton, so a plain grant copies
+    #      the TRUTH over any scratch copy -- the resulting patch carries only the
+    #      appended entry, not "delete every existing entry"). After the grant the
+    #      path is patch-visible; if even then ``broker.covers`` says no, the state is
+    #      genuinely unwritable (denied/oversized) and the tool refuses loudly with
+    #      the gate's own reason instead of writing a registration it cannot commit.
     ws_reg = os.path.join(src, reg_rel)
-    if not os.path.isfile(ws_reg):
+    if not broker.covers(role, node, reg_rel):
         broker.grant(role, node, [reg_rel], intent="modify", reason="register")
+    if not os.path.isfile(ws_reg):
+        broker.grant(role, node, [reg_rel], intent="modify", reason="register",
+                     if_absent=True)
+    if not broker.covers(role, node, reg_rel):
+        denied = (getattr(broker, "last_result", {}) or {}).get("denied") or []
+        why = f" (denied: {', '.join(denied[:3])})" if reg_rel in [str(d) for d in denied] else ""
+        return (f"Error: cannot write {reg_rel}: the path is not patch-visible{why}. "
+                f"Nothing was registered. Inspect it with request_source_access and "
+                f"retry; do not re-create the file by hand.")
     try:
         with open(ws_reg, "r", encoding="utf-8") as f:
             data = json.load(f)
