@@ -32,8 +32,13 @@ class PlanContext:
     def record(self, op: str, **detail: Any) -> None:
         self.records.append({"op": op, **detail})
 
-    def add_response(self, issue_id: str, accepted: bool, feedback: str = "") -> None:
-        self.responses.append({"issue_id": issue_id, "accepted": bool(accepted), "feedback": feedback or ""})
+    def add_response(self, issue_id: str, accepted: bool, feedback: str = "",
+                     response_kind: str = "unspecified") -> None:
+        # B13 (batch 8): responses carry the structured stance; `feedback` stays
+        # for the session record only — the evaluator-facing projection drops it.
+        self.responses.append({"issue_id": issue_id, "accepted": bool(accepted),
+                               "feedback": feedback or "",
+                               "response_kind": str(response_kind)})
 
 
 def set_plan_context(ctx: PlanContext):

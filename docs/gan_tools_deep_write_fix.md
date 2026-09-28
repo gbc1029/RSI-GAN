@@ -20,6 +20,8 @@
 | 第 4 批（读侧） | `fix(gan/tools): list_components workspace overlay, design-role catalog, unsafe registry module paths` | **B18 + H10 + H9**：读侧与两个 deep 工具口径统一（工作区优先、设计目标角色、增删/覆盖可见），注册表 `module` 路径净化。见 §8 |
 | 第 5 批（plan→task 应用） | `fix(gan/framework): heal task design before persist; overlay-validated selection; set_config slot validation` | **B24 + B25 + P-3**：task 设计持久化前自愈（H11/B24 关闭）、`select_component`/`set_config` 槽位同权校验（B25/H12 关闭）、同会话选择（推翻第 4 批决策，见 §9.1）。见 §9 |
 | 第 6 批（注册表统一） | `fix(gan/registries): per-role single-writer catalogs, role-directory binding, md knowledge base` | **A14 + B2 + H6/C6 关闭**：三注册表独立（无 shared）、name 主键、角色目录绑定、单一 `tools` 槽位（legacy 归一化）、kind 机械退役、md 知识库（pull 型 + p/e 同批启用）。见 §10 |
+| 第 7 批（H8 闭合） | `fix(gan/tools): register_component grant decision follows broker.covers` | **B1/H8 关闭**：covers 引导三分支授权 + 不可写响亮拒（甲′；乙重新定位为 C5 伴随设计）。见 §11 |
+| 第 8 批（P→E 隔离） | `fix(gan/framework): planner→evaluator channels become named projections` | **B11 + B12 + B13 + B14**：meta 白名单、receipt.grants 收口、responses 投影 + stance 桶集、receipt 投影；B15'/B28 扩容登记。见 §12 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -731,3 +733,54 @@ covers? ──否──> plain grant（用已提交真相覆盖 scratch / 或常
 | `docs/**`（追加式）、汇总文档 | 本节；B1 待办行关闭 |
 
 **第 7 批之后**，B 类"机械项"从 7 项清到 6 项（B10/B4/B8/B11/B12/B13 仍在，建议作为批次 7.5 一起清）；B1 为全会话资历最老的活缺陷，至此全部批次审查过的静默丢弃类（R1/H8）均闭合。
+
+---
+
+## 12. 第 8 批：P→E 面隔离（B11 + B12 + B13 + B14）
+
+> 起因：对称调查 P→E 与 E→P 的全部信息通道。P→E 面实测出**四个活缺口**（三个静态、一个每轮运行时），同根同修：**事实流动、修辞不过界**——P 的自由文本存在于且仅存在于 P 的审计面（session 轨迹、records 审计副本、events.jsonl、人类可见文件），一切 E 向通道走**命名投影函数**（显式白名单变换），把隔离做成接口性质而非行为约定。用户决策：`response_kind` **必填**；**矛盾格显式渲染 + patch-outcome 尾行**随批做。
+
+### 12.1 缺口实测（修复前）
+
+| 缺口 | 通道 | 实测泄露 |
+|---|---|---|
+| **B11** | `run_summary.meta`（`loop.py` 黑名单只剔 2 键） | **`records` 整包进 E**——含 planner 的 `respond_issue.feedback` 反驳原文（evaluator 可被说服/反向拟合） |
+| **B14**（本批新识别） | `run_summary.receipt` **整包** | `code_patch.rejected_reason` 全文（**引用 P 的工件注释**——探针里 E 的话藏在 P 的注释里经此回传）、grants 话术、design.ops |
+| **B13** | `build_feedback_digest` | `said: <P 反驳原文>` **实测在输出里**——原登记"N3-D 不入 digest"判断有误，实为**每轮运行时定向泄露**（`PlannerResponse.feedback` 坐在数据类里直达 reward 模块） |
+| **B12** | `patch_receipt.json` / `child.meta["receipt"]` | grants 原样携带 agent 自由文本 `reason`（话术位）——`render_receipt` 恰好不渲染是**偶然**非纪律 |
+
+### 12.2 实现（六处，~102 行）
+
+| 文件 | 内容 |
+|---|---|
+| `gan/framework/loop.py` | `_EVALUATOR_META_KEYS`（12 结构键，default-deny 注释写明准入规则）；`_receipt_for_evaluator`（budget/design_stripped/toolset/code_patch{proposed,applied}/patch_rejected 布尔）+ run_summary 接线；`_settle_feedback_digest` 套投影 + `patch_outcome` 参 |
+| `gan/framework/receipt.py` | `_grants_summary`（白名单 role/paths/skipped/missing/intent；`denied`/`ts` 同剥——denied 理由本就不透 agent）+ `build_receipt` 收口；**events.jsonl 原文一字不动** |
+| `gan/summary.py` | `project_responses_for_evaluator`——唯一 P→E responses 投影，reward 模块**物理拿不到** rationale；派生统计（len 等）同样出局（任何原文的函数都把文本留在管线里） |
+| `gan/framework/reward/evaluator_reward.py` | 渲染端：删 `said: {fb}` → `stance:` 行；矛盾格（stance∈{acted,acted_differently} ∧ verdict=unfixed）显式 `claimed handled but not verified`；`patch_outcome.rejected` 尾行（"'acted' stances above may not have materialized"）；`PlannerResponse.response_kind`；同 issue 多响应逐条渲染（G3，`responses_by_id` 收集 list） |
+| `gan/tools/work/planner/respond_issue.py` | schema 增**必填** `response_kind`（五桶修订名 `acted/acted_differently/out_of_scope/disputed/deferred`——`fixed→acted` 避免与 verdict 撞名、`disputed` 是说方立场非裁决）；`ctx.record` **不再携带 feedback 文本**（下游白名单结构免疫）；`feedback` 参数保留（合法消费者：planner 会话轨迹 + 人类审计） |
+| `gan/framework/context.py` | `add_response(..., response_kind="unspecified")` |
+
+### 12.3 桶集设计（B13 讨论结晶）
+
+- **完备性**：三格缺口以"**意图与结果分列**"消解——G1（补丁被拒）不加桶（会话级尾行承载，PlannerResponse 零改动）；G2（stance=fixed ∧ verdict=unfixed）分列 + 矛盾格显式渲染（校准信号最浓的一格）；G3（复合立场）允许多响应逐条渲染；
+- **命名**：`acted`（执行了所述动作）/ `acted_differently`（承认有效、换个修法）/ `out_of_scope` / `disputed`（不同意该发现——说方立场，不是裁决）/ `deferred`；旧数据投影端归 `unspecified`（不伪装立场）；
+- **博弈性质**：粗桶允许**策略**（连续 `out_of_scope` ⇒ E 收窄 issue 范围）不允许**说服**——用类别编码隐蔽信息的信道容量趋近零，且异常分布本身可见。
+
+### 12.4 验证（32/32）
+
+- B11：records/receipt/delta 排除、12 结构键俱在、**新增键 default-deny**；
+- B14：rejection 全文/grants/design.ops/next_hint 对 E 消失，outcomes 布尔俱在；
+- B12：receipt JSON 与 render 无 grant reason；结构字段保留；denied/ts 剥离；
+- B13：投影无 feedback（含工具输出）、五桶+unspecified 渲染、**矛盾行实测**（acted ∧ unfixed）、patch-outcome 尾行成功时缺席、多响应逐条、invalid stance 拒绝、2×2 在投影数据上不回退；
+- 回归：preflight clean；batch-6 核心（目录/装配/选择）复检正常。
+
+### 12.5 E→P 面对称结论（同轮调查，登记未实施）
+
+- E→P 的不对称架构合理（E 给 P 的是指令，无需抽象屏障）；缺口在双向各自的"论证面"：
+- **B15'（新登记）**：E 的 `evidence` 需"指针而非论证"纪律（schema description + 200 字符上限；软约束——evidence 兼工作指派功能，硬结构化会破坏它）；
+- **B28 扩容**：`feedback.penalties` 进 schema 无任何消费者（第三例死数据）——接线（penalty 键名是结构化事实，可过"事实/修辞"检验）或移除；
+- P 失败后的回执对 P **无需脱敏**（rejection 是给 P 的合法裁定反馈）；对 E 的脱敏即 B14。
+
+### 12.6 修完后的 P→E 全通道面
+
+五条 E 向通道全部为命名投影：`diff_summary`（既有）/ `receipt.design.ops`（既有）/ `run_summary.meta`（B11）/ `run_summary.receipt`（B14）/ `feedback_digest.responses`（B13）+ receipt JSON 的 grants（B12）。P 的自由文本单向不出 planner；E 向新通道默认不可见，需显式建投影。

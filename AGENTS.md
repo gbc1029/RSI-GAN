@@ -270,8 +270,21 @@ Tests / verification scripts are kept locally under `scripts/local/` (gitignored
   only ever runs with a design whose every component resolves. Healing removes
   names only; it never adds, restores or rewrites source.
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
-- Do not expose planner rationale/reason to the evaluator (use
-  `gan/summary.py:build_diff_summary`).
+- **Planner→evaluator isolation (batch 8): facts flow, rhetoric does not.** Every
+  evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) —
+  `build_diff_summary` (ops/files), `receipt.design.ops` (`_ops_summary`),
+  `run_summary.meta` (`_EVALUATOR_META_KEYS`), `run_summary.receipt`
+  (`_receipt_for_evaluator`: outcomes only, no `rejected_reason` full text which
+  quotes the planner's artifacts), and `feedback_digest.responses`
+  (`project_responses_for_evaluator`: issue_id/accepted/stance only). The
+  planner's free text (`respond_issue.feedback`, grant `reason`) exists solely in
+  the planner's own audit surfaces (session trajectory, events.jsonl for human
+  review) and never rides back into any decision context. A NEW meta key or
+  receipt field is invisible to the evaluator until its projection is extended
+  on purpose (default-deny, mirroring the per-role access allowlist). The
+  planner responds to issues with a REQUIRED structured stance
+  (`response_kind`: acted / acted_differently / out_of_scope / disputed /
+  deferred) — the evaluator calibrates on decisions, never on persuasion.
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator
   must not fit the benchmark score (blind score first, then reveal).
 - The task agent has **no always-on tools**; its capabilities are all opt-in tools.

@@ -51,6 +51,30 @@ def build_diff_summary(
     return {"schema_version": FEEDBACK_SCHEMA_VERSION, "ops": ops, "files": sorted(files)}
 
 
+# B13 (batch 8): the ONLY planner→evaluator projection of issue responses.
+# `feedback` is the planner's rationale (audit-only: it stays in the planner's
+# session record and events) and is dropped HERE — before the reward module
+# sees the data — so the digest builder physically cannot leak it, no matter
+# how it is refactored. Derived statistics of the text (length etc.) are
+# equally out of scope: any function of the raw text keeps the text in the
+# pipeline. Legacy/missing stances normalize to "unspecified" rather than
+# masquerading as a real stance.
+_RESPONSE_KEYS_FOR_EVALUATOR = ("issue_id", "accepted", "response_kind")
+
+
+def project_responses_for_evaluator(
+    responses: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for r in (responses or []):
+        if not isinstance(r, dict):
+            continue
+        item = {k: r.get(k) for k in _RESPONSE_KEYS_FOR_EVALUATOR}
+        item["response_kind"] = str(item.get("response_kind") or "unspecified")
+        out.append(item)
+    return out
+
+
 def make_feedback(
     issues: Optional[List[Dict[str, Any]]] = None,
     diff_summary: Optional[Dict[str, Any]] = None,

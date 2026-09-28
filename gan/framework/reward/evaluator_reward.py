@@ -35,7 +35,12 @@ class EvaluatorIssue:
 class PlannerResponse:
     issue_id: str
     accepted: bool
+    # B13 (batch 8): the structured stance (acted/acted_differently/out_of_scope/
+    # disputed/deferred). NOTE: `feedback` is the planner's rationale — it is an
+    # audit-only field and is dropped by summary.project_responses_for_evaluator
+    # BEFORE the digest builder runs; it must never be rendered to the evaluator.
     feedback: Optional[str] = None
+    response_kind: Optional[str] = None
 
 
 @dataclass
@@ -161,11 +166,19 @@ def build_feedback_digest(
     predicted_score: Optional[float] = None,
     benchmark_score: Optional[float] = None,
     diff_summary: Optional[Dict[str, Any]] = None,
+    patch_outcome: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build a plain-text digest of what happened to the evaluator's issues.
 
     No scores/weights are attached to outcomes; the blind-vs-actual calibration
     is also stated textually.
+
+    B13 (batch 8): ``responses`` must arrive ALREADY PROJECTED through
+    ``summary.project_responses_for_evaluator`` — the free-text planner
+    rationale is dropped at the channel boundary, so this builder receives and
+    renders only structured facts (accepted / stance). ``patch_outcome`` is the
+    session-level code-patch result ({"rejected", "attempts"}); a rejected patch
+    is rendered as a tail line because it discounts every "acted" stance above.
     """
     lines: List[str] = ["# Feedback digest for your previous issues"]
 
@@ -186,18 +199,31 @@ def build_feedback_digest(
     if not outcomes:
         lines.append("- (no issues were raised in that round)")
     else:
-        responses_by_id = {r.get("issue_id"): r for r in (responses or [])}
-        issues_by_id = {it.get("issue_id"): it for it in (issues or [])}
+        # B13/G3: a planner may respond to the same issue more than once
+        # (a composite stance); render every response instead of collapsing to
+        # the first.
+        responses_by_id: Dict[str, List[Dict[str, Any]]] = {}
+        for r in (responses or []):
+            if isinstance(r, dict):
+                responses_by_id.setdefault(str(r.get("issue_id")), []).append(r)
+        issues_by_id = {it.get("issue_id"): it for it in (issues or []) if isinstance(it, dict)}
         for o in outcomes:
             it = issues_by_id.get(o.issue_id, {})
-            resp = responses_by_id.get(o.issue_id, {})
+            resp_list = responses_by_id.get(o.issue_id, [])
             lines.append(f"- issue {o.issue_id}: {it.get('description', '')}".rstrip())
             lines.append(f"    outcome: {_LABEL_TEXT.get(o.cell, o.cell)}")
-            if resp:
-                fb = str(resp.get("feedback") or "").strip()
-                lines.append(
-                    f"    planner: accepted={bool(resp.get('accepted'))}" + (f", said: {fb}" if fb else "")
-                )
+            if resp_list:
+                for resp in resp_list:
+                    kind = str(resp.get("response_kind") or "unspecified")
+                    line = f"    planner: accepted={bool(resp.get('accepted'))}, stance: {kind}"
+                    # G2: name the contradiction explicitly — the planner claims
+                    # to have acted but the fix verdict says otherwise. This is
+                    # the strongest self-calibration signal in the 2x2 grid.
+                    if (o.cell == CELL_ACCEPTED_UNFIXED
+                            and kind in ("acted", "acted_differently")):
+                        line += (" — claimed handled but not verified; check whether "
+                                 "your issue is actually solvable")
+                    lines.append(line)
             else:
                 lines.append("    planner: (no response)")
             if o.evidence:
@@ -207,6 +233,16 @@ def build_feedback_digest(
         ops = [o.get("op") for o in (diff_summary.get("ops") or [])]
         files = diff_summary.get("files") or []
         lines.append(f"- planner changes (sanitized): ops={ops or '[]'}, files={files or '[]'}")
+
+    po = patch_outcome or {}
+    if po.get("rejected"):
+        # G1: session-level fact — a rejected patch discounts "acted" stances
+        attempts = po.get("attempts", 0)
+        lines.append(
+            f"- NOTE: the planner's code patch was REJECTED this round "
+            f"({attempts} attempt(s)); 'acted'/'acted_differently' stances above may "
+            f"not have materialized in the executed agent."
+        )
 
     lines.append(
         "- Reflect: were your issues valid and useful? Did you over/under-claim? "

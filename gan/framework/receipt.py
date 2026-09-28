@@ -24,6 +24,31 @@ def _ops_summary(records: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]
     return out
 
 
+# B12 (batch 8): grants ride into the receipt WITHOUT agent-authored free text.
+# The allowlist of structural fields kept for the receipt's consumers.
+_GRANT_KEYS_FOR_RECEIPT = ("role", "paths", "skipped", "missing", "intent")
+
+
+def _grants_summary(grants: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Grants WITHOUT the agent-authored free text ``reason`` (audit-only field).
+
+    ``reason`` serves human authorization audit in ``events.jsonl`` and must not
+    ride back into any decision context: the receipt is persisted per node
+    (``patch_receipt.json`` / ``child.meta["receipt"]``) and its renderer feeds
+    the planner's next prompt. Structural facts (paths/intent/skipped/missing)
+    stay: the agent needs them to know what it can still touch. Mirror of
+    ``_ops_summary`` (rationale stripped) and ``build_diff_summary`` (reason
+    stripped). ``denied`` is dropped as well — its reasons were never surfaced
+    to agents.
+    """
+    out: List[Dict[str, Any]] = []
+    for g in grants or []:
+        if not isinstance(g, dict):
+            continue
+        out.append({k: g.get(k) for k in _GRANT_KEYS_FOR_RECEIPT if k in g})
+    return out
+
+
 def _design_diff(config: Optional[Dict[str, Any]], parent_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     cfg = config if isinstance(config, dict) else {}
     par = parent_config if isinstance(parent_config, dict) else {}
@@ -99,7 +124,7 @@ def build_receipt(
             "rejected_reason": rejected_reason,
         },
         "budget": budget or {},
-        "grants": grants or [],
+        "grants": _grants_summary(grants),
         "trajectory_refs": trajectory_refs or [],
         "next_hint": _next_hint(rejected_reason),
     }

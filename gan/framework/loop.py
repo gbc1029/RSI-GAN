@@ -46,8 +46,50 @@ from gan.framework import paths, scores, trajectory
 from gan.framework.loader import load_registry, resolve_domain
 from gan.framework.reward.evaluator_reward import build_feedback_digest
 from gan.framework.reward.packet import RewardPacket
-from gan.summary import build_diff_summary, make_feedback
+from gan.summary import build_diff_summary, make_feedback, project_responses_for_evaluator
 from gan.framework.tree.store import Node, NodeValue, TreeStore
+
+# B11 (batch 8): the allowlist of node-meta keys the EVALUATOR may see in its
+# run summary. Everything else in `child.meta` is the planner's decision
+# paperwork — notably `records`, which carries the planner's respond_issue
+# free text (its argumentation to the evaluator). Default-deny: a new meta key
+# is invisible to the evaluator until it is added here on purpose.
+_EVALUATOR_META_KEYS = (
+    "task_patch_files",        # which files this generation changed
+    "patch_applied",
+    "task_code_commit", "code_commit", "base_commit",
+    "task_patch_rejected",     # patch outcome
+    "toolset_report",          # design-claims vs assembly (B7)
+    "design_stripped",         # healing record (B24)
+    "harness_rc", "invalid_reason", "score_status", "imputed",
+    "modify_depth",
+    # deliberately NOT here: "records" (planner rationale), "receipt" (projected
+    # separately, see _receipt_for_evaluator), "delta_vs_parent" (selection
+    # pressure must not be fittable), "feedback", "run_dir"/"report_path"/
+    # "report_sha"/"design_path"/"model" (paperwork, not judgement input).
+)
+
+
+def _receipt_for_evaluator(receipt):
+    """B14 (batch 8): the evaluator's projection of the plan receipt — outcomes only.
+
+    The FULL receipt is the planner's decision input (``render_receipt``) and
+    must not reach the evaluator wholesale: ``code_patch.rejected_reason``
+    quotes the planner's own artifacts (comments/identifiers inside compile
+    errors), ``grants`` carry agent free text, and ``design.ops`` duplicate the
+    diff_summary channel. The evaluator calibrates on patch OUTCOMES
+    (applied/rejected/budget), not on the planner's paperwork.
+    """
+    if not isinstance(receipt, dict):
+        return {}
+    cp = receipt.get("code_patch") or {}
+    return {
+        "budget": receipt.get("budget") or {},
+        "design_stripped": receipt.get("design_stripped") or [],
+        "toolset": receipt.get("toolset") or {},
+        "code_patch": {"proposed": cp.get("proposed"), "applied": cp.get("applied")},
+        "patch_rejected": bool(cp.get("rejected_reason")),
+    }
 from utils.soft_fail import soft_fail
 
 _MEASURED = ("ok", "partial")
@@ -201,11 +243,18 @@ class GanLoop:
             return None
         digest = build_feedback_digest(
             issues=prev_issues,
-            responses=plan_result.get("responses") or [],
+            # B13 (batch 8): the ONLY planner→evaluator projection of issue
+            # responses — free-text `feedback` never reaches the reward module.
+            responses=project_responses_for_evaluator(plan_result.get("responses") or []),
             verdicts=getattr(ctx, "fix_verdicts", []) or [],
             predicted_score=self._prev_predicted,
             benchmark_score=self._prev_benchmark,
             diff_summary=diff_summary,
+            # G1: the patch outcome is session-level fact; a rejected patch means
+            # "acted" stances above may not have materialized (rendered as a tail
+            # line by the digest builder).
+            patch_outcome={"rejected": bool(plan_result.get("patch_rejection")),
+                           "attempts": plan_result.get("attempts", 0)},
         )
         run_dir = paths.runs_dir(self.output_dir, genid)
         os.makedirs(run_dir, exist_ok=True)
@@ -838,8 +887,14 @@ class GanLoop:
                 benchmark_for_eval = None if child.meta.get("imputed") else child.value.score
                 # BLIND hygiene: never expose the objective score/accuracy in the
                 # blind-phase run summary (score is revealed separately).
-                meta_view = {k: v for k, v in (child.meta or {}).items()
-                             if k not in ("report_summary", "delta_vs_parent")}
+                # B11 (batch 8): ALLOWLIST, not denylist — the planner's node meta
+                # is mostly the planner's own paperwork, and `records` carries the
+                # planner's respond_issue free text (its argumentation to the
+                # evaluator). Any NEW meta key must be added here explicitly:
+                # default-deny keeps rhetoric out of the evaluator by construction,
+                # mirroring the per-role access allowlist.
+                meta_view = {k: child.meta[k] for k in _EVALUATOR_META_KEYS
+                             if k in (child.meta or {})}
                 report_view = {k: v for k, v in (child.meta.get("report_summary") or {}).items()
                                if k not in ("overall_accuracy", "random_guess_accuracy")}
                 try:
@@ -850,7 +905,11 @@ class GanLoop:
                             "report_summary": report_view,
                             "score_status": child.value.score_status,
                             "imputed": bool(child.meta.get("imputed")),
-                            "receipt": self._last_receipt,
+                            # B14 (batch 8): projection, not the whole receipt —
+                            # `code_patch.rejected_reason` quotes the planner's own
+                            # artifacts, `grants` carries agent free text, and
+                            # `design.ops` duplicate the diff_summary channel.
+                            "receipt": _receipt_for_evaluator(self._last_receipt),
                         },
                         prev_feedback={**(self._last_feedback or {}), "digest": self._last_digest},
                         benchmark_score=benchmark_for_eval,
