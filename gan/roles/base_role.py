@@ -13,7 +13,8 @@ from gan.tools.assembly import assemble_tools_dir_reported
 
 
 def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_dir: str,
-                                 patch_str: str) -> None:
+                                 patch_str: str, *, exhausted: bool = False,
+                                 rejected: Optional[str] = None) -> None:
     """Loud safety net for the silent-drop class (R1).
 
     A session that left edits in the workspace but built no patch has DROPPED them.
@@ -21,9 +22,17 @@ def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_di
     now covers the tools we ship, and this probe makes any future omission visible
     (one ``deep_edit_dropped`` event) instead of silent. Advisory only: a failure to
     compute the diff must never fail the session.
+
+    Batch 13 (B41): the retry-exhausted / abandoned patch path is its own silent
+    drop -- ``patch_str`` is non-empty but DISCARDED wholesale, and the original
+    guard (``if ... or patch_str or has_deep_write(records): return``) skipped the
+    probe exactly there. When ``exhausted``/``rejected`` is passed the probe runs
+    regardless of the gates: any workspace content then means edits that will not
+    reach any commit.
     """
     from gan.patch import build_patch_from_workspace, has_deep_write
-    if broker is None or patch_str or has_deep_write(records):
+    forced = bool(exhausted or rejected)
+    if broker is None or (not forced and (patch_str or has_deep_write(records))):
         return
     try:
         leftover = build_patch_from_workspace(broker, role, key)
@@ -33,10 +42,15 @@ def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_di
         return
     from utils.soft_fail import soft_fail
     soft_fail(
-        f"{role}: workspace has {len(leftover)} bytes of uncommitted deep edits but "
-        f"the session recorded no deep-write op; the edits were dropped",
+        (f"{role}: workspace has {len(leftover)} bytes of deep edits that will not reach "
+         f"any commit"
+         + (f" -- the retry loop exhausted/abandoned the proposed patch"
+            if forced else
+            " but the session recorded no deep-write op")
+         + "; the edits were dropped"),
         event_path=paths.events_path(output_dir),
         event_type="deep_edit_dropped", role=role,
+        phase=("exhausted" if forced else "no_record"),
     )
 
 

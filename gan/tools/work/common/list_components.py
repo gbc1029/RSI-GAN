@@ -174,11 +174,11 @@ def tool_function(**kwargs):
         "modified": "this outer's workspace copy differs from the committed one",
     }
 
-    # Batch 5: `selectable` mirrors exactly what select_component accepts, and its
-    # authority changed with P-3: the task design is overlay-validated AND healed
-    # before persist (heal_design_slots), so its mirror is the effective view;
-    # role self-designs are not healed yet and keep the committed-only authority.
-    _sel_effective = (design_role == "task")
+    # Batch 5, extended batch 13: `selectable` mirrors exactly what
+    # select_component accepts. Since batch 13 EVERY design selects against the
+    # effective (workspace-first) registry -- the mirror is the effective view
+    # for the task design and for role self-designs alike.
+    _sel_effective = True
 
     def _selectable(name):
         if _sel_effective:
@@ -302,7 +302,9 @@ def tool_function(**kwargs):
                          "(design_dangling_stripped): " + ", ".join(sorted(dangling)))
         else:
             notes.append("selected but NOT in the committed registry (assembly will skip "
-                         "them; role designs are not healed yet): "
+                         "them; for role designs a successful patch heals this at "
+                         "commit; a rejected/exhausted one leaves it dangling until "
+                         "the next assembly reports it): "
                          + ", ".join(sorted(dangling)))
     if not patch_channel:
         notes.append("no patch channel in this session (evaluate): deep registry/source "

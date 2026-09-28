@@ -129,8 +129,25 @@ def tool_function(name, **kwargs):
     if ws_mod and os.path.isfile(ws_mod):
         os.remove(ws_mod)
     dctx.record("unregister_component", name=name, registry=fn, module=(mod or None))
+    # batch 13 (U'): a still-selected name means the design claims a capability
+    # whose removal is only SCHEDULED -- the two facts live on different
+    # timelines (registry entry: patched; design slot: immediate) and are
+    # calibrated only at the patch-exit heal / assembly report. Detection and
+    # reminder only: the tool never edits the design itself (a rejected or
+    # exhausted patch would leave the removal un-landed while the auto-deselection
+    # persisted -- a permanent, unreported shadow).
+    still_selected = False
+    if dctx is not None and isinstance(getattr(dctx, "config", None), dict):
+        tools = dctx.config.get("tools")
+        if isinstance(tools, (list, tuple)):
+            still_selected = name in [str(x) for x in tools]
+    notice = (f" NOTE: '{name}' is still selected in your design (tools slot); "
+              f"the removal above is only scheduled -- deselect it if that is "
+              f"intended, otherwise the design and the registry will disagree "
+              f"until the patch outcome is known."
+              if still_selected else "")
     return (f"Scheduled removal of tool '{name}' ({rel}); it will be committed with "
-            f"this session's patch after validation.")
+            f"this session's patch after validation.{notice}")
 
 
 op_info = tool_info

@@ -337,11 +337,23 @@ def tool_function(name, module, description=None, **kwargs):
     comps.append(new_entry)
     write_registry_json(ws_reg, data)
     dctx.record("register_component", name=name, module=mod, registry=reg_name)
+    # batch 13 (B42 companion note, text only): when the designed role differs
+    # from the registry's owning role (planner's self-improve session, whose
+    # design target is planner but whose writable registry is task.json), say so
+    # -- the entry cannot be selected in THIS session (the design target's slot
+    # resolves against the designed role's own registry).
+    cross_note = ""
+    designed = getattr(dctx, "role", None)
+    if designed is not None and designed != _OWNING_DIR.get(role, role):
+        cross_note = (f" NOTE: registered into {reg_name} (the {role} session's "
+                      f"writable registry), but your current design target is "
+                      f"'{designed}' -- this tool is not selectable in THIS "
+                      f"session; task-side changes belong to your plan sessions.")
     return (f"Registered tool '{name}' ({module_rel}) in {reg_rel}{note}. It will "
             f"be committed with this session's patch after validation. You can "
             f"select_component it right away (task design); the task agent actually "
             f"gets it only once the patch commits -- a rejected patch strips the "
-            f"selection from the design before persisting.")
+            f"selection from the design before persisting.{cross_note}")
 
 
 op_info = tool_info

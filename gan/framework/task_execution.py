@@ -78,17 +78,23 @@ def heal_design_slots(config: Dict[str, Any], role: str,
     persisted design file, the node meta and the parent->child chain together.
     Returns the stripped ``[{"name", "reason"}]`` (empty = untouched).
 
-    Only the task design is healed (batch 5): role self-designs select against
-    the committed registry only, so no new dangling name can enter them; healing
-    pre-existing ones is separate follow-up work.
+    Only the task design was healed before batch 13: role self-designs selected
+    against the committed registry only, so no NEW dangling name could enter
+    them. Batch 13 retires that restriction: role self-designs now select
+    against the effective (workspace-first) registry too, so they accumulate
+    dangling names exactly like the task design -- the loop's
+    ``_apply_self_patch`` runs this heal at the SUCCESSFUL apply exit (where
+    the committed registry is the new authority) and re-saves the design file
+    when anything was stripped. The exhausted/rejected exit keeps the old file
+    for now (registered backlog: docs/7 section 6.1).
     """
     if not isinstance(config, dict):
         return []
-    # batch 6: the single component slot is ``tools`` for every role; healing
-    # still applies ONLY to the task design (batch-5 scope: role self-designs
-    # select against the committed registry, so no new dangling name enters them)
+    # batch 6: the single component slot is ``tools`` for every role; batch 13:
+    # every role's design is healed (loader resolves each role's own registry;
+    # entry_reason's role-directory binding applies as usual)
     slot = "tools"
-    if role != "task":
+    if role not in ("task", "planner", "evaluator"):
         return []
     names = config.get(slot)
     if not isinstance(names, (list, tuple)) or not names:

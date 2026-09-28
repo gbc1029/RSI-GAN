@@ -54,7 +54,9 @@ def tool_function(key, value, **kwargs):
             return f"Error: '{key}' must be a list of tool names (strings)"
         if key not in ctx.config:
             return f"Error: slot '{key}' not in {ctx.role} design schema"
-        overlay = session_overlay_root() if ctx.role == "task" else None
+        # batch 13: the effective (workspace-first) registry for ALL roles --
+        # mirrors select_component (same authority, same errors)
+        overlay = session_overlay_root()
         reg = load_registry_for_role(ctx.role, overlay_root=overlay)
         for name in value:
             if not reg.has(name):

@@ -26,6 +26,7 @@
 | 第 10 批（闭环加固） | `fix(gan/tools): collision precheck at registration, collisions in the commit gate, metadata-preserving registration (B16/B17/B3)` | **B16 + B17 + B3 + 新算子 `update_component`**：注册期碰撞硬拒（always-on ∪ 已注册组件）、提交门差分第五类、注册元数据保全（条件拉取 + 可选 description）、条目元数据的收编更新路径。见 §14 |
 | 第 11 批（机械清扫） | `fix(gan/framework): initialize broker.last_result, atomic registry writes, list_dir cap (B10/B4/B19/A16)` | **B10 + B4 + B19 + A16 + B8 撤项**：broker.last_result 初始化、注册表原子写（保尾换行）、list_dir 200 上限、loop.yaml 保留键注释；B8 经考古撤项（守卫自 origin 即在）。回归 161 断言。同轮登记 B31–B40。见 §15 |
 | 第 12 批（范畴重划） | docs-only | **无代码改动**：13 项（B9/B31/B32/B40/B35/B33/B34/B36/B37/B38/B28/B15'/B39）按机制归属移入 `docs/7` §2.4（反馈/信息流/恢复；B34→L3①、B31→L4 合并），B21→§4、B20→§7；顺带标注 L2/F1/G5/F1-smoke 已由第 8/9 批实质闭合。见 §16 |
+| 第 13 批（角色自设计 overlay） | `fix(gan): role self-design overlay, patch-exit heal, exhausted-drop event, no-newline patch markers` | **overlay + B26 第一期 + B41 + U′ + B42 文本 + B22**：角色自设计改有效视野权威（批 5 committed-only 正式退役）、成功出口 heal（跨层接线 + receipt `design_stripped`）、耗尽路径响亮事件、unregister「仍被选中」纯提醒、cross-design note、无尾换行补丁生成侧修（七形态过真实 `git apply`）。回归 161→180 断言。见 §17 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -298,11 +299,11 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B19** | `list_dir` 加输出上限（与 `grep` 的 `max_results=100` 对齐）【✅ 已修（第 11 批）：`_MAX_ENTRIES=200` + 尾行 "... and K more entries (use grep, or list a narrower path)"，见 §15.1】 | `list_dir.py` | ~5 行 | — |
 | **B20** | `deny_deep` 接线（**须含 `register_component`**，见 A13） | `access.py` / `build.py` / 3 个 deep 工具 | 跨 4 文件 | — |
 | **B21** | 预算/死键：`task_agent.py` 未传 `max_tool_calls`（默认 40）；`cost.*` 接线或移除 | `task_agent.py` + `loop.yaml` | ~5 行 | **是** |
-| **B22** | `patch.py` 支持 `\ No newline at end of file`（D1 备选） | `patch.py` | ~15 行 | 可选 |
+| **B22** | `patch.py` 支持 `\ No newline at end of file`（D1 备选）【✅ 已修（第 13 批，**生成侧**）：`_no_newline_marker_diff` 包装——喂 difflib 前给无换行末行补 `\n` 保 hunk 结构，生成后按**实测的 git 标记语义**插 marker（每个缺尾换行的 payload 行后必须紧跟 marker，且 marker 归属于面对它的那一侧）；单侧缺换行且内容相同 ⇒ 拆 `-`/`+` 对（git 拒绝把该行当 context）；双缺异内容 ⇒ 两对 marker；双缺同内容 ⇒ 共享 context + 单 marker；padded 后两侧全同 ⇒ 手工构造 `@@` 拆分对。以 `git diff --no-index` 参考输出逐字节比对，七形态全过真实 `git apply`，见 §17】 | `patch.py` | ~15 行 | 可选 |
 | **B23** | 回归断言固化（报告 §六 的 6 条真实链路 e2e）【✅ 已修（第 9 批）：/tmp 探针固化为 `scripts/local/` 三套件 + 统一入口，132 断言，见 §13】 | 测试代码 | 6 例 | — |
 | **B24** | **H11**（第 4 批新发现）任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`；下一代装配时被 B7 记 skip，静默失能且留痕） —— **✅ 已修（第 5 批，A2 自愈）**，见 §9.3 | `gan/framework/task_runner.py:103-128` | ~15 行 | **是** |
 | **B25** | **H12**（第 5 批新发现）`set_config("skills", [...])` 只做 schema 键白名单，未注册组件不经拒绝直接进设计（实证：装配报 `not registered`） —— **✅ 已修（第 5 批，Option 1）**，见 §9.4 | `gan/tools/design/set_config.py` | ~15 行 | **是** |
-| **B26** | **角色设计的 heal**（第 5 批新发现）：`evaluator/planner.self_improve` 在补丁重试循环后**无条件** `save_self_config(cfg)`（`gan/roles/evaluator.py:194`），与 H11 同模式；角色设计现在 committed-only 故**不会新造**悬空，但存量链上的悬空名未自愈。修法 = 角色设计也开 overlay + 自愈（需决策） | `gan/roles/base_role.py:215` + 两个 `self_improve` | ~15 行 | **是** |
+| **B26** | **角色设计的 heal**（第 5 批新发现）：`evaluator/planner.self_improve` 在补丁重试循环后**无条件** `save_self_config(cfg)`（`gan/roles/evaluator.py:194`），与 H11 同模式；角色设计现在 committed-only 故**不会新造**悬空，但存量链上的悬空名未自愈。修法 = 角色设计也开 overlay + 自愈（需决策）【⏳ **第一期已修（第 13 批）**：`heal_design_slots` 去掉 role 限制（对照**本角色**注册表）+ `loop._apply_self_patch` **成功出口** heal + 重存 + 事件 `design_dangling_stripped(stage=self_improve)` + `design_stripped` 进 self receipt；**overlay 权同批实施**（角色自设计 = 有效视野权威，批 5 committed-only 正式退役）+ **U′**（unregister 检测「仍被选中」纯提醒）。**第二期保持待办**（`docs/7` §6.1）：耗尽/被拒出口 heal + `save_self_config` 延迟化，见 §17】 | `gan/roles/base_role.py:215` + 两个 `self_improve` | ~15 行 | **是** |
 | **B31** | 死 `code_edit` 分支（origin 有生产者 `gan/operators/planner_ops/code_edit.py`，`642bcda` 重构删除算子后失联）——**随 B9 一并删** | `gan/summary.py:44` | ~4 行 | — |
 | **B32** | grants 路径在 `diff_summary` 对象内双写（`ops[].paths` + `files`）；收敛为 ops + receipt.grants 两处——**随 B9 files 退出实施**（receipt.grants 经 `_receipt_for_evaluator` 对 E 已剥除，仅 P 可见） | `gan/summary.py` | （随 B9） | — |
 | **B33** | **提示词/种子签名漂移**：`planner.py:65` 与 `seeds/planner.md:27` 仍写 `respond_issue(issue_id, accepted, feedback)` 三参——第 8 批后 `response_kind` **必填**，按指令逐字调用的 LLM 每轮首调必撞 schema 错误（软失败可重试，但指令是 LLM 第一依据）。附带：E 提示词开头深工具枚举句补 `update_component` | `gan/roles/planner.py` + `seeds/planner.md` + `gan/roles/evaluator.py:29` | ~5 行 | — |
@@ -313,6 +314,8 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B38** | **2×2 校准矩阵机器未接线**：`classify_issue`/`run_check_step` 全仓无生产调用（唯一"消费者"是回归冒烟断言）；活着的只有 `*_from_dicts` 转换器。report_issue docstring 明言 "tracked through the 2x2 matrix"——设计意图从未在活路径兑现。**需决策**：接线 or 删机器留转换器 | `gan/framework/reward/evaluator_reward.py` | 需决策 | **是** |
 | **B39** | 可选增强：diffstat（`{file: +n/-m}` 纯数字行级统计，零 planner 措辞——diff 行数是结构变更量度量而非自由文本函数）作为 `meta_view` 新键（default-deny 扩展），补代码面"形状"信息。低优先级 | `loop.py` + `task_runner.py` | ~15 行 | — |
 | **B40** | **E 面冗余三处**（第 11 批冗余审计 R1–R3）：同轮双份 `toolset_report`/`design_stripped`（meta_view 与 receipt 投影——后者正是从同一 `child.meta` 构建）、双份补丁结果（meta + receipt 投影，`budget.attempts`/`proposed` 是 receipt 独有需保留）、digest 尾行 = E 同时收到的 diff_summary JSON 的严格子集。修法 = `_receipt_for_evaluator` 瘦身 + `build_feedback_digest` 删 diff_summary 块；batch8 套件断言同步 | `loop.py` + `evaluator_reward.py` | ~10 行 | — |
+| **B41** | **耗尽路径整批深改静默丢弃**（B26 家族）：`warn_dropped_workspace_edits` 的门（`patch_str or has_deep_write`）恰好在该场景关死——补丁**非空但被整批丢弃**，工作区留有编辑却零报告（审计-事实分叉）。【✅ 已修（第 13 批）：强制模式形参 `exhausted`/`rejected`，强制时无视两门；事件 `deep_edit_dropped` 带 `phase`。见 §17】 | `gan/roles/base_role.py` + 两个 `self_improve` | ~15 行 | — |
+| **B42** | **deep 工具目标注册表按访问角色而非设计角色**（`_OWN_REGISTRY` 以 `actx.role` 为键）⇒ planner `self_improve` 写 `task.json`（能写不能选，半审计越权通道）；选项 (a) 目标跟随 `dctx.role` /(b) 接受为灵活性。【⏳ 第 13 批仅加**文本说明**（cross-design note："not selectable in THIS session"），行为决策仍暂缓。见 §17】 | `gan/tools/deep/*.py` | ~10 行 | **是** |
 
 **B 类详细写法**（B1–B4 为本文档已完整分析的四项；B5–B26 见上表与 `docs/工具管理审查.md` 对应编号）
 
@@ -980,3 +983,79 @@ B9（收窄定稿，含 B31/B32 挂靠）、B33、B34、B35、B36、B37、B38（
 **(3) C2 核实增补（维持登记）**：evaluate 深改可达面实测钉死——registry 三深工具 R1 拒 ✓；**`request_source_access(intent="modify")` 不崩**（dctx.record None 守卫 `:50`，该守卫同时解释 view 授权在 evaluate 的合法性）**且授权成功**（e-set modify 在 allowlist 内）⇒ `edit_source` 可改 ⇒ 效应**静默丢弃**（无补丁构建器；授权层可审计、效应层无丢弃事件）；盲相指令只警告 registry 深改（指令-机制不一致）。守卫方案（patch-less 会话拒 `intent="modify"`、view 全会话可用，~5 行）与补通道方案（与"评估者不改产物"宪法冲突，否决）并存于 C2。**用户拍板：维持登记暂不实施。**
 
 **(4) B26 讨论结晶（登记备忘）**：unregister 顺带 deselect 的**否决理由精确化**——失效仅在"调度成功但补丁最终未落地"情形（重试耗尽/放弃）：已落盘 deselect 永久指向仍存在的工具 ⇒ 反向悬空（正向悬空有 B7/list_components 双报告，反向零报告）+ 审计-事实分叉；工具调用当次失败（零写入无 deselect）与"agent 修正后成功"（最终一致）两分支无失效。"失效场景 3"（dctx 依赖）经逐会话核对在现布局下为**空集**，降级为设计约束备忘（将来扩布局时"dctx.role ≠ 设计角色"错位需显式处理）。**U′ 维持**（unregister 文本提示、不自动改设计）+ **heal 兜底**。overlay 权（有效视野权威扩到角色自设计）：作用 = 决策-生效延迟从 outer 级缩到 inner 级；机制小（~5 行权威放宽 + `list_components` 镜像同步 ~3 行）但**大头在 heal 的跨层接线**（~25-35 行）——"先 heal 后 overlay"是结构必然（overlay 的安全性完全依赖出口 heal）；现committed-only 为**暂留待办**（批 5 遗留），非终局决策。
+
+---
+
+## 17. 第 13 批：角色自设计 overlay + 出口 heal 第一期（overlay / B26-p1 / B41 / U′ / B42 文本 / B22）
+
+> 起因：B22「生成侧修」定案后，用户明确 **overlay 并未实现、需同批实施**，并要求 U′ 收窄为「纯检测 + 提醒」。本批六项一并落地，单提交。
+
+### 17.1 决策记录（用户确认）
+
+| 决策点 | 结论 | 理由 |
+|---|---|---|
+| overlay 权（角色自设计） | **扩到全角色**（批 5 committed-only **正式退役**） | 决策-生效延迟从 **outer 级**缩到 **inner 级**；安全性由成功出口 heal + B7 装配报告 + 下一 outer 可自愈共同兜底（见 17.4） |
+| B26 分期 | **第一期只接成功出口**；失败/耗尽出口保持待办 | 与「重试失败/耗尽处理 = 待办」的前提一致；成功出口是 overlay 世界里频率最高的悬空源 |
+| U′ 形态 | **纯检测 + 提醒**（`'X' is still selected in your design`），**不给**三选指引、**不**自动改设计 | 自动 deselect 在「补丁未落地」时产生**永久反向悬空**（零报告），比不提示更糟 |
+| B42 | **仅文本说明**（cross-design note）；行为决策（目标是否跟随 `dctx.role`）仍暂缓 | 「能写不能选」的语义怪需当场解释，但改目标注册表属行为变更，需单独拍板 |
+| B22 | **生成侧修** | 消费者不修也能读；生成侧修后所有下游（`check_patch`/`apply_patch`/人读）同时受益 |
+
+### 17.2 代码改动（七处）
+
+| # | 文件 | 改动 |
+|---|---|---|
+| ① | `gan/tools/design/select_component.py`、`gan/tools/design/set_config.py`、`gan/framework/context.py` | overlay 权威放宽到**全角色**（`session_overlay_root()` 无条件取；批 5 的 `if ctx.role == "task"` 三元退役）；docstring/返回文案更新（角色自设计给「takes effect for your own design once this session's patch commits」） |
+| ② | `gan/tools/work/common/list_components.py` | `_sel_effective = True`——`selectable` 镜像与选择器同步（**不同步即 H10 同型回归**）；dangling note 文案更新（成功补丁在提交时自愈／被拒耗尽留待下轮装配报告） |
+| ③ | `gan/framework/task_execution.py`、`gan/framework/loop.py` | `heal_design_slots` 去掉 `role != "task"` 早退（改三值白名单，loader 按角色解析各自注册表）；`loop._apply_self_patch` **成功出口** heal + 重存 + 事件 `design_dangling_stripped(stage="self_improve")` + `res["design_stripped"]`；`_make_self_receipt` 接 `design_stripped`（下一轮自省可见自己的自愈） |
+| ④ | `gan/roles/base_role.py`、`gan/roles/{planner,evaluator}.py` | `warn_dropped_workspace_edits` 增 `exhausted`/`rejected` 形参：**强制模式**下无视 `patch_str`/`has_deep_write` 两门；事件 `deep_edit_dropped` 带 `phase`（`exhausted` / `no_record`）；两角色 `self_improve` 在 `reset_access_context` 后传参 |
+| ⑤ | `gan/tools/deep/unregister_component.py` | **U′**：`dctx.config["tools"]` 含该名 ⇒ 成功返回文本追加「仍被选中」提醒（纯提醒，工具**从不**改设计） |
+| ⑥ | `gan/tools/deep/register_component.py` | **B42 配套**：`dctx.role != _OWNING_DIR[role]`（仅 planner `self_improve` 命中）⇒ 追加 cross-design note（registered into task.json，但本会话不可选） |
+| ⑦ | `gan/patch.py` | **B22**：`_no_newline_marker_diff`（见 17.3）；`_deletion_diff` 与 `build_patch_from_workspace` 两个调用点换用 |
+
+### 17.3 B22：实测驱动的 git 标记语义（本批最大的方法论收获）
+
+`difflib.unified_diff` 读的是**带终止符**的行（`readlines(keepends=True)`），故无尾换行的末行会产出**结构损坏**的 hunk（末行无终止符 ⇒ 与下一行粘连 ⇒ `git apply` 报 `corrupt patch at line N`）——两个方向（committed 侧缺、workspace 侧缺）均已实证。
+
+修法（生成侧包装器）：喂 difflib 前给无换行末行补 `\n`（保 hunk 结构），生成后按 git 语义插 marker。
+
+**实测钉死的 git 标记语义**（以 `git diff --no-index` 参考输出**逐字节**比对得出）：
+
+1. marker 是**挂在某一侧 payload 行上的标志**：出现在 context／`-` 行后 = **a 侧**该行缺尾换行；出现在 `+` 行后 = **b 侧**缺；
+2. **每个缺尾换行的 payload 行后必须紧跟 marker**（漏一个 ⇒ `patch does not apply`）；
+3. **单侧**缺换行且两侧末行**内容相同** ⇒ 必须**拆成 `-old` / `+old`**（git 拒绝把该行当共享 context——两侧确实差一个换行字节）；
+4. **双缺**：内容相同 ⇒ 共享 context 行 + **一个** marker；内容不同 ⇒ `-` 行与 `+` 行**各带一个** marker；
+5. padded 后两侧**完全相同**（差异仅为尾换行）⇒ difflib **无 hunk** ⇒ 手工构造 `@@ -N,1 +N,1 @@` + 按侧挂 marker 的拆分对；
+6. 编辑点**远离 EOF** ⇒ hunk 不含末行 ⇒ **不插** marker（与旧行为逐字节一致）。
+
+**七形态验证**（真实 `git apply`，逐例断言「应用后字节 == 工作区意图」）：A 追加 ／ B 工作区丢尾换行 ／ C 双缺异内容 ／ C2 双缺同内容 ／ D 删除无尾换行文件 ／ E 远离 EOF（无 marker）／ F 尾随 context 含无换行末行（有 marker）——**全过**。
+
+**不变式（只改善不倒退）**：改动前这些形态**全部响亮失败**（`corrupt` ／ `does not apply` ／ `no valid patches`），改动后全部正确应用；标记放错仍会被 `git apply` 响亮拒绝，故本改动**不可能**把「能用的补丁」变成「损坏的补丁」。
+
+**过程教训（新增方法论条目）**：本轮先实现后验证，五轮「改-测」才收敛——标记语义的三处误判（marker 归属侧、单侧缺换行必须拆行、marker 行自身终止符）本可由参考 oracle 一次看穿。正确顺序是**先建参考 oracle 再设计实现**（`git diff --no-index` 十行可写）。与批 11 的「复验必须读到行为而非符号」（B8 撤项）同族，记为：**实现前先建参考 oracle**。
+
+### 17.4 overlay 的安全性论证（在「耗尽路径未修」前提下）
+
+| 补丁结局 | 后果 | 兜底 |
+|---|---|---|
+| **提交成功** | 同会话 select 的工具进 committed 树 ⇒ 选择成立；若「unregister 忘 deselect」⇒ **正向悬空** | **本批成功出口 heal**（剥离 + 重存 + 事件 + receipt `design_stripped`） |
+| **被拒 / 耗尽** | 工作区编辑全弃 ⇒ committed 不含会话内注册的工具 ⇒ select 成**正向悬空** | B7 装配**当轮**报告（skip-with-reason）+ 下一 outer **可自愈**（select 已提交名字总被接受）+ **本批 B41 响亮事件** |
+
+即：overlay 的残余风险**有界、可见、可自愈**；真正的缺口（耗尽出口无 heal）保持登记在 `docs/7` §6.1（B26 第二期）。
+
+### 17.5 测试与断言
+
+| 套件 | 变化 | 断言数 |
+|---|---|---|
+| deep-tools | 新增 O1–O6 组：overlay 在 evaluator 自设计同会话 register→select、U′ 两态（命中/未命中）、B42 cross-design note、B41 强制模式事件（含 `phase`）、`heal_design_slots` 覆盖 planner、B22 七形态（marker 存在性 + 真实 `git apply` 逐例） | 72 → **91** |
+| batch6 | **两处断言翻转**：V3「角色自设计 committed-only（ws 条目不可选）」→「有效权威（可选）」；V8「heal is task-only」→「heal covers all roles」——批 5 决策的正式推翻入测 | 57（不变） |
+| batch8 | 无变化 | 32 |
+| **合计** | | 161 → **180** |
+
+覆核：`venv_nat/bin/python scripts/local/run_tool_regression.py` → **all suites passed**；真实仓库 `preflight_tools`（三角色 0 问题）、`code_repo.registry_report`（五类全 0）。
+
+### 17.6 明确未做（不在本批）
+
+- **耗尽/被拒出口 heal** 与 `save_self_config` 延迟化（**B26 第二期**，`docs/7` §6.1 已登记）；
+- **B42 行为变更**（目标注册表是否跟随 `dctx.role`）——本批仅文本说明；
+- B29/B30/B27 等可见性项、C 类（C1/C2/C3/C4/C5/C7）、A15 表述收口；
+- 反馈/信息流批（L4/L3/B9/B31/B32/B33/B34/B35/B36/B37/B40——已按机制归属移入 `docs/7` §2.4）。

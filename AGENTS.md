@@ -270,19 +270,29 @@ batch-8 isolation), one subprocess each.
   and reports per entry `origin` (`workspace`/`code`), `pending`
   (`added`/`removed`/`modified`/`none`) and `selectable` — the latter mirroring
   exactly what `select_component` will accept **now** (the effective,
-  workspace-first registry for the task design; the committed registry for role
-  self-designs). The tool is read-only: it never grants and never writes.
-- **Design authority and healing (batch 5)**: `select_component` and the component
-  slots of `set_config` validate against the same registry — for the **task**
-  design the effective (workspace-first) view, so a component registered this
-  session is selectable in the same session; for role self-designs (planner /
-  evaluator) the committed view only. The task design is **healed** right before
-  it is persisted (`gan/framework/task_execution.py:heal_design_slots`): slot
-  names the committed tree cannot deliver are removed and recorded (event
+  workspace-first registry, **for every role** since batch 13). The tool is
+  read-only: it never grants and never writes.
+- **Design authority and healing (batch 5; extended to all roles in batch 13)**:
+  `select_component` and the component slots of `set_config` validate against the
+  same registry — the effective (workspace-first) view, **for every role**, so a
+  component registered this session is selectable in the same session whichever
+  design is being edited (the batch-5 committed-only exception for role
+  self-designs is retired; safety rests on the exit heal + the B7 assembly
+  report + the next outer's ability to re-select). The task design is **healed**
+  right before it is persisted (`gan/framework/task_execution.py:heal_design_slots`):
+  slot names the committed tree cannot deliver are removed and recorded (event
   `design_dangling_stripped`, receipt `design_stripped`), so a rejected patch can
   never leave a dangling reference in the design inheritance chain — the child
-  only ever runs with a design whose every component resolves. Healing removes
-  names only; it never adds, restores or rewrites source.
+  only ever runs with a design whose every component resolves. Since batch 13 the
+  same heal runs for **role self-designs at the successful patch exit**
+  (`loop._apply_self_patch`, after `self_improve_commit`, against that role's own
+  committed registry: re-saved file + event + `design_stripped` on the self
+  receipt); the exhausted/rejected exit keeps the pre-session file and is
+  registered backlog (`docs/7` §6.1), while `warn_dropped_workspace_edits` fires
+  a loud `deep_edit_dropped` event (`phase="exhausted"`) when that path discards
+  non-empty workspace edits. Healing removes names only; it never adds, restores
+  or rewrites source. `unregister_component` never edits the design itself — when
+  the removed name is still selected it merely *says so* in its return text.
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - **Planner→evaluator isolation (batch 8): facts flow, rhetoric does not.** Every
   evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) —

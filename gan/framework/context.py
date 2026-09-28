@@ -160,11 +160,12 @@ def session_overlay_root():
     ``gan/`` directory, else ``None`` -- callers pass it to
     ``load_registry_for_role(overlay_root=...)``.
 
-    Callers decide WHICH design may use the overlay: the task design is healed
-    against the committed tree before it is persisted
-    (``task_execution.heal_design_slots``), so it may validate against the
-    effective view; role self-designs are not healed yet and must keep the
-    committed-only authority.
+    Callers decide WHICH design may use the overlay: since batch 13 every role's
+    design does (the task design is healed right before persist via
+    ``task_execution.heal_design_slots``; role self-designs get the same
+    calibration at the successful patch-exit heal, with the exhausted-exit
+    healing registered as backlog -- docs/7 section 6.1). Before batch 13 the
+    role self-designs kept the committed-only authority.
     """
     actx = get_access_context()
     if actx is None:

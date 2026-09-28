@@ -177,7 +177,8 @@ class Evaluator(Role):
             if tok_access is not None:
                 reset_access_context(tok_access)
         warn_dropped_workspace_edits(broker, "evaluator", self.access_key("self"),
-                                     dctx.records, self.output_dir, patch_str)
+                                     dctx.records, self.output_dir, patch_str,
+                                     exhausted=exhausted, rejected=rejected)
         self.save_self_config(cfg)
         info = getattr(self, "last_run_info", {}) or {}
         return {"records": dctx.records, "self_design": self.self_design_path(),

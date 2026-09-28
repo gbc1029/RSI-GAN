@@ -464,6 +464,27 @@ class GanLoop:
             self._role_commits[role] = sha
             self.log_event({"type": "self_improve_commit", "role": role,
                             "outer": outer, "commit": sha})
+            # batch 13 (B26 phase 1): the successful commit makes the committed
+            # registry the new authority, so any dangling name in the just-saved
+            # self design (e.g. an unregister whose deselect was forgotten) is
+            # stripped and the file re-saved -- "persisted design == committed
+            # tree deliverable" now holds for role designs on the success path
+            # too. The exhausted/rejected exit keeps the old file for now
+            # (backlog: docs/7 section 6.1); heal removes names only. The
+            # stripped names ride the self receipt (design_stripped) so the
+            # role's next self-improve sees its own heal.
+            from gan.design.store import DesignStore
+            from gan.framework.task_execution import heal_design_slots
+            store = DesignStore(paths.design_root(self.output_dir))
+            cfg = store.load(role)
+            stripped = heal_design_slots(cfg, role, self.code_root)
+            if stripped:
+                store.save(cfg, role)
+                self.log_event({"type": "design_dangling_stripped", "role": role,
+                                "stage": "self_improve",
+                                "stripped": stripped})
+            if isinstance(res, dict):
+                res["design_stripped"] = stripped
         except code_repo.PatchRejected as e:
             # agent-attributable rejection: recover to the previous commit and
             # keep the run going (B-level; the receipt carries the reason)
@@ -579,6 +600,9 @@ class GanLoop:
             genid=f"outer_{outer}", role=role, stage="self_improve",
             records=r.get("records"), patch=r.get("patch_proposed", ""),
             patch_applied=bool(r.get("patch")), rejected_reason=rejected, budget=budget,
+            # batch 13: the successful-exit heal strips dangling names from the
+            # self design; the role sees its own heal at the next self-improve.
+            design_stripped=r.get("design_stripped"),
             # B7: this outer's own instance assembly — carried into the NEXT
             # outer's self-improve receipt (this outer already injects it via
             # the self-improve `recent` payload).
