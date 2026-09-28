@@ -4,6 +4,11 @@ import os
 from gan.framework.context import get_access_context
 from gan.framework.workspace import resolve
 
+# B19 (batch 11): an output cap, mirroring ``grep``'s max_results -- a big
+# directory (a granted component tree, or a mistyped path) must not flood the
+# context with thousands of bare names in one call.
+_MAX_ENTRIES = 200
+
 
 def tool_info():
     return {
@@ -30,6 +35,10 @@ def tool_function(path=".", **kwargs):
         entries = sorted(os.listdir(p))
     except OSError as e:
         return f"Error: {e}"
+    if len(entries) > _MAX_ENTRIES:
+        hidden = len(entries) - _MAX_ENTRIES
+        return ("\n".join(entries[:_MAX_ENTRIES])
+                + f"\n... and {hidden} more entries (use grep, or list a narrower path)")
     return "\n".join(entries)
 
 

@@ -57,6 +57,12 @@ class AccessBroker:
         self.max_files = int(max_files)
         self.max_bytes = int(max_bytes)
         self.grants: Dict[tuple, List[Dict[str, Any]]] = {}
+        # B10 (batch 11): the result of the LAST grant call, empty before any
+        # grant. Readers must not depend on grant() having run first -- the
+        # attribute is part of the documented audit surface (see the ``grant``
+        # docstring), and a bare read before the first grant used to raise
+        # AttributeError (every current reader happened to getattr-guard it).
+        self.last_result: Dict[str, Any] = {}
 
     # -- workspace ---------------------------------------------------------
     def workspace(self, role: str, node_id: Any) -> str:

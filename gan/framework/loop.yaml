@@ -1,6 +1,8 @@
 # GAN-style three-role self-evolution framework - loop / reward / gating config
 # NOTE: every key below MUST have a code consumer (cfg.get(...)); design-only
 # statements live in AGENTS.md / docs, not here (see docs/6_v5改动.md R2).
+# Exception (A16): the ``cost.*`` section is RESERVED -- it has no consumer yet
+# and must not be removed on that ground; wiring it up is backlog item B21.
 
 # ---------------------------------------------------------------------------
 # 双循环调度

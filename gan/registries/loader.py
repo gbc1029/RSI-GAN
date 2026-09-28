@@ -90,13 +90,23 @@ def parse_registry_file(path: Path) -> Tuple[Optional[List[Dict[str, Any]]], Opt
 
 
 def write_registry_json(path, data: Dict[str, Any]) -> None:
-    """Rewrite a registry JSON, PRESERVING its trailing-newline convention.
+    """Rewrite a registry JSON ATOMICALLY, PRESERVING its trailing-newline convention.
 
     Session patches are generated with ``difflib.unified_diff``, which cannot
     express "no newline at end of file". A registry that loses its final newline
     therefore produces a patch ``git apply`` rejects as corrupt, silently blocking
     every register/unregister. Writing through this one helper keeps the invariant
     in a single place.
+
+    B4 (batch 11): the write goes through tmp + ``os.replace`` like every other
+    durable writer in the repo (``checkpoint.py``, ``trajectory.py``,
+    ``design/store.py``). The old truncate-in-place left HALF a registry JSON
+    behind on a mid-write crash; a half-written workspace copy then made every
+    later register/unregister fail with "workspace registry is not parseable",
+    and a half-written committed copy blinded the role's whole assembly. The
+    accepted residue: a crash between the tmp write and the replace leaves a
+    ``.write-tmp`` sibling behind -- it never enters a patch through the deep
+    tools' file-level grants (verified) and is overwritten by the next write.
     """
     p = str(path)
     try:
@@ -104,10 +114,12 @@ def write_registry_json(path, data: Dict[str, Any]) -> None:
             had_nl = f.read().endswith("\n")
     except OSError:
         had_nl = True
-    with open(p, "w", encoding="utf-8") as f:
+    tmp = f"{p}.write-tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         if had_nl:
             f.write("\n")
+    os.replace(tmp, p)
 
 
 def _exposes_tool_api(path: Path) -> bool:

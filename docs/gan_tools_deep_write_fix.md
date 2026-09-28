@@ -24,6 +24,7 @@
 | 第 8 批（P→E 隔离） | `fix(gan/framework): planner→evaluator channels become named projections` | **B11 + B12 + B13 + B14**：meta 白名单、receipt.grants 收口、responses 投影 + stance 桶集、receipt 投影；B15'/B28 扩容登记。见 §12 |
 | 第 9 批（回归固化） | `docs(gan/tools): solidify tool regression suites as scripts/local runners (B23)` | **B23**：/tmp 探针固化为 `scripts/local/` 三套件 + 统一入口（深层 45 / batch-6 55 / batch-8 32 = 132 断言；套件 gitignored，本提交仅文档）。见 §13 |
 | 第 10 批（闭环加固） | `fix(gan/tools): collision precheck at registration, collisions in the commit gate, metadata-preserving registration (B16/B17/B3)` | **B16 + B17 + B3 + 新算子 `update_component`**：注册期碰撞硬拒（always-on ∪ 已注册组件）、提交门差分第五类、注册元数据保全（条件拉取 + 可选 description）、条目元数据的收编更新路径。见 §14 |
+| 第 11 批（机械清扫） | `fix(gan/framework): initialize broker.last_result, atomic registry writes, list_dir cap (B10/B4/B19/A16)` | **B10 + B4 + B19 + A16 + B8 撤项**：broker.last_result 初始化、注册表原子写（保尾换行）、list_dir 200 上限、loop.yaml 保留键注释；B8 经考古撤项（守卫自 origin 即在）。回归 161 断言。同轮登记 B31–B40。见 §15 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -267,7 +268,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 |---|---|---|---|
 | ~~**A14**~~ | ~~P5 措辞收敛~~ —— **✅ 第 6 批结构性消解**：shared.json 已删除，问题对象不复存在（见 §10） | — | — |
 | **A15** | 防御层盲区记为已知限制 | 本文档 §5.3、`docs/7` §3.4 | `warn_dropped_workspace_edits`（`base_role.py:29`）用 `build_patch_from_workspace` 做检测 ⇒ 与补丁构建器**同一盲区**（只看 `granted_paths`），H8 类问题**构造性不可发现**；彻底修法见 C3 |
-| **A16** | `loop.yaml` 自洽说明 | `gan/framework/loop.yaml` 文件头 | 头声明 "every key below MUST have a code consumer" 与 `cost.token_budget_per_gen` / `cost.record_usage`（保留待 G3）冲突；补"保留键"说明，或接线（见 B21） |
+| **A16** | `loop.yaml` 自洽说明【✅ 已修（第 11 批）：采"补保留键说明"分支——头注释补 `cost.*` RESERVED 例外（接线仍挂 B21），见 §15.1】 | `gan/framework/loop.yaml` 文件头 | 头声明 "every key below MUST have a code consumer" 与 `cost.token_budget_per_gen` / `cost.record_usage`（保留待 G3）冲突；补"保留键"说明，或接线（见 B21） |
 
 ### 6.2 B 类：小范围代码（原 23 项 + 第 4 批 B24 + 第 5 批 B26；**B18、B24、B25(=H12) 已完成**，余 23 项）
 
@@ -276,13 +277,13 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B1** | ~~**H8**（原编号 A2）守卫下沉（静默丢弃，**最高优先**）~~ —— **✅ 已修（第 7 批，甲′）**：grant 决策改由 `broker.covers` 引导三分支 + 不可写时响亮拒，见 §11 | `register_component.py` | ~15 行 | — |
 | **B2** | ~~**H1** 跨注册表重复早检查~~ —— **✅ 第 6 批结构性消解**：单文件单写者 ⇒ 跨文件重复不可构造（见 §10） | ~~原位~~ | — | — |
 | **B3** | **H2** 复用 repo 原条目字段（`description`/`params_schema`）【✅ 已修（第 10 批）：条件拉取（内容同一才携带）+ 可选 `description` 入参（300 上限）+ 新算子 `update_component` 补上元数据更新路径，见 §14】 | `register_component.py` 追加前 | ~8 行 | — |
-| **B4** | **原子写** `write_registry_json` | `registries/loader.py:70` | ~5 行 | — |
+| **B4** | **原子写** `write_registry_json`【✅ 已修（第 11 批）：tmp + `os.replace`（与 checkpoint/trajectory/design-store 同约定），尾换行探测保留；`.write-tmp` 残留经 deep 工具 file 级 grant 不进补丁（实测），见 §15.1】 | `registries/loader.py:70` | ~5 行 | — |
 | **B5** | ~~**H6** 默认注册表按模块前缀路由~~ —— **✅ 第 6 批结构性消解**：角色目录绑定（见 §10） | ~~原位~~ | — | — |
 | **B6** | ~~报告 R4：`unregister` 对"多注册表声明同一组件"只删第一个~~ —— **✅ 第 6 批结构性消解**：每组件只可能声明在一个文件（见 §10） | ~~原位~~ | — | — |
 | **B7** | 报告 R5：always-on 工具（`gan/tools/**`）不参与 V3/AST 校验 | `preflight.py` | ~15 行 | — |
-| **B8** | 报告 R6：`load_tools` 每次把 `tools_dir` 插 `sys.path`（跨 outer 线性增长） | `agent/tools/__init__.py:27-28` | ~4 行 | — |
-| **B9** | 报告 R7：`build_diff_summary.files` 混用完整路径与 basename | `summary.py:37-42` | ~3 行 | — |
-| **B10** | 报告 R8：`AccessBroker.last_result` 未在 `__init__` 初始化（**本会话起有真实读者**） | `access.py` | ~2 行 | — |
+| **B8** | 报告 R6：`load_tools` 每次把 `tools_dir` 插 `sys.path`（跨 outer 线性增长）【❌ **撤项（第 11 批复核）**：插入同行自带守卫 `str(tools_dir) not in sys.path`，自 origin `64ad88d` 即存在（`git log -S` 证实）；残余增长 = 不同实例目录各一条，driver 模式每 outer 独立子进程即清零。此前"复验：仍在"是误判（只看 insert 符号、未读同行守卫条件），见 §15.2】 | `agent/tools/__init__.py:27-28` | — | — |
+| **B9** | 报告 R7：`build_diff_summary.files` 混用完整路径与 basename【第 11 批**收窄定稿**（讨论链见 §15.3–15.4）：原描述不准——单调用方下两分支从不作用于同类对象，"归一化不一致"为死症状；真实问题 = (a) files 语义宽（grants+产出物一锅）违反其规范职能"planner 动作摘要"、渲染语 "planner changes" 把 view 纯阅读说成改动；(b) 内嵌 `schema_version` 死键。**方案**：files 退出（ops-only）+ 调用方停喂 report_path（report 经 report_view 已有通道，不设新键）+ 删死键（常量+`validate_feedback` 绊线保留，**不升 v2**——升版使 B9 前 checkpoint 在恢复点 ValueError）+ `evaluator.py` 提示词块加轮次标签（op 清单隔代错位消歧）+ 删死 `code_edit` 分支（B31 挂靠）+ grants 收敛为 ops+receipt 两处（B32 挂靠） | `gan/summary.py` + `loop.py:962` | ~15 行 | **是** |
+| **B10** | 报告 R8：`AccessBroker.last_result` 未在 `__init__` 初始化（**本会话起有真实读者**）【✅ 已修（第 11 批）：`__init__` 初始化空 dict（实测 AttributeError 消除；现有读者均为 getattr 兜底属侥幸），见 §15.1】 | `access.py` | ~2 行 | — |
 | **B11** | N3-A/C：`meta_view` 未排除 `records` | `loop.py:834` | ~2 行 | — |
 | **B12** | N3-B/N4：`receipt.grants` 剥 `reason`，与 `_ops_summary` 白名单策略统一 | `receipt.py:94` | ~5 行 | — |
 | **B13** | N3-D：`evaluator_reward.py` 的 `said: {fb}` 不入 digest | `reward/evaluator_reward.py:199` | ~3 行 | — |
@@ -291,7 +292,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B16** | T1/R3：注册期碰撞预检（复用 `validate_registry`/`assemble_collisions`）【✅ 已修（第 10 批）：硬拒、范围 = 本角色 always-on ∪ 已注册组件，拒绝零写入，见 §14】 | `register_component.py` | ~15 行 | — |
 | **B17** | R3：把 `collisions` 纳入提交门控（`registry_report` + `_registry_worsened` 差分）【✅ 已修（第 10 批）：第五类 `(role, basename, 源列表)` 差分键，先在碰撞永不阻塞，见 §14】 | `code_repo.py` | ~15 行 | — |
 | **B18** | P3 残留：`list_components` 只扫 `broker.repo_root`，工作区新文件不可见 —— **✅ 已修（第 4 批，Tier 2）**，见 §8.5 | `list_components.py:63,69-70` | ~15 行 | — |
-| **B19** | `list_dir` 加输出上限（与 `grep` 的 `max_results=100` 对齐） | `list_dir.py` | ~5 行 | — |
+| **B19** | `list_dir` 加输出上限（与 `grep` 的 `max_results=100` 对齐）【✅ 已修（第 11 批）：`_MAX_ENTRIES=200` + 尾行 "... and K more entries (use grep, or list a narrower path)"，见 §15.1】 | `list_dir.py` | ~5 行 | — |
 | **B20** | `deny_deep` 接线（**须含 `register_component`**，见 A13） | `access.py` / `build.py` / 3 个 deep 工具 | 跨 4 文件 | — |
 | **B21** | 预算/死键：`task_agent.py` 未传 `max_tool_calls`（默认 40）；`cost.*` 接线或移除 | `task_agent.py` + `loop.yaml` | ~5 行 | **是** |
 | **B22** | `patch.py` 支持 `\ No newline at end of file`（D1 备选） | `patch.py` | ~15 行 | 可选 |
@@ -299,6 +300,16 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B24** | **H11**（第 4 批新发现）任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`；下一代装配时被 B7 记 skip，静默失能且留痕） —— **✅ 已修（第 5 批，A2 自愈）**，见 §9.3 | `gan/framework/task_runner.py:103-128` | ~15 行 | **是** |
 | **B25** | **H12**（第 5 批新发现）`set_config("skills", [...])` 只做 schema 键白名单，未注册组件不经拒绝直接进设计（实证：装配报 `not registered`） —— **✅ 已修（第 5 批，Option 1）**，见 §9.4 | `gan/tools/design/set_config.py` | ~15 行 | **是** |
 | **B26** | **角色设计的 heal**（第 5 批新发现）：`evaluator/planner.self_improve` 在补丁重试循环后**无条件** `save_self_config(cfg)`（`gan/roles/evaluator.py:194`），与 H11 同模式；角色设计现在 committed-only 故**不会新造**悬空，但存量链上的悬空名未自愈。修法 = 角色设计也开 overlay + 自愈（需决策） | `gan/roles/base_role.py:215` + 两个 `self_improve` | ~15 行 | **是** |
+| **B31** | 死 `code_edit` 分支（origin 有生产者 `gan/operators/planner_ops/code_edit.py`，`642bcda` 重构删除算子后失联）——**随 B9 一并删** | `gan/summary.py:44` | ~4 行 | — |
+| **B32** | grants 路径在 `diff_summary` 对象内双写（`ops[].paths` + `files`）；收敛为 ops + receipt.grants 两处——**随 B9 files 退出实施**（receipt.grants 经 `_receipt_for_evaluator` 对 E 已剥除，仅 P 可见） | `gan/summary.py` | （随 B9） | — |
+| **B33** | **提示词/种子签名漂移**：`planner.py:65` 与 `seeds/planner.md:27` 仍写 `respond_issue(issue_id, accepted, feedback)` 三参——第 8 批后 `response_kind` **必填**，按指令逐字调用的 LLM 每轮首调必撞 schema 错误（软失败可重试，但指令是 LLM 第一依据）。附带：E 提示词开头深工具枚举句补 `update_component` | `gan/roles/planner.py` + `seeds/planner.md` + `gan/roles/evaluator.py:29` | ~5 行 | — |
+| **B34** | `_last_receipt` 不入 `_state_dict` ⇒ checkpoint 恢复后首个 E 的 receipt 投影为 `{}`（同轮 issues/digest 均恢复） | `gan/framework/loop.py:343` | ~2 行 | — |
+| **B35** | **条件性 B14 旁路**：legacy 路径（base 未解析，`task_runner.py:123`）把 `PatchRejected` 理由全文（引用 planner 注释/标识符的编译错误与门拒绝文本）写进 `meta["task_patch_rejected"]` → `_EVALUATOR_META_KEYS` 放行直达 E；主路径安全（`:114` 固定串 "no new code commit"）。修法：legacy 路径同写固定串 | `gan/framework/task_runner.py` | ~2 行 | — |
+| **B36** | **幽灵字段**：`EvalContext.summary/weaknesses/suggestions` 无任何生产工具（E 工具只写 issues/verdicts/predicted_score/penalties）；读者仅 `_build_packet→packet.textual`（无代码读者）与 `eval.json` 恒空行。定性反馈的设计位置 = 结构化 issues + digest，prose 无需进 P ⇒ 删字段 | `gan/framework/context.py` + `loop.py` | ~10 行 | — |
+| **B37** | `RewardPacket.evaluator_reward` 从未被任何调用方设置、从未被读取 | `gan/framework/reward/packet.py` | ~3 行 | — |
+| **B38** | **2×2 校准矩阵机器未接线**：`classify_issue`/`run_check_step` 全仓无生产调用（唯一"消费者"是回归冒烟断言）；活着的只有 `*_from_dicts` 转换器。report_issue docstring 明言 "tracked through the 2x2 matrix"——设计意图从未在活路径兑现。**需决策**：接线 or 删机器留转换器 | `gan/framework/reward/evaluator_reward.py` | 需决策 | **是** |
+| **B39** | 可选增强：diffstat（`{file: +n/-m}` 纯数字行级统计，零 planner 措辞——diff 行数是结构变更量度量而非自由文本函数）作为 `meta_view` 新键（default-deny 扩展），补代码面"形状"信息。低优先级 | `loop.py` + `task_runner.py` | ~15 行 | — |
+| **B40** | **E 面冗余三处**（第 11 批冗余审计 R1–R3）：同轮双份 `toolset_report`/`design_stripped`（meta_view 与 receipt 投影——后者正是从同一 `child.meta` 构建）、双份补丁结果（meta + receipt 投影，`budget.attempts`/`proposed` 是 receipt 独有需保留）、digest 尾行 = E 同时收到的 diff_summary JSON 的严格子集。修法 = `_receipt_for_evaluator` 瘦身 + `build_feedback_digest` 删 diff_summary 块；batch8 套件断言同步 | `loop.py` + `evaluator_reward.py` | ~10 行 | — |
 
 **B 类详细写法**（B1–B4 为本文档已完整分析的四项；B5–B26 见上表与 `docs/工具管理审查.md` 对应编号）
 
@@ -871,3 +882,50 @@ covers? ──否──> plain grant（用已提交真相覆盖 scratch / 或常
 
 - **原地改实现后描述过时**：`edit_source` 改模块时条目（含 description）原样存活，没有任何机制强制 agent 同步更新描述。可选缓解 = 可见性（receipt/diff 提示"模块已改、条目描述未动"），与 B29（`set_prompt` 记录升级）同族，登记候选。
 - **AGENTS.md 引导句**（"改工具源码用原地 edit_source，unregister+recreate 用于删除/恢复"）已随批写入；若未来 agent 行为数据显示仍走退化路径，再考虑 register 对"内容不同 + 同名"的提示强化。
+
+---
+
+## 15. 第 11 批：机械清扫 + 撤项更正 + 追溯发现登记
+
+> 起因：用户要求逐项解释"机械清扫组"。复核发现 **B8 是误报**并撤项；B9 经多轮讨论收窄定稿；随后按用户指令"先提交已有（B10/B4/B19/A16），其余登记"执行。
+
+### 15.1 实现（B10/B4/B19/A16）
+
+| 文件 | 内容 |
+|---|---|
+| `gan/framework/access.py` | B10：`__init__` 初始化 `self.last_result = {}`（实测此前 AttributeError；现有读者均为 getattr 兜底属侥幸） |
+| `gan/registries/loader.py` | B4：`write_registry_json` 改 tmp + `os.replace`（与 checkpoint/trajectory/design-store 同约定）；尾换行探测逻辑原样保留；实测 file 级 grant 下 `.write-tmp` 兄弟文件不进补丁（glob 授权也只展开具体文件；仅手工授权父目录才可能带入 junk，量级可忽略） |
+| `gan/tools/work/common/list_dir.py` | B19：`_MAX_ENTRIES=200` + 尾行 "... and K more entries (use grep, or list a narrower path)"（对齐 grep `max_results=100` 量级） |
+| `gan/framework/loop.yaml` | A16：头注释补 `cost.*` RESERVED 例外（"补说明"分支；接线仍挂 B21） |
+
+回归：runner **161/161**（deep 72 / batch6 57 / batch8 32）——deep +4（B10 初始化、B19 cap/uncapped/missing）、batch6 +2（B4 尾换行两种约定均保留 + 无 tmp 残留）。
+
+### 15.2 B8 撤项（考古依据 + 方法教训）
+
+`agent/tools/__init__.py:26` 的插入**同行带守卫**：`if use_file_spec and str(tools_dir) not in sys.path:`。`git log -S "not in sys.path"` 证实守卫自 origin 提交 `64ad88d` 即存在；全仓仅此一处 `sys.path.insert`。残余增长 = 不同实例目录各一条：默认 driver 模式每 outer 一个独立子进程（进程退出即清零）；legacy `--in-process` 每 outer 约 2 条。
+
+**教训（入决策记）**：B8 此前两轮"复验：仍在"都是**误判**——只 grep 了 `sys.path.insert` 符号存在，未读同行守卫条件。"复验"必须读到**行为**（条件/分支），不能停在**符号**（存在性）。
+
+### 15.3 追溯与讨论结论（本轮多点调查，全部实测）
+
+**E 输入面轮次归属（三层时间深度）**：E_N 收到 = 当轮执行事实（`meta_view`/`report_view`/`score_status`/轨迹）+ 滞后一轮的 receipt 投影（`receipt_{N-1}`——语义恰对齐：branch-per-node 下它描述被评代码的**继承基线**）+ 滞后一轮的 `prev_feedback`（issues[N-1] 原始清单、diff_summary[N-1]（op 清单，**隔代错位**）、digest[N-1]（issues[N-2] 的闭环故事））。滞后对 receipt/digest 是**结构必然**（生产依赖 evaluate 后信息）；对 op 清单是**实现选择**（records 在 plan 后即齐）。跨 outer 不重置滚动状态（单链有意延续）；**跨 checkpoint `_last_receipt` 丢失**（→B34）。`feedback.penalties` E/P 均不渲染（B28 消费侧死确认）；`_source_access_log` 把 evaluator 的 grants 也装进 plan receipt（跨角色结构事实流动，量级极小——**观察不立案**）。
+
+**make_feedback 准确性**：`issues` ✓（闭环完整：E_N 提 → P_{N+1} 表态（投影）→ E_{N+1} 裁决 → digest[N+1]）；`penalties` 条件准确（生产侧活：三个 eval_point 组件直写 `ctx.penalties`；死的只是消费侧——B28 表述修正）；E 的定性反馈（summary/weaknesses/suggestions）**从未被生产**——定性内容的设计位置 = 结构化 issues + digest（→B36 删字段）。
+
+**冗余审计（口径：同一消费者、同轮、同一事实 ≥2 次）**：R1/R2（meta 与 receipt 投影双份 `toolset_report`/`design_stripped`/补丁结果——receipt 投影正是从同一 `child.meta` 构建）、R3（digest 尾行 = E 同时收到的 diff_summary JSON 的严格子集，纯散文框架）、R4（grant 路径对象内双写 `ops[].paths`+`files`）→ **B40**（R4 随 B9 files 退出消解）。设计性重复 5 处保留（各通道单一定义投影 = batch 8 结构本身；`_ops_summary` 与 `build_diff_summary` 的 docstring 互指待补）。
+
+**op 清单滞后讨论**：错位实锤（E_{N+1} 评的执行对应 P_{N+1} 的设计，看到的清单是 plan_N 的；提示词块无时间标签）；"通过工作区可读取"路线**否决**（design config 是结果态且不在 E 读集、parent config 在树 JSONL 不可达——要做成"动作"绕一圈还是框架投影）；**决策 = 保持滞后 + 时间标签**（并入 B9）。依据：E 的规范校准闭环（stance vs verdict）由 digest 完整实现且轮次配对正确；op 清单在 E 面边际价值低；当轮通道会扩大 P→E 即时博弈对齐面。
+
+**算子记录 vs 代码 diff 讨论**：二者覆盖**不重叠**的改动面（设计面/代码面），通道已分离（ops ↔ `task_patch_files` + E 只读自读）。**代码 diff 全文传 E 否决**——planner 自由文本最密载体（注释/docstring/标识符；B14 已实证注释 taunt 通道）、E 评产物不需行级差异（旧版本在 git 历史，E 无 git 访问）、体量超限。安全中间形态 **diffstat**（纯数字，零措辞）登记 **B39**（可选低优先）。"算子记录是自我报告"的担忧不成立：`ctx.record` 由工具内部固定调用、字段固定，与 git diff 同级客观性。
+
+### 15.4 新登记（并入 §6.2 表）
+
+B9（收窄定稿，含 B31/B32 挂靠）、B33、B34、B35、B36、B37、B38（需决策）、B39（可选）、B40。
+
+### 15.5 变更清单（第 11 批）
+
+| 文件 | 内容 |
+|---|---|
+| `gan/framework/access.py`、`gan/registries/loader.py`、`gan/tools/work/common/list_dir.py`、`gan/framework/loop.yaml` | B10/B4/B19/A16 |
+| `scripts/local/regress_deep_tools.py`、`regress_batch6.py` | +6 断言（B10/B19×3/B4×2） |
+| `docs/**` | 本节 + §0.1 行 + §6 行标记与新登记 + 总账同步（B8 撤项、机械清扫组清空、执行顺序更新） |
