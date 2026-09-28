@@ -367,7 +367,7 @@ def _hard_rollback(code_root: str, sha: Optional[str]) -> None:
 def registry_report(code_root: str) -> Dict[str, Any]:
     """Snapshot of registry health for a code tree (used for *differential* gating).
 
-    Reports four independent problem classes so the commit layer can refuse a patch
+    Reports five independent problem classes so the commit layer can refuse a patch
     that makes any of them worse, while never blocking on pre-existing problems:
 
     - ``unparseable``: registry files that are not valid JSON / not an object with
@@ -378,12 +378,19 @@ def registry_report(code_root: str) -> Dict[str, Any]:
       (batch 6: one single-writer file per role -- cross-file duplicates are
       structurally impossible, so there is no merged view to check);
     - ``orphan``     : component files declared by NO registry file.
+    - ``collision``  : toolset basename fights (batch 10 / B17) -- a registered
+      component whose file stem equals an always-on tool's (or another registered
+      component's) stem makes the assembly copy two files onto one toolset
+      basename; last writer wins and one tool silently disappears. Keyed as
+      ``(role, basename, sorted repo-relative sources)`` so a THIRD source joining
+      the pile is a new key too.
     """
     from pathlib import Path
     from gan.registries.loader import (
         parse_registry_file, entry_reason,
         orphan_modules, _REGISTRY_FILES, _ROLE_OF_FILE,
     )
+    from gan.framework.preflight import assemble_collisions
 
     reg_dir = os.path.join(code_root, "gan", "registries")
     comp_dir = Path(os.path.join(code_root, "gan", "components"))
@@ -416,8 +423,18 @@ def registry_report(code_root: str) -> Dict[str, Any]:
     # orphan: reuse the loader's single definition (component-looking file declared
     # by no registry) so the gate and selection-time validation cannot disagree
     orphan = set(orphan_modules(Path(reg_dir), comp_dir))
+    # collision (batch 10 / B17): the same universe the assembly copies from --
+    # always-on tool files + registered component modules -- fighting for one
+    # toolset basename. Sources are stored repo-relative so the differential keys
+    # stay stable within a run's before/after snapshots.
+    collision = set()
+    for role in ("task", "planner", "evaluator"):
+        for base, srcs in assemble_collisions(role, code_root=code_root).items():
+            collision.add((role, base,
+                           tuple(sorted(os.path.relpath(s, code_root).replace(os.sep, "/")
+                                        for s in srcs))))
     return {"invalid": invalid, "unparseable": unparseable,
-            "duplicate": duplicate, "orphan": orphan}
+            "duplicate": duplicate, "orphan": orphan, "collision": collision}
 
 
 def _registry_worsened(before: Dict[str, Any], after: Dict[str, Any], strict: bool = True) -> str:
@@ -446,6 +463,17 @@ def _registry_worsened(before: Dict[str, Any], after: Dict[str, Any], strict: bo
         items = "; ".join(sorted(new_orph))
         return (f"component file(s) not registered in any registry: {items} "
                 f"(register them with register_component, or remove the files)")
+    # batch 10 / B17: a NEW toolset basename collision means the patch registered
+    # (or hand-declared) a component whose file stem fights an always-on tool or
+    # another registered component for one toolset slot -- one of the two would
+    # silently disappear at the next assembly. Pre-existing collisions never
+    # block (differential, like every class here).
+    new_col = after["collision"] - before["collision"]
+    if new_col:
+        items = "; ".join(f"{r}:{b} <- [{', '.join(srcs)}]"
+                          for (r, b, srcs) in sorted(new_col))
+        return (f"new toolset basename collision(s) (two files would be copied onto "
+                f"one toolset basename; one silently disappears): {items}")
     return ""
 
 

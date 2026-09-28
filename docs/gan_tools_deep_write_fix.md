@@ -23,6 +23,7 @@
 | 第 7 批（H8 闭合） | `fix(gan/tools): register_component grant decision follows broker.covers` | **B1/H8 关闭**：covers 引导三分支授权 + 不可写响亮拒（甲′；乙重新定位为 C5 伴随设计）。见 §11 |
 | 第 8 批（P→E 隔离） | `fix(gan/framework): planner→evaluator channels become named projections` | **B11 + B12 + B13 + B14**：meta 白名单、receipt.grants 收口、responses 投影 + stance 桶集、receipt 投影；B15'/B28 扩容登记。见 §12 |
 | 第 9 批（回归固化） | `docs(gan/tools): solidify tool regression suites as scripts/local runners (B23)` | **B23**：/tmp 探针固化为 `scripts/local/` 三套件 + 统一入口（深层 45 / batch-6 55 / batch-8 32 = 132 断言；套件 gitignored，本提交仅文档）。见 §13 |
+| 第 10 批（闭环加固） | `fix(gan/tools): collision precheck at registration, collisions in the commit gate, metadata-preserving registration (B16/B17/B3)` | **B16 + B17 + B3 + 新算子 `update_component`**：注册期碰撞硬拒（always-on ∪ 已注册组件）、提交门差分第五类、注册元数据保全（条件拉取 + 可选 description）、条目元数据的收编更新路径。见 §14 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -274,7 +275,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 |---|---|---|---|---|
 | **B1** | ~~**H8**（原编号 A2）守卫下沉（静默丢弃，**最高优先**）~~ —— **✅ 已修（第 7 批，甲′）**：grant 决策改由 `broker.covers` 引导三分支 + 不可写时响亮拒，见 §11 | `register_component.py` | ~15 行 | — |
 | **B2** | ~~**H1** 跨注册表重复早检查~~ —— **✅ 第 6 批结构性消解**：单文件单写者 ⇒ 跨文件重复不可构造（见 §10） | ~~原位~~ | — | — |
-| **B3** | **H2** 复用 repo 原条目字段（`description`/`params_schema`） | `register_component.py` 追加前 | ~8 行 | — |
+| **B3** | **H2** 复用 repo 原条目字段（`description`/`params_schema`）【✅ 已修（第 10 批）：条件拉取（内容同一才携带）+ 可选 `description` 入参（300 上限）+ 新算子 `update_component` 补上元数据更新路径，见 §14】 | `register_component.py` 追加前 | ~8 行 | — |
 | **B4** | **原子写** `write_registry_json` | `registries/loader.py:70` | ~5 行 | — |
 | **B5** | ~~**H6** 默认注册表按模块前缀路由~~ —— **✅ 第 6 批结构性消解**：角色目录绑定（见 §10） | ~~原位~~ | — | — |
 | **B6** | ~~报告 R4：`unregister` 对"多注册表声明同一组件"只删第一个~~ —— **✅ 第 6 批结构性消解**：每组件只可能声明在一个文件（见 §10） | ~~原位~~ | — | — |
@@ -287,8 +288,8 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B13** | N3-D：`evaluator_reward.py` 的 `said: {fb}` 不入 digest | `reward/evaluator_reward.py:199` | ~3 行 | — |
 | **B14** | 报告 R4：`summary.py` 删死分支 + "未知 op 透传 + 安全字段白名单"（含 `planner.py` 的 `code_edit` 死分支） | `summary.py:24-40` | ~25 行 | — |
 | **B15** | 选择静默降级**残余**：`preflight_tools` 校验"设计选中项是否仍存在/valid" | `preflight.py` | ~20 行 | — |
-| **B16** | T1/R3：注册期碰撞预检（复用 `validate_registry`/`assemble_collisions`） | `register_component.py` | ~15 行 | — |
-| **B17** | R3：把 `collisions` 纳入提交门控（`registry_report` + `_registry_worsened` 差分） | `code_repo.py` | ~15 行 | — |
+| **B16** | T1/R3：注册期碰撞预检（复用 `validate_registry`/`assemble_collisions`）【✅ 已修（第 10 批）：硬拒、范围 = 本角色 always-on ∪ 已注册组件，拒绝零写入，见 §14】 | `register_component.py` | ~15 行 | — |
+| **B17** | R3：把 `collisions` 纳入提交门控（`registry_report` + `_registry_worsened` 差分）【✅ 已修（第 10 批）：第五类 `(role, basename, 源列表)` 差分键，先在碰撞永不阻塞，见 §14】 | `code_repo.py` | ~15 行 | — |
 | **B18** | P3 残留：`list_components` 只扫 `broker.repo_root`，工作区新文件不可见 —— **✅ 已修（第 4 批，Tier 2）**，见 §8.5 | `list_components.py:63,69-70` | ~15 行 | — |
 | **B19** | `list_dir` 加输出上限（与 `grep` 的 `max_results=100` 对齐） | `list_dir.py` | ~5 行 | — |
 | **B20** | `deny_deep` 接线（**须含 `register_component`**，见 A13） | `access.py` / `build.py` / 3 个 deep 工具 | 跨 4 文件 | — |
@@ -822,3 +823,51 @@ covers? ──否──> plain grant（用已提交真相覆盖 scratch / 或常
 | `scripts/local/`（5 个文件，gitignored） | 本地验证资产；后续批次动手前跑 runner 作为安全网 |
 | `docs/**` | 本节 + §0.1 行 + §6 B23 行标记 + 总账（`docs/8_工具待办与已办.md`）B23 移入已办、执行顺序更新 |
 | `AGENTS.md` | "Tests / verification scripts" 句提及回归入口 |
+
+---
+
+## 14. 第 10 批：闭环加固（B16 + B17 + B3 + `update_component`）
+
+> 起因：用户要求给出"闭环加固组"的具体描述/定位/方案，随后三轮决策讨论定案。讨论先实证了三个问题的机理（`assemble_tools_dir` 平铺 basename 装配、后拷者胜、组件实测可遮蔽冻结 plumbing 工具；门对碰撞零检测；unregister→re-register 丢元数据且补丁表现为"删带描述条目、加裸条目"）。
+
+### 14.1 决策记录（防翻案）
+
+| 决策点 | 结论 | 过程 |
+|---|---|---|
+| always-on/opt-in 物理隔离 | **保持两树**（B16/B17 关碰撞） | 用户先问"取消物理隔离的工作量与效果"，看完隔离三层机制与两条调用路径的说明后拍板。要点：task 侧**已经是**无隔离世界（`always_on_dirs("task")==[]`）；p/e 保留分离的唯一原因是 plumbing 必须冻结——真合并（甲）会使 `gan/components/<role>/**` 写根 glob 覆盖 plumbing（agent 可改自身约束工具），只能靠写根排除项把隔离藏回来；命名空间前缀（乙=C7）破坏身份契约或 LLM 可见名。碰撞根因是**平铺 basename 装配 + 后者覆盖**，非"两棵树"本身 |
+| B16 行为 | **硬拒**（拒绝零写入零授权） | 静默丢失不可警告化；遮蔽冻结 plumbing 兼具完整性问题属性（可演化代码替换冻结工具） |
+| B16 范围 | **always-on ∪ 已注册组件** | 后者主要兜手工构造的注册表状态（无效条目也占 basename，保守拒绝） |
+| 元数据修改能力 | **B 案：专用算子 `update_component`** | 用户先要求核查 `edit_source` 能否改 description——**能**（`_resolve` 只查 src 根，无 grant/扩展名/类型检查；已授权路径编辑随补丁走，未授权路径编辑静默丢=S3/A15 盲区）。"无更新路径"修正为"未被收编的原始编辑"（三缺口：验证时机/语义可见性/引导）。收编方案用户选专用算子而非 register-upsert |
+| description 入参 | **可选，300 字符上限** | 必填的"过时元数据"论证（单次写入 + 无更新路径 + 实现可原地演化 ⇒ 过时是默认轨迹；被信任的错描述比缺失更糟）——upsert 可消解该论证但用户选了专用算子，可选的摩擦理由仍成立 |
+| 拉取条件 | **内容同一才携带**（filecmp 同字节） | 用户点名的"同名不同实现"即同路径不同内容 = 源码修改的退化形态；一等形态是 `edit_source` 原地改（条目原样存活）。**不拒绝** re-register 不同内容（合法 deep-modify），只裸条目 + 提示引导 |
+| 执行方式 | 先出完整方案，确认后一次执行 | — |
+
+### 14.2 实现
+
+| 文件 | 内容 |
+|---|---|
+| `gan/tools/deep/register_component.py` | **B16**（step 4.6）：候选 basename vs `always_on_dirs(设计角色)` ∪ 已提交注册表可解析模块的 basename 集合；同名已存在则跳过预检（让重复扫描给出精确的 "Already registered"/different-module 信息）；命中即响亮拒（点名冲突源、建议换 stem），插入点在 grants 之前 ⇒ 零写入。**B3**（step 4.5 + append）：`description` 可选入参（str、≤300，写前校验）；未传时从已提交注册表同名条目**条件拉取**——module 一致 ∧ `filecmp` 同字节 ⇒ 携带 `description`/`params_schema`；内容不同 ⇒ 裸条目 + 返回文本提示（传 description 或用 `update_component`） |
+| `gan/tools/deep/update_component.py`（**新**） | 条目元数据的收编更新路径：`name` 必填 + `description`（可选 str ≤300，空串=清除）+ `params_schema`（可选 dict）；骨架与 register/unregister 同构（design ctx R1 检查、`frozen.is_allowed`、**unregister 权威序找条目**——ws 副本存在扫 ws，本会话已移除的名字报 not found 不复活、covers 三分支 grant 舞步、写前校验 + `entry_reason` backstop、`write_registry_json` 保尾换行）；`record("update_component", name, registry, fields, description_chars)`。**不做**：改 `module`（re-point = 源码修改）、复活条目、碰他角色注册表。零外部改动（deep 工具 always-on 目录扫描直载，无需注册表条目/`frozen.py` 改动） |
+| `gan/framework/code_repo.py` | **B17**：`registry_report` 增第五类 `collision` = `(role, basename, sorted 仓库相对源路径)` 三元组集合（三角色 `assemble_collisions` 展平；相对路径保证差分键在 before/after 快照间稳定；第三源加入 ⇒ 新键）；`_registry_worsened` 增 `new_col` 差分拒绝（先在碰撞永不阻塞）。`_needs_registry_check` 不动：always-on 不可写 ⇒ 新碰撞必伴 components/registries 改动 |
+
+### 14.3 验证（runner 155/155；第 9 批安全网首次实战）
+
+- deep 套件 45→**68**：X1（B16 硬拒 always-on stem：`report_issue` 对 evaluator → 拒、零写入、granted_paths 不变）；X2（B16 vs 已注册无效条目占位）；X3（description 入参 + 超上限拒）；X4（unregister→re-register 同内容 ⇒ description+params_schema 拉回）；X5（内容不同 ⇒ 裸条目 + NOT-carried 提示）；X6a–i（update_component：改描述/改 params_schema/空串清除/record 形状/补丁携带/未知名拒/空更新拒/超限拒/不复活本会话移除条目/evaluator 侧自己的注册表）；X7a（**门拒新增碰撞**——手写注册表条目路径，B16 挡不到的绕行）；X7b（**先在碰撞不阻塞无关补丁**——差分语义）。
+- batch6 套件：V7 "四类" 断言随批更新为五类，且断言 gate 的 collision 与 `assemble_collisions` **同源同见**。
+- batch8 套件 32/32 不回归。真实仓库 preflight 0 问题 0 碰撞、gate 五类全空。
+
+### 14.4 变更清单（第 10 批）
+
+| 文件 | 内容 |
+|---|---|
+| `gan/tools/deep/register_component.py` | B16 预检 + B3 元数据保全（`_collision_sources`/`load_designed_registry` helper、`_DESCRIPTION_CAP=300`） |
+| `gan/tools/deep/update_component.py` | 新算子（元数据收编更新路径） |
+| `gan/framework/code_repo.py` | gate 第五类 + 差分拒绝 |
+| `scripts/local/regress_deep_tools.py` | +23 断言（X1–X7） |
+| `scripts/local/regress_batch6.py` | V7 五类断言更新 |
+| `docs/**`、`AGENTS.md` | 本节 + §0.1 行 + §6 三行标记 + 总账 + deep 工具清单/身份契约段同步 |
+
+### 14.5 残余登记（不入本批）
+
+- **原地改实现后描述过时**：`edit_source` 改模块时条目（含 description）原样存活，没有任何机制强制 agent 同步更新描述。可选缓解 = 可见性（receipt/diff 提示"模块已改、条目描述未动"），与 B29（`set_prompt` 记录升级）同族，登记候选。
+- **AGENTS.md 引导句**（"改工具源码用原地 edit_source，unregister+recreate 用于删除/恢复"）已随批写入；若未来 agent 行为数据显示仍走退化路径，再考虑 register 对"内容不同 + 同名"的提示强化。

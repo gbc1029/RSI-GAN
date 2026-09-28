@@ -33,7 +33,7 @@ live under `scripts/dgmh/`.
   `read_trajectory`, `read_session_trajectory`, `list_editable`, `list_components`),
   `design/` (shallow design
   operators), `deep/` (gated deep gate: `request_source_access` + `register_component` +
-  `unregister_component`),
+  `unregister_component` + `update_component`),
   `assembly.py`.
 - `gan/components/` — **opt-in** tool implementations, one tree per role (batch 6):
   `task/` (tools + the curated `task/knowledge/*.md` base), `evaluator/`,
@@ -249,6 +249,14 @@ batch-8 isolation), one subprocess each.
   `code_root` or in the workspace) and never creates, restores or deletes source
   files — restoring a deleted component means re-granting it
   (`request_source_access(..., refresh=true)`) and registering it again.
+  An entry's catalog **metadata** (`description`/`params_schema`) is edited by
+  `update_component` (deep); changing a tool's source is `edit_source` in place —
+  the entry and its metadata survive untouched — not unregister+re-register.
+  A component whose file stem equals an always-on tool's (or another registered
+  component's) stem would make the assembly copy two files onto one toolset
+  basename, silently shadowing one of them: `register_component` refuses such a
+  stem up front, and the differential commit gate refuses a NEW collision
+  (pre-existing ones never block).
   Patch visibility follows `granted_paths`: a file the agent created in the
   workspace reaches the patch only when a grant covers it (grant the parent
   **directory** to have new files inside it captured). `AccessBroker.covers` is the

@@ -17,13 +17,17 @@ role-directory binding -- a registry entry may only reference the designed role'
 own component tree, so the entry lands where its writer can write and its reader
 can read.
 """
+import filecmp
 import json
 import os
 from pathlib import Path
+from typing import Any, Dict
 
 from gan.framework import frozen
 from gan.framework.context import get_access_context, get_design_context
-from gan.registries.loader import entry_reason, write_registry_json
+from gan.registries.loader import (
+    entry_reason, parse_registry_file, resolve_module, write_registry_json,
+)
 
 # batch 6: one registry per role, and each role designs exactly one --
 # planner designs the TASK agent -> registers task tools; evaluator designs
@@ -32,6 +36,47 @@ _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
 # role -> the component directory its registry may reference (role-directory
 # binding; the allowlist already enforces the same split, this is the message)
 _OWNING_DIR = {"planner": "task", "evaluator": "evaluator"}
+
+_DESCRIPTION_CAP = 300  # catalog metadata, not rhetoric (mirrors the B15' discipline)
+
+
+def _collision_sources(role_designed: str, code_root: str, base: str) -> str:
+    """Repo-relative sources that already produce basename ``base`` ("" = none).
+
+    B16 (batch 10): ``assemble_tools_dir`` copies this role's always-on files and
+    its registered components into ONE flat toolset directory keyed by file name
+    (last writer wins, nothing detects the fight), so a component whose stem
+    equals an always-on tool's stem would silently shadow that frozen plumbing
+    tool at the next assembly. This enumerates the same universe the assembly
+    copies from (``always_on_dirs`` + the committed registry's resolvable
+    modules) and reports who already holds the basename. Invalid entries are
+    included on purpose: their file occupies the basename today and a later
+    hand-fix of the entry would make the collision real.
+    """
+    from gan.tools.assembly import always_on_dirs, py_files_in
+    sources = []
+    for d in always_on_dirs(role_designed, code_root=code_root):
+        sources.extend(py_files_in(d))
+    comp_dir = Path(code_root) / "gan" / "components"
+    reg = load_designed_registry(role_designed, code_root)
+    for e in reg.entries:
+        if isinstance(e, dict) and e.get("module"):
+            p = resolve_module(comp_dir, e.get("module"))
+            if p is not None:
+                sources.append(str(p))
+    hits = sorted({os.path.relpath(s, code_root).replace(os.sep, "/")
+                   for s in sources if os.path.basename(s) == base})
+    return ", ".join(hits)
+
+
+def load_designed_registry(role_designed: str, code_root: str):
+    """The committed per-role registry of the DESIGNED role (tolerant load)."""
+    from gan.registries.loader import load_registry_for_role
+    return load_registry_for_role(
+        role_designed,
+        registry_dir=Path(code_root) / "gan" / "registries",
+        components_dir=Path(code_root) / "gan" / "components",
+    )
 
 
 def _granted_coverage(broker, role, node, module_rel: str) -> bool:
@@ -60,7 +105,11 @@ def tool_info():
             "Applied to your workspace; committed with this session's patch after "
             "validation. The module must live under your designed role's component "
             "tree (planner -> gan/components/task/** via task.json; evaluator -> "
-            "gan/components/evaluator/** via evaluator.json)."
+            "gan/components/evaluator/** via evaluator.json). A stem that would "
+            "collide with an always-on tool or another registered component at "
+            "assembly is refused (both would fight for one toolset basename). Pass "
+            "description= to author the catalog line (<=300 chars); re-registering "
+            "the same content carries the committed description over."
         ),
         "input_schema": {
             "type": "object",
@@ -70,13 +119,16 @@ def tool_info():
                 "module": {"type": "string",
                            "description": "Path relative to gan/components, e.g. "
                                           "task/skills/foo.py"},
+                "description": {"type": "string",
+                                "description": "Optional catalog description "
+                                               "(<=300 chars)."},
             },
             "required": ["name", "module"],
         },
     }
 
 
-def tool_function(name, module, **kwargs):
+def tool_function(name, module, description=None, **kwargs):
     actx = get_access_context()
     if actx is None or getattr(actx, "broker", None) is None:
         return "Error: no access context"
@@ -161,6 +213,43 @@ def tool_function(name, module, **kwargs):
     if reason:
         return f"Error: invalid entry ({reason})"
 
+    # 4.5) metadata validation (B3, batch 10): the description is catalog
+    # metadata, not rhetoric -- refuse wrong type / over-length BEFORE anything
+    # is granted or written (zero side effects on refusal).
+    if description is not None and not isinstance(description, str):
+        return "Error: description must be a string"
+    if isinstance(description, str) and len(description) > _DESCRIPTION_CAP:
+        return (f"Error: description too long ({len(description)} chars; "
+                f"cap {_DESCRIPTION_CAP})")
+
+    # 4.6) collision precheck (B16, batch 10). ``assemble_tools_dir`` copies this
+    # role's always-on tools and its registered components into ONE flat toolset
+    # directory keyed by file name (last writer wins, nothing detects the fight),
+    # so a NEW component whose stem equals an always-on tool's stem would
+    # silently shadow that frozen plumbing tool at the next assembly. Refuse
+    # loudly here -- nothing has been granted or written yet. Skipped when the
+    # name already exists: the duplicate scan below then delivers its precise
+    # "Already registered" / different-module message instead.
+    ws_reg = os.path.join(src, reg_rel)
+    same_name_exists = False
+    for _p in ([Path(ws_reg)] if os.path.isfile(ws_reg) else []) + \
+              [Path(code_root) / "gan" / "registries" / reg_name]:
+        _ents, _err = parse_registry_file(_p)
+        if not _err and any(isinstance(x, dict) and x.get("name") == name
+                            for x in (_ents or [])):
+            same_name_exists = True
+            break
+    if not same_name_exists:
+        holders = _collision_sources(_OWNING_DIR.get(role, role), code_root,
+                                     f"{Path(mod).stem}.py")
+        if holders:
+            return (f"Error: cannot register '{name}': {Path(mod).stem}.py would "
+                    f"collide with {holders} at assembly (both are copied into the "
+                    f"role's toolset under the same file name; one silently "
+                    f"disappears, and a component would shadow a frozen always-on "
+                    f"tool). Pick a different module stem (name must equal the "
+                    f"stem).")
+
     # 5) bring the registry into the workspace and append the entry (read-modify-write
     #    on the workspace copy; the rest of the file is preserved).
     #
@@ -183,7 +272,6 @@ def tool_function(name, module, **kwargs):
     #      path is patch-visible; if even then ``broker.covers`` says no, the state is
     #      genuinely unwritable (denied/oversized) and the tool refuses loudly with
     #      the gate's own reason instead of writing a registration it cannot commit.
-    ws_reg = os.path.join(src, reg_rel)
     if not broker.covers(role, node, reg_rel):
         broker.grant(role, node, [reg_rel], intent="modify", reason="register")
     if not os.path.isfile(ws_reg):
@@ -209,11 +297,48 @@ def tool_function(name, module, **kwargs):
                 return f"Already registered: '{name}' in {reg_rel}"
             return (f"Error: '{name}' already registered in {reg_rel} with a "
                     f"different module ({c.get('module')})")
-    comps.append({"name": name, "module": mod})
+    # B3 (batch 10): metadata preservation. A bare {"name","module"} append
+    # silently strips the catalog description on every unregister->re-register
+    # round trip. Carry the committed entry's description/params_schema over --
+    # but ONLY when the implementation is unchanged (same module path,
+    # byte-identical file): same bytes => same tool => the old description is
+    # still true. A different implementation is a source modification; its
+    # metadata must not ride along silently.
+    new_entry: Dict[str, Any] = {"name": name, "module": mod}
+    note = ""
+    if description:
+        new_entry["description"] = description
+    else:
+        prev_ents, _prev_err = parse_registry_file(
+            Path(code_root) / "gan" / "registries" / reg_name)
+        prev = next((e for e in (prev_ents or [])
+                     if isinstance(e, dict) and e.get("name") == name), None)
+        if prev is not None and \
+                str(prev.get("module") or "").replace("\\", "/") == mod:
+            ws_mod = os.path.join(src, module_rel)
+            cand = ws_mod if os.path.isfile(ws_mod) \
+                else os.path.join(code_root, module_rel)
+            committed_mod = os.path.join(code_root, module_rel)
+            same_impl = (os.path.realpath(cand) == os.path.realpath(committed_mod)
+                         or filecmp.cmp(cand, committed_mod, shallow=False))
+            if same_impl:
+                carried = [f for f in ("description", "params_schema")
+                           if prev.get(f) not in (None, "")]
+                for f in carried:
+                    new_entry[f] = prev[f]
+                if carried:
+                    note = (f" (description carried over from the committed entry: "
+                            f"{', '.join(carried)})")
+            else:
+                note = (" Note: the committed implementation of this name differs "
+                        "from the file you are registering; its description was "
+                        "NOT carried. Pass description= here, or use "
+                        "update_component once this patch commits.")
+    comps.append(new_entry)
     write_registry_json(ws_reg, data)
     dctx.record("register_component", name=name, module=mod, registry=reg_name)
-    return (f"Registered tool '{name}' ({module_rel}) in {reg_rel}. It will be "
-            f"committed with this session's patch after validation. You can "
+    return (f"Registered tool '{name}' ({module_rel}) in {reg_rel}{note}. It will "
+            f"be committed with this session's patch after validation. You can "
             f"select_component it right away (task design); the task agent actually "
             f"gets it only once the patch commits -- a rejected patch strips the "
             f"selection from the design before persisting.")
