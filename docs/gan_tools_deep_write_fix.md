@@ -22,6 +22,7 @@
 | 第 6 批（注册表统一） | `fix(gan/registries): per-role single-writer catalogs, role-directory binding, md knowledge base` | **A14 + B2 + H6/C6 关闭**：三注册表独立（无 shared）、name 主键、角色目录绑定、单一 `tools` 槽位（legacy 归一化）、kind 机械退役、md 知识库（pull 型 + p/e 同批启用）。见 §10 |
 | 第 7 批（H8 闭合） | `fix(gan/tools): register_component grant decision follows broker.covers` | **B1/H8 关闭**：covers 引导三分支授权 + 不可写响亮拒（甲′；乙重新定位为 C5 伴随设计）。见 §11 |
 | 第 8 批（P→E 隔离） | `fix(gan/framework): planner→evaluator channels become named projections` | **B11 + B12 + B13 + B14**：meta 白名单、receipt.grants 收口、responses 投影 + stance 桶集、receipt 投影；B15'/B28 扩容登记。见 §12 |
+| 第 9 批（回归固化） | `docs(gan/tools): solidify tool regression suites as scripts/local runners (B23)` | **B23**：/tmp 探针固化为 `scripts/local/` 三套件 + 统一入口（深层 45 / batch-6 55 / batch-8 32 = 132 断言；套件 gitignored，本提交仅文档）。见 §13 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -293,7 +294,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B20** | `deny_deep` 接线（**须含 `register_component`**，见 A13） | `access.py` / `build.py` / 3 个 deep 工具 | 跨 4 文件 | — |
 | **B21** | 预算/死键：`task_agent.py` 未传 `max_tool_calls`（默认 40）；`cost.*` 接线或移除 | `task_agent.py` + `loop.yaml` | ~5 行 | **是** |
 | **B22** | `patch.py` 支持 `\ No newline at end of file`（D1 备选） | `patch.py` | ~15 行 | 可选 |
-| **B23** | 回归断言固化（报告 §六 的 6 条真实链路 e2e） | 测试代码 | 6 例 | — |
+| **B23** | 回归断言固化（报告 §六 的 6 条真实链路 e2e）【✅ 已修（第 9 批）：/tmp 探针固化为 `scripts/local/` 三套件 + 统一入口，132 断言，见 §13】 | 测试代码 | 6 例 | — |
 | **B24** | **H11**（第 4 批新发现）任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`；下一代装配时被 B7 记 skip，静默失能且留痕） —— **✅ 已修（第 5 批，A2 自愈）**，见 §9.3 | `gan/framework/task_runner.py:103-128` | ~15 行 | **是** |
 | **B25** | **H12**（第 5 批新发现）`set_config("skills", [...])` 只做 schema 键白名单，未注册组件不经拒绝直接进设计（实证：装配报 `not registered`） —— **✅ 已修（第 5 批，Option 1）**，见 §9.4 | `gan/tools/design/set_config.py` | ~15 行 | **是** |
 | **B26** | **角色设计的 heal**（第 5 批新发现）：`evaluator/planner.self_improve` 在补丁重试循环后**无条件** `save_self_config(cfg)`（`gan/roles/evaluator.py:194`），与 H11 同模式；角色设计现在 committed-only 故**不会新造**悬空，但存量链上的悬空名未自愈。修法 = 角色设计也开 overlay + 自愈（需决策） | `gan/roles/base_role.py:215` + 两个 `self_improve` | ~15 行 | **是** |
@@ -784,3 +785,40 @@ covers? ──否──> plain grant（用已提交真相覆盖 scratch / 或常
 ### 12.6 修完后的 P→E 全通道面
 
 五条 E 向通道全部为命名投影：`diff_summary`（既有）/ `receipt.design.ops`（既有）/ `run_summary.meta`（B11）/ `run_summary.receipt`（B14）/ `feedback_digest.responses`（B13）+ receipt JSON 的 grants（B12）。P 的自由文本单向不出 planner；E 向新通道默认不可见，需显式建投影。
+
+---
+
+## 13. 第 9 批：回归固化（B23）
+
+> 起因：用户指令"现在做B23固化"。固化动机已被现实坐实——三套 /tmp 探针中两套（深层 11 例 `gan_verify/regress.py`、batch-6 35 例 `b6_verify.py`）已被 tmp 清理删除，仅 `b8_verify.py`（32 例）幸存。本批把它们重建为持久资产；**套件本身 gitignored（仓库约定：本地测试不上传），进提交的只有文档**。
+
+### 13.1 产物（`scripts/local/`）
+
+| 文件 | 内容 |
+|---|---|
+| `_toolreg_common.py` | 共享脚手架：`Ver` 判定器（PASS/FAIL 实时打印 + 非零退出）；临时 code_root fixture（最小 `gan/` 骨架：每角色一个注册表 + bash/editor/calc/evaluator 组件；`calc`/`retry` 为"已提交未注册"的注册候选）；`loader_dirs` contextmanager（重定向 loader 默认目录——`select_component`/`set_config` 这类无显式目录参数的 API 才读它）；真实 `AccessBroker` + contextvars 会话脚手架（planner plan 会话 / evaluator 会话） |
+| `regress_deep_tools.py` | **深层门回归，45 断言**：S1–S4 场景矩阵（§11.1 全表）；`p3_uncovered`（新模块未覆盖 → 拒绝点名补救 → 授权目录后成功且补丁双携带）；`covers` 谓词单元（文件授权不覆盖兄弟文件等）；U 注销套件（按名、ws 模块删除、删除入补丁、记录带 module）；R 拒绝族（module 穿越/跨树/身份不符/非 .py/无设计上下文 R1/无访问上下文）；E 评测者向自己的注册表注册 |
+| `regress_batch6.py` | **批 6 统一回归，55 断言**：V1 loader（目录/legacy kind/角色目录绑定/文件内重名/unsafe/identity/provenance）；V2 装配（`tools` 槽位、legacy `skills` 键、未知项 skip 带 reason）；V3 算子（别名、record 归一、set_config 原子拒绝、**P-3 同会话选择**、角色自设计 committed-only）；V4 归一化（`normalize_config` 折叠序 + `DesignStore.load`）；V5 knowledge（物化：单篇/总量封顶 skip 入 report、隐藏/非 md 忽略、env 改名与清洗；工具：列/读/basename 封目录/20k clip 标记/无 env 报错）；V6 注册记录无 kind + 同会话 select；V8 自愈（ghost 剥离 + **register→select→poison patch→strip** 链）；V7 preflight（0 问题 0 碰撞 / 孤儿 / 碰撞）+ gate 四类快照 |
+| `regress_batch8.py` | **批 8 P→E 隔离，32 断言**（`b8_verify.py` 逐条移植）：B11 meta 白名单（含 default-deny）、B14 receipt 投影、B12 grants 收口、B13 投影+渲染（矛盾行/尾行/多响应）、B13a 工具记录形状、2×2 冒烟 |
+| `run_tool_regression.py` | 统一入口：**每套件独立子进程**（contextvars/loader 默认值的隔离 = 当年 /tmp 探针的同一性质），汇总退出码 |
+
+运行：`venv_nat/bin/python scripts/local/run_tool_regression.py`（全部）或 `… regress_deep_tools.py`（单套件）。相对 /tmp 探针的改进：tempfile 目录不受 tmp 清理影响、`bootstrap` 不依赖 cwd、逐断言实时输出。
+
+### 13.2 重建中的语义发现（固化 ≠ 复读，三处按真实语义重写用例）
+
+1. **S2"同名不同模块"冲突分支的可达性**：`register_component` 的身份检查（name==stem）先于注册表重名扫描，用 `name=calc, module=task/skills/bash.py` 调用**永远先撞身份错误**——冲突分支只能由手工构造的存量条目（name 与 module 不一致；注册表条目是 DATA，会话可写入这种数据）触发。套件用两条用例分别锁死：身份优先序 + 构造数据触发冲突。
+2. **unregister 的权威序**：扫描 workspace 优先、committed 兜底——此前批次的"注册"只落在会话工作区，fixture 的 committed 注册表必须**真的含目标条目**注销才能走到。U 组前置写入 committed 注册表。
+3. **目录 glob 授权的语义**（p3 的补救路径）：`grant(["gan/components/task/skills/**"])` 因 `**` 匹配目录自身而授予**目录**（`_grant_concrete` 对目录 copytree）⇒ `covers` 对目录下**新建文件**为 True；若 glob 只展开为已存在文件，新兄弟文件永远不会被覆盖。错误信息里提示的 `**` 形式是正确的，套件把该行为锁死（先拒后授再成功）。
+
+### 13.3 验证
+
+- runner 全绿：deep-tools 45/45、batch-6 55/55、batch-8 32/32（**132 断言**）；runner 复跑与异 cwd 复跑均全绿（幂等）。
+- 数说：原三套共 78 断言（11+35+32）；重建后 132——深层套件为**超集重建**（原 11 例清单已失传，按 §8.6/§11 场景矩阵重推），batch-6 逐组超集，batch-8 逐条移植。
+
+### 13.4 变更清单（第 9 批）
+
+| 文件 | 内容 |
+|---|---|
+| `scripts/local/`（5 个文件，gitignored） | 本地验证资产；后续批次动手前跑 runner 作为安全网 |
+| `docs/**` | 本节 + §0.1 行 + §6 B23 行标记 + 总账（`docs/8_工具待办与已办.md`）B23 移入已办、执行顺序更新 |
+| `AGENTS.md` | "Tests / verification scripts" 句提及回归入口 |

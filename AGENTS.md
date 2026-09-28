@@ -75,6 +75,12 @@ python -m domains.report  --domain paper_review --dname ./outputs/demo
 ```
 
 Tests / verification scripts are kept locally under `scripts/local/` (gitignored).
+The tool-management regression suites (per-role registries, deep gate, P→E
+projections) live there too: run `venv_nat/bin/python
+scripts/local/run_tool_regression.py` before and after touching `gan/tools/`,
+`gan/registries/`, `gan/framework/{access,task_execution,receipt,loop}.py` or the
+design operators — three suites (deep gate S1–S4 / batch-6 unification /
+batch-8 isolation), one subprocess each.
 
 ## Conventions
 
