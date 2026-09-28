@@ -364,7 +364,7 @@ patch 0B                                    <-- 注册被静默丢弃
 | 编号 | 项 | 范围 | 需决策的点 |
 |---|---|---|---|
 | **C1** | **H7** 编译门覆盖 import 断裂 | `code_repo.validate_python` + `apply_code_patch` | 见下 |
-| **C2** | `evaluate()` 的深改定位 | `roles/evaluator.py` + `edit_source.py` | 加守卫（小，~5 行）vs 补**补丁通道**（大，且与"评估者不改产物"的设计冲突） |
+| **C2** | `evaluate()` 的深改定位 | `roles/evaluator.py` + `edit_source.py` | 加守卫（小，~5 行）vs 补**补丁通道**（大，且与"评估者不改产物"的设计冲突）【第 12 批续·核实增补：可达面已实测——registry 三深工具 R1 拒；`request_source_access(intent="modify")` 在 evaluate **不崩**（dctx.record None 守卫 `:50`）且**授权成功**（e-set modify 在 allowlist 内）⇒ edit_source 可改 ⇒ 效应**静默丢弃**（evaluate 无补丁构建器；授权层可审计、效应层无"将被丢弃"事件）；盲相指令只警告 registry 深改、未覆盖此旁门（指令-机制不一致）。守卫 = patch-less 会话拒 modify 意图、view 全会话可用（~5 行）；用户拍板**维持登记暂不实施**】 |
 | **C3** | 防御层检测方法重构（A15 的彻底版） | `roles/base_role.py` + 新检测逻辑 | 见下 |
 | **C4** | 补丁闸门判据重设计 | `patch.py` + `planner.py`/`evaluator.py` 的 `_build_patch` 闸门 | 报告 P0 建议改为"workspace 相对 `code_root` 确有差异"；本会话实际选了 **records 判据**（`has_deep_write`）+ 防御层——**H8 与 C3 都源于这个差异** |
 | **C5** | P2 的根本面：补丁只遍历 `granted_paths` | `patch.py` + 授权模型 | "未 grant 的新文件"是否升为一等公民（改枚举方式 or 授权模型改目录级）；`list_editable` 只返回具体文件是加重因素 |
@@ -968,3 +968,15 @@ B9（收窄定稿，含 B31/B32 挂靠）、B33、B34、B35、B36、B37、B38（
 | `docs/7_遗留问题与待办.md` | 新增 §2.4（13 项移入清单 + 闭合标注 + 方法论）、§3.4 末指针块、§4.1（B21）、§0.1 注记 |
 | `docs/8_工具待办与已办.md` | §2.1 A16 移入已办；§2.2 重组为 8 项（含指针）；§1 加第 12 批行；§3 执行顺序更新；状态基准更新 |
 | 本文件 | §0.1 行、§6 指针、本节 |
+
+### 16.6 第 12 批续：outer/inner 边界与两角色越权面的核实（登记，无代码）
+
+> 起因：用户就"重试循环失败/耗尽"追问三个方向后定案三项。
+
+**(1) `docs/7` §6.1 登记定案**：**"outer 对齐 inner"设计可行且正确**（定义 = inner 既有失败语义"放弃修改+记录回执+交予后续 inner 代"；outer 已实现 3/4），**不列 invalid**；登记的是**缺口**——耗尽/放弃路径的设计-树错位破坏移交一致性（`patch_retry_k` 耗尽 ⇒ `patch=""` 整批丢弃 + `warn_dropped` 门条件关死 + 已落盘 deselect 永久生效 ⇒ 反向悬空 + 审计-事实分叉）。"outer 对齐 inner 状态"（回滚）不可行：角色设计无 inner 历史版本 + 回滚销毁合法浅编辑——要的是前向收敛（heal）非回到过去。**可行解 = B26 甲推广到空 patch/耗尽出口**（出口后 heal+重存；安全性：self_improve→apply→receipt→refresh 序列无消费者窗口）+ **B41**（耗尽丢弃响亮事件 + `warn_dropped` 门条件盲区）。`patch_retry_k` 重试成功的乐观分支无此问题；失效的是其补集（修正后仍失败/放弃/耗尽）。
+
+**(2) B42 新登记（登记暂缓）**：**deep 工具目标注册表按访问角色而非设计角色选择**——`_OWN_REGISTRY` 以 `actx.role` 为键 ⇒ planner plan 会话对齐（设计 task）而 self_improve 错位（设计 planner、仍写 task.json）；叠加 allowlist 无会话维度 + 补丁构建器全收 ⇒ planner 可在"improve yourself"会话修改 task 面（半审计越权通道：门照常 applies、提交可审计，但绕过 plan 会话的全部对齐机器——无法 select 进 task 设计、记录进 self receipt、task 侧 diff_summary 不可见）。选项 (a) 目标跟随 `dctx.role`（planner.self_improve 拒 task.json 写、指回 plan；evaluator 两侧全对齐不受影响，~10 行）/(b) 接受为灵活性。**用户拍板：登记暂缓。**
+
+**(3) C2 核实增补（维持登记）**：evaluate 深改可达面实测钉死——registry 三深工具 R1 拒 ✓；**`request_source_access(intent="modify")` 不崩**（dctx.record None 守卫 `:50`，该守卫同时解释 view 授权在 evaluate 的合法性）**且授权成功**（e-set modify 在 allowlist 内）⇒ `edit_source` 可改 ⇒ 效应**静默丢弃**（无补丁构建器；授权层可审计、效应层无丢弃事件）；盲相指令只警告 registry 深改（指令-机制不一致）。守卫方案（patch-less 会话拒 `intent="modify"`、view 全会话可用，~5 行）与补通道方案（与"评估者不改产物"宪法冲突，否决）并存于 C2。**用户拍板：维持登记暂不实施。**
+
+**(4) B26 讨论结晶（登记备忘）**：unregister 顺带 deselect 的**否决理由精确化**——失效仅在"调度成功但补丁最终未落地"情形（重试耗尽/放弃）：已落盘 deselect 永久指向仍存在的工具 ⇒ 反向悬空（正向悬空有 B7/list_components 双报告，反向零报告）+ 审计-事实分叉；工具调用当次失败（零写入无 deselect）与"agent 修正后成功"（最终一致）两分支无失效。"失效场景 3"（dctx 依赖）经逐会话核对在现布局下为**空集**，降级为设计约束备忘（将来扩布局时"dctx.role ≠ 设计角色"错位需显式处理）。**U′ 维持**（unregister 文本提示、不自动改设计）+ **heal 兜底**。overlay 权（有效视野权威扩到角色自设计）：作用 = 决策-生效延迟从 outer 级缩到 inner 级；机制小（~5 行权威放宽 + `list_components` 镜像同步 ~3 行）但**大头在 heal 的跨层接线**（~25-35 行）——"先 heal 后 overlay"是结构必然（overlay 的安全性完全依赖出口 heal）；现committed-only 为**暂留待办**（批 5 遗留），非终局决策。
