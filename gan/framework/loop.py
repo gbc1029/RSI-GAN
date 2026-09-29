@@ -538,6 +538,52 @@ class GanLoop:
             soft_fail(f"workspace resync had {len(sync_failures)} failure(s) "
                       f"(outer_{outer}): " + "; ".join(sync_failures[:5]))
 
+    def _component_drift(self, patch: str, applied: bool) -> List[Dict[str, Any]]:
+        """B30 (b): registered components whose MODULE this patch changed.
+
+        ``module_changed`` restates what ``task_patch_files`` already tells the
+        planner; the added value is the catalog annotation, computed with the SAME
+        stamp comparison as (c) so the two can never disagree. Skipped entirely when
+        the patch did not apply (nothing landed => no drift to report).
+        """
+        if not applied or not (patch or "").strip():
+            return []
+        from gan.framework import code_repo
+        from gan.registries.loader import load_registry_for_role, stale_metadata
+        try:
+            changed = set(code_repo.changed_files(patch))
+        except Exception:  # noqa: BLE001 -- advisory
+            return []
+        out: List[Dict[str, Any]] = []
+        for role in ("task", "planner", "evaluator"):
+            try:
+                reg = load_registry_for_role(role, code_root=self.code_root)
+            except Exception:  # noqa: BLE001
+                continue
+            stale_names = {s["name"] for s in stale_metadata(reg)}
+            for e in reg.entries:
+                if not isinstance(e, dict):
+                    continue
+                name = str(e.get("name"))
+                mod = str(e.get("module") or "")
+                if not mod or f"gan/components/{mod}" not in changed:
+                    continue
+                out.append({
+                    "name": name, "module": mod, "registry": f"{role}.json",
+                    "module_changed": True,
+                    "entry_touched": f"gan/registries/{role}.json" in changed,
+                    "description_stale_after": name in stale_names,
+                })
+        return out
+
+    def _catalog_stale(self, role: str) -> List[Dict[str, Any]]:
+        """B30 (c-L4): this role's stale catalog entries, for its own receipt."""
+        try:
+            from gan.framework.preflight import catalog_stale
+            return catalog_stale(role, code_root=self.code_root)
+        except Exception:  # noqa: BLE001 -- advisory
+            return []
+
     def _make_receipt(self, genid: Any, plan_result: Dict[str, Any],
                       parent_cfg: Dict[str, Any], child: Node, outer: Any) -> Dict[str, Any]:
         from gan.framework.receipt import build_receipt
@@ -568,6 +614,14 @@ class GanLoop:
             # selected vs actually assembled" gap for the just-executed child in
             # the receipt it consumes at its next plan session.
             toolset=child.meta.get("toolset_report"),
+            # B30 (b): registered components whose module this patch changed, with
+            # the catalog annotation ((c) makes its source of truth the same stamp,
+            # and the evaluator's projection deliberately excludes both it and the
+            # startup stale list -- bookkeeping, not a task fact).
+            component_drift=self._component_drift(
+                plan_result.get("patch_proposed", ""), 
+                bool(child.meta.get("patch_applied"))),
+            catalog_stale=self._catalog_stale("planner"),
             # H11/B24 (batch 5): the dangling slot names the framework stripped
             # from the design right before persisting it.
             design_stripped=child.meta.get("design_stripped"),
@@ -609,6 +663,9 @@ class GanLoop:
             # one-off startup event does not repeat every outer).
             design_stripped=((r.get("design_stripped") or [])
                              + self.preflight_design_stripped.pop(role, [])),
+            component_drift=self._component_drift(r.get("patch_proposed", ""),
+                                                  bool(r.get("patch"))),
+            catalog_stale=self._catalog_stale(role),
             # B7: this outer's own instance assembly — carried into the NEXT
             # outer's self-improve receipt (this outer already injects it via
             # the self-improve `recent` payload).

@@ -262,6 +262,23 @@ batch-8 isolation), one subprocess each.
   **directory** to have new files inside it captured). `AccessBroker.covers` is the
   single definition of that predicate; `list_components` reports it per orphan as
   `patch_covered`.
+  **Catalog-metadata drift (B30, batch 17)**: an entry carries an optional
+  `source_sha` (sha256 of the module bytes, first 12 chars) meaning "the description
+  was written against THIS version". It is stamped only when METADATA is written
+  (`register_component` / `update_component` — refreshing the description is what
+  clears the flag); a module edited on its own therefore drifts. Detection is
+  ADVISORY and never gating: `list_components` reports per-entry `description_stale`
+  (+ aggregate note) **without touching `valid`/`selectable`**, `edit_source` adds a
+  one-line note when a mutating edit hits a registered component (`view` never
+  does), `preflight_tools.catalog_stale` reports it at startup WITHOUT failing, and
+  the planner's receipt carries `component_drift` (per-patch, computed from the same
+  stamp so the two can never disagree). A missing stamp means unknown and is never
+  reported. Deliberately NOT done: refusing to commit/select on drift (whether a
+  change is user-visible is the agent's call, and a hand-edited registry could forge
+  the stamp — it is not a security boundary) and auto-rewriting descriptions. Both
+  the startup list and `component_drift` stay out of the evaluator's projection: they
+  are catalog bookkeeping, not task facts (the evaluator already has
+  `task_patch_files`, and `name == file stem` makes the component identity free).
 - **`list_components` reads the design target, not the access role**: the catalog it
   lists is the one `select_component` consults (`DesignContext.role`), which differs
   from `AccessContext.role` in the planner's `plan` session (access `planner`,

@@ -238,6 +238,49 @@ def resolve_module(components_dir, mod: Any) -> Optional[Path]:
     return None
 
 
+def module_sha12(path: Any) -> Optional[str]:
+    """Content stamp of a module file: sha256 hex, first 12 chars (B30).
+
+    Single definition of the ``source_sha`` entry field. It means "the catalog
+    description was written against THIS version of the module": the writers
+    (``register_component`` / ``update_component``) stamp it whenever METADATA is
+    written, and every reader (``list_components``, the startup preflight, the
+    ``edit_source`` hint) compares it with the CURRENT bytes. A module edited on
+    its own therefore shows up as drift; refreshing the description clears it.
+
+    Advisory only: the stamp is never read by ``entry_reason``, never part of
+    ``_REQUIRED`` and never affects selection, validity or the commit gate.
+    """
+    if not path:
+        return None
+    from gan.framework.scores import sha256_file
+    h = sha256_file(str(path))
+    return h[:12] if h else None
+
+
+def stale_metadata(reg: "ComponentRegistry") -> List[Dict[str, str]]:
+    """Entries whose stamp disagrees with the current module bytes (B30).
+
+    Only STAMPED entries can be stale: a missing stamp means "unknown" and is
+    never reported (back-compat with entries written before the field existed, and
+    with hand-written catalogs that simply omit it).
+    """
+    out: List[Dict[str, str]] = []
+    for e in reg.entries:
+        if not isinstance(e, dict):
+            continue
+        stamped = e.get("source_sha")
+        if not stamped:
+            continue
+        name = str(e.get("name"))
+        mod_path = reg.module_path(name)
+        current = module_sha12(mod_path) if mod_path else None
+        if current and current != str(stamped):
+            out.append({"name": name, "module": str(e.get("module")),
+                        "stamped": str(stamped), "current": current})
+    return out
+
+
 def entry_reason(entry: Any, components_dir, owning_role: Optional[str] = None) -> Optional[str]:
     """Return None if valid, else a short reason string.
 

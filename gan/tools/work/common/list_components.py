@@ -67,6 +67,7 @@ from gan.framework.context import get_access_context, get_design_context
 from gan.registries.loader import (
     entry_reason,
     load_registry_for_role,
+    module_sha12,
     orphan_modules,
     parse_registry_file,
     resolve_registry_file,
@@ -200,6 +201,16 @@ def tool_function(**kwargs):
         ok, sreason = _selectable(name)
         reason = entry_reason(entry, eff_reg.components_dir if pending != "removed"
                               else code_reg.components_dir, design_role)
+        # B30 (L2): catalog-metadata drift, ADVISORY only -- it never feeds
+        # `valid`/`selectable` (a stale description is a bookkeeping fact, not a
+        # capability fact). `None` = no stamp = unknown (never a false alarm).
+        _stamped = entry.get("source_sha")
+        _stale = None
+        if _stamped:
+            _reg_for_path = eff_reg if pending != "removed" else code_reg
+            _mod = _reg_for_path.module_path(name)
+            _cur = module_sha12(_mod) if _mod else None
+            _stale = bool(_cur) and _cur != str(_stamped)
         registered.append({
             "name": str(entry.get("name")),
             "kind": str(entry.get("kind") or ""),   # legacy descriptive tag
@@ -211,6 +222,12 @@ def tool_function(**kwargs):
             "pending": pending,
             "selectable": ok,
             "selectable_reason": None if ok else sreason,
+            "description_stale": _stale,
+            "description_note": (
+                None if not _stale else
+                "the module changed after this description was written -- call "
+                "update_component if the change is user-visible (or clear the "
+                "description)"),
             "note": _PENDING_NOTE.get(pending),
         })
 
@@ -279,6 +296,11 @@ def tool_function(**kwargs):
             f"registry file {design_role}.json is unparseable in the {origin} copy "
             f"({err}); the entries it declares are NOT listed below and its modules "
             f"may appear as orphans -- fix it before registering/selecting")
+    stale_n = sum(1 for r in registered if r.get("description_stale"))
+    if stale_n:
+        notes.append(f"{stale_n} component(s) have a STALE catalog description "
+                     f"(their module changed after the description was written; "
+                     f"update_component refreshes it)")
     removed_n = sum(1 for r in registered if r["pending"] == "removed")
     if removed_n:
         notes.append(f"{removed_n} tool(s) are scheduled for removal in this outer's "

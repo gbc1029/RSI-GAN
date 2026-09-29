@@ -27,7 +27,8 @@ from pathlib import Path
 
 from gan.framework import frozen
 from gan.framework.context import get_access_context, get_design_context
-from gan.registries.loader import entry_reason, parse_registry_file, write_registry_json
+from gan.registries.loader import (entry_reason, parse_registry_file,
+                                   resolve_module, write_registry_json)
 
 # role -> the registry it designs (single-writer file, batch 6)
 _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
@@ -156,6 +157,17 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     # backstop (entries are DATA): the updated entry must still be a valid one.
     # A metadata edit cannot break the identity/role contracts, but validate the
     # result anyway across the workspace-first search path.
+    # B30 (L1): updating the metadata is the act of declaring "this description
+    # matches the CURRENT module", so refresh the stamp here -- this is the only
+    # way the drift flag clears. If the module cannot be resolved the entry is
+    # already invalid (reported by preflight); leave the previous stamp alone.
+    from gan.registries.loader import module_sha12
+    mod_path = resolve_module([Path(src) / "gan" / "components",
+                               Path(code_root) / "gan" / "components"],
+                              entry.get("module"))
+    stamp = module_sha12(mod_path) if mod_path else None
+    if stamp:
+        entry["source_sha"] = stamp
     reason = entry_reason(entry,
                           [Path(src) / "gan" / "components",
                            Path(code_root) / "gan" / "components"],

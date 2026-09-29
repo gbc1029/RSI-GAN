@@ -30,6 +30,7 @@
 | 第 14 批（装配/预检加固） | `fix(gan): validate always-on tools by owner, repair dangling designs at startup, make the tool-load layer visible (B7/B15/B27)` | **B7 + B15 + B27**：always-on 工具纳入 AST 接口校验并按 owner 分流；悬空角色设计在启动期**修复 + 留证 + 反馈**（不 fail-fast）；工具**加载层**可见化（拷贝层 → 真实可用层）。回归 180→197 断言。见 §18 |
 | 第 15 批（S 族登记） | docs-only 登记 | **无代码改动、无决策**：把「会话级权限」升为 **S 族（会话席位权限）**——**S1 = B42**（self_improve 写 task 面）、**S2 = B43**（plan 写 planner 自身，本次实测发现）、**S3 = C2**（evaluate 写自身）、**S2 子族 = B44**（planner 自面残缺）。含根因、席位对照表、逐项实测证据与两处未决选项。见 §19 |
 | 第 16 批（B29 提示词事实） | `feat(gan): record and project structural facts of a prompt rewrite (B29)` | **B29**：`prompt_change_facts`（长度/行数/增删行/相似度/改动行号区间/短哈希/空/`equals_seed`，**绝不含文本**）+ `DesignContext.record` 框架铸入 `target_role`；`set_prompt` 与 `set_config(key=prompt)` 同源记录；`build_diff_summary` 删幻影 `section` 并投影事实、`_ops_summary` 补事实键、`render_receipt` 加一行改动量。回归 197→212 断言。见 §20 |
+| 第 17 批（B30 目录元数据漂移） | `feat(gan): stamp, detect and report catalog-metadata drift (B30 a/b/c L1-L4)` | **B30 (a)+(b)+(c)**：条目新增 `source_sha` 盖戳（register 写 / update 刷新，**仅在元数据被写时**）；`list_components` 每项 `description_stale` + 聚合行（**不影响 valid/selectable**）；`edit_source` 改动已注册模块时一行提示（`view` 不提示）；`preflight_tools.catalog_stale`（**非致命**）+ planner 回执行；`component_drift` 投影事实（与 (c) 同一套戳比较，永不互相矛盾）。回归 212→232 断言。**不做的**：L5 阻断、L6 自动修复。见 §21 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -309,7 +310,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B26** | **角色设计的 heal**（第 5 批新发现）：`evaluator/planner.self_improve` 在补丁重试循环后**无条件** `save_self_config(cfg)`（`gan/roles/evaluator.py:194`），与 H11 同模式；角色设计现在 committed-only 故**不会新造**悬空，但存量链上的悬空名未自愈。修法 = 角色设计也开 overlay + 自愈（需决策）【⏳ **第一期已修（第 13 批）**：`heal_design_slots` 去掉 role 限制（对照**本角色**注册表）+ `loop._apply_self_patch` **成功出口** heal + 重存 + 事件 `design_dangling_stripped(stage=self_improve)` + `design_stripped` 进 self receipt；**overlay 权同批实施**（角色自设计 = 有效视野权威，批 5 committed-only 正式退役）+ **U′**（unregister 检测「仍被选中」纯提醒）。**第二期保持待办**（`docs/7` §6.1）：耗尽/被拒出口 heal + `save_self_config` 延迟化，见 §17】 | `gan/roles/base_role.py:215` + 两个 `self_improve` | ~15 行 | **是** |
 | **B27** | 子进程 `load_tools` 的 skip 只有一行日志 ⇒ 装配报告只能证明"被拷贝"，不能证明"真的可用"【✅ 已修（第 14 批）：`load_tools(report_path/env GAN_TOOLS_LOAD_REPORT)` 写加载报告；task 侧并入 `tools_load_report.json` + 事件 `task_tools_loaded` + node meta，角色侧并入 `assembly_report["load"]` + 事件 `role_tools_loaded`；失败按 owner 分类（组件/角色自有 = 可执行项交回 agent；frozen = `framework_failed` 升级且不交 agent）。见 §18】 | `agent/tools/__init__.py` + report 链 | ~25 行 | — |
 | **B29** | `set_prompt` 只记 `chars` ⇒ 提示词重写是唯一不透明知识通道（`build_diff_summary` 的 `set_prompt` 分支只取无人生产的 `section`，`_ops_summary` 白名单连 `chars` 都丢） | `gan/tools/design/set_prompt.py` + 两处投影 | ~15 行 | — 【✅ 已修（第 16 批）：见 §20】 |
-| **B30** | 原地改实现后条目描述过时的可见性（`edit_source` 不 record；提交后 `pending=none`，实现与条目描述的分歧无人可见） | `receipt/diff` 链 + `edit_source` | ~10-25 行 | soft |
+| **B30** | 原地改实现后条目描述过时的可见性（`edit_source` 不 record；提交后 `pending=none`，实现与条目描述的分歧无人可见） | `receipt/diff` 链 + `edit_source` | ~10-25 行 | soft 【✅ 已修（第 17 批）：见 §21】 |
 | **B43** | **S 族 S2：plan 会话可写 planner 自身源码**——`AccessContext(role="planner")` 的写集 = `TASK_SOURCE + PLANNER_SELF`，而 plan 的设计目标是 `task`（`planner.py:104`）⇒ 席位与写面错配：可 grant/编辑 `gan/roles/planner.py`、`seeds/planner.md`、`work/planner/**`、`components/planner/**`，并随**任务代补丁**提交（血缘/`task_patch_files` 归因被污染；E 的 diff_summary 会列出它读不到的路径）。【第 15 批登记（未决）：见 §19】 | `frozen.py` + `access.py` | 需 seat 维度 | **是** |
 | **B44** | **S 族 S2 子族：planner 自面残缺**——`PLANNER_SELF` 含 `gan/components/planner/**` 却缺 `registries/planner.json`，`_OWN_REGISTRY["planner"]="task.json"` + 目录绑定 ⇒ 可写却无法注册；新增该树文件触发 orphan ⇒ 提交门拒**整包**，且提示"用 register_component 注册"不可执行（闭环陷阱）。实测：`components/planner/` 目录不存在、`planner.json` 0 条目。【第 15 批登记（未决）：(甲)补齐自面 /(乙)收回死区，见 §19.4】 | `frozen.py` + `register_component.py` + `code_repo.py` | ~10 行（选甲） | **是** |
 | **B31** | 死 `code_edit` 分支（origin 有生产者 `gan/operators/planner_ops/code_edit.py`，`642bcda` 重构删除算子后失联）——**随 B9 一并删** | `gan/summary.py:44` | ~4 行 | — |
@@ -1292,3 +1293,89 @@ rec0 kind=input redacted=True len=48278
 
 - **B30**（原地改实现后条目描述过时的可见性）——仍待办；其 (b) 投影事实 / (c) `source_sha` 漂移检测方案已在讨论中给出，未决策；
 - **S 族**（§19：S1=B42 / S2=B43 / S3=C2 / B44）——**第 15 批仅登记，未决、未改动**。
+
+---
+
+## 21. 第 17 批：目录元数据漂移的盖戳、检测与汇报（B30 a/b/c，L1–L4）
+
+> 起因：B30 讨论定案——(c) 作为**已有工具的附带自动检测**而非独立工具；(a)+(b)+(c) 全做；(c) 取 **L1+L2+L3+L4**，
+> **L5 阻断 / L6 自动修复明确不做**。其中 (a) 与 (c)-L3 是同一处同一时刻的同一件事，合并实现一次。
+
+### 21.1 决策记录（用户确认）
+
+| 决策点 | 结论 | 理由 |
+|---|---|---|
+| (c) 的形态 | **附着于既有工具（register/update 写戳、list_components 读标记、edit_source 提示、preflight 报告）**，**不新开工具** | ① 盖戳必须框架侧，否则 agent 可"重新盖戳"绕过；② 读侧已有正确落点（`list_components` 的 `description` 旁），新工具会造**同一问题的第二个事实源**（H10 类）；③ 本仓库新开工具的判据是"**能力**缺失"（如 `update_component`），这里读写能力都在 |
+| 自动化切到哪 | **L1 盖戳 + L2 读侧标记 + L3 写时提示 + L4 启动/回执报告** | 见 21.2；L5/L6 明确不做 |
+| **L5 阻断**（提交门/选择拒） | **不做** | 改动是否对外可见只有 agent 知道（改 typo、内部重构都合法）；卫生事实变硬门会误伤；且 `source_sha` 可被手写注册表篡改 ⇒ **不是安全边界**；违反批 14 准则（只在无人能修 或 继续会产出静默错结果时中断） |
+| **L6 自动修复** | **不做** | 销毁 agent 撰写的元数据；旧描述可能仍大体准确；B3 的既有立场是"字节同一才携带"，**从不**替 agent 猜描述时效 |
+| 留给 agent 手动 | ① 判断改动是否对外可见；② 写新描述（`update_component`，也是**刷新戳的唯一动作**）；③ 决定是否清空 | 框架不猜语义 |
+| E 面 | **不给**（L4 与 (b) 都不进 `diff_summary`/E 投影） | 见 21.5 |
+
+### 21.2 自动化的四层（L1–L4）
+
+| 层 | 落点 | 行为 |
+|---|---|---|
+| **L1 盖戳** | `register_component`（新建条目时）、`update_component`（写元数据时**刷新**）、B3 字节同一携带路径 | `source_sha` = 模块字节 sha256 前 12 位；**只在元数据被写时盖戳/刷新**——模块单独改动**不刷新**，否则标记永不亮 |
+| **L2 读侧标记** | `list_components` 每项 `description_stale`（`true`/`false`/`null`=未知）+ `description_note`；聚合 `notes` 加一行 | **纯 advisory**：`description_stale` **绝不参与** `valid`/`selectable` |
+| **L3 写时提示** | `edit_source`（`str_replace`/`insert`/`create`/`undo_edit`，**`view` 不提示**） | 命中**任一角色注册表**的条目时追加一行 NOTE，区分"戳不同 / 无戳 / 仍匹配"三态；扫三张注册表（"是否注册组件"是目录事实，与谁在编辑无关） |
+| **L4 启动/回执** | `preflight_tools.catalog_stale`（**不进 `tools_ok`**）+ `render_receipt` 一行 | 与批 14 一致：可修 + 可记录 + **不拒启** |
+
+### 21.3 (b) 投影事实：与 (c) 共用同一套戳
+
+`loop._component_drift(patch, applied)` → `build_receipt(component_drift=...)`：
+
+```
+{"name", "module", "registry", "module_changed": true,
+ "entry_touched": <注册表文件是否在补丁里>, "description_stale_after": <用 (c) 的同一套戳比较>}
+```
+
+- **只在补丁真正落地时计算**（未落地 ⇒ 无漂移可报）；被拒补丁不产生幻影漂移；
+- `description_stale_after` 用与 (c) **完全相同**的戳比较 ⇒ **两者永不互相矛盾**（补丁里同时 `update_component` ⇒ 戳已刷新 ⇒ `false`）；
+- `entry_touched` 只是**近似**参考键，结论性字段是 `description_stale_after`；
+- `render_receipt`：有 drift 时点名组件并给可执行动作，否则回退到"N 条描述陈旧"。
+
+### 21.4 代码改动
+
+| # | 文件 | 改动 |
+|---|---|---|
+| ① | `gan/registries/loader.py` | `module_sha12(path)`（复用 `scores.sha256_file`，截 12 位）+ `stale_metadata(reg)`（**只报有戳且不一致的条目**；无戳=unknown 永不误报）——盖戳语义的**单一定义** |
+| ② | `gan/tools/deep/register_component.py` | 元数据写入时盖戳（哈希对象 = 它自己刚校验过的那份 ws 优先文件） |
+| ③ | `gan/tools/deep/update_component.py` | 写 `description`/`params_schema` 时**重算覆盖**戳（模块解析不到则不动，条目本身已 invalid，交给 preflight） |
+| ④ | `gan/tools/work/common/list_components.py` | L2：每项 `description_stale`/`description_note` + 聚合行；`valid`/`selectable` 路径**零改动** |
+| ⑤ | `gan/tools/work/common/edit_source.py` | L3：`_registered_component_note`（best-effort，异常绝不影响编辑；`view` 不触发） |
+| ⑥ | `gan/framework/preflight.py` | L4：`catalog_stale(role)` + 每角色报告段；**不进 `tools_ok`** |
+| ⑦ | `gan/framework/receipt.py` | `build_receipt(component_drift=, catalog_stale=)`；`render_receipt` 一行（drift 优先，否则计数） |
+| ⑧ | `gan/framework/loop.py` | `_component_drift` + `_catalog_stale`，接入 `_make_receipt`（plan）与 `_make_self_receipt`（self_improve） |
+
+**未触碰**：`_receipt_for_evaluator`、`build_diff_summary` —— 两个新字段**默认不进 E 面**（§21.5）。
+
+### 21.5 为什么 L4/(b) 是"目录卫生"而非任务事实
+
+（用户专门就此提问，结论记录在此，防后来者"顺手"把它推进 E 面。）
+
+1. **E 已经拿到事实本体**：`meta_view.task_patch_files`（本代真实改动文件，`_EVALUATOR_META_KEYS` 第 1 项）与 `diff_summary.ops[].paths`（授权面）；且**组件身份是免费的**——身份契约强制 `name == 文件 stem`（`loader.py:249`），E 看路径即知组件名。
+2. **剩下的增量只有"描述 ↔ 模块版本"的对应关系**，而 task agent **从不读注册表描述**（它读模块自带 `tool_info()`）⇒ 陈旧描述**不可能改变本代行为或分数**。本仓库的界线是：**影响能力/能解释结果**的工具事实给 E（`toolset_report` 的 skip、`design_stripped`），**记账类不给**。
+3. **owner 不对**：修法是 `update_component`，只有 planner 能做；批 14 准则 = 把可执行项交给能执行它的一方。
+4. **L4 甚至字面上不是任务事实**：`preflight` 在**启动期**跑（无 `genid`），且扫三个角色的全部条目（含 E 读不到的 planner/evaluator 树）。
+5. **(b) 的细微差别**：它按补丁算，`module_changed` 那半确实挂在某一代上，但那是 `task_patch_files` 的同义复述 + 免费名字映射；新增内容只有 `entry_touched`/`description_stale_after` = 记账。若坚持给 E，诚实说法是"对既有事实的语义重述"，不建议。
+6. **tie-in**：若 E 的 `task_patch_files` 里出现 **self 树路径**（如 `gan/roles/planner.py`），那不是卫生问题，而是 **B43（plan 座位写自身）的现场症状**，应在座位层修。
+
+### 21.6 测试与断言
+
+| 套件 | 新增 | 断言数 |
+|---|---|---|
+| deep-tools | R1（盖戳只随元数据写；模块单独改动 ⇒ 漂移；戳/当前值形状）、R2（`description_stale` 三态、**不影响 valid/selectable**、聚合行）、R3（命中已注册模块 ⇒ NOTE；`view` ⇒ 无；未注册新文件 ⇒ 无）、R4（非致命：`catalog_stale` 非空而 `tools_ok` 仍 True；回执渲染）、R5（`component_drift` 形状；刷新后不再声称 stale；**E 投影不含两字段**） | 123 → **143** |
+| batch6 | 无变化 | 57 |
+| batch8 | 无变化 | 32 |
+| **合计** | | 212 → **232** |
+
+另修一处**既有断言**：`X5 rebuilt entry is bare` 原为精确键集断言，`source_sha` 是框架戳而非携带元数据 ⇒ 改为"排除 `source_sha` 后为 `{name, module}` 且无 `description`/`params_schema`"（断言意图不变）。
+
+覆核：`venv_nat/bin/python scripts/local/run_tool_regression.py` → all suites passed；真实仓库 `preflight_tools` 三角色 `catalog_stale` 均 0、`tools_ok: True`；端到端闭环实测：**改实现 → L3 提示"DIFFERENT version" → L2 亮起（valid/selectable 不变）→ 聚合行 → `update_component` 后标记清除**。
+
+### 21.7 明确未做
+
+- **L5 阻断 / L6 自动修复**（理由见 21.1）；
+- 章节目录级摘要（"哪一节被改"）——标题是作者文本，属内容，不做；
+- **B45**（`build_diff_summary.files` 被喂 `report_path`）——经排查**已在 B9 既定范围内**，不新开条目，见 `docs/7` §2.4 的 B9 备注。

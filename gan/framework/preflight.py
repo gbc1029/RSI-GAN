@@ -133,6 +133,10 @@ def preflight_tools(
         out[role] = {
             "problems": validate_registry(role, registry_dir=reg_dir, components_dir=comp_dir),
             "collisions": assemble_collisions(role, code_root=croot),
+            # B30 (L4): catalog-metadata drift -- NON-fatal (bookkeeping, not a
+            # capability loss and not something an interrupted run would silently
+            # get wrong); reported here and on the planner's own receipt.
+            "catalog_stale": catalog_stale(role, code_root=croot),
             # B7: always-on API exposure, split by owner (frozen = fatal below,
             # owned = reported and handed back to the role)
             "always_on": always_on_problems(role, code_root=croot),
@@ -171,6 +175,25 @@ def always_on_problems(role: str, code_root: Optional[str] = None
                 "owner": info.get("owner") or ""}
         out["owned" if info.get("owner") else "frozen"].append(item)
     return out
+
+
+def catalog_stale(role: str, code_root: Optional[str] = None,
+                  registry_dir=None, components_dir=None) -> List[Dict[str, str]]:
+    """B30 (L4): entries whose description predates the current module bytes.
+
+    Advisory by construction: the consumer is the OPERATOR (startup report) and the
+    planner's own receipt -- never the evaluator, and never ``tools_ok``. A stale
+    catalog description cannot change this generation's capability or score; it only
+    misleads the next catalog reader, whose repair action (``update_component``)
+    belongs to the planner.
+    """
+    from gan.registries.loader import load_registry_for_role, stale_metadata
+    from gan.tools.assembly import gan_roots
+    _tools, rdir, cdir = gan_roots(code_root)
+    reg = load_registry_for_role(role,
+                                 registry_dir=registry_dir or rdir,
+                                 components_dir=components_dir or cdir)
+    return stale_metadata(reg)
 
 
 def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,

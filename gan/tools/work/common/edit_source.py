@@ -57,6 +57,43 @@ def _resolve(actx, path: str) -> str:
     return cand
 
 
+def _registered_component_note(abs_path: str) -> str:
+    """One-line NOTE when the edited file IS a registered component (B30 a/L3).
+
+    Advisory, best-effort, and READ-ONLY: an exception here must never break the
+    edit. Scans ALL role registries rather than the caller's own -- "is this file
+    a catalog entry?" is a catalog fact, independent of who is editing (and this
+    avoids re-introducing the role-vs-target mismatch the S family is about).
+    """
+    try:
+        from gan.framework.context import session_overlay_root
+        from gan.registries.loader import load_registry_for_role, module_sha12
+        target = os.path.realpath(abs_path)
+        for role in ("task", "planner", "evaluator"):
+            reg = load_registry_for_role(role, overlay_root=session_overlay_root())
+            for e in reg.entries:
+                if not isinstance(e, dict):
+                    continue
+                mod_path = reg.module_path(str(e.get("name")))
+                if not mod_path or os.path.realpath(str(mod_path)) != target:
+                    continue
+                stamped = e.get("source_sha")
+                current = module_sha12(abs_path)
+                if not stamped:
+                    detail = "it carries no catalog stamp yet"
+                elif current and current != str(stamped):
+                    detail = ("its catalog description was written against a "
+                              "DIFFERENT version of this module")
+                else:
+                    detail = "its catalog description still matches this version"
+                return (f"\nNOTE: this file is the implementation of registered "
+                        f"component '{e.get('name')}' ({role}.json); {detail}. "
+                        f"Call update_component if the change is user-visible.")
+    except Exception:  # noqa: BLE001 -- advisory probe must never fail an edit
+        return ""
+    return ""
+
+
 def tool_function(command, path, file_text=None, view_range=None,
                   old_str=None, new_str=None, insert_line=None, **kwargs):
     actx = get_access_context()
@@ -66,10 +103,16 @@ def tool_function(command, path, file_text=None, view_range=None,
         abs_path = _resolve(actx, path)
     except ValueError as e:
         return f"Error: {e}"
-    return _edit.tool_function(
+    out = _edit.tool_function(
         command=command, path=abs_path, file_text=file_text, view_range=view_range,
         old_str=old_str, new_str=new_str, insert_line=insert_line,
     )
+    # B30 (a/L3): a MUTATING edit of a registered component is the moment the
+    # catalog metadata may go stale -- say so here, where the actor still has the
+    # context. Reads (view) deliberately produce no such pressure.
+    if str(command) != "view" and not str(out).startswith("Error"):
+        out = f"{out}{_registered_component_note(abs_path)}"
+    return out
 
 
 op_info = tool_info

@@ -174,6 +174,8 @@ def build_receipt(
     trajectory_refs: Optional[List[str]] = None,
     toolset: Optional[Dict[str, Any]] = None,
     design_stripped: Optional[List[Dict[str, Any]]] = None,
+    component_drift: Optional[List[Dict[str, Any]]] = None,
+    catalog_stale: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     design = _design_diff(config, parent_config)
     design["applied"] = bool(records)
@@ -184,6 +186,11 @@ def build_receipt(
         "stage": stage,
         "design": design,
         "toolset": toolset or {},
+        # B30 (b)/(c-L4): catalog bookkeeping for the role that can act on it.
+        # Deliberately NOT in _receipt_for_evaluator: a stale description cannot
+        # change this generation's capability or score, so it is not a task fact.
+        "component_drift": list(component_drift or []),
+        "catalog_stale": list(catalog_stale or []),
         # H11/B24 (batch 5): slot names the framework removed from the design
         # right before persisting, because the committed tree cannot deliver them
         # (a patch that was rejected, or an inherited dangling reference).
@@ -252,6 +259,19 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"design note: dangling slot names STRIPPED before persist: {snames} "
                      f"— re-add only after the component is committed "
                      f"(register_component + patch)")
+    drift = receipt.get("component_drift") or []
+    if drift:
+        names = ", ".join(
+            f"'{d.get('name')}'" + ("" if d.get("description_stale_after") is False
+                                    else " (catalog description now stale)")
+            for d in drift)
+        parts.append(f"catalog note: this patch changed registered component(s) {names} "
+                     f"— call update_component if the change is user-visible "
+                     f"(otherwise the description keeps describing the old behavior)")
+    elif receipt.get("catalog_stale"):
+        parts.append(f"catalog note: {len(receipt['catalog_stale'])} component(s) have a "
+                     f"STALE catalog description (module changed after the description "
+                     f"was written) — update_component refreshes it")
     if receipt.get("next_hint"):
         parts.append(f"hint: {receipt['next_hint']}")
     if not parts:

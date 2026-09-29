@@ -26,6 +26,7 @@ from typing import Any, Dict
 from gan.framework import frozen
 from gan.framework.context import get_access_context, get_design_context
 from gan.registries.loader import (
+    module_sha12,
     entry_reason, parse_registry_file, resolve_module, write_registry_json,
 )
 
@@ -191,6 +192,13 @@ def tool_function(name, module, description=None, **kwargs):
                 f"so it would not be part of this session's patch. Grant its directory "
                 f"first: request_source_access(paths=['{hint}'], intent='modify').")
 
+    # B30 (L1): stamp the module version this entry's metadata is written
+    # against. Only a METADATA write stamps (register/update) -- a module edited
+    # on its own must NOT refresh the stamp, or the drift check could never fire.
+    # The stamped file is the same one the validity checks below read
+    # (workspace copy first), which is also the version this patch commits.
+    module_file = ws_mod if in_ws else os.path.join(code_root, module_rel)
+
     # 3) identity contract: name == file stem (tools are keyed by stem, so a
     #    mismatch assembles but never loads). Friendly check first; entry_reason
     #    below is the backstop.
@@ -305,6 +313,9 @@ def tool_function(name, module, description=None, **kwargs):
     # still true. A different implementation is a source modification; its
     # metadata must not ride along silently.
     new_entry: Dict[str, Any] = {"name": name, "module": mod}
+    stamp = module_sha12(module_file)
+    if stamp:
+        new_entry["source_sha"] = stamp
     note = ""
     if description:
         new_entry["description"] = description
