@@ -28,6 +28,7 @@
 | 第 12 批（范畴重划） | docs-only | **无代码改动**：13 项（B9/B31/B32/B40/B35/B33/B34/B36/B37/B38/B28/B15'/B39）按机制归属移入 `docs/7` §2.4（反馈/信息流/恢复；B34→L3①、B31→L4 合并），B21→§4、B20→§7；顺带标注 L2/F1/G5/F1-smoke 已由第 8/9 批实质闭合。见 §16 |
 | 第 13 批（角色自设计 overlay） | `fix(gan): role self-design overlay, patch-exit heal, exhausted-drop event, no-newline patch markers` | **overlay + B26 第一期 + B41 + U′ + B42 文本 + B22**：角色自设计改有效视野权威（批 5 committed-only 正式退役）、成功出口 heal（跨层接线 + receipt `design_stripped`）、耗尽路径响亮事件、unregister「仍被选中」纯提醒、cross-design note、无尾换行补丁生成侧修（七形态过真实 `git apply`）。回归 161→180 断言。见 §17 |
 | 第 14 批（装配/预检加固） | `fix(gan): validate always-on tools by owner, repair dangling designs at startup, make the tool-load layer visible (B7/B15/B27)` | **B7 + B15 + B27**：always-on 工具纳入 AST 接口校验并按 owner 分流；悬空角色设计在启动期**修复 + 留证 + 反馈**（不 fail-fast）；工具**加载层**可见化（拷贝层 → 真实可用层）。回归 180→197 断言。见 §18 |
+| 第 15 批（S 族登记） | docs-only 登记 | **无代码改动、无决策**：把「会话级权限」升为 **S 族（会话席位权限）**——**S1 = B42**（self_improve 写 task 面）、**S2 = B43**（plan 写 planner 自身，本次实测发现）、**S3 = C2**（evaluate 写自身）、**S2 子族 = B44**（planner 自面残缺）。含根因、席位对照表、逐项实测证据与两处未决选项。见 §19 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -308,6 +309,8 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B27** | 子进程 `load_tools` 的 skip 只有一行日志 ⇒ 装配报告只能证明"被拷贝"，不能证明"真的可用"【✅ 已修（第 14 批）：`load_tools(report_path/env GAN_TOOLS_LOAD_REPORT)` 写加载报告；task 侧并入 `tools_load_report.json` + 事件 `task_tools_loaded` + node meta，角色侧并入 `assembly_report["load"]` + 事件 `role_tools_loaded`；失败按 owner 分类（组件/角色自有 = 可执行项交回 agent；frozen = `framework_failed` 升级且不交 agent）。见 §18】 | `agent/tools/__init__.py` + report 链 | ~25 行 | — |
 | **B29** | `set_prompt` 只记 `chars` ⇒ 提示词重写是唯一不透明知识通道（`build_diff_summary` 的 `set_prompt` 分支只取无人生产的 `section`，`_ops_summary` 白名单连 `chars` 都丢） | `gan/tools/design/set_prompt.py` + 两处投影 | ~15 行 | — |
 | **B30** | 原地改实现后条目描述过时的可见性（`edit_source` 不 record；提交后 `pending=none`，实现与条目描述的分歧无人可见） | `receipt/diff` 链 + `edit_source` | ~10-25 行 | soft |
+| **B43** | **S 族 S2：plan 会话可写 planner 自身源码**——`AccessContext(role="planner")` 的写集 = `TASK_SOURCE + PLANNER_SELF`，而 plan 的设计目标是 `task`（`planner.py:104`）⇒ 席位与写面错配：可 grant/编辑 `gan/roles/planner.py`、`seeds/planner.md`、`work/planner/**`、`components/planner/**`，并随**任务代补丁**提交（血缘/`task_patch_files` 归因被污染；E 的 diff_summary 会列出它读不到的路径）。【第 15 批登记（未决）：见 §19】 | `frozen.py` + `access.py` | 需 seat 维度 | **是** |
+| **B44** | **S 族 S2 子族：planner 自面残缺**——`PLANNER_SELF` 含 `gan/components/planner/**` 却缺 `registries/planner.json`，`_OWN_REGISTRY["planner"]="task.json"` + 目录绑定 ⇒ 可写却无法注册；新增该树文件触发 orphan ⇒ 提交门拒**整包**，且提示"用 register_component 注册"不可执行（闭环陷阱）。实测：`components/planner/` 目录不存在、`planner.json` 0 条目。【第 15 批登记（未决）：(甲)补齐自面 /(乙)收回死区，见 §19.4】 | `frozen.py` + `register_component.py` + `code_repo.py` | ~10 行（选甲） | **是** |
 | **B31** | 死 `code_edit` 分支（origin 有生产者 `gan/operators/planner_ops/code_edit.py`，`642bcda` 重构删除算子后失联）——**随 B9 一并删** | `gan/summary.py:44` | ~4 行 | — |
 | **B32** | grants 路径在 `diff_summary` 对象内双写（`ops[].paths` + `files`）；收敛为 ops + receipt.grants 两处——**随 B9 files 退出实施**（receipt.grants 经 `_receipt_for_evaluator` 对 E 已剥除，仅 P 可见） | `gan/summary.py` | （随 B9） | — |
 | **B33** | **提示词/种子签名漂移**：`planner.py:65` 与 `seeds/planner.md:27` 仍写 `respond_issue(issue_id, accepted, feedback)` 三参——第 8 批后 `response_kind` **必填**，按指令逐字调用的 LLM 每轮首调必撞 schema 错误（软失败可重试，但指令是 LLM 第一依据）。附带：E 提示词开头深工具枚举句补 `update_component` | `gan/roles/planner.py` + `seeds/planner.md` + `gan/roles/evaluator.py:29` | ~5 行 | — |
@@ -319,7 +322,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B39** | 可选增强：diffstat（`{file: +n/-m}` 纯数字行级统计，零 planner 措辞——diff 行数是结构变更量度量而非自由文本函数）作为 `meta_view` 新键（default-deny 扩展），补代码面"形状"信息。低优先级 | `loop.py` + `task_runner.py` | ~15 行 | — |
 | **B40** | **E 面冗余三处**（第 11 批冗余审计 R1–R3）：同轮双份 `toolset_report`/`design_stripped`（meta_view 与 receipt 投影——后者正是从同一 `child.meta` 构建）、双份补丁结果（meta + receipt 投影，`budget.attempts`/`proposed` 是 receipt 独有需保留）、digest 尾行 = E 同时收到的 diff_summary JSON 的严格子集。修法 = `_receipt_for_evaluator` 瘦身 + `build_feedback_digest` 删 diff_summary 块；batch8 套件断言同步 | `loop.py` + `evaluator_reward.py` | ~10 行 | — |
 | **B41** | **耗尽路径整批深改静默丢弃**（B26 家族）：`warn_dropped_workspace_edits` 的门（`patch_str or has_deep_write`）恰好在该场景关死——补丁**非空但被整批丢弃**，工作区留有编辑却零报告（审计-事实分叉）。【✅ 已修（第 13 批）：强制模式形参 `exhausted`/`rejected`，强制时无视两门；事件 `deep_edit_dropped` 带 `phase`。见 §17】 | `gan/roles/base_role.py` + 两个 `self_improve` | ~15 行 | — |
-| **B42** | **deep 工具目标注册表按访问角色而非设计角色**（`_OWN_REGISTRY` 以 `actx.role` 为键）⇒ planner `self_improve` 写 `task.json`（能写不能选，半审计越权通道）；选项 (a) 目标跟随 `dctx.role` /(b) 接受为灵活性。【⏳ 第 13 批仅加**文本说明**（cross-design note："not selectable in THIS session"），行为决策仍暂缓。见 §17】 | `gan/tools/deep/*.py` | ~10 行 | **是** |
+| **B42** | **deep 工具目标注册表按访问角色而非设计角色**（`_OWN_REGISTRY` 以 `actx.role` 为键）⇒ planner `self_improve` 写 `task.json`（能写不能选，半审计越权通道）；选项 (a) 目标跟随 `dctx.role` /(b) 接受为灵活性。【⏳ 第 13 批仅加**文本说明**（cross-design note："not selectable in THIS session"），行为决策仍暂缓。见 §17】 | `gan/tools/deep/*.py` | ~10 行 | **是** 【第 15 批：升为 **S 族**成员（S1），见 §19】 |
 
 **B 类详细写法**（B1–B4 为本文档已完整分析的四项；B5–B26 见上表与 `docs/工具管理审查.md` 对应编号）
 
@@ -371,7 +374,7 @@ patch 0B                                    <-- 注册被静默丢弃
 | 编号 | 项 | 范围 | 需决策的点 |
 |---|---|---|---|
 | **C1** | **H7** 编译门覆盖 import 断裂 | `code_repo.validate_python` + `apply_code_patch` | 见下 |
-| **C2** | `evaluate()` 的深改定位 | `roles/evaluator.py` + `edit_source.py` | 加守卫（小，~5 行）vs 补**补丁通道**（大，且与"评估者不改产物"的设计冲突）【第 12 批续·核实增补：可达面已实测——registry 三深工具 R1 拒；`request_source_access(intent="modify")` 在 evaluate **不崩**（dctx.record None 守卫 `:50`）且**授权成功**（e-set modify 在 allowlist 内）⇒ edit_source 可改 ⇒ 效应**静默丢弃**（evaluate 无补丁构建器；授权层可审计、效应层无"将被丢弃"事件）；盲相指令只警告 registry 深改、未覆盖此旁门（指令-机制不一致）。守卫 = patch-less 会话拒 modify 意图、view 全会话可用（~5 行）；用户拍板**维持登记暂不实施**】 |
+| **C2** | `evaluate()` 的深改定位 | `roles/evaluator.py` + `edit_source.py` | 加守卫（小，~5 行）vs 补**补丁通道**（大，且与"评估者不改产物"的设计冲突）【第 12 批续·核实增补：可达面已实测——registry 三深工具 R1 拒；`request_source_access(intent="modify")` 在 evaluate **不崩**（dctx.record None 守卫 `:50`）且**授权成功**（e-set modify 在 allowlist 内）⇒ edit_source 可改 ⇒ 效应**静默丢弃**（evaluate 无补丁构建器；授权层可审计、效应层无"将被丢弃"事件）；盲相指令只警告 registry 深改、未覆盖此旁门（指令-机制不一致）。守卫 = patch-less 会话拒 modify 意图、view 全会话可用（~5 行）；用户拍板**维持登记暂不实施**】 【第 15 批：升为 **S 族**成员（S1），见 §19】 |
 | **C3** | 防御层检测方法重构（A15 的彻底版） | `roles/base_role.py` + 新检测逻辑 | 见下 |
 | **C4** | 补丁闸门判据重设计 | `patch.py` + `planner.py`/`evaluator.py` 的 `_build_patch` 闸门 | 报告 P0 建议改为"workspace 相对 `code_root` 确有差异"；本会话实际选了 **records 判据**（`has_deep_write`）+ 防御层——**H8 与 C3 都源于这个差异** |
 | **C5** | P2 的根本面：补丁只遍历 `granted_paths` | `patch.py` + 授权模型 | "未 grant 的新文件"是否升为一等公民（改枚举方式 or 授权模型改目录级）；`list_editable` 只返回具体文件是加重因素 |
@@ -1117,3 +1120,98 @@ B9（收窄定稿，含 B31/B32 挂靠）、B33、B34、B35、B36、B37、B38（
 - **B29**（`set_prompt` 只记 `chars`）与 **B30**（原地改实现后条目描述过时的可见性）——投影/可见性两项，仍待办（`docs/8` §2.2）；
 - **B42 行为决策**（deep 工具目标注册表是否跟随 `dctx.role`）、**B26 第二期**（耗尽出口 heal + 延迟保存）、**B20**（deny_deep 接线）；
 - **task 设计文件的启动期扫描**：任务设计是**每代工件**，权威副本随 tree meta 走且已在持久化时自愈（B24），启动期批量改写会篡改历史——B15 只修角色设计（实现注释已写明）。
+
+---
+
+## 19. 第 15 批（登记）：S 族 ·「会话席位权限」（seat-scoped authority）
+
+> **docs-only，无代码改动、无决策**。用户指示：把"会话级权限"问题升为一族并登记，含现有 B42、本次新发现的
+> （plan 写 planner 自身）、以及 evaluator 在 evaluate 中可修改自身的问题。
+
+### 19.1 根因与族定义
+
+**根因**：权限与注册表归属**只按 role 建表**（`gan/framework/frozen.py:26-58` 的 `ACCESS`），而运行时实际有
+**三个席位**——plan / evaluate / self_improve。**席位**才决定"编辑哪份设计、走哪条补丁通道、归因到哪个账本"：
+
+| 维度 | plan 席位 | self_improve 席位 | evaluate 席位 |
+|---|---|---|---|
+| 设计目标（`DesignContext.role`） | `task`（`planner.py:104`） | 自身（`planner.py:182` / `evaluator.py:117`） | 无 dctx |
+| 补丁应用 | `apply_task_patch` | `apply_self_patch` | **无补丁构建器** |
+| 账本 | 子代血缘 commit + `task_<genid>` | `self-improve <role>` | — |
+| receipt stage | `plan` | `self_improve` | `evaluate` |
+| 轨迹 | `.../<genid>/planner.jsonl` | `.../<role>__<attempt>.jsonl` | `.../<genid>/evaluator.jsonl` |
+| 生效时机 | 本代 | 下一 outer | 无 |
+
+**框架其余部分都已按席位区分，唯独源码写集没有席位维度** ⇒ 授权面相对席位语义宽了一档（或错位）。这不是
+设计决策，是 allowlist 只按 role 建表的**遗留不对称**。
+
+**共同处置准则**（与第 14 批同源）：越界时**拒绝但不崩**（拒绝 + 事件 + 把可执行项交回该席位）。
+**共同修复方向（未决，本批不实施）**：seat 维度（三处会话构造点已知席位，值就在手边）、**读写不对称**
+（读面保持 role 宽松、只收紧写）、`_OWN_REGISTRY`/`_OWNING_DIR` seat 化、过渡期"拒绝不崩"。
+
+### 19.2 三位成员
+
+| 成员 | 席位 | 位面 | 症状 / 落错账本 | 现状 |
+|---|---|---|---|---|
+| **S1 = B42** | self_improve | 写 task 代码面（`_OWN_REGISTRY["planner"]="task.json"`） | 能写不能选（半审计越权）；记录落 `task.json` 与 task 设计 | 第 13 批仅**文本提示**；**未决** |
+| **S2 = B43（新）** | plan | 写 planner 自身 | 落进任务代血缘 commit；E 的 diff_summary 列出 E 读不到的路径 | **无任何提示**；实测可达（19.3）；**未决** |
+| **S3 = C2** | evaluate | 写 evaluator 自身 | 授权成功 + 无补丁构建器 ⇒ 双重失效 | 第 12 批**维持登记暂不实施** |
+
+**为什么算一族**：同一张表（`frozen.ACCESS` 按 role）、同一处判定（`frozen.is_allowed`，`grant`/注册/提交门都经它）、
+同族症状（行为落错账本 / 提示与事实不一致 / 效应被丢弃）、同一修复、同一处置准则。
+**为什么不能合并成一条**：位面不同（设计目标 vs 注册表归属 vs 补丁通道存在性）；S3 是"双重失效"、S2 无提示、S1 有提示但无拒绝。
+
+### 19.3 S2（B43）实测证据：plan 座位的越界写面完全可达
+
+```
+is_allowed(planner, gan/roles/planner.py, modify): True
+is_allowed(planner, gan/design/seeds/planner.md, modify): True
+grant result: ['gan/roles/planner.py', 'gan/design/seeds/planner.md']
+granted_paths: ['gan/roles/planner.py', 'gan/design/seeds/planner.md']
+ws copy exists: True
+patch targets: ['gan/roles/planner.py']
+allowlist accepts them for role 'planner': True
+```
+
+链路：`planner.plan` 设 `set_access_context(broker, "planner", akey)`（`planner.py:111-113`）→ 写集 =
+`TASK_SOURCE + PLANNER_SELF`（`frozen.py:53-54`；`PLANNER_SELF` 含 `gan/roles/planner.py`、`work/planner/**`、
+`components/planner/**`、`seeds/planner.md`）→ `_build_patch()` 用 `build_patch_from_workspace(broker,"planner",akey)`
+**收全部 granted 路径**（`planner.py:126`）→ `task_runner.py:103-110` 走 `apply_task_patch(code_root,"planner",…)`
+→ 仅校验 `frozen.is_allowed(role,…)` + 编译 + 注册表差分（`code_repo.py:533-551`）⇒ **提交为任务代的 code commit**。
+
+**两处附带核实**：① plan 座位改的是 task **设计**（`dctx.role="task"`），故**泄漏只在源码写面**，它碰不到自己的设计文件；
+② E 的读集 = `TASK_SOURCE + EVALUATOR_SELF`，**不含** `gan/roles/planner.py` ⇒ E 会从 `diff_summary.ops[].paths`/`files`
+看到自己无法核验的路径。
+
+### 19.4 S2 子族（B44）实测证据：planner 自面"可写 → 无法注册 → 整包拒"
+
+**三条规则合力**：① `PLANNER_SELF` 含 `gan/components/planner/**`，**缺** `gan/registries/planner.json`（`frozen.py:34-38`）；
+② `_OWN_REGISTRY["planner"]="task.json"` + `_OWNING_DIR["planner"]="task"`（`register_component.py:35-38`）⇒ planner 会话注册
+`planner/**` 被**第一道校验**拒（"outside the designed role's component tree (task/…)"，`:164-172`）；③ `orphan_modules`
+全域扫描（`loader.py:438-474`）+ 提交门 `new_orph` 硬拒（`code_repo.py:461-463`）+ `validate_registry` 把 orphan 计入
+`problems`（⇒ `tools_ok` 判死）。
+
+**事实**：`gan/components/planner/` **目录不存在**（仓库只有 `task/`、`evaluator/`）；注册表条目 task 4 / evaluator 4 / **planner 0**。
+
+**dry-run 复现（整包拒）**：
+
+```
+patch targets: ['gan/components/planner/helper_tool.py', 'gan/components/task/helper_util.py']
+check_patch ok: False
+reason: component file(s) not registered in any registry: planner/helper_tool.py
+        (register them with register_component, or remove the files)
+```
+
+即：允许写的新组件 → orphan → **同会话的合法 task 改动一起陪葬** → 提示"用 `register_component` 注册"而**该路走不通**
+（规则②）→ 只能删文件。**对照**：evaluator 自面是通的（`EVALUATOR_SELF` 含 `registries/evaluator.json`、目录存在、
+`_OWNING_DIR` 对齐），故这是 **planner 一处的不一致，不是模型级缺陷**。
+
+**两个未决选项**：**(甲) 补齐自面**（`PLANNER_SELF` 加 `planner.json`；`_OWN_REGISTRY`/`_OWNING_DIR` seat 化；
+`gan/components/planner/` 纳入版本控制）／**(乙) 收回死区**（移除 `components/planner/**`，写明"planner 自面无组件"）。
+无论选哪个，提交门对 planner 树的提示文案都需改。**与 S1 共用同一次 seat 重构，但登记与验收分开**
+（S1 验收 = 越界被拒且不崩；S2 验收 = planner 走通 `register→select→assemble` 闭环）。
+
+### 19.5 与相邻族的边界
+
+- **A15 / C3 = 审计可见性族**（"看不见"）——S 族是"权限不该有"；可见性问题是权限正确之后的下一层；
+- **B29 / B30 = 投影欠描述族**（"记录太薄"）——与 S 族无关（B29 属可见性/事实面，不涉权限）。
