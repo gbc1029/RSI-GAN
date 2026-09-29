@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
+from gan.framework.receipt import PROMPT_FACT_KEYS  # B29 prompt facts
+
 FEEDBACK_SCHEMA_VERSION = "v1"
 
 
@@ -24,7 +26,18 @@ def build_diff_summary(
         if op in ("tune_param", "apply_config"):
             entry["key"] = r.get("key")
         elif op == "set_prompt":
-            entry["section"] = r.get("section")
+            # B29 (batch 16): structural facts only -- and the phantom ``section``
+            # this branch used to read had NO producer (the live operator recorded
+            # ``chars`` only), so evaluators saw ``{"op": "set_prompt",
+            # "section": null}``: a prompt rewrite was invisible except for its op
+            # name. The reader's TEXT is deliberately NOT here: it is audit
+            # evidence the evaluator may fetch from the task trajectory, never an
+            # assertion pushed into its decision surface. (This does not relax the
+            # batch-8 rule for respond_issue.feedback, whose derived statistics
+            # stay banned.)
+            for k in PROMPT_FACT_KEYS:
+                if k in r:
+                    entry[k] = r[k]
         elif op == "set_tool_enabled":
             entry["name"] = r.get("name")
             entry["enabled"] = r.get("enabled")
@@ -45,6 +58,11 @@ def build_diff_summary(
             entry["paths"] = list(r.get("paths", []) or [])  # reason intentionally stripped
             for p in r.get("paths", []) or []:
                 files.add(p)
+        # B29: prompt facts ride whichever op produced them (set_prompt, or
+        # set_config with key="prompt"); copied by presence, default-deny.
+        for k in PROMPT_FACT_KEYS:
+            if k in r:
+                entry[k] = r[k]
         ops.append(entry)
     for f in patch_files or []:
         files.add(os.path.basename(f))

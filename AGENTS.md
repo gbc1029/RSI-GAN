@@ -331,6 +331,19 @@ batch-8 isolation), one subprocess each.
   planner responds to issues with a REQUIRED structured stance
   (`response_kind`: acted / acted_differently / out_of_scope / disputed /
   deferred) — the evaluator calibrates on decisions, never on persuasion.
+  **Artifact vs rationale (B29, batch 16)**: the ARTIFACT under evolution gets
+  structural facts; the planner's RATIONALE gets nothing. `set_prompt` /
+  `set_config(key="prompt")` record `prompt_change_facts` (`gan/framework/receipt.py`:
+  chars/lines/prev_*/added_lines/removed_lines/similarity/changed_from+to/sha256_12/
+  empty/equals_seed — numbers and hashes only, never text) and `DesignContext.record`
+  stamps `target_role` for every design record (framework-owned, written after the
+  caller's fields so it cannot be shadowed). Those facts are whitelisted into
+  `build_diff_summary` and `receipt.design.ops`. The prompt TEXT is deliberately not
+  projected: it is audit evidence the evaluator may fetch from the task trajectory
+  (`read_trajectory` archives the child's input message verbatim, redacted only for
+  benchmark/score strings), never an assertion pushed into its decision surface —
+  the isolation is on the PROMPT surface, not on the read surface. This does NOT
+  relax the `respond_issue.feedback` rule: its derived statistics stay banned.
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator
   must not fit the benchmark score (blind score first, then reveal).
 - The task agent has **no always-on tools**; its capabilities are all opt-in tools.

@@ -106,7 +106,19 @@ class DesignContext:
     records: List[Dict[str, Any]] = field(default_factory=list)
 
     def record(self, op: str, **detail: Any) -> None:
-        self.records.append({"op": op, **detail})
+        """Append one structured record; the framework stamps ``target_role``.
+
+        B29 (batch 16): ``target_role`` is the design this session EDITS
+        (``self.role``) -- not who edits it. It is written AFTER ``detail`` so a
+        caller cannot shadow it, and it is framework-owned: no design operator can
+        write ``ctx.role``. Stamping it here rather than at each call site makes it
+        impossible to forget (every operator, including future ones, carries it)
+        and impossible to spoof, while keeping the label tied to the same field
+        that already decides which design file is written/validated -- so a wrong
+        label would imply a wrong edit, which the registry resolution and the
+        persist path already police.
+        """
+        self.records.append({"op": op, **detail, "target_role": self.role})
 
 
 def set_design_context(ctx: DesignContext):

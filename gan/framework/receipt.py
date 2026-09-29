@@ -10,6 +10,72 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
+# B29 (batch 15): the STRUCTURAL vocabulary of a prompt rewrite. Deliberately
+# numbers/hashes only -- never text, never a substring, never a reversible
+# encoding. This is the *artifact* being evolved (like source code, for which
+# `files`/diffstat are already exposed), NOT the planner's rationale: the batch-8
+# rule that even derived statistics of `respond_issue.feedback` stay out is NOT
+# relaxed by this list.
+PROMPT_FACT_KEYS = (
+    "target_role", "changed", "chars", "prev_chars", "lines", "prev_lines",
+    "added_lines", "removed_lines", "similarity", "changed_from", "changed_to",
+    "sha256_12", "prev_sha256_12", "empty", "equals_seed",
+)
+
+
+def prompt_change_facts(prev: Any, new: Any, seed: Any = None) -> Dict[str, Any]:
+    """Structural facts of a prompt rewrite (B29).
+
+    Computed AT RECORD TIME on purpose: the projections only receive ``records``
+    (no design config, no previous value), so the facts must be self-contained.
+    ``prev`` is the value in the session's design draft before the operator
+    overwrote it -- exactly the inherited prompt.
+
+    No text leaves this function. See ``PROMPT_FACT_KEYS`` for why that line is
+    drawn here and not at ``respond_issue.feedback``.
+
+    ``changed_from``/``changed_to`` are 1-based line numbers on the **old** prompt
+    (``0`` = no change). A pure insertion has an EMPTY span: ``changed_to ==
+    changed_from - 1`` (e.g. appending after line 3 reports ``from=4, to=3``) --
+    that is the honest reading "inserted after line 3", not a claim that a line
+    changed. ``equals_seed`` is ``None`` when the caller did not supply the seed
+    (unknown, never a false ``False``).
+    """
+    import difflib
+    import hashlib
+
+    def _sha12(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+    a_s, b_s = str(prev or ""), str(new or "")
+    a, b = a_s.splitlines(), b_s.splitlines()
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    added = removed = 0
+    first = last = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag in ("replace", "delete"):
+            removed += i2 - i1
+        if tag in ("replace", "insert"):
+            added += j2 - j1
+        if first == 0:
+            first = i1 + 1          # 1-based; 0 = no change
+        last = max(last, i2)
+    seed_s = None if seed is None else str(seed)
+    return {
+        "changed": a_s != b_s,
+        "chars": len(b_s), "prev_chars": len(a_s),
+        "lines": len(b), "prev_lines": len(a),
+        "added_lines": added, "removed_lines": removed,
+        "similarity": (round(sm.ratio(), 2) if (a or b) else 1.0),
+        "changed_from": first, "changed_to": last,
+        "sha256_12": _sha12(b_s), "prev_sha256_12": _sha12(a_s),
+        "empty": not b_s.strip(),
+        "equals_seed": (None if seed_s is None else (b_s == seed_s)),
+    }
+
+
 def _ops_summary(records: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     out = []
     for r in records or []:
@@ -18,6 +84,11 @@ def _ops_summary(records: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]
         op = r.get("op")
         entry: Dict[str, Any] = {"op": op}
         for k in ("slot", "name", "key", "intent", "paths"):
+            if k in r:
+                entry[k] = r[k]
+        # B29: prompt facts are copied ONLY when a producer recorded them
+        # (default-deny by presence, like every other projection here)
+        for k in PROMPT_FACT_KEYS:
             if k in r:
                 entry[k] = r[k]
         out.append(entry)
@@ -143,6 +214,15 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"applied design changes: {ops or 'yes'}")
         if design.get("prompt_changed"):
             parts.append("prompt changed")
+        for o in (design.get("ops") or []):
+            if o.get("op") in ("set_prompt", "set_config") and o.get("changed"):
+                parts.append(
+                    f"prompt rewritten: {o.get('prev_lines')}->{o.get('lines')} lines, "
+                    f"+{o.get('added_lines')}/-{o.get('removed_lines')}, "
+                    f"similarity {o.get('similarity')}"
+                    + (f" (reset to the {o.get('target_role')} seed)"
+                       if o.get("equals_seed") else ""))
+                break
         if design.get("tools_added"):
             parts.append(f"tools added: {design['tools_added']}")
         if design.get("tools_removed"):

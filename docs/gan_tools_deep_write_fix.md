@@ -29,6 +29,7 @@
 | 第 13 批（角色自设计 overlay） | `fix(gan): role self-design overlay, patch-exit heal, exhausted-drop event, no-newline patch markers` | **overlay + B26 第一期 + B41 + U′ + B42 文本 + B22**：角色自设计改有效视野权威（批 5 committed-only 正式退役）、成功出口 heal（跨层接线 + receipt `design_stripped`）、耗尽路径响亮事件、unregister「仍被选中」纯提醒、cross-design note、无尾换行补丁生成侧修（七形态过真实 `git apply`）。回归 161→180 断言。见 §17 |
 | 第 14 批（装配/预检加固） | `fix(gan): validate always-on tools by owner, repair dangling designs at startup, make the tool-load layer visible (B7/B15/B27)` | **B7 + B15 + B27**：always-on 工具纳入 AST 接口校验并按 owner 分流；悬空角色设计在启动期**修复 + 留证 + 反馈**（不 fail-fast）；工具**加载层**可见化（拷贝层 → 真实可用层）。回归 180→197 断言。见 §18 |
 | 第 15 批（S 族登记） | docs-only 登记 | **无代码改动、无决策**：把「会话级权限」升为 **S 族（会话席位权限）**——**S1 = B42**（self_improve 写 task 面）、**S2 = B43**（plan 写 planner 自身，本次实测发现）、**S3 = C2**（evaluate 写自身）、**S2 子族 = B44**（planner 自面残缺）。含根因、席位对照表、逐项实测证据与两处未决选项。见 §19 |
+| 第 16 批（B29 提示词事实） | `feat(gan): record and project structural facts of a prompt rewrite (B29)` | **B29**：`prompt_change_facts`（长度/行数/增删行/相似度/改动行号区间/短哈希/空/`equals_seed`，**绝不含文本**）+ `DesignContext.record` 框架铸入 `target_role`；`set_prompt` 与 `set_config(key=prompt)` 同源记录；`build_diff_summary` 删幻影 `section` 并投影事实、`_ops_summary` 补事实键、`render_receipt` 加一行改动量。回归 197→212 断言。见 §20 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -307,7 +308,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B25** | **H12**（第 5 批新发现）`set_config("skills", [...])` 只做 schema 键白名单，未注册组件不经拒绝直接进设计（实证：装配报 `not registered`） —— **✅ 已修（第 5 批，Option 1）**，见 §9.4 | `gan/tools/design/set_config.py` | ~15 行 | **是** |
 | **B26** | **角色设计的 heal**（第 5 批新发现）：`evaluator/planner.self_improve` 在补丁重试循环后**无条件** `save_self_config(cfg)`（`gan/roles/evaluator.py:194`），与 H11 同模式；角色设计现在 committed-only 故**不会新造**悬空，但存量链上的悬空名未自愈。修法 = 角色设计也开 overlay + 自愈（需决策）【⏳ **第一期已修（第 13 批）**：`heal_design_slots` 去掉 role 限制（对照**本角色**注册表）+ `loop._apply_self_patch` **成功出口** heal + 重存 + 事件 `design_dangling_stripped(stage=self_improve)` + `design_stripped` 进 self receipt；**overlay 权同批实施**（角色自设计 = 有效视野权威，批 5 committed-only 正式退役）+ **U′**（unregister 检测「仍被选中」纯提醒）。**第二期保持待办**（`docs/7` §6.1）：耗尽/被拒出口 heal + `save_self_config` 延迟化，见 §17】 | `gan/roles/base_role.py:215` + 两个 `self_improve` | ~15 行 | **是** |
 | **B27** | 子进程 `load_tools` 的 skip 只有一行日志 ⇒ 装配报告只能证明"被拷贝"，不能证明"真的可用"【✅ 已修（第 14 批）：`load_tools(report_path/env GAN_TOOLS_LOAD_REPORT)` 写加载报告；task 侧并入 `tools_load_report.json` + 事件 `task_tools_loaded` + node meta，角色侧并入 `assembly_report["load"]` + 事件 `role_tools_loaded`；失败按 owner 分类（组件/角色自有 = 可执行项交回 agent；frozen = `framework_failed` 升级且不交 agent）。见 §18】 | `agent/tools/__init__.py` + report 链 | ~25 行 | — |
-| **B29** | `set_prompt` 只记 `chars` ⇒ 提示词重写是唯一不透明知识通道（`build_diff_summary` 的 `set_prompt` 分支只取无人生产的 `section`，`_ops_summary` 白名单连 `chars` 都丢） | `gan/tools/design/set_prompt.py` + 两处投影 | ~15 行 | — |
+| **B29** | `set_prompt` 只记 `chars` ⇒ 提示词重写是唯一不透明知识通道（`build_diff_summary` 的 `set_prompt` 分支只取无人生产的 `section`，`_ops_summary` 白名单连 `chars` 都丢） | `gan/tools/design/set_prompt.py` + 两处投影 | ~15 行 | — 【✅ 已修（第 16 批）：见 §20】 |
 | **B30** | 原地改实现后条目描述过时的可见性（`edit_source` 不 record；提交后 `pending=none`，实现与条目描述的分歧无人可见） | `receipt/diff` 链 + `edit_source` | ~10-25 行 | soft |
 | **B43** | **S 族 S2：plan 会话可写 planner 自身源码**——`AccessContext(role="planner")` 的写集 = `TASK_SOURCE + PLANNER_SELF`，而 plan 的设计目标是 `task`（`planner.py:104`）⇒ 席位与写面错配：可 grant/编辑 `gan/roles/planner.py`、`seeds/planner.md`、`work/planner/**`、`components/planner/**`，并随**任务代补丁**提交（血缘/`task_patch_files` 归因被污染；E 的 diff_summary 会列出它读不到的路径）。【第 15 批登记（未决）：见 §19】 | `frozen.py` + `access.py` | 需 seat 维度 | **是** |
 | **B44** | **S 族 S2 子族：planner 自面残缺**——`PLANNER_SELF` 含 `gan/components/planner/**` 却缺 `registries/planner.json`，`_OWN_REGISTRY["planner"]="task.json"` + 目录绑定 ⇒ 可写却无法注册；新增该树文件触发 orphan ⇒ 提交门拒**整包**，且提示"用 register_component 注册"不可执行（闭环陷阱）。实测：`components/planner/` 目录不存在、`planner.json` 0 条目。【第 15 批登记（未决）：(甲)补齐自面 /(乙)收回死区，见 §19.4】 | `frozen.py` + `register_component.py` + `code_repo.py` | ~10 行（选甲） | **是** |
@@ -1215,3 +1216,79 @@ reason: component file(s) not registered in any registry: planner/helper_tool.py
 
 - **A15 / C3 = 审计可见性族**（"看不见"）——S 族是"权限不该有"；可见性问题是权限正确之后的下一层；
 - **B29 / B30 = 投影欠描述族**（"记录太薄"）——与 S 族无关（B29 属可见性/事实面，不涉权限）。
+
+---
+
+## 20. 第 16 批：提示词改写的结构性事实（B29）
+
+> 起因：用户先问"E 有查看 task-agent 源码的权限，隔离 E 与 prompt 原文本是否还有必要"。核实后发现**名义隔离**：
+> E 的读集确实不含 `gan/design/**`，但**归档的 task 轨迹里就有 prompt 全文**。用户选择 **C 路线**，随后确定
+> 事实集为"核心 9 项 + `equals_seed` + `target_role`"，并要求先解释 `target_role` 的提取与准确性保证。
+
+### 20.1 决策记录（用户确认）
+
+| 决策点 | 结论 | 理由 |
+|---|---|---|
+| 隔离的性质 | **C 路线：把隔离改成"显式的可读 + 投影只放事实"** | 隔离是**名义的**：实测归档轨迹含 prompt 全文；且 E 的职责本就包含抓作弊（`frozen.py` 明说读 t-set 是为 cheating/rule checks），把最强作弊载体留在"要自己翻才算看见"的状态，是把审计义务与可见性设计成正交 |
+| 两条通道的认识论地位 | `diff_summary`/receipt 字段 = **框架的断言**（只放结构事实）；`read_trajectory` = **E 自己取证的原材料**（原文可读） | 批 8 的实质不是"防止文本进入 E 的 context"（做不到），而是"不让 planner 的文本以框架断言的身份进入 E 的决策面" |
+| 事实集 | **核心 9 项 + `equals_seed` + `target_role`** | 见 20.2；"改动大小"用长度/行数/增删行，"改动范围"用行号区间 + 相似度 |
+| `target_role` 的提取方式 | **在 `DesignContext.record` 里框架铸入**（不靠每个算子手写） | 不可能漏（含未来算子）、不可能伪造（写在 `**detail` 之后）、与行为同源（同一字段决定写哪份设计文件） |
+| 不放松批 8 | `respond_issue.feedback` 的**派生统计量继续全禁** | 那是 planner 的**辩解**（统计量仍带修辞）；prompt 是**演化产物**（与源码同类，`files`/diffstat 已在暴露） |
+
+### 20.2 事实集（`gan/framework/receipt.py:PROMPT_FACT_KEYS`）
+
+`target_role` · `changed` · `chars` · `prev_chars` · `lines` · `prev_lines` · `added_lines` · `removed_lines` ·
+`similarity` · `changed_from` · `changed_to` · `sha256_12` · `prev_sha256_12` · `empty` · `equals_seed`
+
+**约定**：`changed_from`/`changed_to` 是**旧提示词**的 1-based 行号（`0` = 无改动）；**纯插入为空区间**（`to == from-1`，
+如"在第 3 行后追加"= `from=4, to=3`）——这是诚实的读法，而非声称某行被改。`equals_seed` 在调用方未提供种子时为 `None`（未知，绝不误报 `False`）。
+
+**绝不外传**：prompt 原文、任何片段、任何 hunk、**章节标题**（标题是作者文本）、任何可逆编码。
+
+### 20.3 代码改动
+
+| # | 文件 | 改动 |
+|---|---|---|
+| ① | `gan/framework/receipt.py` | 新增 `PROMPT_FACT_KEYS` + `prompt_change_facts(prev, new, seed=None)`（纯函数，记录时计算——投影只拿得到 `records`）；`_ops_summary` 按**存在性**补拷事实键；`render_receipt` 增一行改动量（`prompt rewritten: 42→58 lines, +18/-2, similarity 0.62`，种子重置时补注） |
+| ② | `gan/framework/context.py` | `DesignContext.record` 铸入 `target_role`（写在 `**detail` **之后** ⇒ 调用方无法覆盖；`PlanContext` **不动**——它没有 `role` 字段） |
+| ③ | `gan/tools/design/set_prompt.py` | 赋值**前**取 `prev = ctx.config.get("prompt")`（唯一能同时看到新旧两侧的位置），记录事实；`_seed_prompt(role)` 复用 `gan.design.initial_config` 取种子（`equals_seed` 的权威与 loop 播种同源），失败即 `None` |
+| ④ | `gan/tools/design/set_config.py` | `key == "prompt"` 走同一套（此前只记 `key`，与 set_prompt 同盲区） |
+| ⑤ | `gan/summary.py` | `set_prompt` 分支**删掉幻影 `section`**（无生产者，E 曾看到 `{"op":"set_prompt","section":null}`）改用事实键；并加统一尾部：事实随任何产出它的 op（含 `set_config(key=prompt)`）按存在性拷入 |
+
+**两条通道的分工（写进 AGENTS.md）**：结构事实只走投影层；prompt 原文留在设计文件与会话轨迹，
+E 可用 `read_trajectory` 取阅（归档的正是子进程 `input` 消息，仅按 `_SENSITIVE` 分数/准确率关键词脱敏）。
+
+### 20.4 路线 C 的实测依据（为什么"隔离"不成立）
+
+`outputs/gan_run/trajectory/outer_1/0/task.jsonl`：
+
+```
+rec0 kind=input redacted=True len=48278
+  head: "You are an agent. |  | This is peer review: read the paper and decide ..."
+```
+
+即 E 的必读证据（`read_trajectory`）里就是 prompt 全文；脱敏只覆盖分数/准确率类字符串。
+
+### 20.5 测试与断言
+
+| 套件 | 新增 | 断言数 |
+|---|---|---|
+| deep-tools | Q1（事实形状：同文重设/追加/重写/清空/无文本泄漏/`equals_seed` 未知）、Q2（`target_role` 铸入不可覆盖 + `PlanContext` 不受影响）、Q3（两个算子端到端记录事实 + 种子重置判定 + 无文本）、Q4（E 投影无幻影 `section` 且带事实、无文本；P receipt 事实齐备） | 108 → **123** |
+| batch6 | 两处**精确字典**断言随记录形状更新（V3 记录形状、V6 仍验证"无 `kind`"） | 57（不变） |
+| batch8 | 无变化 | 32 |
+| **合计** | | 197 → **212** |
+
+覆核：`venv_nat/bin/python scripts/local/run_tool_regression.py` → all suites passed；真实仓库 `preflight_tools` `tools_ok: True`。
+
+### 20.6 过程记录（新增方法论条目）
+
+**字符串替换式改代码必须先确认命中的类/函数**。本轮把 `target_role` 的铸入用 `replace(old, new, 1)` 打在
+"第一个匹配的 `def record`"上，结果命中了**文件更靠前**的 `PlanContext.record`——它**没有 `role` 字段**，
+一旦有 `plan_ctx.record(...)` 调用就会 `AttributeError`（`respond_issue` 走这条链）。回归套件当时**没有**覆盖到，
+是我自己的验证脚本因 `KeyError: 'target_role'` 反查才发现。**教训**：`replace(..., 1)` 的锚点必须**唯一**
+（把类名或前后文写进 `old`），改完立刻用一个**读行为的探针**（本例：断言记录键集）验证，而不是只看 diff。
+
+### 20.7 明确未做（不在本批）
+
+- **B30**（原地改实现后条目描述过时的可见性）——仍待办；其 (b) 投影事实 / (c) `source_sha` 漂移检测方案已在讨论中给出，未决策；
+- **S 族**（§19：S1=B42 / S2=B43 / S3=C2 / B44）——**第 15 批仅登记，未决、未改动**。

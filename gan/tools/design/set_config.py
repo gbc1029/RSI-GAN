@@ -14,6 +14,7 @@ role self-designs. The write is atomic: if ANY name fails, the whole call is
 refused and the design is untouched.
 """
 from gan.framework.context import get_design_context, session_overlay_root
+from gan.framework.receipt import prompt_change_facts
 from gan.design.schema import allowed_keys
 from gan.registries.loader import load_registry_for_role
 
@@ -70,6 +71,13 @@ def tool_function(key, value, **kwargs):
     if key == "params" and isinstance(value, dict) and "model" in value:
         # Frozen framework setting: role model is not an evolvable design value.
         value = {k: v for k, v in value.items() if k != "model"}
+    if key == "prompt":
+        # B29: ``set_config(key="prompt")`` is the same act as set_prompt and had
+        # the same blind spot (it recorded only the key). Capture the replaced
+        # value BEFORE the assignment and record the same structural facts.
+        from gan.tools.design.set_prompt import _seed_prompt
+        prev = (ctx.config or {}).get("prompt") or ""
+        extra.update(prompt_change_facts(prev, value, seed=_seed_prompt(ctx.role)))
     ctx.config[key] = value
     ctx.record("set_config", key=key, **extra)
     return f"{ctx.role}.{key} updated"
