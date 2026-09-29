@@ -1,10 +1,12 @@
 from pathlib import Path
 import importlib
 import importlib.util
+import json
+import os
 import sys
 
 
-def load_tools(logging=print, names=[], tools_dir=None):
+def load_tools(logging=print, names=[], tools_dir=None, report_path=None):
     """Discover tool modules exposing ``tool_info()`` and ``tool_function``.
 
     Args:
@@ -12,12 +14,21 @@ def load_tools(logging=print, names=[], tools_dir=None):
         names: list of tool names, or 'all'/[] for none.
         tools_dir: optional directory to scan instead of ``agent/tools``. Used by
             the GAN roles to load their own operator / gating toolsets.
+        report_path: optional JSON sink for the LOAD outcome (B27). Defaults to
+            ``$GAN_TOOLS_LOAD_REPORT``. The assembly report only proves a file was
+            COPIED into the toolset; a module that fails to import (or lost its
+            tool API) is skipped right here with a log line nobody reads, so the
+            framework could not tell "assembled" from "actually available". The
+            report closes that gap and rides the existing toolset report into the
+            node meta / role assembly report.
     """
+    report_path = report_path or os.environ.get("GAN_TOOLS_LOAD_REPORT") or None
     base_dir = Path(__file__).parent
     tools_dir = Path(tools_dir) if tools_dir is not None else base_dir
     use_file_spec = tools_dir.resolve() != base_dir.resolve()
 
     tools = []
+    loaded, skipped = [], []
 
     # Get all Python files in the tools directory (excluding __init__.py)
     tool_files = sorted(f for f in tools_dir.glob("*.py") if f.stem != "__init__")
@@ -41,6 +52,8 @@ def load_tools(logging=print, names=[], tools_dir=None):
 
             if not (hasattr(module, 'tool_info') and hasattr(module, 'tool_function')):
                 logging(f"Skipping tool {tool_file}: missing tool_info/tool_function")
+                skipped.append({"file": tool_file.name,
+                                "reason": "missing tool_info/tool_function"})
                 continue
             tool_name = tool_file.stem
             if names and (names == 'all' or tool_name in names):
@@ -49,8 +62,27 @@ def load_tools(logging=print, names=[], tools_dir=None):
                     'function': module.tool_function,
                     'name': tool_name,
                 })
+                loaded.append(tool_name)
+            else:
+                skipped.append({"file": tool_file.name,
+                                "reason": "not selected by the design"})
         except Exception as e:
             logging(f"Skipping tool {tool_file}: import failed: {e}")
+            skipped.append({"file": tool_file.name,
+                            "reason": f"import failed: {type(e).__name__}: {e}"[:200]})
             continue
+
+    if report_path:
+        # best effort: the report must never break tool loading
+        try:
+            _dir = os.path.dirname(str(report_path))
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
+            with open(str(report_path), "w", encoding="utf-8") as f:
+                json.dump({"tools_dir": str(tools_dir), "names": names,
+                           "loaded": loaded, "skipped": skipped},
+                          f, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001 -- advisory sink
+            pass
 
     return tools

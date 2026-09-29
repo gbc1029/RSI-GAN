@@ -100,9 +100,12 @@ def heal_design_slots(config: Dict[str, Any], role: str,
     if not isinstance(names, (list, tuple)) or not names:
         return []
     from gan.registries.loader import load_registry_for_role
-    from gan.tools.assembly import gan_roots
+    from gan.tools.assembly import always_on_index, gan_roots
     _tools, rdir, cdir = gan_roots(code_root)
     reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
+    # B15 report fidelity: an always-on tool needs no selection (it is assembled
+    # regardless), so "not registered" would read as a lost capability. Name it.
+    always_on = set(always_on_index(role, code_root=code_root)) if role != "task" else set()
     kept: List[str] = []
     stripped: List[Dict[str, str]] = []
     for name in names:
@@ -110,8 +113,11 @@ def heal_design_slots(config: Dict[str, Any], role: str,
         if reg.module_path(name) is not None:
             kept.append(name)
         else:
-            stripped.append({"name": name,
-                             "reason": reg.reason(name) or "not resolvable"})
+            reason = reg.reason(name) or "not resolvable"
+            if reason == "not registered" and f"{name}.py" in always_on:
+                reason = ("always-on tool (no selection needed -- it is assembled "
+                          "for this role regardless)")
+            stripped.append({"name": name, "reason": reason})
     if stripped:
         config[slot] = kept
     return stripped
@@ -192,6 +198,11 @@ def assemble_task_env(
                   f, ensure_ascii=False, indent=2)
     env["GAN_TASK_DESIGN"] = "/workspace/.gan_runtime/design.json"
     env["GAN_TASK_TOOLS_DIR"] = "/workspace/.gan_runtime/tools"
+    # B27: the child writes the LOAD outcome of every tool file here (relative to
+    # its cwd = run_dir, so it resolves identically with or without a container
+    # mount). The assembly report only proves a file was copied; without this the
+    # parent could not distinguish "assembled" from "actually loadable".
+    env["GAN_TOOLS_LOAD_REPORT"] = ".gan_runtime/tools_load_report.json"
     env["GAN_TASK_KNOWLEDGE_DIR"] = "/workspace/.gan_runtime/knowledge"
     if task_brief:
         env["GAN_TASK_BRIEF"] = task_brief

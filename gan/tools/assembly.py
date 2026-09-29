@@ -63,6 +63,66 @@ def always_on_dirs(role: str, code_root: Optional[str] = None) -> List[str]:
     return [d for d in dirs if os.path.isdir(d)]
 
 
+def always_on_owner(role: str, path: str, root_dir: Optional[str] = None) -> Optional[str]:
+    """Which role may modify ``path``, or None when it is FROZEN plumbing (B7).
+
+    The always-on set mixes two very different owners (``always_on_dirs``): the
+    role's OWN evolvable tools (``work/<role>/**``, inside that role's write
+    roots) and frozen plumbing (``work/common``, ``design``, ``deep``, which no
+    role may modify -- ``gan/framework/frozen.py`` is the single authority). A
+    broken file needs a different response per owner: an agent-owned one is a
+    fixable fact to hand back to that role, a frozen one is a framework bug that
+    must fail fast at startup.
+    """
+    import gan.framework.frozen as frozen
+    if root_dir is None:
+        # no code tree in scope (in-process / direct call): derive the repo root
+        # from the tools dir so the allowlist patterns still match
+        tools_dir, _rdir, _cdir = gan_roots(None)
+        root_dir = os.path.dirname(os.path.dirname(tools_dir))
+    rel = str(os.path.relpath(path, root_dir)).replace(os.sep, "/")
+    for r in ("planner", "evaluator"):
+        if frozen.is_allowed(r, rel, intent="modify"):
+            return r
+    return None
+
+
+def always_on_index(role: str, code_root: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """``{basename: {"path", "owner"}}`` for every always-on file of ``role``.
+
+    Built from the same ``always_on_dirs``/``py_files_in`` helpers the real
+    assembly copies with, so the classification cannot drift from what lands in
+    the toolset. Used by the startup always-on check (B7) and by the runtime
+    load-report classification (B27).
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for d in always_on_dirs(role, code_root=code_root):
+        for f in py_files_in(d):
+            out[os.path.basename(f)] = {
+                "path": f, "owner": always_on_owner(role, f, code_root),
+            }
+    return out
+
+
+def classify_tool_file(role: str, basename: str,
+                       code_root: Optional[str] = None) -> Dict[str, Any]:
+    """Where an assembled tool file came from, and who owns it (B27).
+
+    ``{"kind": "always_on_frozen" | "always_on_owned" | "component", "owner": ...}``.
+    A load failure must be routed accordingly: a component (or a role-owned
+    always-on tool) is an agent-fixable fact that belongs in the role's next
+    instruction, while a frozen always-on file is a framework bug to escalate and
+    NOT to hand to an agent that cannot touch it.
+    """
+    idx = always_on_index(role, code_root=code_root)
+    hit = idx.get(basename)
+    if hit is None:
+        return {"kind": "component", "owner": None}
+    owner = hit.get("owner")
+    return {"kind": "always_on_owned" if owner else "always_on_frozen",
+            "owner": owner, "source": hit.get("path")}
+
+
 def selected_module_paths_reported(role: str, config: Optional[Dict[str, Any]],
                                    code_root: Optional[str] = None
                                    ) -> Tuple[List[str], List[Dict[str, str]]]:

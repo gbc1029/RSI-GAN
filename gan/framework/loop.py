@@ -130,6 +130,9 @@ class GanLoop:
         # last round receipt (injected into the next round's plan/evaluate/self_improve)
         self._last_receipt: Optional[Dict[str, Any]] = None
         self._last_self_receipt: Optional[Dict[str, Any]] = None
+        # B15: names stripped from a role design by the STARTUP repair; merged
+        # into that role's first self receipt so the actionable note reaches it
+        self.preflight_design_stripped: Dict[str, list] = {}
         # run-attempt id: identifies THIS loop instantiation (one per outer worker /
         # in-process run). Outer-level trajectory files are keyed by it so that
         # re-running an outer never truncates or mixes a previous attempt's traces.
@@ -602,7 +605,10 @@ class GanLoop:
             patch_applied=bool(r.get("patch")), rejected_reason=rejected, budget=budget,
             # batch 13: the successful-exit heal strips dangling names from the
             # self design; the role sees its own heal at the next self-improve.
-            design_stripped=r.get("design_stripped"),
+            # B15: merge the STARTUP repair for this role (consumed once, so a
+            # one-off startup event does not repeat every outer).
+            design_stripped=((r.get("design_stripped") or [])
+                             + self.preflight_design_stripped.pop(role, [])),
             # B7: this outer's own instance assembly — carried into the NEXT
             # outer's self-improve receipt (this outer already injects it via
             # the self-improve `recent` payload).

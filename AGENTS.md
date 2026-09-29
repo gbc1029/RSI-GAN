@@ -293,6 +293,28 @@ batch-8 isolation), one subprocess each.
   non-empty workspace edits. Healing removes names only; it never adds, restores
   or rewrites source. `unregister_component` never edits the design itself — when
   the removed name is still selected it merely *says so* in its return text.
+- **Startup integrity and the load layer (batch 14)**: three checks close the gap
+  between "the design says X" and "the session really has X".
+  `preflight_tools` (startup, fatal unless `loop.toolset_preflight: false`) now also
+  AST-checks the **always-on** files, split by OWNER via `gan/framework/frozen.py`:
+  a broken FROZEN plumbing file (`work/common`, `design`, `deep` — nobody in the run
+  may modify it, and it degrades every role) fails fast, while a broken **role-owned**
+  tool (`work/<role>/**`, an agent artifact) is reported in `always_on.owned` and
+  handed back to that role instead. `repair_dangling_designs` (B15) repairs a role
+  design whose `tools` slot names something the committed tree cannot deliver: the
+  unreachable names are stripped, the previous file is preserved as
+  `config.json.dangling-<ts>`, an event records it, and the strip rides that role's
+  next self receipt (the actionable `render_receipt` note) — deliberately NOT fatal,
+  because the design is a losslessly repairable agent artifact and it outlives the
+  session (aborting undoes nothing). `load_tools` writes a **load report**
+  (`$GAN_TOOLS_LOAD_REPORT`; task child via `assemble_task_env`, roles via
+  `Role.run`) listing what actually imported; it is merged into the task toolset
+  report / the role `assembly_report` and classified by owner, so a component that
+  failed to load becomes an agent-fixable item in the next instruction while a
+  broken frozen tool is escalated (`framework_failed`) and never handed to an agent
+  that cannot touch it. General rule these implement: **abort only when nobody can
+  repair the state OR continuing would produce a silently wrong result; otherwise
+  strip/repair, record, and feed the owner.**
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - **Planner→evaluator isolation (batch 8): facts flow, rhetoric does not.** Every
   evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) —

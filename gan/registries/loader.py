@@ -122,6 +122,46 @@ def write_registry_json(path, data: Dict[str, Any]) -> None:
     os.replace(tmp, p)
 
 
+def _exposed_names(tree) -> set:
+    """Top-level BOUND names introduced by ``tree`` (see :func:`module_api_reason`)."""
+    exposed = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            exposed.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                # the BOUND name: an alias shadows the imported name
+                exposed.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    exposed.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            exposed.add(node.target.id)
+    return exposed
+
+
+def module_api_reason(path: Path) -> Optional[str]:
+    """Why ``path`` cannot serve as a tool module -- ``None`` when it can (B7).
+
+    Single definition shared by every STATIC consumer: ``entry_reason`` (registry
+    entries), the startup always-on check (``gan/framework/preflight``) and the
+    runtime load-report classification (B27). Distinguishes the two failure
+    families so a report can name the real cause: the file cannot be read/parsed
+    at all, versus it parses but does not bind both required names.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        return f"unreadable: {str(e)[:100]}"
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as e:
+        return f"unparseable: {str(e)[:100]}"
+    missing = [n for n in ("tool_info", "tool_function") if n not in _exposed_names(tree)]
+    return ("missing " + "/".join(missing)) if missing else None
+
+
 def _exposes_tool_api(path: Path) -> bool:
     """True if the module binds both ``tool_info`` and ``tool_function``.
 
@@ -144,25 +184,7 @@ def _exposes_tool_api(path: Path) -> bool:
     Deliberately syntactic: it answers "are the two names bound", not "are they
     callable" -- the latter stays ``load_tools``' runtime job.
     """
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    exposed = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            exposed.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                # the BOUND name: an alias shadows the imported name
-                exposed.add(alias.asname or alias.name.split(".")[0])
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    exposed.add(target.id)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            exposed.add(node.target.id)
-    return {"tool_info", "tool_function"} <= exposed
+    return module_api_reason(path) is None
 
 
 def _as_dirs(components_dir) -> List[Path]:

@@ -226,6 +226,46 @@ class DomainTaskRunner:
                 soft_fail(f"existing-domain report failed for genid {genid}: {e}",
                           event_path=paths.events_path(self.output_dir),
                           event_type="existing_domain_report_failed", genid=str(genid))
+        # B27: merge the CHILD-reported load outcome into the toolset report (the
+        # assembly stage can only report what it copied). Failures are classified
+        # by owner: a component (or a role-owned always-on tool) is an agent-fixable
+        # fact that rides into node meta -> the planner's next instruction; a
+        # FROZEN always-on file is a framework bug, escalated and explicitly NOT
+        # handed to an agent that cannot modify it.
+        load_failed: List[Dict[str, Any]] = []
+        load_report_path = os.path.join(run_dir, ".gan_runtime", "tools_load_report.json")
+        if os.path.isfile(load_report_path):
+            try:
+                with open(load_report_path, "r", encoding="utf-8") as f:
+                    load_report = json.load(f)
+            except Exception as e:  # noqa: BLE001 -- advisory meta
+                load_report = {"error": f"unreadable load report: {e}"[:200]}
+            from gan.tools.assembly import classify_tool_file
+            for item in (load_report.get("skipped") or []):
+                reason = str(item.get("reason") or "")
+                if not (reason.startswith("import failed")
+                        or reason.startswith("missing tool_info")):
+                    continue      # "not selected by the design" is not a failure
+                cls = classify_tool_file("task", str(item.get("file") or ""),
+                                         code_root=self.code_root)
+                load_failed.append({"name": item.get("file"), "reason": reason[:160],
+                                    **cls})
+            if toolset_report.get("skipped") is None:
+                toolset_report["skipped"] = []
+            toolset_report["load"] = {**load_report, "failed": load_failed}
+            try:
+                from gan.framework import paths as _paths
+                from utils import trajectory_log as _tlog
+                _tlog.append(_paths.events_path(self.output_dir), {
+                    "type": "task_tools_loaded", "genid": str(genid),
+                    "loaded": load_report.get("loaded") or [],
+                    "failed": load_failed,
+                    "framework_failed": [f for f in load_failed
+                                         if f.get("kind") == "always_on_frozen"],
+                })
+            except Exception as e:  # noqa: BLE001 -- audit write failure
+                print(f"[WARN] task_tools_loaded event write failed: {e}")
+
         if report is None and os.path.isfile(report_path):
             from utils.soft_fail import soft_fail
             soft_fail(f"report.json exists but is unparseable for genid {genid} "

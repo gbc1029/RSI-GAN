@@ -167,12 +167,27 @@ def build_gan_loop(
                     **model_registry.describe(["gan.task", "gan.planner", "gan.evaluator"])})
     if code_root:
         loop.log_event({"type": "code_init", "code_root": code_root})
+    # B15: repair a persisted role design that names something the committed tree
+    # cannot deliver (strip + forensic copy + report), BEFORE the integrity probe
+    # so that probe sees the repaired tree. Non-fatal by design: the design file
+    # is an agent-authored, losslessly repairable object, and it outlives the
+    # session (aborting would refuse service without undoing anything).
+    from gan.framework import preflight as preflight_mod
+    design_repair = preflight_mod.repair_dangling_designs(
+        paths.design_root(output_dir), code_root=code_root)
+    if design_repair["stripped"] or design_repair["errors"]:
+        loop.log_event({"type": "design_dangling_stripped", "stage": "preflight",
+                        **design_repair})
+        # the owning role learns about it in its next self receipt
+        for s in design_repair["stripped"]:
+            loop.preflight_design_stripped.setdefault(s["role"], []).append(s)
     # Registry/toolset integrity. Pure local check (filesystem + AST, no model calls),
     # so unlike the optional model probe it runs by default — a broken registry
     # otherwise degrades silently: invalid/orphan components are skipped by
     # selection/assembly/loading without any error. Set `loop.toolset_preflight: false`
-    # to log-only (escape hatch for an already-dirty code tree).
-    from gan.framework import preflight as preflight_mod
+    # to log-only (escape hatch for an already-dirty code tree). Since B7 the
+    # always-on files are checked too, split by owner: a broken FROZEN plumbing
+    # file is fatal here, a role's own tool is reported and handed back to it.
     tool_results = preflight_mod.preflight_tools(code_root=code_root)
     loop.log_event({"type": "preflight_tools", "results": tool_results})
     if not preflight_mod.tools_ok(tool_results):

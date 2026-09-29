@@ -27,6 +27,7 @@
 | 第 11 批（机械清扫） | `fix(gan/framework): initialize broker.last_result, atomic registry writes, list_dir cap (B10/B4/B19/A16)` | **B10 + B4 + B19 + A16 + B8 撤项**：broker.last_result 初始化、注册表原子写（保尾换行）、list_dir 200 上限、loop.yaml 保留键注释；B8 经考古撤项（守卫自 origin 即在）。回归 161 断言。同轮登记 B31–B40。见 §15 |
 | 第 12 批（范畴重划） | docs-only | **无代码改动**：13 项（B9/B31/B32/B40/B35/B33/B34/B36/B37/B38/B28/B15'/B39）按机制归属移入 `docs/7` §2.4（反馈/信息流/恢复；B34→L3①、B31→L4 合并），B21→§4、B20→§7；顺带标注 L2/F1/G5/F1-smoke 已由第 8/9 批实质闭合。见 §16 |
 | 第 13 批（角色自设计 overlay） | `fix(gan): role self-design overlay, patch-exit heal, exhausted-drop event, no-newline patch markers` | **overlay + B26 第一期 + B41 + U′ + B42 文本 + B22**：角色自设计改有效视野权威（批 5 committed-only 正式退役）、成功出口 heal（跨层接线 + receipt `design_stripped`）、耗尽路径响亮事件、unregister「仍被选中」纯提醒、cross-design note、无尾换行补丁生成侧修（七形态过真实 `git apply`）。回归 161→180 断言。见 §17 |
+| 第 14 批（装配/预检加固） | `fix(gan): validate always-on tools by owner, repair dangling designs at startup, make the tool-load layer visible (B7/B15/B27)` | **B7 + B15 + B27**：always-on 工具纳入 AST 接口校验并按 owner 分流；悬空角色设计在启动期**修复 + 留证 + 反馈**（不 fail-fast）；工具**加载层**可见化（拷贝层 → 真实可用层）。回归 180→197 断言。见 §18 |
 
 > 第 2 轮之后的提交 hash 见 `git log --oneline`（文档内不写自身提交的 hash，避免自引用失效）。
 
@@ -284,7 +285,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B4** | **原子写** `write_registry_json`【✅ 已修（第 11 批）：tmp + `os.replace`（与 checkpoint/trajectory/design-store 同约定），尾换行探测保留；`.write-tmp` 残留经 deep 工具 file 级 grant 不进补丁（实测），见 §15.1】 | `registries/loader.py:70` | ~5 行 | — |
 | **B5** | ~~**H6** 默认注册表按模块前缀路由~~ —— **✅ 第 6 批结构性消解**：角色目录绑定（见 §10） | ~~原位~~ | — | — |
 | **B6** | ~~报告 R4：`unregister` 对"多注册表声明同一组件"只删第一个~~ —— **✅ 第 6 批结构性消解**：每组件只可能声明在一个文件（见 §10） | ~~原位~~ | — | — |
-| **B7** | 报告 R5：always-on 工具（`gan/tools/**`）不参与 V3/AST 校验 | `preflight.py` | ~15 行 | — |
+| **B7** | 报告 R5：always-on 工具（`gan/tools/**`）不参与 V3/AST 校验 | `preflight.py` | ~15 行 | — 【✅ 已修（第 14 批）：`always_on_dirs`/`py_files_in` 同源扫描 + `module_api_reason`；按 `frozen.py` 可写面分 owner——frozen 进 `tools_ok`（启动致命）、角色自有仅入 `always_on.owned` 并交回该角色。见 §18】 |
 | **B8** | 报告 R6：`load_tools` 每次把 `tools_dir` 插 `sys.path`（跨 outer 线性增长）【❌ **撤项（第 11 批复核）**：插入同行自带守卫 `str(tools_dir) not in sys.path`，自 origin `64ad88d` 即存在（`git log -S` 证实）；残余增长 = 不同实例目录各一条，driver 模式每 outer 独立子进程即清零。此前"复验：仍在"是误判（只看 insert 符号、未读同行守卫条件），见 §15.2】 | `agent/tools/__init__.py:27-28` | — | — |
 | **B9** | 报告 R7：`build_diff_summary.files` 混用完整路径与 basename【第 11 批**收窄定稿**（讨论链见 §15.3–15.4）：原描述不准——单调用方下两分支从不作用于同类对象，"归一化不一致"为死症状；真实问题 = (a) files 语义宽（grants+产出物一锅）违反其规范职能"planner 动作摘要"、渲染语 "planner changes" 把 view 纯阅读说成改动；(b) 内嵌 `schema_version` 死键。**方案**：files 退出（ops-only）+ 调用方停喂 report_path（report 经 report_view 已有通道，不设新键）+ 删死键（常量+`validate_feedback` 绊线保留，**不升 v2**——升版使 B9 前 checkpoint 在恢复点 ValueError）+ `evaluator.py` 提示词块加轮次标签（op 清单隔代错位消歧）+ 删死 `code_edit` 分支（B31 挂靠）+ grants 收敛为 ops+receipt 两处（B32 挂靠） | `gan/summary.py` + `loop.py:962` | ~15 行 | **是** |
 | **B10** | 报告 R8：`AccessBroker.last_result` 未在 `__init__` 初始化（**本会话起有真实读者**）【✅ 已修（第 11 批）：`__init__` 初始化空 dict（实测 AttributeError 消除；现有读者均为 getattr 兜底属侥幸），见 §15.1】 | `access.py` | ~2 行 | — |
@@ -292,7 +293,7 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B12** | N3-B/N4：`receipt.grants` 剥 `reason`，与 `_ops_summary` 白名单策略统一 | `receipt.py:94` | ~5 行 | — |
 | **B13** | N3-D：`evaluator_reward.py` 的 `said: {fb}` 不入 digest | `reward/evaluator_reward.py:199` | ~3 行 | — |
 | **B14** | 报告 R4：`summary.py` 删死分支 + "未知 op 透传 + 安全字段白名单"（含 `planner.py` 的 `code_edit` 死分支） | `summary.py:24-40` | ~25 行 | — |
-| **B15** | 选择静默降级**残余**：`preflight_tools` 校验"设计选中项是否仍存在/valid" | `preflight.py` | ~20 行 | — |
+| **B15** | 选择静默降级**残余**：`preflight_tools` 校验"设计选中项是否仍存在/valid" | `preflight.py` | ~20 行 | — 【✅ 已修（第 14 批）：启动期 `repair_dangling_designs` = 剥离 + `.dangling-<ts>` 取证副本 + 事件 `design_dangling_stripped{stage:preflight}` + 该角色下一次 self receipt 反馈；**不 fail-fast**（设计是 agent 可无损修复的对象，且文件比会话活得长）。见 §18】 |
 | **B16** | T1/R3：注册期碰撞预检（复用 `validate_registry`/`assemble_collisions`）【✅ 已修（第 10 批）：硬拒、范围 = 本角色 always-on ∪ 已注册组件，拒绝零写入，见 §14】 | `register_component.py` | ~15 行 | — |
 | **B17** | R3：把 `collisions` 纳入提交门控（`registry_report` + `_registry_worsened` 差分）【✅ 已修（第 10 批）：第五类 `(role, basename, 源列表)` 差分键，先在碰撞永不阻塞，见 §14】 | `code_repo.py` | ~15 行 | — |
 | **B18** | P3 残留：`list_components` 只扫 `broker.repo_root`，工作区新文件不可见 —— **✅ 已修（第 4 批，Tier 2）**，见 §8.5 | `list_components.py:63,69-70` | ~15 行 | — |
@@ -304,6 +305,9 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B24** | **H11**（第 4 批新发现）任务补丁被拒时设计仍被持久化 ⇒ 设计永久引用不存在的组件（`task_runner` 中 `apply_task_patch(...)` 之后**无条件** `persist_design(...)`；下一代装配时被 B7 记 skip，静默失能且留痕） —— **✅ 已修（第 5 批，A2 自愈）**，见 §9.3 | `gan/framework/task_runner.py:103-128` | ~15 行 | **是** |
 | **B25** | **H12**（第 5 批新发现）`set_config("skills", [...])` 只做 schema 键白名单，未注册组件不经拒绝直接进设计（实证：装配报 `not registered`） —— **✅ 已修（第 5 批，Option 1）**，见 §9.4 | `gan/tools/design/set_config.py` | ~15 行 | **是** |
 | **B26** | **角色设计的 heal**（第 5 批新发现）：`evaluator/planner.self_improve` 在补丁重试循环后**无条件** `save_self_config(cfg)`（`gan/roles/evaluator.py:194`），与 H11 同模式；角色设计现在 committed-only 故**不会新造**悬空，但存量链上的悬空名未自愈。修法 = 角色设计也开 overlay + 自愈（需决策）【⏳ **第一期已修（第 13 批）**：`heal_design_slots` 去掉 role 限制（对照**本角色**注册表）+ `loop._apply_self_patch` **成功出口** heal + 重存 + 事件 `design_dangling_stripped(stage=self_improve)` + `design_stripped` 进 self receipt；**overlay 权同批实施**（角色自设计 = 有效视野权威，批 5 committed-only 正式退役）+ **U′**（unregister 检测「仍被选中」纯提醒）。**第二期保持待办**（`docs/7` §6.1）：耗尽/被拒出口 heal + `save_self_config` 延迟化，见 §17】 | `gan/roles/base_role.py:215` + 两个 `self_improve` | ~15 行 | **是** |
+| **B27** | 子进程 `load_tools` 的 skip 只有一行日志 ⇒ 装配报告只能证明"被拷贝"，不能证明"真的可用"【✅ 已修（第 14 批）：`load_tools(report_path/env GAN_TOOLS_LOAD_REPORT)` 写加载报告；task 侧并入 `tools_load_report.json` + 事件 `task_tools_loaded` + node meta，角色侧并入 `assembly_report["load"]` + 事件 `role_tools_loaded`；失败按 owner 分类（组件/角色自有 = 可执行项交回 agent；frozen = `framework_failed` 升级且不交 agent）。见 §18】 | `agent/tools/__init__.py` + report 链 | ~25 行 | — |
+| **B29** | `set_prompt` 只记 `chars` ⇒ 提示词重写是唯一不透明知识通道（`build_diff_summary` 的 `set_prompt` 分支只取无人生产的 `section`，`_ops_summary` 白名单连 `chars` 都丢） | `gan/tools/design/set_prompt.py` + 两处投影 | ~15 行 | — |
+| **B30** | 原地改实现后条目描述过时的可见性（`edit_source` 不 record；提交后 `pending=none`，实现与条目描述的分歧无人可见） | `receipt/diff` 链 + `edit_source` | ~10-25 行 | soft |
 | **B31** | 死 `code_edit` 分支（origin 有生产者 `gan/operators/planner_ops/code_edit.py`，`642bcda` 重构删除算子后失联）——**随 B9 一并删** | `gan/summary.py:44` | ~4 行 | — |
 | **B32** | grants 路径在 `diff_summary` 对象内双写（`ops[].paths` + `files`）；收敛为 ops + receipt.grants 两处——**随 B9 files 退出实施**（receipt.grants 经 `_receipt_for_evaluator` 对 E 已剥除，仅 P 可见） | `gan/summary.py` | （随 B9） | — |
 | **B33** | **提示词/种子签名漂移**：`planner.py:65` 与 `seeds/planner.md:27` 仍写 `respond_issue(issue_id, accepted, feedback)` 三参——第 8 批后 `response_kind` **必填**，按指令逐字调用的 LLM 每轮首调必撞 schema 错误（软失败可重试，但指令是 LLM 第一依据）。附带：E 提示词开头深工具枚举句补 `update_component` | `gan/roles/planner.py` + `seeds/planner.md` + `gan/roles/evaluator.py:29` | ~5 行 | — |
@@ -1059,3 +1063,57 @@ B9（收窄定稿，含 B31/B32 挂靠）、B33、B34、B35、B36、B37、B38（
 - **B42 行为变更**（目标注册表是否跟随 `dctx.role`）——本批仅文本说明；
 - B29/B30/B27 等可见性项、C 类（C1/C2/C3/C4/C5/C7）、A15 表述收口；
 - 反馈/信息流批（L4/L3/B9/B31/B32/B33/B34/B35/B36/B37/B40——已按机制归属移入 `docs/7` §2.4）。
+
+---
+
+## 18. 第 14 批：装配/预检加固（B7 / B15 / B27）
+
+> 起因：装配加固组讨论定案——用户拍板「B15 由框架替 agent 剥离 + 留证」、「B7 的 frozen/角色分流按 `frozen.py`」。
+> 本批把**工具加载层**从"只有子进程一行日志"变成"装配报告的一部分"，并把 always-on 与设计悬空纳入启动期。
+
+### 18.1 决策记录（用户确认）
+
+| 决策点 | 结论 | 理由 |
+|---|---|---|
+| 检验到 invalid 后怎么办 | **按 owner 与"能否无损修复"分层**，不搞统一策略 | 见 18.2 的三条判据 |
+| **B15** 悬空设计 | **框架替 agent 剥离 + 留证（`.dangling-<ts>`）+ 事件 + 下一次 self receipt 反馈**，**不 fail-fast** | 设计文件是 agent 产物且**可无损修复**（只删不增）；仓库对**同一类对象**已有先例（`_seed_self_designs` 对不可解析设计 = 留证 + 重播种 + 继续）；且坏状态**比会话活得长**，中断不撤销任何东西、只拒绝服务 |
+| **B7** always-on | **按 `frozen.py` 可写面自动分流**：frozen（`work/common`/`design`/`deep`）= 启动**致命**；角色自有（`work/<role>`）= 仅报告 + 交回该角色 | 单一权威（不新增"哪些算冻结"清单）；frozen 坏了影响全体且**无人能在 run 内修** ⇒ 与 `preflight_tools` 既有立场同族；角色自有的坏文件是 agent 自己的产物 ⇒ 不该拒绝启动 |
+| **B27** 加载失败 | **一律不中断**（剥离 + 报告 + 按 owner 分流反馈） | 环内发现时该代已在跑；中断白扔一轮且事实仍未记录。组件/角色自有 = **可执行项**交回 agent；frozen = 升级事件 `framework_failed` 且**不交给无法修改它的 agent** |
+
+### 18.2 判据（写在实现注释里，防后来者"统一成一种策略"）
+
+1. **有没有 owner？** 无（冻结代码/框架不变量）→ 中断；有（agent 产物）→ 不中断。
+2. **继续会不会产出"看起来成功的错结果"？** 会（静默回退、静默换语义）→ 中断（C4 先例）；不会（能力缺失但事实入档）→ 继续。
+3. **中断能撤销吗？** 不能（设计已落盘、代码已提交）→ 中断只是拒绝服务。
+
+### 18.3 代码改动
+
+| # | 文件 | 改动 |
+|---|---|---|
+| ① | `gan/registries/loader.py` | 新增公开 `module_api_reason(path)`：区分 `unreadable` / `unparseable` / `missing tool_info/tool_function`；`_exposes_tool_api` 改为其薄封装（`entry_reason` 行为与文案不变），static 校验**单一实现**供三处复用 |
+| ② | `gan/tools/assembly.py` | 新增 `always_on_owner`（按 `frozen.is_allowed(role, rel, intent="modify")` 判定；`code_root=None` 时自动推导仓库根）、`always_on_index`（`always_on_dirs`+`py_files_in` 同源，**不会与真实装配漂移**）、`classify_tool_file`（`always_on_frozen`/`always_on_owned`/`component`） |
+| ③ | `gan/framework/preflight.py` | 新增 `always_on_problems(role)`（B7，按 owner 分桶）与 `repair_dangling_designs(design_root, code_root)`（B15，剥离+取证+重存，逐条返回）；`preflight_tools` 每角色加 `always_on` 段；`tools_ok` 只看 **frozen** 那桶（+ 原有 problems/collisions） |
+| ④ | `gan/framework/task_execution.py` | `heal_design_slots` 的剥离原因细化：名字是 **always-on** 工具时报 `always-on tool (no selection needed …)`，而不是误导性的 `not registered` |
+| ⑤ | `gan/build.py` | 启动期先跑 B15 修复；有剥离/错误则记事件 `design_dangling_stripped{stage:"preflight"}`，并把逐条剥离塞进 `loop.preflight_design_stripped[role]` |
+| ⑥ | `gan/framework/loop.py` | `_make_self_receipt` 合并该角色启动期剥离（**消费一次**，不会每个 outer 重复提示）→ 经 `render_receipt` 既有可执行文案（"dangling slot names STRIPPED … re-add only after the component is committed"）回到 planner |
+| ⑦ | `agent/tools/__init__.py` | `load_tools(..., report_path=None)`，默认取 env `GAN_TOOLS_LOAD_REPORT`；记录 `loaded` 与 `skipped[{file,reason}]`（`import failed` / `missing tool_info/tool_function` / `not selected by the design`），best-effort 写 JSON，**永不因报告失败而影响加载** |
+| ⑧ | `gan/framework/task_execution.py` + `task_runner.py` | `assemble_task_env` 设相对 sink `.gan_runtime/tools_load_report.json`（子进程 cwd=run_dir，容器/非容器一致）；`task_runner` 在子进程结束后读回、**过滤"未选中"**、按 owner 分类、写入 `toolset_report["load"]`、发事件 `task_tools_loaded`（含 `framework_failed`）→ 随 node meta 到 planner |
+| ⑨ | `gan/roles/base_role.py` | `run()` 前后 set/restore env sink（`logs/tools_load_<role>_<instance>.json`），`_merge_load_report` 把结果并进 `assembly_report["load"]` + 事件 `role_tools_loaded`；`_load_failures` 复用同一分类 |
+
+**为什么 B27 不改 `llm_withtools.py`**：`load_tools` 自身读 env 即可——角色侧在调用点 set/restore，task 子进程由 `assemble_task_env` 注入。零改动覆盖两条路径。
+
+### 18.4 测试与断言
+
+| 套件 | 新增 | 断言数 |
+|---|---|---|
+| deep-tools | P1（B7：frozen 检出/致命、owned 仅报告、恢复后干净）、P2（B15：只剥不可达名、取证副本保原状、就地修复、幂等）、P3（always-on 剥离原因精确）、P4（B27：加载报告三态、owner 三分类） | 91 → **108** |
+| batch6 / batch8 | 无变化 | 57 / 32 |
+| **合计** | | 180 → **197** |
+
+覆核：`venv_nat/bin/python scripts/local/run_tool_regression.py` → all suites passed；真实仓库 `preflight_tools`（三角色 always-on frozen/owned 均 0）与 `registry_report` 五类全空。
+
+### 18.5 明确未做（不在本批）
+
+- **B29**（`set_prompt` 只记 `chars`）与 **B30**（原地改实现后条目描述过时的可见性）——投影/可见性两项，仍待办（`docs/8` §2.2）；
+- **B42 行为决策**（deep 工具目标注册表是否跟随 `dctx.role`）、**B26 第二期**（耗尽出口 heal + 延迟保存）、**B20**（deny_deep 接线）；
+- **task 设计文件的启动期扫描**：任务设计是**每代工件**，权威副本随 tree meta 走且已在持久化时自愈（B24），启动期批量改写会篡改历史——B15 只修角色设计（实现注释已写明）。
