@@ -62,7 +62,7 @@ class Planner(Role):
         if evaluator_issues:
             parts.append(
                 "\n## Evaluator issues to respond to\n"
-                "You MUST call `respond_issue(issue_id, accepted, feedback)` for EACH issue below."
+                "You MUST call `respond_issue(issue_id, accepted, response_kind, feedback)` with a structured `response_kind` (acted / acted_differently / out_of_scope / disputed / deferred) for EACH issue below."
                 "\n```json\n"
                 f"{json.dumps(evaluator_issues, ensure_ascii=False, indent=2)[:4000]}\n```"
             )

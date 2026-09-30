@@ -16,22 +16,13 @@ from gan.tools.assembly import assemble_tools_dir_reported
 def _load_failures(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Failure entries of a load report, classified by owner (B27).
 
-    ``"not selected by the design"`` is not a failure (it is the expected state of
-    every non-selected file present in the toolset dir). A frozen always-on file
-    is a framework bug -- recorded, but explicitly flagged as NOT agent-fixable.
+    Delegates to the single predicate/classifier source
+    (``gan.tools.assembly.load_failures``); the ``_role``/``_code_root`` keys
+    were stamped by ``_merge_load_report`` before this call.
     """
-    from gan.tools.assembly import classify_tool_file
-    out: List[Dict[str, Any]] = []
-    for item in ((report or {}).get("skipped") or []):
-        reason = str(item.get("reason") or "")
-        if not (reason.startswith("import failed")
-                or reason.startswith("missing tool_info")):
-            continue
-        cls = classify_tool_file(role=report.get("_role") or "",
-                                 basename=str(item.get("file") or ""),
-                                 code_root=report.get("_code_root"))
-        out.append({"name": item.get("file"), "reason": reason[:160], **cls})
-    return out
+    from gan.tools.assembly import load_failures as _shared
+    return _shared(report, role=str(report.get("_role") or ""),
+                   code_root=report.get("_code_root"))
 
 
 def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_dir: str,

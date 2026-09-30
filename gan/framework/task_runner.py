@@ -240,16 +240,9 @@ class DomainTaskRunner:
                     load_report = json.load(f)
             except Exception as e:  # noqa: BLE001 -- advisory meta
                 load_report = {"error": f"unreadable load report: {e}"[:200]}
-            from gan.tools.assembly import classify_tool_file
-            for item in (load_report.get("skipped") or []):
-                reason = str(item.get("reason") or "")
-                if not (reason.startswith("import failed")
-                        or reason.startswith("missing tool_info")):
-                    continue      # "not selected by the design" is not a failure
-                cls = classify_tool_file("task", str(item.get("file") or ""),
-                                         code_root=self.code_root)
-                load_failed.append({"name": item.get("file"), "reason": reason[:160],
-                                    **cls})
+            from gan.tools.assembly import load_failures
+            load_failed = load_failures(load_report, "task",
+                                        code_root=self.code_root)
             if toolset_report.get("skipped") is None:
                 toolset_report["skipped"] = []
             toolset_report["load"] = {**load_report, "failed": load_failed}

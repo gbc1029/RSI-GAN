@@ -272,6 +272,26 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"catalog note: {len(receipt['catalog_stale'])} component(s) have a "
                      f"STALE catalog description (module changed after the description "
                      f"was written) — update_component refreshes it")
+    load_failed = (ts.get("load") or {}).get("failed") or []
+    fixable = [f for f in load_failed
+               if f.get("kind") in ("component", "always_on_owned")]
+    frozen = [f for f in load_failed if f.get("kind") == "always_on_frozen"]
+    if fixable:
+        # B27 second half (batch 19): runtime load failures belong in the same
+        # per-decision channel as the B7 capability note — otherwise the design
+        # can look intact while the tool is absent, and the agent misdiagnoses
+        # "registration/selection lost" when the real cause is module code.
+        names = ", ".join(f"'{f.get('name')}' ({str(f.get('reason'))[:60]})"
+                          for f in fixable)
+        parts.append(f"toolset note: design-selected tools DID NOT LOAD at runtime: "
+                     f"{names} — registry/design are consistent; the cause is the "
+                     f"module code (import error / broken tool_info), not a lost "
+                     f"registration: inspect via list_components + read_file, "
+                     f"fix with edit_source, it takes effect next session")
+    if frozen:
+        parts.append(f"framework note: {len(frozen)} FROZEN tool(s) failed to load "
+                     f"— escalated to framework owners; do NOT attempt to repair, "
+                     f"selection/registration changes cannot help")
     if receipt.get("next_hint"):
         parts.append(f"hint: {receipt['next_hint']}")
     if not parts:
