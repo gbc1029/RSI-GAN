@@ -21,7 +21,7 @@ class Evaluator(Role):
     def _blind_instruction(
         self,
         run_summary: Dict[str, Any],
-        prev_feedback: Optional[Dict[str, Any]],
+        parent_feedback: Optional[Dict[str, Any]],
         blind_enabled: bool = True,
         task_brief: Optional[str] = None,
     ) -> str:
@@ -39,22 +39,22 @@ class Evaluator(Role):
                 "for each problem you find (process / cheating / detail / overfitting)."
             )
         parts.append(f"\n## Run artifacts (trajectory / results summary)\n```json\n{json.dumps(run_summary, ensure_ascii=False, indent=2)[:6000]}\n```")
-        if prev_feedback and prev_feedback.get("digest"):
+        if parent_feedback and parent_feedback.get("digest"):
             parts.append(
                 "\n## Feedback digest on YOUR previous issues (text; no scores)\n"
-                f"{prev_feedback.get('digest')}"
+                f"{parent_feedback.get('digest')}"
             )
-        if prev_feedback and prev_feedback.get("issues"):
+        if parent_feedback and parent_feedback.get("issues"):
             parts.append(
                 "\n## YOUR issues from the previous round\n"
                 "For EACH issue below, call `judge_fix(issue_id, fixed, evidence)` judging "
                 "from the NEW trajectory/code whether it was actually fixed (not merely changed).\n"
-                f"```json\n{json.dumps(prev_feedback.get('issues'), ensure_ascii=False, indent=2)[:3000]}\n```"
+                f"```json\n{json.dumps(parent_feedback.get('issues'), ensure_ascii=False, indent=2)[:3000]}\n```"
             )
-        if prev_feedback and prev_feedback.get("diff_summary") is not None:
+        if parent_feedback and parent_feedback.get("diff_summary") is not None:
             parts.append(
                 "\n## Diff summary of the planner's changes (no rationale)\n"
-                f"```json\n{json.dumps(prev_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
+                f"```json\n{json.dumps(parent_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
             )
         return "\n".join(parts)
 
@@ -76,7 +76,7 @@ class Evaluator(Role):
     def evaluate(
         self,
         run_summary: Optional[Dict[str, Any]] = None,
-        prev_feedback: Optional[Dict[str, Any]] = None,
+        parent_feedback: Optional[Dict[str, Any]] = None,
         benchmark_score: Optional[float] = None,
         broker: Any = None,
         node_id: Any = None,
@@ -92,7 +92,7 @@ class Evaluator(Role):
                                          trajectory_genids=trajectory_genids)
                       if broker is not None else None)
         try:
-            hist = self.run(self._blind_instruction(run_summary or {}, prev_feedback, blind_enabled, task_brief),
+            hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief),
                             trajectory_file=self.session_trajectory(node_id))
             if benchmark_score is not None:
                 self.run(

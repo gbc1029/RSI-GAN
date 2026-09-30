@@ -4,10 +4,10 @@ Outer loop = one meta generation (planner + evaluator self-improve).
 Inner loop = one task-agent generation (plan -> task run -> evaluate -> commit).
 
 Collaborators are duck-typed so the loop can be smoke-tested offline:
-    planner.plan(parent_summary, parents, last_feedback, evaluator_issues, config, node_id, broker)
+    planner.plan(parent_summary, parents, parent_feedback, evaluator_issues, config, node_id, broker)
         -> {"records": [...], "responses": [...], "config": Config, "patch": str}
     task_runner(plan, parent, genid) -> Node
-    evaluator.evaluate(run_summary, prev_feedback, benchmark_score, node_id, broker) -> EvalContext-like
+    evaluator.evaluate(run_summary, parent_feedback, benchmark_score, node_id, broker) -> EvalContext-like
     planner.self_improve(recent) / evaluator.self_improve(recent)
 
 Evaluator feedback is TEXT (a digest), not a numeric reward.
@@ -133,7 +133,10 @@ class GanLoop:
         # node meta (``feedback`` / ``feedback_digest`` / ``receipt``), which the
         # next selection reads back -- so nothing here needs checkpointing.
         self._parent_receipt: Optional[Dict[str, Any]] = None
-        self._last_self_receipt: Optional[Dict[str, Any]] = None
+        # batch21: per-role self receipts -- the formerly shared single variable
+        # mixed roles (evaluator rendered planner's receipt, planner rendered
+        # evaluator's; docs/6 F3/F4 registered the overwrite, L3②).
+        self._self_receipts: Dict[str, Dict[str, Any]] = {}
         # B15: names stripped from a role design by the STARTUP repair; merged
         # into that role's first self receipt so the actionable note reaches it
         self.preflight_design_stripped: Dict[str, list] = {}
@@ -362,6 +365,9 @@ class GanLoop:
             # checkpointed -- they are rebuilt from parent.meta at the next
             # selection; the per-round record lives on the tree.
             "digests": self._digests,
+            # batch21: per-role self receipts ride the checkpoint (consumed by
+            # the next outer's self_improve; cannot be rebuilt from the tree).
+            "self_receipts": dict(self._self_receipts),
             "advantages": self._advantages,
             "prev_predicted": self._prev_predicted,
             "prev_benchmark": self._prev_benchmark,
@@ -377,6 +383,7 @@ class GanLoop:
         # files are deliberately ignored (the mirrors are rebuilt from
         # parent.meta at the next selection).
         self._digests = list(state.get("digests") or [])
+        self._self_receipts = dict(state.get("self_receipts") or {})
         self._advantages = list(state.get("advantages") or [])
         self._prev_predicted = state.get("prev_predicted")
         self._prev_benchmark = state.get("prev_benchmark")
@@ -694,7 +701,7 @@ class GanLoop:
             soft_fail(f"self patch_receipt.json write failed ({role}, outer {outer}): {e}",
                       event_path=paths.events_path(self.output_dir),
                       event_type="receipt_write_failed", role=role, outer=outer)
-        self._last_self_receipt = rec
+        self._self_receipts[role] = rec
         self.log_event({"type": "self_receipt", "role": role, "outer": outer,
                         "code_applied": rec["code_patch"]["applied"], "rejected": bool(rejected)})
         return rec
@@ -910,7 +917,7 @@ class GanLoop:
                     plan_result = self.planner.plan(
                         parent_summary=self._parent_summary(parent),
                         parents=[self._parent_summary(p) for p in parents],
-                        last_feedback=parent_feedback,
+                        parent_feedback=parent_feedback,
                         evaluator_issues=evaluator_issues,
                         config=parent_cfg,
                         node_id=genid,
@@ -1018,7 +1025,7 @@ class GanLoop:
                             # `design.ops` duplicate the diff_summary channel.
                             "receipt": _receipt_for_evaluator(self._parent_receipt),
                         },
-                        prev_feedback={**(parent_feedback or {}), "digest": self._parent_digest},
+                        parent_feedback={**(parent_feedback or {}), "digest": self._parent_digest},
                         benchmark_score=benchmark_for_eval,
                         node_id=genid,
                         broker=self.broker,
@@ -1142,7 +1149,7 @@ class GanLoop:
                 if p is not None and str(p) != "initial" and p not in si_refs:
                     si_refs.append(p)
             try:
-                res = self.evaluator.self_improve(recent={**recent_eval, "receipt": self._last_self_receipt},
+                res = self.evaluator.self_improve(recent={**recent_eval, "receipt": self._self_receipts.get("evaluator")},
                                                   broker=self.broker,
                                                   max_tool_calls=self.self_improve_max_tool_calls,
                                                   trajectory_genids=si_refs,
@@ -1154,7 +1161,7 @@ class GanLoop:
             except Exception as e:
                 self.log_event({"type": "self_improve_error", "role": "evaluator", "error": str(e)})
             try:
-                res = self.planner.self_improve(recent={**recent_plan, "receipt": self._last_self_receipt},
+                res = self.planner.self_improve(recent={**recent_plan, "receipt": self._self_receipts.get("planner")},
                                                 broker=self.broker,
                                                 max_tool_calls=self.self_improve_max_tool_calls,
                                                 trajectory_genids=si_refs,

@@ -28,7 +28,7 @@ class Planner(Role):
     def _plan_instruction(
         self,
         parent_summary: Dict[str, Any],
-        last_feedback: Optional[Dict[str, Any]] = None,
+        parent_feedback: Optional[Dict[str, Any]] = None,
         evaluator_issues: Optional[List[Dict[str, Any]]] = None,
         parents: Optional[List[Dict[str, Any]]] = None,
         task_brief: Optional[str] = None,
@@ -66,10 +66,10 @@ class Planner(Role):
                 "\n```json\n"
                 f"{json.dumps(evaluator_issues, ensure_ascii=False, indent=2)[:4000]}\n```"
             )
-        if last_feedback and last_feedback.get("diff_summary") is not None:
+        if parent_feedback and parent_feedback.get("diff_summary") is not None:
             parts.append(
                 "\n## Diff summary (what changed last round, sanitized)\n"
-                f"```json\n{json.dumps(last_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
+                f"```json\n{json.dumps(parent_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
             )
         if parent_predicted_score is not None or parent_benchmark_score is not None:
             parts.append(
@@ -83,7 +83,7 @@ class Planner(Role):
         self,
         parent_summary: Optional[Dict[str, Any]] = None,
         parents: Optional[List[Dict[str, Any]]] = None,
-        last_feedback: Optional[Dict[str, Any]] = None,
+        parent_feedback: Optional[Dict[str, Any]] = None,
         evaluator_issues: Optional[List[Dict[str, Any]]] = None,
         config: Any = None,
         node_id: Any = None,
@@ -96,7 +96,7 @@ class Planner(Role):
         patch_retry_k: int = 2,
         max_tool_calls: int = 40,
     ) -> Dict[str, Any]:
-        if last_feedback is not None and not validate_feedback(last_feedback):
+        if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
 
         task_design = config if isinstance(config, dict) else {}
@@ -114,7 +114,7 @@ class Planner(Role):
         exhausted = False
         try:
             hist = self.run(
-                self._plan_instruction(parent_summary or {}, last_feedback, evaluator_issues,
+                self._plan_instruction(parent_summary or {}, parent_feedback, evaluator_issues,
                                        parents, task_brief, receipt,
                                        parent_predicted_score, parent_benchmark_score),
                 max_tool_calls=max_tool_calls, trajectory_file=traj)

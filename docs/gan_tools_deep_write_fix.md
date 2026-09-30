@@ -1455,3 +1455,39 @@ rec0 kind=input redacted=True len=48278
 
 - **L1 闭合**；**B34 余量**收窄为 self-improve 侧 `_last_self_receipt`（loop 侧恢复缺口消失）；**A1 仍开**（`task_runner.py` 空补丁判据，方案已给出待批）；
 - 未做：`recent_eval` 的 `_digests` 经验流保持执行序语义（self-improve 元认知，恰当）；`planner.plan(last_feedback=…)` 形参名不动（P 侧语义本就 parent-scoped，名字指"你要回应的那份"）。
+
+## 24. 第 21 批：形参改名收口 + per-role 自改回执（`_self_receipts`）
+
+**Scope**：`gan/roles/planner.py`、`gan/roles/evaluator.py`（纯改名）、`gan/framework/loop.py`（改名 + `_last_self_receipt` 结构修正）、`scripts/local/regress_batch8.py`。
+
+### 24.1 形参/变量改名（#1-#3，纯改名零行为变化）
+
+| 现名 | 改为 | 范围 |
+|---|---|---|
+| `planner.plan(last_feedback=…)` | `parent_feedback` | planner.py 形参 2 处 + 体内 8 子串；loop.py `:893` 调用 kwarg；模块头 docstring |
+| `evaluator.evaluate(prev_feedback=…)`/`_blind_instruction(prev_feedback,…)` | `parent_feedback` | evaluator.py 形参 2 处 + 体内引用；loop.py `:1001` 调用 kwarg |
+
+统一后：planner 局部 `parent_feedback`（:880）＝ P 侧调用 kwarg ＝ E 侧形参名 ＝ `_settle_feedback_digest` 参数——枝语义命名四方同名，歧义归零。E 渲染的话术（"YOUR issues from the previous round"）不改（对 LLM 的表述，非代码语义）。
+
+### 24.2 `_last_self_receipt` → `self._self_receipts`（#4，唯一行为修正）
+
+- **文档语义**（考古）：`docs/5` 设计意图为"角色把**自己**上一 outer 的自改回执带进下一 outer 自省"——per-role 本意，单变量实现错位；`docs/6` F3/F4 与 `docs/7` L3② 早已登记跨角色覆盖（修复表述："两角色都拿到 planner 的"**不准**——实况为**双方互读对方**：E 拿 planner 的、P 拿同 outer 刚产出的 evaluator 的）。
+- **修法**：per-role 字典 `self._self_receipts`；`_make_self_receipt` 写 `self._self_receipts[role]`；`recent["receipt"]` 按**接收者**角色取自身上一份（`get("evaluator")`/`get("planner")`）。
+- **checkpoint**：增 `self_receipts` 键（该通道无法由树重建）+ `_load_state` 回放——L3① 的 self-improve 侧残余闭合。
+- **收益**：① L3② 闭合；② B15 的启动剥离 note（消费一次合入 self receipt）不再被送错角色；③ 恢复后首个 outer 的自省不再空 receipt；④ B26 第二期（outer 放弃回执）的前置卫生就位。
+
+### 24.3 测试
+
+| 套件 | 新增 | 断言数 |
+|---|---|---|
+| batch8 | batch21 ×3（两侧 kwargs 零残留；per-role 写/读点 + 单变量零残留；checkpoint 回放） | 45 → **48** |
+| deep-tools / batch6 | 无新增 | 143 / 57 |
+| **合计** | | 245 → **248** |
+
+覆核：`run_tool_regression.py` → all suites passed。
+
+### 24.4 收账
+
+- **L3①② 全部闭合**（docs/7 :201 行收账）；**B34 名下无 loop/self-improve 侧残余**（仅剩 `docs/6` F3/F4 历史行，原文保留）；
+- 未做：`planner.plan(receipt=)`/`evaluator._plan…` 的 `receipt=` 形参名不动（其值即 `parent_receipt` 投影，语义名可保留；如后续统一可再议）。
+
