@@ -228,7 +228,12 @@ batch-8 isolation), one subprocess each.
   (`gan/registries/*.json`), its module file **stem**, and its `tool_info()["name"]`
   must be the same string. The tool loop keys tools by file stem
   (`agent/tools/__init__.py`), so a mismatch assembles a tool that silently
-  never loads. `gan/registries/loader.py:entry_reason` enforces this at selection
+  never loads. Only the FIRST TWO are statically enforced today
+  (`loader.entry_reason`: name == stem, plus the AST binding of
+  `tool_info`/`tool_function`); the THIRD (`tool_info()["name"]`, which the
+  runtime dispatch dict keys by) has NO static gate — it is kept aligned by
+  convention over the shipped components (K2; a real gate would require an
+  import). `gan/registries/loader.py:entry_reason` enforces this at selection
   time (plus the **role-directory binding**: a registry entry may only reference
   its own role's component tree — one single-writer file per role since batch 6);
   `gan/framework/code_repo.py` (differential gate on commits touching
@@ -304,8 +309,12 @@ batch-8 isolation), one subprocess each.
   same heal runs for **role self-designs at the successful patch exit**
   (`loop._apply_self_patch`, after `self_improve_commit`, against that role's own
   committed registry: re-saved file + event + `design_stripped` on the self
-  receipt); the exhausted/rejected exit keeps the pre-session file and is
-  registered backlog (`docs/7` §6.1), while `warn_dropped_workspace_edits` fires
+  receipt); on the exhausted/rejected exit the persisted file is the SESSION
+  DRAFT that `Role.save_self_config` saved unconditionally at session end
+  (BEFORE the loop revealed the patch outcome), and it is left UN-healed there
+  — it is NOT the pre-session file (K1, doc-erratum batch 18 per `docs/8` §1);
+  the exhausted-exit heal plus a delayed
+  save remain backlog (`docs/7` §6.1). Meanwhile `warn_dropped_workspace_edits` fires
   a loud `deep_edit_dropped` event (`phase="exhausted"`) when that path discards
   non-empty workspace edits. Healing removes names only; it never adds, restores
   or rewrites source. `unregister_component` never edits the design itself — when
@@ -378,6 +387,10 @@ batch-8 isolation), one subprocess each.
 - Design/plan: `docs/2_GAN_plan.md`
 - Implementation record: `docs/4_v1实现和v2改动.md`
 - Modification decision record (v3/v4): `docs/5_v3改动.md`
+- v5 change record: `docs/6_v5改动.md`; outstanding-issue ledger: `docs/7_遗留问题与待办.md`;
+  tool-management ledger (todo/done snapshot): `docs/8_工具待办与已办.md`
+  (+ audit trail `docs/工具管理审查.md`, `docs/工具管理复核报告.md`,
+  `docs/工具管理线复核报告_2.md`, session summary `docs/gan_tools_deep_write_fix.md`)
 - Environment/deployment record: `docs/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

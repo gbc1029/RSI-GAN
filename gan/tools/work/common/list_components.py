@@ -36,11 +36,11 @@ Per-entry fields (``registered``):
 - ``valid`` / ``reason`` : validity of the copy the agent will act on (workspace
   copy when one exists, else the committed copy); for ``pending:"removed"`` it
   describes the committed copy, which is the one that still exists;
-- ``selectable`` : **exactly what ``select_component`` will do now** (batch 5:
-  the effective, workspace-first registry for the task design -- the design is
-  healed against the committed tree before persist, so same-session selection is
-  safe -- and the committed registry for role self-designs, which are not healed
-  yet), so a tool registered this session IS selectable for the task design,
+- ``selectable`` : **exactly what ``select_component`` will do now** (batch 13:
+  the effective, workspace-first registry FOR EVERY ROLE -- task designs are
+  healed against the committed tree before persist, role self-designs are healed
+  at the successful patch exit and repaired at startup by B15, so same-session
+  selection is safe everywhere), so a tool registered this session IS selectable,
   and a tool scheduled for removal is no longer accepted;
 - ``note``       : the human-readable form of any tension between the above.
 

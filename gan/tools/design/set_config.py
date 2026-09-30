@@ -8,10 +8,11 @@ The ``tools`` slot (batch 6: one component slot per role; legacy ``skills``/
 ``select_component`` -- a raw list write here used to bypass the registry check
 entirely, so an unregistered name could enter the design without any rejection
 and silently lose the capability at assembly. The authority is the same one
-``select_component`` uses: the effective (workspace-first) registry for the TASK
-design (which the framework heals before persisting), the committed registry for
-role self-designs. The write is atomic: if ANY name fails, the whole call is
-refused and the design is untouched.
+``select_component`` uses: the effective (workspace-first) registry, and since
+batch 13 FOR EVERY ROLE (role self-designs included; the batch-5 committed-only
+exception is retired -- safety rests on the successful-exit heal, the B7
+assembly report and the ability to re-select next outer). The write is atomic:
+if ANY name fails, the whole call is refused and the design is untouched.
 """
 from gan.framework.context import get_design_context, session_overlay_root
 from gan.framework.receipt import prompt_change_facts

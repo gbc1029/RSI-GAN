@@ -275,10 +275,12 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | 编号 | 项 | 位置 | 说明 |
 |---|---|---|---|
 | ~~**A14**~~ | ~~P5 措辞收敛~~ —— **✅ 第 6 批结构性消解**：shared.json 已删除，问题对象不复存在（见 §10） | — | — |
-| **A15** | 防御层盲区记为已知限制 | 本文档 §5.3、`docs/7` §3.4 | `warn_dropped_workspace_edits`（`base_role.py:29`）用 `build_patch_from_workspace` 做检测 ⇒ 与补丁构建器**同一盲区**（只看 `granted_paths`），H8 类问题**构造性不可发现**；彻底修法见 C3 |
+| **A15** | 防御层盲区记为已知限制【第 18 批：定并入 C3（本行位置列修正——"已知限制"正文实际在 §6.3 C3 条目与 `docs/7` §3.4；§5.3 为弱指针）】 | 本文档 §6.3（C3 条目）、`docs/7` §3.4 | `warn_dropped_workspace_edits`（`base_role.py`）用 `build_patch_from_workspace` 做检测 ⇒ 与补丁构建器**同一盲区**（只看 `granted_paths`），H8 类问题**构造性不可发现**；彻底修法见 C3 |
 | **A16** | `loop.yaml` 自洽说明【✅ 已修（第 11 批）：采"补保留键说明"分支——头注释补 `cost.*` RESERVED 例外（接线仍挂 B21），见 §15.1】 | `gan/framework/loop.yaml` 文件头 | 头声明 "every key below MUST have a code consumer" 与 `cost.token_budget_per_gen` / `cost.record_usage`（保留待 G3）冲突；补"保留键"说明，或接线（见 B21） |
 
 ### 6.2 B 类：小范围代码（原 23 项 + 第 4 批 B24 + 第 5 批 B26；**B18、B24、B25(=H12) 已完成**，余 23 项）
+
+> 【第 18 批计数注记】"余 23 项"为快照口径，未随后续批次回填：批 7/10/11/14 已闭合 B1/B3/B4/B7/B10（+B8 撤项），B11–B14 已于批 8 兑现（见下表行内标注），B34/B31/B35/B36/B37/B38/B40/B28/B15'/B39/B33/B9/B32 等已按第 12 批移往 `docs/7` §2.4/§4/§7。逐项当前状态以 `docs/8` §5 为准。
 
 | 编号 | 项 | 位置 | 规模 | 需决策 |
 |---|---|---|---|---|
@@ -292,10 +294,10 @@ D2 的备选（"分割装配权限"：evaluate 不装配 register/unregister）�
 | **B8** | 报告 R6：`load_tools` 每次把 `tools_dir` 插 `sys.path`（跨 outer 线性增长）【❌ **撤项（第 11 批复核）**：插入同行自带守卫 `str(tools_dir) not in sys.path`，自 origin `64ad88d` 即存在（`git log -S` 证实）；残余增长 = 不同实例目录各一条，driver 模式每 outer 独立子进程即清零。此前"复验：仍在"是误判（只看 insert 符号、未读同行守卫条件），见 §15.2】 | `agent/tools/__init__.py:27-28` | — | — |
 | **B9** | 报告 R7：`build_diff_summary.files` 混用完整路径与 basename【第 11 批**收窄定稿**（讨论链见 §15.3–15.4）：原描述不准——单调用方下两分支从不作用于同类对象，"归一化不一致"为死症状；真实问题 = (a) files 语义宽（grants+产出物一锅）违反其规范职能"planner 动作摘要"、渲染语 "planner changes" 把 view 纯阅读说成改动；(b) 内嵌 `schema_version` 死键。**方案**：files 退出（ops-only）+ 调用方停喂 report_path（report 经 report_view 已有通道，不设新键）+ 删死键（常量+`validate_feedback` 绊线保留，**不升 v2**——升版使 B9 前 checkpoint 在恢复点 ValueError）+ `evaluator.py` 提示词块加轮次标签（op 清单隔代错位消歧）+ 删死 `code_edit` 分支（B31 挂靠）+ grants 收敛为 ops+receipt 两处（B32 挂靠） | `gan/summary.py` + `loop.py:962` | ~15 行 | **是** |
 | **B10** | 报告 R8：`AccessBroker.last_result` 未在 `__init__` 初始化（**本会话起有真实读者**）【✅ 已修（第 11 批）：`__init__` 初始化空 dict（实测 AttributeError 消除；现有读者均为 getattr 兜底属侥幸），见 §15.1】 | `access.py` | ~2 行 | — |
-| **B11** | N3-A/C：`meta_view` 未排除 `records` | `loop.py:834` | ~2 行 | — |
-| **B12** | N3-B/N4：`receipt.grants` 剥 `reason`，与 `_ops_summary` 白名单策略统一 | `receipt.py:94` | ~5 行 | — |
-| **B13** | N3-D：`evaluator_reward.py` 的 `said: {fb}` 不入 digest | `reward/evaluator_reward.py:199` | ~3 行 | — |
-| **B14** | 报告 R4：`summary.py` 删死分支 + "未知 op 透传 + 安全字段白名单"（含 `planner.py` 的 `code_edit` 死分支） | `summary.py:24-40` | ~25 行 | — |
+| **B11** | N3-A/C：`meta_view` 未排除 `records`【✅ 已修（第 8 批）——`_EVALUATOR_META_KEYS` 白名单，见 §12；第 18 批补注】 | `loop.py` | ~2 行 | — |
+| **B12** | N3-B/N4：`receipt.grants` 剥 `reason`，与 `_ops_summary` 白名单策略统一【✅ 已修（第 8 批）——`_grants_summary`；澄清：`_receipt_for_evaluator` 是整包丢弃（E 不收 grants 整包），本条是 **grants 对象之内**的字段白名单 | `receipt.py` | ~5 行 | — |
+| **B13** | N3-D：`evaluator_reward.py` 的 `said: {fb}` 不入 digest【✅ 已修（第 8 批）——`project_responses_for_evaluator` 通道投影 + 必填 `response_kind` 五桶 + 矛盾格渲染；**注记（第 18 批）**：同 issue 多响应仅**渲染层**支持，`classify_issue` 经 `by_response = {r.issue_id: r}` 每 issue 取**最后一条** ⇒ 矛盾格只对最后表态生效（残余视觉，随反馈批可注记） | `reward/evaluator_reward.py` | ~3 行 | — |
+| **B14** | 报告 R4：`summary.py` 删死分支 + "未知 op 透传 + 安全字段白名单"（含 `planner.py` 的 `code_edit` 死分支）【❌ 所指更正（第 18 批）：`planner.py` 的 `code_edit` 死分支已随 `e87fedc` 删除（`git log -S` 实证）——原文该半句为过期陈述；本项有效范围 = `summary.py` 解析器死分支与白名单透传（第 5 批已做最小子集，其余死分支清理仍挂）；机制面已按第 12 批并入 L4 为主登记 | `summary.py` | ~25 行 | — |
 | **B15** | 选择静默降级**残余**：`preflight_tools` 校验"设计选中项是否仍存在/valid" | `preflight.py` | ~20 行 | — 【✅ 已修（第 14 批）：启动期 `repair_dangling_designs` = 剥离 + `.dangling-<ts>` 取证副本 + 事件 `design_dangling_stripped{stage:preflight}` + 该角色下一次 self receipt 反馈；**不 fail-fast**（设计是 agent 可无损修复的对象，且文件比会话活得长）。见 §18】 |
 | **B16** | T1/R3：注册期碰撞预检（复用 `validate_registry`/`assemble_collisions`）【✅ 已修（第 10 批）：硬拒、范围 = 本角色 always-on ∪ 已注册组件，拒绝零写入，见 §14】 | `register_component.py` | ~15 行 | — |
 | **B17** | R3：把 `collisions` 纳入提交门控（`registry_report` + `_registry_worsened` 差分）【✅ 已修（第 10 批）：第五类 `(role, basename, 源列表)` 差分键，先在碰撞永不阻塞，见 §14】 | `code_repo.py` | ~15 行 | — |
@@ -380,7 +382,7 @@ patch 0B                                    <-- 注册被静默丢弃
 | **C3** | 防御层检测方法重构（A15 的彻底版） | `roles/base_role.py` + 新检测逻辑 | 见下 |
 | **C4** | 补丁闸门判据重设计 | `patch.py` + `planner.py`/`evaluator.py` 的 `_build_patch` 闸门 | 报告 P0 建议改为"workspace 相对 `code_root` 确有差异"；本会话实际选了 **records 判据**（`has_deep_write`）+ 防御层——**H8 与 C3 都源于这个差异** |
 | **C5** | P2 的根本面：补丁只遍历 `granted_paths` | `patch.py` + 授权模型 | "未 grant 的新文件"是否升为一等公民（改枚举方式 or 授权模型改目录级）；`list_editable` 只返回具体文件是加重因素 |
-| **C6** | 注册表作用域模型（H6 彻底版） | `registries/loader.py:entry_reason` + `code_repo._registry_worsened` + `schema.py` | 见下 |
+| **C6** | 注册表作用域模型（H6 彻底版）【✅ 第 6 批结构性消解：角色目录绑定——见 §10；与上表 B5 同项，此处仅保留分析】 | ~~原位~~ | ~~见下~~ |
 | **C7** | T1 的**命名空间前缀**方案 | `assembly.py` | 若不走 B16/B17 的检测路线则须做它 |
 
 #### C1 — H7：深删除会打断 import 方，而编译门不覆盖
@@ -1379,3 +1381,42 @@ rec0 kind=input redacted=True len=48278
 - **L5 阻断 / L6 自动修复**（理由见 21.1）；
 - 章节目录级摘要（"哪一节被改"）——标题是作者文本，属内容，不做；
 - **B45**（`build_diff_summary.files` 被喂 `report_path`）——经排查**已在 B9 既定范围内**，不新开条目，见 `docs/7` §2.4 的 B9 备注。
+
+## 22. 第 19 批：B33 收口 + B27 第二半（receipt 加载失败通道）
+
+**Scope**：`seeds/planner.md` / `gan/roles/{planner,evaluator}.py` / `gan/tools/assembly.py` / `gan/framework/{receipt,task_runner}.py` / `gan/roles/base_role.py` / `scripts/local/regress_batch8.py`（gitignored）。docs 同步：`docs/8` §1/§4/§5.2。
+
+### 22.1 B33（三处指令-机制签名对齐）
+
+| 现场文件 | 过期 | 改为 |
+|---|---|---|
+| `seeds/planner.md:12` | `unregister_component(name, kind, registry=...)`（kind 已于第 6 批机械退役） | `unregister_component(name, registry=...)` |
+| `seeds/planner.md:27` + `gan/roles/planner.py:65` | `respond_issue(issue_id, accepted, feedback)` 三参旧签名 | 四参 + 必填 `response_kind`（五桶列名）；种子把 `accepted=false ⇒ 必须给理由`改为 stance 正解（`disputed` 给理由/`deferred` 延后），消除"无回应=否认"的正激励误绑定原文 |
+| `gan/roles/evaluator.py` 盲相/揭示两处提示 | 深工具枚举缺 `update_component` | 三工具枚举补齐（联动 B30 `description_stale` 修复闭环） |
+
+### 22.2 K4 / B27 第二半（receipt 侧呈现运行期加载失败）
+
+数据链（第 14 批）本已全通——`load_tools` 写报告 → `task_runner`/`base_role` 收纳（含 owner 分类）→ `_EVALUATOR_META_KEYS` 放行 → 事件入账。缺的是唯一的**决策轮通道**：`render_receipt` 只渲染装配层 `skipped`（B7 capability note），不渲染 `load.failed` ⇒ "设计/注册一致但工具缺席" 被误诊为"注册/选择丢了"，修复动错层。
+
+- **`gan/framework/receipt.py:render_receipt`** 新增两分支：
+  - fixable（`kind ∈ {component, always_on_owned}`）→ `toolset note: design-selected tools DID NOT LOAD at runtime: … — registry/design are consistent; the cause is the module code …, fix with edit_source`（预反驳误诊 + 指名正确修复动词）；
+  - frozen（`always_on_frozen`）→ `framework note: N FROZEN tool(s) failed to load — escalated; do NOT attempt to repair`（与 preflight `framework_failed` 同原则：不把不可修复事故伪装成可修复）。
+- **过滤口径单源化**：前缀判据 + `classify_tool_file` 分类从三处副本收敛为 `gan/tools/assembly.py:load_failures` 一份；`base_role._load_failures` 改一行委托（`_role`/`_code_root` 戳仍由 `_merge_load_report` 负责置入），`task_runner.py` 内联 copy 删除改调 helper（顺手统一 `classify_tool_file` 传参形态）。
+- **不新增投影键**（white-list `toolset_report` 已放行；G5 default-deny 不动）；只读 receipt 字典。
+
+### 22.3 测试
+
+| 套件 | 新增 | 断言数 |
+|---|---|---|
+| batch8 | B27b ×4（fixable 行含 `DID NOT LOAD`/`edit_source` 且含"not a lost registration"；frozen 行升级且**不给**修复指引；无 `load` 键 receipt 渲染 byte 不变等价） | 32 → **36** |
+| deep-tools / batch6 | 签名箭头不改行为，无新增 | 143 / 57 |
+| **合计** | | 232 → **236** |
+
+覆核：`venv_nat/bin/python scripts/local/run_tool_regression.py` → all suites passed。
+
+### 22.4 收账与未做
+
+- **K4 闭合**（B27 两半齐）；**B33 闭合**（三处 + stance 语义修正）；**K9 已于第 18 批闭合**（两份冻结 docstring）。
+- 未做/不改：`render_receipt` 截断优先级未动（load 行在 `next_hint` 前，超长自然优先）；`seeds/evaluator.md` 是否需同款 stance 语（其无 `respond_issue`，不适用）。
+- 下批候选：**B35**（legacy `PatchRejected` 全文进 E meta，~2 行）；**C4′ 拍板** 与 **K2 处置三选一** 仍是等待决策项。
+
