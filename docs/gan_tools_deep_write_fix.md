@@ -1420,3 +1420,38 @@ rec0 kind=input redacted=True len=48278
 - 未做/不改：`render_receipt` 截断优先级未动（load 行在 `next_hint` 前，超长自然优先）；`seeds/evaluator.md` 是否需同款 stance 语（其无 `respond_issue`，不适用）。
 - 下批候选：**B35**（legacy `PatchRejected` 全文进 E meta，~2 行）；**C4′ 拍板** 与 **K2 处置三选一** 仍是等待决策项。
 
+## 23. 第 20 批：滚动反馈/回执镜像收敛为 parent-child 语义（L1 收口 + 文档口径更正）
+
+**Scope**：`gan/framework/loop.py`（唯一改动文件）+ `scripts/local/regress_batch8.py`。docs：`docs/7` §2.4 簇γ、`docs/8` §1/§4/§5.2。
+
+### 23.1 定性（先改结论再改代码）
+
+- **功能正确**：`_last_feedback` 的构造/双落位/checkpoint 链路本身无误；
+- **文档记录错误**：`docs/7` 簇γ "evaluator 与 digest 系统性读循环本地"的程度表述过强——线性主干（parent = 上一轮被评估 child）上滚动值与 `parent.meta` **恒等**（同一对象经 `child.meta["feedback"]/["receipt"]` 回流），错位仅**三窗口**：分支/回选（UCB+branch_limit=2）、invalid child 被滤出候选后、恢复后重选偏离期；
+- **根因 = 命名歧义**：`_last_*` 暗示时序语义，消费点需要的是 **parent-child 语义**（"本代 planner 所回应的那份 issues/receipt"）。
+
+### 23.2 改动
+
+| 面 | 改动 |
+|---|---|
+| 改名+时机 | `_last_feedback/_last_digest/_last_receipt` → `_parent_feedback/_parent_digest/_parent_receipt`；**选代时刷新**（选 parent 处三行，取自 `parent.meta`），settle 不再写滚动变量 |
+| 读点 ×3 | `evaluate.receipt` → `_receipt_for_evaluator(self._parent_receipt)`；`evaluate.prev_feedback` → `{**(parent_feedback or {}), "digest": self._parent_digest}`；`_settle_feedback_digest` 加 `parent_feedback`/`parent_meta` 参数，`prev_issues` 取 parent、`predicted/benchmark` 取 `parent.meta` 的 per-node 值（批 5 `:1019` 注释预告的接线补齐） |
+| settle 落位 | digest 落 `child.meta["feedback_digest"]`（下一次选代成为 `_parent_digest` 的来源——本批唯一新增落位）；`feedback`/`receipt` 仍只落 child.meta |
+| checkpoint | `_state_dict` 移除 `last_feedback/last_digest`（镜像可由 parent.meta 重建；`_last_receipt` 本就不在——恢复期恒 None 的缺口随之消失）；`_load_state` 显式忽略旧键（pre-batch20 存档兼容） |
+| 退役 | `_prev_predicted/_prev_benchmark` 退役（digest 不再读；赋值点保留仅作状态文件兼容） |
+| self_improve | `recent_eval["last_feedback"]` 键删除（`evaluator.self_improve` 从未消费，死键）；`_digests` 经验流不动 |
+
+### 23.3 测试
+
+| 套件 | 新增 | 断言数 |
+|---|---|---|
+| batch8 | batch20 ×9：选代刷新/旧名退役/evaluate 换源/digest 落位 4 条静态接线 + digest 与 parent issues 配对、校准读 parent.meta、旧枝 issue 不入 digest、首代无 digest 4 条行为 + pre-batch20 状态文件兼容 1 条 | 36 → **45** |
+| deep-tools / batch6 | 无新增 | 143 / 57 |
+| **合计** | | 236 → **245** |
+
+覆核：`run_tool_regression.py` → all suites passed。
+
+### 23.4 收账与未做
+
+- **L1 闭合**；**B34 余量**收窄为 self-improve 侧 `_last_self_receipt`（loop 侧恢复缺口消失）；**A1 仍开**（`task_runner.py` 空补丁判据，方案已给出待批）；
+- 未做：`recent_eval` 的 `_digests` 经验流保持执行序语义（self-improve 元认知，恰当）；`planner.plan(last_feedback=…)` 形参名不动（P 侧语义本就 parent-scoped，名字指"你要回应的那份"）。

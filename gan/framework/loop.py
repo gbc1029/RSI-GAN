@@ -127,8 +127,12 @@ class GanLoop:
         self.plan_max_tool_calls = int(cfg.get("loop.plan_max_tool_calls", 40))
         self.patch_retry_k = int(cfg.get("loop.patch_retry_k", 2))
         self.code_root = os.path.abspath(code_root) if code_root else None
-        # last round receipt (injected into the next round's plan/evaluate/self_improve)
-        self._last_receipt: Optional[Dict[str, Any]] = None
+        # batch20: the rolling mirrors below carry PARENT-CHILD semantics only --
+        # they are refreshed at parent selection (from parent.meta) and are NEVER
+        # written at settle time. The durable per-round record lives on the child
+        # node meta (``feedback`` / ``feedback_digest`` / ``receipt``), which the
+        # next selection reads back -- so nothing here needs checkpointing.
+        self._parent_receipt: Optional[Dict[str, Any]] = None
         self._last_self_receipt: Optional[Dict[str, Any]] = None
         # B15: names stripped from a role design by the STARTUP repair; merged
         # into that role's first self receipt so the actionable note reaches it
@@ -145,8 +149,10 @@ class GanLoop:
         self.evaluator_tree = TreeStore(self.output_dir, "evaluator").load()
         self._gen_counter = self._max_int_genid() + 1
         # rolling state
-        self._last_feedback: Optional[Dict[str, Any]] = None
-        self._last_digest: Optional[str] = None
+        self._parent_feedback: Optional[Dict[str, Any]] = None
+        self._parent_digest: Optional[str] = None
+        # retired by batch20 (digest now reads the selected parent's meta);
+        # kept assigned + checkpointed only for state-file back-compat.
         self._prev_predicted: Optional[float] = None
         self._prev_benchmark: Optional[float] = None
         self._digests: List[str] = []
@@ -237,11 +243,17 @@ class GanLoop:
         ctx: Any,
         diff_summary: Optional[Dict[str, Any]],
         genid: Any,
+        parent_feedback: Optional[Dict[str, Any]],
+        parent_meta: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        """Build the TEXT digest for the *previous* round's issues."""
-        if self._last_feedback is None:
+        """Build the TEXT digest pairing THIS round's planner responses with the
+        SELECTED parent's issues (batch20: parent-child semantics; the planner
+        session whose ``plan_result`` we are settling responded to exactly these
+        issues). Calibration reads the parent's persisted predicted/benchmark
+        (per-node, batch-v5) instead of loop-local rolling values."""
+        if not parent_feedback:
             return None
-        prev_issues = self._last_feedback.get("issues") or []
+        prev_issues = parent_feedback.get("issues") or []
         if not prev_issues:
             return None
         digest = build_feedback_digest(
@@ -250,8 +262,8 @@ class GanLoop:
             # responses — free-text `feedback` never reaches the reward module.
             responses=project_responses_for_evaluator(plan_result.get("responses") or []),
             verdicts=getattr(ctx, "fix_verdicts", []) or [],
-            predicted_score=self._prev_predicted,
-            benchmark_score=self._prev_benchmark,
+            predicted_score=(parent_meta or {}).get("predicted_score"),
+            benchmark_score=(parent_meta or {}).get("benchmark_score"),
             diff_summary=diff_summary,
             # G1: the patch outcome is session-level fact; a rejected patch means
             # "acted" stances above may not have materialized (rendered as a tail
@@ -346,8 +358,9 @@ class GanLoop:
     def _state_dict(self, outer: int, inner: int) -> Dict[str, Any]:
         return {
             "gen_counter": self._gen_counter,
-            "last_feedback": self._last_feedback,
-            "last_digest": self._last_digest,
+            # batch20: parent_feedback / parent_digest / parent_receipt are NOT
+            # checkpointed -- they are rebuilt from parent.meta at the next
+            # selection; the per-round record lives on the tree.
             "digests": self._digests,
             "advantages": self._advantages,
             "prev_predicted": self._prev_predicted,
@@ -360,8 +373,9 @@ class GanLoop:
 
     def _load_state(self, state: Dict[str, Any]) -> None:
         self._gen_counter = int(state.get("gen_counter", self._gen_counter))
-        self._last_feedback = state.get("last_feedback")
-        self._last_digest = state.get("last_digest")
+        # batch20: ``last_feedback`` / ``last_digest`` keys of PRE-batch20 state
+        # files are deliberately ignored (the mirrors are rebuilt from
+        # parent.meta at the next selection).
         self._digests = list(state.get("digests") or [])
         self._advantages = list(state.get("advantages") or [])
         self._prev_predicted = state.get("prev_predicted")
@@ -881,6 +895,12 @@ class GanLoop:
                 parent_meta = parent.meta or {}
                 parent_feedback = parent_meta.get("feedback")
                 parent_receipt = parent_meta.get("receipt")
+                # batch20: mirrors carry parent-child semantics; the per-round
+                # record lands on the child meta at settle (feedback /
+                # feedback_digest / receipt) and the next selection reads it.
+                self._parent_feedback = parent_feedback
+                self._parent_receipt = parent_receipt
+                self._parent_digest = parent_meta.get("feedback_digest")
                 parent_predicted_score = parent_meta.get("predicted_score")
                 parent_benchmark_score = parent_meta.get("benchmark_score")
                 evaluator_issues = (parent_feedback or {}).get("issues")
@@ -996,9 +1016,9 @@ class GanLoop:
                             # `code_patch.rejected_reason` quotes the planner's own
                             # artifacts, `grants` carries agent free text, and
                             # `design.ops` duplicate the diff_summary channel.
-                            "receipt": _receipt_for_evaluator(self._last_receipt),
+                            "receipt": _receipt_for_evaluator(self._parent_receipt),
                         },
-                        prev_feedback={**(self._last_feedback or {}), "digest": self._last_digest},
+                        prev_feedback={**(parent_feedback or {}), "digest": self._parent_digest},
                         benchmark_score=benchmark_for_eval,
                         node_id=genid,
                         broker=self.broker,
@@ -1039,8 +1059,8 @@ class GanLoop:
                 self.task_tree.add_node(child)
                 self._append_score(child)
                 self._write_eval(child, ctx, packet)
-                self._last_receipt = self._make_receipt(genid, plan_result, parent_cfg, child, outer)
-                child.meta["receipt"] = self._last_receipt
+                child.meta["receipt"] = self._make_receipt(
+                    genid, plan_result, parent_cfg, child, outer)
                 if child.meta.get("task_patch_files") and self.broker is not None:
                     self._resync_workspace(outer, child.meta["task_patch_files"])
                 if not self.keep_workdirs:
@@ -1051,7 +1071,13 @@ class GanLoop:
                     plan_result.get("records"),
                     [child.meta.get("report_path")] if child.meta.get("report_path") else None,
                 )
-                self._last_digest = self._settle_feedback_digest(plan_result, ctx, diff_summary, genid)
+                digest = self._settle_feedback_digest(
+                    plan_result, ctx, diff_summary, genid,
+                    parent_feedback=parent_feedback, parent_meta=parent_meta)
+                if digest:
+                    # batch20: land the parent-scoped digest on the node so the
+                    # next selection can serve it as ``_parent_digest``.
+                    child.meta["feedback_digest"] = digest
 
                 # stagnation + advantage (only measured scores count as improvement)
                 ps, cs = parent.value.score, child.value.score
@@ -1073,13 +1099,16 @@ class GanLoop:
                     "modify_depth": child.modify_depth,
                 })
 
-                # feedback for next round: planner gets issues + diff summary
-                self._last_feedback = make_feedback(
+                # feedback for next round: planner gets issues + diff summary.
+                # batch20: the durable record is the child node meta only; the
+                # loop-local mirror is refreshed at SELECTION (parent.meta), so
+                # a branching re-selection can never inherit the wrong branch's
+                # feedback.
+                child.meta["feedback"] = make_feedback(
                     issues=getattr(ctx, "issues", []),
                     diff_summary=diff_summary,
                     penalties=packet.penalties,
                 )
-                child.meta["feedback"] = self._last_feedback
                 # The node was added before evaluator results and receipt were
                 # available; append a durable meta update so replayed trees
                 # retain all parent-context fields.
@@ -1097,7 +1126,9 @@ class GanLoop:
             # B7: each role's own instance assembly rides its self-improve
             # payload — the CURRENT outer's assembly state is visible at the
             # decision point (kept/adjusted eval_points / planner prompt).
-            recent_eval = {"digests": self._digests[-I_max:], "last_feedback": self._last_feedback,
+            # batch20: ``last_feedback`` dropped -- evaluator.self_improve never
+            # consumed it; the digests list remains the experience stream.
+            recent_eval = {"digests": self._digests[-I_max:],
                            "toolset_report": getattr(self.evaluator, "assembly_report", None)}
             recent_plan = {"advantages": self._advantages[-I_max:],
                            "task_tree_size": len(self.task_tree),
