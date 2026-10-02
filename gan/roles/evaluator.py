@@ -104,6 +104,9 @@ class Evaluator(Role):
             reset_eval_context(tok_eval)
             if tok_access is not None:
                 reset_access_context(tok_access)
+        # evaluate adds no warn_dropped epilogue: it is read-only by design
+        # (deep write verbs refuse in patch-less sessions at the tool layer),
+        # so no "should have landed" workspace content can exist.
         return ctx
 
     def self_improve(self, recent: Optional[Dict[str, Any]] = None, broker: Any = None,

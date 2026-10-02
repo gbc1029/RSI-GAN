@@ -46,6 +46,12 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
         return "Error: no access context"
     if isinstance(paths, str):
         paths = [paths]
+    # A deep WRITE verb needs a session with a patch channel; evaluate builds
+    # nothing, so "modify" there would own copies that can never land.
+    if intent == "modify" and dctx is None:
+        return ("Error: intent='modify' is unavailable in this session -- there "
+                "is no patch channel here (evaluate is read-only). view grants "
+                "remain available; do NOT retry with modify.")
     # Default (if_absent): never overwrite a workspace copy that already exists -- it may
     # hold this session's edit_source edits or unregister_component deletions. refresh=True
     # is the explicit escape hatch that discards them and re-copies the repo version.

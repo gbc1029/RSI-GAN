@@ -723,6 +723,11 @@ class GanLoop:
                 "fix_verdicts": getattr(ctx, "fix_verdicts", []),
                 "penalties": dict(getattr(packet, "penalties", {}) or {}),
                 "weaknesses": list(getattr(ctx, "weaknesses", []) or []),
+                # B28 (batch 25): the eval-point verdicts (point/rating/comment)
+                # join the generation's evidence card -- a structured sink (not
+                # just the trajectory replay) for the four shipped eval points;
+                # audit-file only, no evaluator-projection key is added.
+                "eval_point_results": list(getattr(ctx, "eval_point_results", []) or []),
             }
             d = paths.runs_dir(self.output_dir, child.genid)
             os.makedirs(d, exist_ok=True)

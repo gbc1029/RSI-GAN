@@ -108,17 +108,15 @@ def tool_function(command, path, file_text=None, view_range=None,
         return f"Error: {e}"
     cmd = str(command)
     mutating = cmd in ("create", "str_replace", "insert", "undo_edit")
-    # Batch 23: enforce the declaration ceremony AT THE EDIT -- a deep edit is
-    # only legitimate on a path the session granted with intent="modify".
-    # A copy obtained for VIEW (or no grant at all) has no patch-standing: the
-    # gate used to drop such edits LOUDLY but AFTER the chat loop (the agent
-    # could not recover in-session), and in mixed sessions (a legal modify
-    # grant elsewhere) the leave-tone probe was gated off entirely. Rejecting
-    # here turns the drop into an in-session, fixable error -- and the escape
-    # route is real: re-requesting with intent="modify" default-keeps the
-    # workspace copy (if_absent), so the edits survive and the modify record
-    # flips the patch gate.
-    if mutating and not str(file_text or "").startswith("Error"):
+    # A deep edit is only legitimate on a path granted for MODIFY, and only
+    # in a session that has a patch builder (evaluate is read-only: session
+    # fact outranks the path grant). The escape route is real: re-requesting
+    # with intent="modify" keeps the workspace copy (if_absent), so edits
+    # survive and the modify record flips the patch gate.
+    if mutating:
+        if get_design_context() is None:
+            return ("Error: edit refused: this session has no patch channel "
+                    "(read-only); source edits cannot reach any commit.")
         ci = _covering_intent(actx, abs_path)
         if ci != "modify":
             hint = "request_source_access(paths=[<the same paths>], intent='modify')"
@@ -135,12 +133,11 @@ def tool_function(command, path, file_text=None, view_range=None,
         old_str=old_str, new_str=new_str, insert_line=insert_line,
     )
     if mutating and not str(out).startswith("Error"):
-        # Batch 23: record the mutation (deep-write signal; the op name is not
-        # in the shallow design-op whitelist, so has_deep_write counts it via
-        # the existing unknown-op default). `path` is the workspace-relative
-        # form -- the same口径 the patch builder and `covers` consume. The
-        # evaluate session carries no design context (no patch channel); skip
-        # the record there rather than lie into a ledger nothing will read.
+        # Record the mutation: `path` is the workspace-relative form (the
+        # 口径 the patch builder and covers() consume) so the projection and
+        # the patch gate share one position fact. Sessions without a design
+        # context (evaluate) skip it rather than write into a ledger nothing
+        # reads.
         dctx = get_design_context()
         if dctx is not None:
             rel = os.path.relpath(abs_path, _root(actx)).replace(os.sep, "/")
@@ -149,10 +146,6 @@ def tool_function(command, path, file_text=None, view_range=None,
         # the catalog metadata may go stale -- say so here, where the actor
         # still has the context. Reads (view) deliberately produce no pressure.
         out = f"{out}{_registered_component_note(abs_path)}"
-    elif cmd == "view" and not str(out).startswith("Error"):
-        # keep the B30 note behavior for the historical custom: view produces
-        # no pressure note; nothing to do here.
-        pass
     return out
 
 
