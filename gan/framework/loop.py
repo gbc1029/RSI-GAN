@@ -433,8 +433,15 @@ class GanLoop:
                 try:
                     self.broker.clear_workspace(role)
                 except Exception as e:
+                    # n3: the broker has already dropped this role's grants, so
+                    # the next grant recopies pristine bytes -- the stale-copy
+                    # window is bounded to deep edits in THIS outer only.
                     soft_fail(f"clear_workspace failed for {role}: {e} — stale "
-                              f"copies may linger until the next resync")
+                              f"copies may linger until the next resync; the "
+                              f"role's grants were dropped, so the next grant "
+                              f"recopies pristine repo bytes "
+                              f"(stale bytes can only win if_absent within THIS "
+                              f"outer — do not continue this outer unattended)")
         self.log_event({"type": "role_refresh", "outer": outer})
 
     def _source_access_log(self, outer: Any) -> List[Dict[str, Any]]:

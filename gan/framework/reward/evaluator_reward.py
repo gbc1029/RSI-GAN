@@ -21,6 +21,13 @@ CELL_REJECTED_WITH_FEEDBACK = "rejected_with_feedback"
 CELL_REJECTED_NO_FEEDBACK = "rejected_no_feedback"
 CELL_UNJUDGED = "unjudged"          # accepted, but no judge_fix verdict was given
 
+# B38 (batch 22): stances that constitute "the planner stated a position" on a
+# rejected issue. This is the structured (projectable) replacement of the old
+# free-text feedback read -- see classify_issue.
+_GENUINE_STANCES = frozenset({
+    "acted", "acted_differently", "out_of_scope", "disputed", "deferred",
+})
+
 
 @dataclass
 class EvaluatorIssue:
@@ -101,9 +108,21 @@ def classify_issue(
     verdict: Optional[FixVerdict],
 ) -> IssueOutcome:
     accepted = bool(response.accepted) if response is not None else False
-    has_feedback = bool(
-        response is not None and response.feedback and str(response.feedback).strip()
-    )
+    # B38: the ONLY production caller feeds B13-projected responses
+    # (loop -> project_responses_for_evaluator), whose free-text `feedback` is
+    # dropped at the channel boundary BY DESIGN. Deriving "did the planner state
+    # a position" from that text made the cell blind to the channel it runs on:
+    # every reasoned rebuttal was rendered as "silently ignored" (the
+    # rejected_with_feedback cell was unreachable in production). The structured
+    # stance is the projected carrier of that fact. `feedback` is still read as
+    # a backward-compat fallback for RAW (unprojected) callers (regression
+    # smoke); its TEXT itself never enters the cell (rationale stays audit-only).
+    if response is None:
+        has_feedback = False
+    else:
+        stance = str(getattr(response, "response_kind", "") or "").strip()
+        has_feedback = (stance in _GENUINE_STANCES
+                        or bool(str(getattr(response, "feedback", "") or "").strip()))
     judged = verdict is not None
     fixed = bool(verdict.fixed) if judged else False
 

@@ -42,6 +42,11 @@ def _iter_files(root: str):
     else:
         for dirpath, _dirs, files in os.walk(root):
             for name in files:
+                # n2: compiled caches are not source; diffing workspace-vs-repo
+                # copies of them (or proposing their deletion when a copy is
+                # absent) is pure patch noise, not a session edit.
+                if name.endswith((".pyc", ".pyo")):
+                    continue
                 yield os.path.join(dirpath, name)
 
 

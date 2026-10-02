@@ -125,20 +125,23 @@ def classify_tool_file(role: str, basename: str,
 
 def load_failures(report: Optional[Dict[str, Any]], role: str,
                   code_root: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Failure entries of a load report, classified by owner (B27; batch 19).
+    """Failure entries of a load report, classified by owner (B27; batch 19/n1).
 
     Single source of the failure predicate previously duplicated in
     ``task_runner`` and ``base_role._load_failures``: ``"not selected by the
-    design"`` is NOT a failure (expected state of every non-selected file), only
-    ``import failed`` / ``missing tool_info`` entries count, each classified via
-    :func:`classify_tool_file` so a consumer can route agent-fixable items vs
-    frozen-framework bugs.
+    design"`` is NOT a failure (expected state of every non-selected file); the
+    fixable/reportable classes are ``import failed``, ``missing tool_info``,
+    ``tool_info failed`` and ``name mismatch`` (n1, runtime identity gate),
+    each classified via :func:`classify_tool_file` so a consumer can route
+    agent-fixable items vs frozen-framework bugs.
     """
     out: List[Dict[str, Any]] = []
     for item in ((report or {}).get("skipped") or []):
         reason = str(item.get("reason") or "")
         if not (reason.startswith("import failed")
-                or reason.startswith("missing tool_info")):
+                or reason.startswith("missing tool_info")
+                or reason.startswith("tool_info failed")
+                or reason.startswith("name mismatch")):
             continue
         cls = classify_tool_file(role, str(item.get("file") or ""),
                                  code_root=code_root)

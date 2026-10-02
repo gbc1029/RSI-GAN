@@ -80,10 +80,27 @@ class AccessBroker:
 
         Granted source is copied into the workspace on demand, so clearing it is
         safe: it is never the only copy.
+
+        n3: a FAILED clear was previously silent (``ignore_errors=True``); a
+        stale copy that survived would then silently win the next session's
+        ``if_absent`` re-grant -- the agent would keep reading LAST outer's
+        bytes with no event. A failed clear now drops the role's grants too and
+        RE-RAISES (the caller logs it loudly), so the next resync recopies
+        pristine bytes and the stale window becomes a loud, recoverable failure
+        instead of a silent wrong inheritance.
         """
         p = os.path.join(self.workspaces_dir, role)
         if os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
+            try:
+                shutil.rmtree(p)
+            except OSError:
+                # still drop the grants: never let them point at a workspace we
+                # could not reset (that is the state that would win if_absent)
+                self._drop_role_grants(role)
+                raise
+        self._drop_role_grants(role)
+
+    def _drop_role_grants(self, role: str) -> None:
         for k in [k for k in self.grants if k[0] == role]:
             self.grants.pop(k, None)
 
@@ -104,6 +121,11 @@ class AccessBroker:
             if full == out_real or full.startswith(out_real + os.sep):
                 ign.append(n)
             elif full == ws_real or full.startswith(ws_real + os.sep):
+                ign.append(n)
+            elif n == "__pycache__":
+                # n2: never pull compiled caches into a granted workspace copy
+                # (byte-identical to the repo side, so no patch diff — pure
+                # workspace noise).
                 ign.append(n)
         return ign
 

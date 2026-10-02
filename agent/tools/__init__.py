@@ -55,10 +55,38 @@ def load_tools(logging=print, names=[], tools_dir=None, report_path=None):
                 skipped.append({"file": tool_file.name,
                                 "reason": "missing tool_info/tool_function"})
                 continue
+            try:
+                info = module.tool_info()
+            except Exception as e:  # noqa: BLE001 -- one broken tool must not sink the toolset
+                logging(f"Skipping tool {tool_file}: tool_info failed: {e}")
+                skipped.append({"file": tool_file.name,
+                                "reason": f"tool_info failed: {type(e).__name__}: {e}"[:200]})
+                continue
+            # n1 (runtime identity gate): the module file stem is the loader key
+            # and the `names` filter, while `tool_info()["name"]` is what the
+            # chat loop keys dispatch by. A mismatch would "assemble" a tool
+            # that no call can ever reach (loaded in the report, dead in
+            # dispatch). The shipped components are verified consistent; a
+            # mismatch is therefore a contract bug -> load fail-closed with a
+            # fixable report entry instead of silently dead-loading.
+            if not isinstance(info, dict):
+                logging(f"Skipping tool {tool_file}: "
+                        f"tool_info returned {type(info).__name__}, not dict")
+                skipped.append({"file": tool_file.name,
+                                "reason": f"tool_info returned {type(info).__name__}, not dict"})
+                continue
+            info_name = str(info.get("name") or "")
+            if info_name != tool_file.stem:
+                logging(f"Skipping tool {tool_file}: tool_info name '{info_name}' "
+                        f"!= file stem '{tool_file.stem}'")
+                skipped.append({"file": tool_file.name,
+                                "reason": f"name mismatch: tool_info name '{info_name}' "
+                                          f"!= file stem '{tool_file.stem}' (runtime identity gate)"})
+                continue
             tool_name = tool_file.stem
             if names and (names == 'all' or tool_name in names):
                 tools.append({
-                    'info': module.tool_info(),
+                    'info': info,
                     'function': module.tool_function,
                     'name': tool_name,
                 })
