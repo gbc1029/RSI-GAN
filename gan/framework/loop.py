@@ -233,9 +233,7 @@ class GanLoop:
                 "coverage": child.value.coverage,
             },
             textual={
-                "summary": getattr(ctx, "summary", ""),
                 "weaknesses": getattr(ctx, "weaknesses", []),
-                "suggestions": getattr(ctx, "suggestions", []),
             },
             penalties=dict(getattr(ctx, "penalties", {}) or {}),
         )
@@ -724,9 +722,7 @@ class GanLoop:
                 "issues": getattr(ctx, "issues", []),
                 "fix_verdicts": getattr(ctx, "fix_verdicts", []),
                 "penalties": dict(getattr(packet, "penalties", {}) or {}),
-                "summary": getattr(ctx, "summary", ""),
                 "weaknesses": list(getattr(ctx, "weaknesses", []) or []),
-                "suggestions": list(getattr(ctx, "suggestions", []) or []),
             }
             d = paths.runs_dir(self.output_dir, child.genid)
             os.makedirs(d, exist_ok=True)

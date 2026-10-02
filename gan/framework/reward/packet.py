@@ -1,14 +1,13 @@
 """RewardPacket - the unified "loss function" serialized for all roles.
 
-All three roles exchange feedback through this structure. The evaluator's own
-outer-loop reward is attached under ``evaluator_reward``.
+All three roles exchange feedback through this structure.
 """
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 SCHEMA_VERSION = "v1"
 
@@ -17,13 +16,13 @@ SCHEMA_VERSION = "v1"
 class RewardPacket:
     # benchmark score / delta / cost / fail rate
     numeric: Dict[str, Any] = field(default_factory=dict)
-    # summary / strengths / weaknesses / suggestions
+    # weaknesses / other qualitative audit surface (B36 revision, batch 24)
     textual: Dict[str, Any] = field(default_factory=dict)
     # cannot_run / reward_hacking_suspect / rule_violation
     penalties: Dict[str, Any] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
-    # decomposition of the evaluator's *own* outer-loop reward (2x2 matrix + calibration)
-    evaluator_reward: Optional[Dict[str, Any]] = None
+    # B37 (batch 24): the `evaluator_reward` field was deleted -- never set,
+    # never read in the entire history (ghost slot of the packet schema).
 
     # -- convenience -------------------------------------------------------
     @property
@@ -48,7 +47,6 @@ class RewardPacket:
             textual=dict(data.get("textual", {}) or {}),
             penalties=dict(data.get("penalties", {}) or {}),
             schema_version=data.get("schema_version", SCHEMA_VERSION),
-            evaluator_reward=data.get("evaluator_reward"),
         )
 
     def save(self, path: str | os.PathLike) -> None:

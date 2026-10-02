@@ -161,7 +161,8 @@ class Planner(Role):
 
         records = design_ctx.records + plan_ctx.records
         warn_dropped_workspace_edits(broker, "planner", akey, records,
-                                     self.output_dir, patch_str)
+                                     self.output_dir, patch_str,
+                                     exhausted=exhausted, rejected=rejected)
         info = getattr(self, "last_run_info", {}) or {}
         return {
             "records": records,

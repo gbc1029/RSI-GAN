@@ -20,33 +20,18 @@ def build_diff_summary(
 ) -> Dict[str, Any]:
     ops: List[Dict[str, Any]] = []
     files: set = set()
+    # L4 (batch 24): the six dead-operator parsers (tune_param / apply_config /
+    # add_config / set_tool_enabled / swap_module / code_edit) are DELETED --
+    # no producer exists since the registry unification (batches 6/10), so the
+    # branches could only ever render `{"op": <dead>, "key": null}`-style ghost
+    # rows. Unknown ops fall through to the passthrough below ({"op": name}),
+    # and structured fields ride explicitly-named branches only (extend for
+    # LIVE ops on purpose; update_component/unregister_component carry their
+    # position facts in the receipt, so no branch is warranted yet).
     for r in plan_records or []:
         op = r.get("op")
         entry: Dict[str, Any] = {"op": op}
-        if op in ("tune_param", "apply_config"):
-            entry["key"] = r.get("key")
-        elif op == "set_prompt":
-            # B29 (batch 16): structural facts only -- and the phantom ``section``
-            # this branch used to read had NO producer (the live operator recorded
-            # ``chars`` only), so evaluators saw ``{"op": "set_prompt",
-            # "section": null}``: a prompt rewrite was invisible except for its op
-            # name. The reader's TEXT is deliberately NOT here: it is audit
-            # evidence the evaluator may fetch from the task trajectory, never an
-            # assertion pushed into its decision surface. (This does not relax the
-            # batch-8 rule for respond_issue.feedback, whose derived statistics
-            # stay banned.)
-            for k in PROMPT_FACT_KEYS:
-                if k in r:
-                    entry[k] = r[k]
-        elif op == "set_tool_enabled":
-            entry["name"] = r.get("name")
-            entry["enabled"] = r.get("enabled")
-        elif op == "swap_module":
-            entry["module_a"] = r.get("module_a")
-            entry["module_b"] = r.get("module_b")
-        elif op == "add_config":
-            entry["key"] = r.get("key")            # rationale intentionally stripped
-        elif op == "set_config":
+        if op == "set_config":
             # B14 minimal subset (batch 5): the live operator's structured fields.
             entry["key"] = r.get("key")
             if r.get("selected") is not None:
@@ -54,10 +39,20 @@ def build_diff_summary(
         elif op in ("select_component", "deselect_component"):
             entry["slot"] = r.get("slot")
             entry["name"] = r.get("name")
-        elif op in ("code_edit", "request_source_access"):
+        elif op == "request_source_access":
             entry["paths"] = list(r.get("paths", []) or [])  # reason intentionally stripped
             for p in r.get("paths", []) or []:
                 files.add(p)
+        elif op == "edit_source":
+            # Batch 23: the deep edit surface now records its mutations. Same
+            # branch shape as request_source_access: structured position facts
+            # only (workspace REL -- the口径 the patch builder and covers()
+            # already consume); the free text/grep evidence channels stay out.
+            if r.get("command"):
+                entry["command"] = r["command"]
+            if r.get("path"):
+                entry["path"] = r["path"]
+                files.add(os.path.basename(str(r["path"])))
         # B29: prompt facts ride whichever op produced them (set_prompt, or
         # set_config with key="prompt"); copied by presence, default-deny.
         for k in PROMPT_FACT_KEYS:

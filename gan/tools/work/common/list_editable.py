@@ -15,7 +15,9 @@ def tool_info():
         "name": "list_editable",
         "description": (
             "List the concrete source files YOU may read and modify. Use these exact "
-            "paths in request_source_access (do NOT pass glob patterns)."
+            "paths in request_source_access (do NOT pass glob patterns for EXISTING "
+            "files). To CREATE a NEW file, request its parent DIRECTORY (glob root) "
+            "instead — a file outside every granted path cannot reach the commit."
         ),
         "input_schema": {
             "type": "object",

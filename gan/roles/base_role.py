@@ -30,40 +30,105 @@ def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_di
                                  rejected: Optional[str] = None) -> None:
     """Loud safety net for the silent-drop class (R1).
 
-    A session that left edits in the workspace but built no patch has DROPPED them.
-    The known cause was a deep tool that forgot to record its op; ``has_deep_write``
-    now covers the tools we ship, and this probe makes any future omission visible
-    (one ``deep_edit_dropped`` event) instead of silent. Advisory only: a failure to
-    compute the diff must never fail the session.
+    Two independent probes (batch 24 / P2-A):
 
-    Batch 13 (B41): the retry-exhausted / abandoned patch path is its own silent
-    drop -- ``patch_str`` is non-empty but DISCARDED wholesale, and the original
-    guard (``if ... or patch_str or has_deep_write(records): return``) skipped the
-    probe exactly there. When ``exhausted``/``rejected`` is passed the probe runs
-    regardless of the gates: any workspace content then means edits that will not
-    reach any commit.
+    1. **granted-root leftover** -- a session that left edits UNDER a granted
+       path but built no patch has dropped them. The known cause was a deep
+       tool that forgot to record its op; ``has_deep_write`` now covers the
+       tools we ship, and this probe makes any future omission visible (one
+       ``deep_edit_dropped`` event) instead of silent. Batch 13 (B41): the
+       retry-exhausted / abandoned patch path is its own silent drop --
+       ``patch_str`` is non-empty but DISCARDED wholesale, so when
+       ``exhausted``/``rejected`` is passed the probe runs regardless of the
+       gates: any workspace content then means edits that will not reach any
+       commit.
+
+    2. **gan-data outside every grant** -- the batch-23 guard now prevents
+       blind edits ON granted copies, but files created OUTSIDE every granted
+       path (knowledge md, catalog README, a new helper) never reach the patch
+       builder's walk at all -- and probe 1 cannot see them either, precisely
+       in the mixed sessions where a legal modify record also exists. Since
+       the knowledge base is DATA (no registry gate will ever refuse its
+       absence), a gan/-prefixed file that no grant covers and that the patch
+       did not carry is reported SPECIFICALLY (`gan_data_left_unpatched`), so
+       authoring a knowledge note never vanishes quietly. Files outside
+       ``gan/**`` are scratch BY DESIGN and stay unprobed (no false alarms).
+
+    Advisory only: a failure to compute either probe must never fail the
+    session.
     """
     from gan.patch import build_patch_from_workspace, has_deep_write
-    forced = bool(exhausted or rejected)
-    if broker is None or (not forced and (patch_str or has_deep_write(records))):
-        return
-    try:
-        leftover = build_patch_from_workspace(broker, role, key)
-    except Exception:  # noqa: BLE001 -- advisory probe must not fail the session
-        return
-    if not leftover:
-        return
     from utils.soft_fail import soft_fail
+    forced = bool(exhausted or rejected)
+    if broker is None:
+        return
+    # -- probe 1: granted-root leftover (unchanged semantics) ----------------
+    if forced or not (patch_str or has_deep_write(records)):
+        try:
+            leftover = build_patch_from_workspace(broker, role, key)
+        except Exception:  # noqa: BLE001 -- advisory probe must not fail the session
+            leftover = ""
+        if leftover:
+            soft_fail(
+                (f"{role}: workspace has {len(leftover)} bytes of deep edits that will not reach "
+                 f"any commit"
+                 + (f" -- the retry loop exhausted/abandoned the proposed patch"
+                    if forced else
+                    " but the session recorded no deep-write op")
+                 + "; the edits were dropped"),
+                event_path=paths.events_path(output_dir),
+                event_type="deep_edit_dropped", role=role,
+                phase=("exhausted" if forced else "no_record"),
+            )
+    # -- probe 2: gan/** files outside every granted path (batch 24) ---------
+    # Runs ALWAYS: the whole point is mixed sessions where the record-based
+    # gates above are already closed.
+    try:
+        _warn_uncovered_gan_files(broker, role, key, output_dir, patch_str)
+    except Exception:  # noqa: BLE001 -- advisory probe must not fail the session
+        pass
+
+
+def _warn_uncovered_gan_files(broker, role: str, key: Any, output_dir: str,
+                              patch_str: str) -> None:
+    """Report ``gan/**`` workspace files that NO granted path covers (P2-A).
+
+    The batch-23 edit guard protects edits ON granted copies; this closes the
+    complementary hole: files created OUTSIDE every granted path never enter
+    the patch builder's walk, and for DATA like the knowledge base no other
+    gate (registry diff / orphan check) will ever refuse their absence. A
+    `gan_data_left_unpatched` event keeps such authoring from vanishing
+    quietly. Files outside ``gan/**`` are scratch by design -- never probed.
+    """
+    from gan.patch import build_patch_from_workspace
+    from utils.soft_fail import soft_fail
+    granted_paths = [str(g).replace("\\", "/").rstrip("/")
+                     for g in (broker.granted_paths(role, key) or [])]
+    pending = []
+    for root, _dirs, files in os.walk(broker.src_dir(role, key)):
+        for name in files:
+            if name.endswith((".pyc", ".pyo")) or name.startswith("."):
+                continue
+            rel = os.path.relpath(os.path.join(root, name),
+                                  broker.src_dir(role, key)).replace(os.sep, "/")
+            if not rel.startswith("gan/"):
+                continue
+            covered = any(g and (rel == g or rel.startswith(g + "/"))
+                          for g in granted_paths)
+            if not covered:
+                pending.append(rel)
+    if not pending:
+        return
     soft_fail(
-        (f"{role}: workspace has {len(leftover)} bytes of deep edits that will not reach "
-         f"any commit"
-         + (f" -- the retry loop exhausted/abandoned the proposed patch"
-            if forced else
-            " but the session recorded no deep-write op")
-         + "; the edits were dropped"),
+        f"{role}: {len(pending)} file(s) under gan/** exist in the workspace but are "
+        f"covered by NO granted path, so the session patch cannot carry them "
+        f"and they will be dropped at the outer boundary: "
+        f"{sorted(pending)[:8]}. If these were meant to land (knowledge note / "
+        f"catalog file), re-request their parent directories with "
+        f"intent='modify' and the next patch will carry them.",
         event_path=paths.events_path(output_dir),
-        event_type="deep_edit_dropped", role=role,
-        phase=("exhausted" if forced else "no_record"),
+        event_type="gan_data_left_unpatched", role=role,
+        files=sorted(pending)[:20],
     )
 
 

@@ -11,8 +11,11 @@ workspace. Only the base ``editor`` capabilities are exposed, path-checked here.
 """
 import os
 
+import os
+from typing import Optional
+
 from agent.tools import edit as _edit
-from gan.framework.context import get_access_context
+from gan.framework.context import get_access_context, get_design_context
 
 
 def tool_info():
@@ -103,16 +106,74 @@ def tool_function(command, path, file_text=None, view_range=None,
         abs_path = _resolve(actx, path)
     except ValueError as e:
         return f"Error: {e}"
+    cmd = str(command)
+    mutating = cmd in ("create", "str_replace", "insert", "undo_edit")
+    # Batch 23: enforce the declaration ceremony AT THE EDIT -- a deep edit is
+    # only legitimate on a path the session granted with intent="modify".
+    # A copy obtained for VIEW (or no grant at all) has no patch-standing: the
+    # gate used to drop such edits LOUDLY but AFTER the chat loop (the agent
+    # could not recover in-session), and in mixed sessions (a legal modify
+    # grant elsewhere) the leave-tone probe was gated off entirely. Rejecting
+    # here turns the drop into an in-session, fixable error -- and the escape
+    # route is real: re-requesting with intent="modify" default-keeps the
+    # workspace copy (if_absent), so the edits survive and the modify record
+    # flips the patch gate.
+    if mutating and not str(file_text or "").startswith("Error"):
+        ci = _covering_intent(actx, abs_path)
+        if ci != "modify":
+            hint = "request_source_access(paths=[<the same paths>], intent='modify')"
+            if ci == "view":
+                why = "only covered by a VIEW grant"
+            else:
+                why = "not covered by any grant in this session"
+            return (f"Error: edit refused: this path is {why}, so this edit "
+                    f"would NOT reach the session patch. Re-request the same "
+                    f"paths as {hint} -- your current session edits are KEPT "
+                    f"(no refresh needed) -- then re-apply this edit.")
     out = _edit.tool_function(
         command=command, path=abs_path, file_text=file_text, view_range=view_range,
         old_str=old_str, new_str=new_str, insert_line=insert_line,
     )
-    # B30 (a/L3): a MUTATING edit of a registered component is the moment the
-    # catalog metadata may go stale -- say so here, where the actor still has the
-    # context. Reads (view) deliberately produce no such pressure.
-    if str(command) != "view" and not str(out).startswith("Error"):
+    if mutating and not str(out).startswith("Error"):
+        # Batch 23: record the mutation (deep-write signal; the op name is not
+        # in the shallow design-op whitelist, so has_deep_write counts it via
+        # the existing unknown-op default). `path` is the workspace-relative
+        # form -- the same口径 the patch builder and `covers` consume. The
+        # evaluate session carries no design context (no patch channel); skip
+        # the record there rather than lie into a ledger nothing will read.
+        dctx = get_design_context()
+        if dctx is not None:
+            rel = os.path.relpath(abs_path, _root(actx)).replace(os.sep, "/")
+            dctx.record("edit_source", command=cmd, path=rel)
+        # B30 (a/L3): a MUTATING edit of a registered component is the moment
+        # the catalog metadata may go stale -- say so here, where the actor
+        # still has the context. Reads (view) deliberately produce no pressure.
         out = f"{out}{_registered_component_note(abs_path)}"
+    elif cmd == "view" and not str(out).startswith("Error"):
+        # keep the B30 note behavior for the historical custom: view produces
+        # no pressure note; nothing to do here.
+        pass
     return out
+
+
+def _covering_intent(actx, abs_path: str) -> Optional[str]:
+    """Intent of the grant covering ``abs_path`` ("modify" | "view" | None).
+
+    Mirrors ``AccessBroker.covers``' walk (exact rel first, then ancestor
+    directories) but reads the per-grant intent the broker already stores in
+    its records (``access.py`` grant()); "modify" wins wherever it appears.
+    """
+    broker = actx.broker
+    rel = os.path.relpath(abs_path, _root(actx)).replace(os.sep, "/")
+    best = None
+    for rec in broker.grants.get((actx.role, str(actx.node_id)), []):
+        for g in rec.get("paths", []):
+            g = str(g).replace("\\", "/").rstrip("/")
+            if g and (rel == g or rel.startswith(g + "/")):
+                if rec.get("intent") == "modify":
+                    return "modify"
+                best = best or "view"
+    return best
 
 
 op_info = tool_info

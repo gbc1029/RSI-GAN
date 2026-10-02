@@ -17,7 +17,9 @@ def tool_info():
             "when shallow design/config operators cannot express the change (e.g. adding a new "
             "config key, a new component implementation, or editing an implementation). "
             "Requesting a path you already hold KEEPS your local copy; pass refresh=true to "
-            "discard local edits and re-copy the pristine repo version."
+            "discard local edits and re-copy the pristine repo version. Files you CREATE need "
+            "a granted parent DIRECTORY (glob root) to ride the session patch — new files "
+            "outside every granted path are dropped at the outer boundary."
         ),
         "input_schema": {
             "type": "object",
@@ -66,7 +68,10 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
                      if kept else "")
         if intent == "modify":
             return (f"Granted {intent} access to: {granted}{where}. "
-                    f"Edit these copies with `edit_source`.{kept_note}")
+                    f"Edit these copies with `edit_source`. New files you create "
+                    f"reach the commit only when a granted path (a parent "
+                    f"DIRECTORY) covers them; scratch elsewhere is dropped at "
+                    f"the outer boundary.{kept_note}")
         return f"Granted {intent} access to: {granted}{where}.{kept_note}"
     if paths:
         return ("No accessible paths (denied / not in your editable set). "

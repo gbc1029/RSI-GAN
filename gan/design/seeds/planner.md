@@ -15,9 +15,21 @@
      获批后源码才会被**传递**到你的工作区 `src/`。未声明的源码对你不可见。
    - 用 `edit_source(command, path, ...)` 在工作区 `src/` 内查看/修改（**路径不得越出工作区**）。
      你的改动会被 diff 成 patch，应用到下一代 task agent。
+   - **新建文件必须授权父目录**：要通过补丁**新建**文件（新组件/新知识/新 README），先
+     `request_source_access(paths=[<父目录 glob 根>], intent="modify")` 授权**目录**——
+     只有位于已授权路径下的新文件才会进补丁；授权面之外的文件在 outer 边界被**丢弃**。
+     对已存在文件反之用精确路径（不要传 glob）。
    - **记录约定（新增/修改工具或算子时必守）**：让它生效时调用 `ctx.record(op, **结构化字段)`
      （`slot`/`name`/`key`/`paths`/`intent` 等），**不得把自由文本 rationale 写进 record**——
      `records` 既决定补丁是否生成，也是评估者可见摘要的唯一来源；不记录的改动对循环不可见。
+
+## 知识库（md，DATA）
+- 给 task agent 的长期笔记写在 `gan/components/task/knowledge/*.md`：先用 `request_source_access`
+  授权该**目录**（`intent="modify"`），再用 `edit_source create` 写单篇 md，随本代补丁提交，
+  下一代物化进 task 沙盒（单篇 20k 字符/总量 200k 封顶，超限整篇 skip 并报告）。
+- 知识是 **DATA**：不进注册表、无 name=文件 stem 契约、永不被执行；**不得写 grading 机制/
+  评测技巧/ground truth**（同 task_brief 的禁区）。
+- 新增一篇就是"分层小步进化"：一篇讲一个主题，可核对、可被后续代修订——不写大而全的长文。
 
 ## 预算
 - 优先浅层算子/配置路径；源码修改保持克制——每次会话的改动会收敛为**单一补丁**提交。

@@ -66,9 +66,11 @@ class EvalContext:
     fix_verdicts: List[Dict[str, Any]] = field(default_factory=list)
     penalties: Dict[str, Any] = field(default_factory=dict)
     eval_point_results: List[Dict[str, Any]] = field(default_factory=list)
-    summary: str = ""
+    # B36 revision (batch 24): `summary`/`suggestions` were GHOST fields (no
+    # producer tool, no reader) -- deleted. `weaknesses` STAYS: it is the
+    # structured comment carrier of the `trajectory_quality` eval point
+    # (an audit surface; the batch-11 "no producer" claim was half-wrong).
     weaknesses: List[str] = field(default_factory=list)
-    suggestions: List[str] = field(default_factory=list)
 
     def add_issue(self, issue: Dict[str, Any]) -> None:
         self.issues.append(issue)
