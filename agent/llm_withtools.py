@@ -1,9 +1,195 @@
+import contextlib
+import contextvars
+import concurrent.futures as _cfutures
+import io
 import re
+import sys
 import json
 
 from agent.llm import get_response_from_llm
 from agent.tools import load_tools
 from utils import trajectory_log
+
+# --- tool-execution packaging (C1/C2/C3) -------------------------------------
+# The tool loop's ONLY execution chokepoint is ``process_tool_call``, so the
+# dispatch-level safety net lives here, not inside each tool:
+#   C1 -- one wedged call must not sink the session: hard timeout per call
+#         (the killer thread CANNOT be cancelled -- Python threads are not
+#         killable -- so a timed-out call keeps running in the background and
+#         the per-tool wedge breaker below bounds the leak to
+#         ``max_workers + per-tool wedge limit``). Known residue: worker
+#         threads are NON-daemon, so interpreter exit joins them -- a wedged
+#         tool can delay process shutdown by up to its own completion time.
+#         Bounded in practice: the harness/outer timeouts already cap the
+#         enclosing process.
+#   C2 -- a tool returning megabytes must not eat the context window: a
+#         CENTRAL cap with an explicit in-band marker (never silent).
+#   C3 -- tool ``print`` output is captured out of the loop's log stream and
+#         merged into the tool result (visible to the agent, absent from
+#         stdout/stderr mixing).
+_TOOL_CALL_TIMEOUT_S = 600          # default per-call budget (roles; task passes its own)
+_TOOL_OUTPUT_CAP = 16_000           # chars, tool return text
+_WEDGE_DISABLE_LIMIT = 2            # wedges per tool before it is disabled for the session
+_TOOL_EXECUTOR = None               # lazily built module-level executor (thread reuse)
+
+
+def _tool_executor():
+    global _TOOL_EXECUTOR
+    if _TOOL_EXECUTOR is None:
+        _TOOL_EXECUTOR = _cfutures.ThreadPoolExecutor(max_workers=4)
+    return _TOOL_EXECUTOR
+
+
+class _CaptureProxy:
+    """Thread-safe stdout/stderr capture proxy (C3 + C1 interplay).
+
+    ``sys.stdout``/``sys.stderr`` are PROCESS-GLOBAL: a ``redirect_stdout``
+    running inside a wedged tool thread would keep swallowing the MAIN
+    thread's output after the call was abandoned. The proxy starts in
+    capture mode; the moment the main thread abandons the call it flips the
+    proxy to pass-through (``release()``), so nothing prints into a lost
+    buffer afterwards. Non-wedge calls release the proxy naturally in the
+    thread's own ``finally`` (tool prints stay merged, C3 semantics).
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._buf = io.StringIO()
+        self._capture = True          # flipped by release(): main thread ONLY
+
+    def write(self, s):
+        if self._capture:
+            try:
+                self._buf.write(s)
+            except Exception:                       # noqa: BLE001 -- never fail the tool on capture
+                try:
+                    self._real.write(s)
+                except Exception:                   # noqa: BLE001 -- last resort: drop
+                    pass
+        else:
+            try:
+                self._real.write(s)
+            except Exception:                       # noqa: BLE001
+                pass
+        return len(s)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:                           # noqa: BLE001
+            pass
+
+    def isatty(self):
+        try:
+            return bool(self._real.isatty())
+        except Exception:                           # noqa: BLE001
+            return False
+
+    def value(self) -> str:
+        return self._buf.getvalue()
+
+    def release(self):
+        self._capture = False
+
+
+def _run_captured(fn, tool_input, proc_out, proc_err):
+    """Run ONE tool function with stdout/stderr captured (C3).
+
+    Runs INSIDE the executor thread through PRE-CONSTRUCTED proxies (main
+    thread owns them, so an abandoned call can ALWAYS flip them back; see
+    the ``_CaptureProxy`` docstring). Returns ``(result, proc_out, proc_err)``.
+    """
+    try:
+        with contextlib.redirect_stdout(proc_out), contextlib.redirect_stderr(proc_err):
+            return (fn(**tool_input), proc_out, proc_err)
+    except BaseException as e:                       # noqa: BLE001 -- the loop classifies below
+        return (e, proc_out, proc_err)
+    finally:
+        # natural release in the normal path; a wedged call relies on the
+        # main thread's release() (abandon = proxy becomes pass-through)
+        proc_out.release()
+        proc_err.release()
+
+
+def _audit_text(proxy) -> "str | None":
+    """Captured text of one released proxy (None when nothing was printed)."""
+    try:
+        return proxy.value() or None
+    except Exception:                               # noqa: BLE001
+        return None
+
+
+def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
+    """Execute one tool call with the dispatch-level safety net.
+
+    Returns ``(tool_output_text, audit)``. ``audit`` carries the structured
+    facts the tool loop records into the trajectory (nothing here is silent):
+
+    - ``wedged`` / ``wedge_limit`` / ``tool_disabled`` -- C1 timeouts and the
+      per-tool breaker;
+    - ``truncated`` / ``original_chars``             -- C2 central cap;
+    - ``tool_stdout`` / ``tool_stderr``              -- C3 captured output
+      (stderr means the tool escaped its own error handling; audit-only).
+
+    Contexts (AccessContext / PlanContext / ...) are SEEDED explicitly: tools
+    read their session state via contextvars, and a bare executor thread would
+    start with an empty context and break every context-dependent tool.
+    """
+    timeout_s = int(timeout_s or _TOOL_CALL_TIMEOUT_S)
+    if tool_name not in tools_dict:
+        return f"Error: Tool '{tool_name}' not found", {}
+    entry = tools_dict[tool_name]
+    meta = entry.setdefault("_meta", {})
+    if meta.get("wedges", 0) >= _WEDGE_DISABLE_LIMIT:
+        return (f"Error: tool '{tool_name}' is DISABLED for this session: it wedged "
+                f"{meta['wedges']} time(s). Fix the tool's hang cause before retrying "
+                f"(or use another tool to make progress).", {"tool_disabled": True})
+
+    fn = entry["function"]
+    ctx = contextvars.copy_context()
+    # proxies are built HERE (main thread) so an abandoned call can always
+    # flip them back -- even if the executor thread has not started yet
+    proc_out, proc_err = _CaptureProxy(sys.stdout), _CaptureProxy(sys.stderr)
+    try:
+        fut = _tool_executor().submit(ctx.run, _run_captured, fn,
+                                      dict(tool_input or {}), proc_out, proc_err)
+        result, out_proxy, err_proxy = fut.result(timeout=timeout_s)
+    except _cfutures.TimeoutError:
+        # the call thread keeps running -- its capture proxies MUST stop
+        # swallowing the main thread's output immediately
+        proc_out.release()
+        proc_err.release()
+        meta["wedges"] = meta.get("wedges", 0) + 1
+        wedged, limit = meta["wedges"], _WEDGE_DISABLE_LIMIT
+        if wedged >= limit:
+            return (f"Error: tool '{tool_name}' exceeded {timeout_s}s ({wedged}/{limit} "
+                    f"wedges) and is now DISABLED for this session.",
+                    {"wedged": wedged, "wedge_limit": limit})
+        return (f"Error: tool '{tool_name}' exceeded the {timeout_s}s call budget and was "
+                f"abandoned ({wedged}/{limit}); the call may still be running in the "
+                f"background. Make progress with other tools.",
+                {"wedged": wedged, "wedge_limit": limit})
+    if isinstance(result, BaseException):
+        return (f"Error executing tool '{tool_name}': {result}",
+                {"tool_stdout": _audit_text(out_proxy), "tool_stderr": _audit_text(err_proxy)})
+
+    audit = {}
+    printed = _audit_text(out_proxy)
+    errd = _audit_text(err_proxy)
+    if printed:
+        result = f"{result}\n-- tool stdout (captured) --\n{printed}"
+        audit["tool_stdout"] = printed
+    if errd:
+        audit["tool_stderr"] = errd
+
+    text = result if isinstance(result, str) else str(result)
+    if len(text) > _TOOL_OUTPUT_CAP:
+        audit["truncated"] = True
+        audit["original_chars"] = len(text)
+        text = (text[:_TOOL_OUTPUT_CAP]
+                + f"\n...[truncated: {len(text)} chars total, showing first "
+                  f"{_TOOL_OUTPUT_CAP}; use read_file/grep with tighter bounds]")
+    return text, audit
 
 def get_tooluse_prompt(tool_infos=[]):
     """
@@ -84,15 +270,6 @@ def check_for_tool_uses(response):
             malformed += 1
     return (tool_uses if tool_uses else None), malformed
 
-def process_tool_call(tools_dict, tool_name, tool_input):
-    try:
-        if tool_name in tools_dict:
-            return tools_dict[tool_name]['function'](**tool_input)
-        else:
-            return f"Error: Tool '{tool_name}' not found"
-    except Exception as e:
-        return f"Error executing tool '{tool_name}': {str(e)}"
-
 def _emit(logging, trajectory_file, kind, **fields):
     """Emit one structured record (or fall back to plain logging)."""
     if trajectory_file:
@@ -109,6 +286,10 @@ def chat_with_agent(
     multiple_tool_calls=False,  # Whether to allow multiple tool calls in a single response
     max_tool_calls=40,  # Maximum number of tool calls allowed in a single response, -1 for unlimited
     tools_dir=None,  # Optional custom tools directory (GAN roles use their own toolsets)
+    tool_timeout_s=None,  # C1: per-CALL budget in seconds (None -> module default 600).
+                          # A wedged tool is abandoned at the call level (its thread
+                          # keeps running; a per-tool breaker disables repeat offenders)
+                          # instead of hanging the whole session.
     trajectory_file=None,  # Optional structured JSONL trajectory sink
     return_info=False,  # If True, also return {"truncated", "tool_calls"}
 ):
@@ -191,8 +372,23 @@ def chat_with_agent(
                     tool_name = tool_use['tool_name']
                     tool_input = tool_use['tool_input']
                     _emit(logging, trajectory_file, "tool_call", tool=tool_name, input=tool_input)
-                    tool_output = process_tool_call(tools_dict, tool_name, tool_input)
+                    tool_output, tool_audit = process_tool_call(
+                        tools_dict, tool_name, tool_input, timeout_s=tool_timeout_s)
                     num_tool_calls += 1
+                    if tool_audit.get("wedged"):
+                        _emit(logging, trajectory_file, "tool_wedged", tool=tool_name,
+                              wedged=tool_audit["wedged"], wedge_limit=tool_audit["wedge_limit"])
+                    if tool_audit.get("tool_disabled"):
+                        _emit(logging, trajectory_file, "tool_disabled", tool=tool_name)
+                    if tool_audit.get("truncated"):
+                        _emit(logging, trajectory_file, "tool_output_truncated", tool=tool_name,
+                              original_chars=tool_audit["original_chars"])
+                    if tool_audit.get("tool_stdout"):
+                        _emit(logging, trajectory_file, "tool_stdout", tool=tool_name,
+                              text=str(tool_audit["tool_stdout"])[:2000])
+                    if tool_audit.get("tool_stderr"):
+                        _emit(logging, trajectory_file, "tool_stderr", tool=tool_name,
+                              text=str(tool_audit["tool_stderr"])[:2000])
                     _emit(logging, trajectory_file, "tool_output", tool=tool_name,
                           output=str(tool_output))
                     tool_msg = f'''<json>

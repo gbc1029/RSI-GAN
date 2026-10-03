@@ -126,6 +126,10 @@ class GanLoop:
         self.self_improve_max_tool_calls = int(cfg.get("loop.self_improve_max_tool_calls", 30))
         self.plan_max_tool_calls = int(cfg.get("loop.plan_max_tool_calls", 40))
         self.patch_retry_k = int(cfg.get("loop.patch_retry_k", 2))
+        # C batch: per-CALL tool budget stamped onto every refreshed role
+        # instance (dispatch-level net lives in agent.llm_withtools; roles pass
+        # the instance attribute through Role.run).
+        self.tool_call_timeout_s = int(cfg.get("loop.tool_call_timeout_s", 600))
         self.code_root = os.path.abspath(code_root) if code_root else None
         # batch20: the rolling mirrors below carry PARENT-CHILD semantics only --
         # they are refreshed at parent selection (from parent.meta) and are NEVER
@@ -425,6 +429,13 @@ class GanLoop:
                 inst.attempt_id = self._attempt
             except Exception as e:
                 soft_fail(f"attempt_id assignment failed for "
+                          f"{getattr(inst, 'role', '?')}: {e}")
+            # C1: stamp the per-call tool budget (Role.run picks the attribute
+            # up when the caller does not pass tool_timeout_s explicitly).
+            try:
+                inst.tool_timeout_s = self.tool_call_timeout_s
+            except Exception as e:
+                soft_fail(f"tool_timeout_s stamp failed for "
                           f"{getattr(inst, 'role', '?')}: {e}")
         if self.broker is not None:
             for role in ("planner", "evaluator"):

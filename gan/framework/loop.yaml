@@ -18,6 +18,9 @@ loop:
   patch_retry_k: 2                 # in-session retries when a produced patch is rejected
   toolset_preflight: true          # validate registry/toolset integrity at startup (fail-fast;
                                    # pure local check, no model calls). false = log-only.
+  tool_call_timeout_s: 600         # C batch: per-CALL tool budget in seconds (dispatch net in
+                                   # agent.llm_withtools; a wedged call is abandoned + breaker,
+                                   # not a hung session). Task child uses its own constant.
 
 # ---------------------------------------------------------------------------
 # task 树/DAG 约束与父代选择

@@ -77,6 +77,11 @@ Respond in JSON format with the following schema:
             tools_available=(tools if tools else []),
             tools_dir=(tools_dir if tools else None),
             trajectory_file=getattr(self, "trajectory_file", None),
+            # C1: task child lives under the harness QUESTION_TIMEOUT (300s) --
+            # a wedged tool must fail at the call level well before the whole
+            # question subprocess is killed (S2 fixed the outer timeout; this
+            # keeps a single slow tool from spending the entire question).
+            tool_timeout_s=240,
         )
 
         # Extract the response

@@ -200,6 +200,21 @@ batch-8 isolation), one subprocess each.
   use the frozen, workspace-confined `edit_source` / `read_file` / `list_dir` /
   `grep`. A real sandbox (bubblewrap / container) is deferred until roles execute
   self-written code or adversarial leakage must be ruled out (see v4.14).
+- **Tool dispatch net (batch 27)**: the tool loop's single execution chokepoint
+  `agent/llm_withtools.py:process_tool_call` packages every call with three
+  dispatch-level guarantees — **C1** a per-call timeout (`loop.tool_call_timeout_s`,
+  roles via `Role.run` → instance attribute; task child 240s under the harness
+  QUESTION_TIMEOUT) with a per-tool wedge breaker (2 wedges → disabled for the
+  session, events `tool_wedged`/`tool_disabled`; wedged threads are non-daemon, so
+  interpreter exit joins them — bounded by the enclosing process timeouts);
+  **C2** a central 16k-char output cap with an explicit in-band truncation marker
+  + `tool_output_truncated` event (fine-grained caps like `read_file`'s 8000 stay);
+  **C3** tool stdout/stderr captured OUT of the loop's log stream via
+  `_CaptureProxy` (main-thread-owned, flipped back to pass-through when a call is
+  abandoned — a wedged thread must never swallow main-thread output) and merged
+  into the tool result as `-- tool stdout (captured) --` + audit events. Tool STATE
+  travels via explicitly SEEDED contextvars (`contextvars.copy_context()`) — a bare
+  executor thread would break every context-dependent tool.
 - **Model config**: the single source is `gan/framework/models.yaml`, read only by
   `gan/framework/models.py` (`resolve/resolve_section/describe`) — a **pure lookup**
   with NO env, NO fallback and NO precedence chain. Sections: `gan.{task,planner,evaluator}`,
@@ -228,12 +243,14 @@ batch-8 isolation), one subprocess each.
   (`gan/registries/*.json`), its module file **stem**, and its `tool_info()["name"]`
   must be the same string. The tool loop keys tools by file stem
   (`agent/tools/__init__.py`), so a mismatch assembles a tool that silently
-  never loads. Only the FIRST TWO are statically enforced today
-  (`loader.entry_reason`: name == stem, plus the AST binding of
-  `tool_info`/`tool_function`); the THIRD (`tool_info()["name"]`, which the
-  runtime dispatch dict keys by) has NO static gate — it is kept aligned by
-  convention over the shipped components (K2; a real gate would require an
-  import). `gan/registries/loader.py:entry_reason` enforces this at selection
+  never loads. The FIRST TWO are statically enforced (`loader.entry_reason`:
+  name == stem, plus the AST binding of `tool_info`/`tool_function`);
+  the THIRD (`tool_info()["name"]`, which the runtime dispatch dict keys by)
+  is enforced at LOAD time since batch 22 (`ca44ffb`): `agent/tools/__init__.py`
+  import-checks the module and fail-closes a `name != stem` file with a
+  skip-with-reason report entry (erratum vs batch 18: a STATIC gate can never
+  check the name VALUE without an import, so the load-time runtime gate is
+  the settled K2 form). `gan/registries/loader.py:entry_reason` enforces this at selection
   time (plus the **role-directory binding**: a registry entry may only reference
   its own role's component tree — one single-writer file per role since batch 6);
   `gan/framework/code_repo.py` (differential gate on commits touching

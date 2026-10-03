@@ -278,6 +278,7 @@ class Role(AgentSystem):
         tools_available: Any = "all",
         max_tool_calls: int = 40,
         trajectory_file: Optional[str] = None,
+        tool_timeout_s: Optional[int] = None,
     ):
         full_msg = f"{self.current_prompt()}\n\n# Task\n{instruction}"
         path = trajectory_file or getattr(self, "trajectory_file", None)
@@ -300,6 +301,11 @@ class Role(AgentSystem):
                 tools_dir=self.tools_dir,
                 max_tool_calls=max_tool_calls,
                 trajectory_file=path,
+                # C1: per-CALL budget. Resolution order: explicit arg -> the
+                # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
+                # -> the dispatch default (agent.llm_withtools, 600).
+                tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
+                                else getattr(self, "tool_timeout_s", None)),
                 return_info=True,
             )
         finally:
