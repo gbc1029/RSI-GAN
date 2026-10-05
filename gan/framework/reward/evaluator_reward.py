@@ -184,7 +184,6 @@ def build_feedback_digest(
     verdicts: Optional[List[Dict[str, Any]]] = None,
     predicted_score: Optional[float] = None,
     benchmark_score: Optional[float] = None,
-    diff_summary: Optional[Dict[str, Any]] = None,
     patch_outcome: Optional[Dict[str, Any]] = None,
     round_label: Optional[str] = None,
 ) -> str:
@@ -200,13 +199,19 @@ def build_feedback_digest(
     session-level code-patch result ({"rejected", "attempts"}); a rejected patch
     is rendered as a tail line because it discounts every "acted" stance above.
 
-    B9 (batch 32): the ops line is OPS-ONLY (``files`` exited from
-    ``build_diff_summary``) and carries ``round_label`` (the planner round whose
-    records are rendered) — the evaluator's self_improve view concatenates the
-    last digests, and without the label the per-round op lists cannot be
-    attributed (the "隔代错位" the ledger registered).
+    B9 (batch 32) -> B33: the digest's design role is the CALIBRATION NARRATIVE
+    (issue -> projected stance -> fix verdict -> prediction bias -> patch
+    discount). The planner-action inventory is a different surface with its own
+    named carrier (the ``diff_summary`` JSON block, rendered in the same call),
+    so the former "planner changes (sanitized)" line -- a strict subset of that
+    block -- EXITED here; ``diff_summary`` param with it. Attribution moves to
+    the header: the self_improve view concatenates the last digests, and the
+    ``round_label`` header keeps them attributable.
     """
-    lines: List[str] = ["# Feedback digest for your previous issues"]
+    header = "# Feedback digest for your previous issues"
+    if round_label:
+        header += f" (planner round {round_label})"
+    lines: List[str] = [header]
 
     if predicted_score is not None or benchmark_score is not None:
         p = "?" if predicted_score is None else predicted_score
@@ -255,13 +260,11 @@ def build_feedback_digest(
             if o.evidence:
                 lines.append(f"    your evidence: {o.evidence}")
 
-    if diff_summary:
-        ops = [o.get("op") for o in (diff_summary.get("ops") or [])]
-        # B9 (batch 32): ops-only + round label; the "files" half of the line
-        # (and the field it rendered) is gone -- changed files are an outcome
-        # fact owned by meta_view.task_patch_files, not by this projection.
-        label = f" [planner round {round_label}]" if round_label else ""
-        lines.append(f"- planner changes (sanitized){label}: ops={ops or '[]'}")
+    # B33: the "planner changes (sanitized)" inventory line EXITED -- it was a
+    # strict subset of the diff_summary JSON block delivered in the same call,
+    # and the inventory is a different design surface (the named projection),
+    # not part of the calibration narrative. The G1 tail below STAYS: it is
+    # interpretive (discounts the "acted" stances above), not inventory.
 
     po = patch_outcome or {}
     if po.get("rejected"):

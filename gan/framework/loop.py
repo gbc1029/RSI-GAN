@@ -84,6 +84,11 @@ def _receipt_for_evaluator(receipt):
         return {}
     cp = receipt.get("code_patch") or {}
     return {
+        # B40 (batch 33, user decision): the lagged facts below describe the
+        # PARENT round -- label them with the receipt's own genid so the
+        # evaluator cannot misread them as current-round events. toolset stays
+        # IN (decision: do not exit; its role is inherited-baseline context).
+        "round": receipt.get("genid"),
         "budget": receipt.get("budget") or {},
         "design_stripped": receipt.get("design_stripped") or [],
         "toolset": receipt.get("toolset") or {},
@@ -246,7 +251,6 @@ class GanLoop:
         self,
         plan_result: Dict[str, Any],
         ctx: Any,
-        diff_summary: Optional[Dict[str, Any]],
         genid: Any,
         parent_feedback: Optional[Dict[str, Any]],
         parent_meta: Optional[Dict[str, Any]],
@@ -255,7 +259,11 @@ class GanLoop:
         SELECTED parent's issues (batch20: parent-child semantics; the planner
         session whose ``plan_result`` we are settling responded to exactly these
         issues). Calibration reads the parent's persisted predicted/benchmark
-        (per-node, batch-v5) instead of loop-local rolling values."""
+        (per-node, batch-v5) instead of loop-local rolling values.
+
+        B33: ``diff_summary`` is no longer an input -- the planner-action
+        inventory rides the named projection (``feedback.diff_summary`` JSON
+        block, written by the caller alongside this digest), not the narrative."""
         if not parent_feedback:
             return None
         prev_issues = parent_feedback.get("issues") or []
@@ -269,15 +277,14 @@ class GanLoop:
             verdicts=getattr(ctx, "fix_verdicts", []) or [],
             predicted_score=(parent_meta or {}).get("predicted_score"),
             benchmark_score=(parent_meta or {}).get("benchmark_score"),
-            diff_summary=diff_summary,
             # G1: the patch outcome is session-level fact; a rejected patch means
             # "acted" stances above may not have materialized (rendered as a tail
             # line by the digest builder).
             patch_outcome={"rejected": bool(plan_result.get("patch_rejection")),
                            "attempts": plan_result.get("attempts", 0)},
-            # B9 (batch 32): the op list rides the digest with its planner round --
-            # the self_improve view concatenates the last digests, and without a
-            # label the per-round op lists cannot be attributed (隔代错位).
+            # B9 (batch 32) -> B33: the label rides the digest HEADER -- the
+            # self_improve view concatenates the last digests, and without it
+            # they cannot be attributed to their planner rounds (隔代错位).
             round_label=str(genid),
         )
         run_dir = paths.runs_dir(self.output_dir, genid)
@@ -1108,9 +1115,11 @@ class GanLoop:
                 # sanitized diff summary + text digest for the previous round
                 # B9 (batch 32): ops-only -- the report_path feed and the files
                 # bag are gone (the parameter no longer exists to be misused).
+                # B33: the digest no longer takes diff_summary -- the inventory's
+                # single E-face carrier is the feedback.diff_summary JSON block.
                 diff_summary = build_diff_summary(plan_result.get("records"))
                 digest = self._settle_feedback_digest(
-                    plan_result, ctx, diff_summary, genid,
+                    plan_result, ctx, genid,
                     parent_feedback=parent_feedback, parent_meta=parent_meta)
                 if digest:
                     # batch20: land the parent-scoped digest on the node so the
