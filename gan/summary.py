@@ -2,11 +2,10 @@
 
 The evaluator must NOT receive the planner's free-text rationale (prompt
 injection channel). It only receives a structural summary: which operators were
-applied and which files changed.
+applied (ops-only since B9, batch 32).
 """
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 
 from gan.framework.receipt import PROMPT_FACT_KEYS  # B29 prompt facts
@@ -16,10 +15,20 @@ FEEDBACK_SCHEMA_VERSION = "v1"
 
 def build_diff_summary(
     plan_records: Optional[List[Dict[str, Any]]] = None,
-    patch_files: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    """B9 (batch 32): the summary is OPS-ONLY.
+
+    ``files`` exited and the embedded ``schema_version`` dead key with it:
+    - "which files changed" is an OUTCOME fact owned by ``task_patch_files``
+      (computed from the actually-landed patch), not by this intent-level
+      projection -- a second copy here could only diverge;
+    - grant paths under a "changes" label told the evaluator that VIEWED
+      paths (often whole directories) and the evidence file (``report.json``)
+      were "changed" -- active misinformation, not just redundancy (B32).
+    Grant facts ride ``ops[].paths`` under the op's own semantics; the caller
+    no longer feeds ``report_path`` (the parameter is gone, not merely unused).
+    """
     ops: List[Dict[str, Any]] = []
-    files: set = set()
     # L4 (batch 24): the six dead-operator parsers (tune_param / apply_config /
     # add_config / set_tool_enabled / swap_module / code_edit) are DELETED --
     # no producer exists since the registry unification (batches 6/10), so the
@@ -41,8 +50,6 @@ def build_diff_summary(
             entry["name"] = r.get("name")
         elif op == "request_source_access":
             entry["paths"] = list(r.get("paths", []) or [])  # reason intentionally stripped
-            for p in r.get("paths", []) or []:
-                files.add(p)
         elif op == "edit_source":
             # Batch 23: the deep edit surface now records its mutations. Same
             # branch shape as request_source_access: structured position facts
@@ -52,16 +59,13 @@ def build_diff_summary(
                 entry["command"] = r["command"]
             if r.get("path"):
                 entry["path"] = r["path"]
-                files.add(os.path.basename(str(r["path"])))
         # B29: prompt facts ride whichever op produced them (set_prompt, or
         # set_config with key="prompt"); copied by presence, default-deny.
         for k in PROMPT_FACT_KEYS:
             if k in r:
                 entry[k] = r[k]
         ops.append(entry)
-    for f in patch_files or []:
-        files.add(os.path.basename(f))
-    return {"schema_version": FEEDBACK_SCHEMA_VERSION, "ops": ops, "files": sorted(files)}
+    return {"ops": ops}
 
 
 # B13 (batch 8): the ONLY planner→evaluator projection of issue responses.

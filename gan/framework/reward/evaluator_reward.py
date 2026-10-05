@@ -186,6 +186,7 @@ def build_feedback_digest(
     benchmark_score: Optional[float] = None,
     diff_summary: Optional[Dict[str, Any]] = None,
     patch_outcome: Optional[Dict[str, Any]] = None,
+    round_label: Optional[str] = None,
 ) -> str:
     """Build a plain-text digest of what happened to the evaluator's issues.
 
@@ -198,6 +199,12 @@ def build_feedback_digest(
     renders only structured facts (accepted / stance). ``patch_outcome`` is the
     session-level code-patch result ({"rejected", "attempts"}); a rejected patch
     is rendered as a tail line because it discounts every "acted" stance above.
+
+    B9 (batch 32): the ops line is OPS-ONLY (``files`` exited from
+    ``build_diff_summary``) and carries ``round_label`` (the planner round whose
+    records are rendered) — the evaluator's self_improve view concatenates the
+    last digests, and without the label the per-round op lists cannot be
+    attributed (the "隔代错位" the ledger registered).
     """
     lines: List[str] = ["# Feedback digest for your previous issues"]
 
@@ -250,8 +257,11 @@ def build_feedback_digest(
 
     if diff_summary:
         ops = [o.get("op") for o in (diff_summary.get("ops") or [])]
-        files = diff_summary.get("files") or []
-        lines.append(f"- planner changes (sanitized): ops={ops or '[]'}, files={files or '[]'}")
+        # B9 (batch 32): ops-only + round label; the "files" half of the line
+        # (and the field it rendered) is gone -- changed files are an outcome
+        # fact owned by meta_view.task_patch_files, not by this projection.
+        label = f" [planner round {round_label}]" if round_label else ""
+        lines.append(f"- planner changes (sanitized){label}: ops={ops or '[]'}")
 
     po = patch_outcome or {}
     if po.get("rejected"):

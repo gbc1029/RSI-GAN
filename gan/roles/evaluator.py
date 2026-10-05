@@ -52,8 +52,11 @@ class Evaluator(Role):
                 f"```json\n{json.dumps(parent_feedback.get('issues'), ensure_ascii=False, indent=2)[:3000]}\n```"
             )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
+            # B9 (batch 32): the block is scoped to the parent round explicitly --
+            # the ops list LAGS one round by design (kept滞后, per the ledger
+            # decision), and an unlabeled block invited cross-round misattribution.
             parts.append(
-                "\n## Diff summary of the planner's changes (no rationale)\n"
+                "\n## Diff summary of the planner's changes in the parent round (no rationale)\n"
                 f"```json\n{json.dumps(parent_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
             )
         return "\n".join(parts)

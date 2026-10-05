@@ -275,6 +275,10 @@ class GanLoop:
             # line by the digest builder).
             patch_outcome={"rejected": bool(plan_result.get("patch_rejection")),
                            "attempts": plan_result.get("attempts", 0)},
+            # B9 (batch 32): the op list rides the digest with its planner round --
+            # the self_improve view concatenates the last digests, and without a
+            # label the per-round op lists cannot be attributed (隔代错位).
+            round_label=str(genid),
         )
         run_dir = paths.runs_dir(self.output_dir, genid)
         os.makedirs(run_dir, exist_ok=True)
@@ -322,6 +326,24 @@ class GanLoop:
         child.meta["imputed"] = True
         child.meta["imputed_score"] = imputed
 
+    def _finalize_invalid_node(self, node: Node, reason: str, detail: str,
+                               outer: Optional[int], inner: Optional[int]) -> None:
+        """Shared tail of EVERY invalid-child path (A2, batch 32): archive the
+        node, clean the work dir, persist the invalid record, log loudly -- and
+        append a scores row so the generation is visible to score consumers.
+        Authority evidence stays in ``runs/<genid>/``; the row (score None,
+        score_status "invalid") only asserts that the generation existed and
+        produced no measurable score."""
+        self.task_tree.add_node(node)
+        try:
+            shutil.rmtree(paths.work_dir(self.output_dir, node.genid), ignore_errors=True)
+        except Exception as e:
+            soft_fail(f"work dir cleanup failed for genid {node.genid}: {e}")
+        self._write_invalid(node.genid, reason, detail, outer, inner)
+        self.log_event({"type": "inner_invalid", "genid": node.genid,
+                        "reason": reason, "detail": detail[:300]})
+        self._append_score(node)
+
     def _archive_invalid(
         self, reason: str, parent: Optional[Node], parents: List[Node], genid: Any,
         detail: str = "", outer: Optional[int] = None, inner: Optional[int] = None,
@@ -335,13 +357,7 @@ class GanLoop:
             value=NodeValue(score=None, score_status="invalid"),
             meta={"invalid": True, "invalid_reason": reason, "invalid_detail": detail[:500]},
         )
-        self.task_tree.add_node(node)
-        try:
-            shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
-        except Exception as e:
-            soft_fail(f"work dir cleanup failed for genid {genid}: {e}")
-        self._write_invalid(genid, reason, detail, outer, inner)
-        self.log_event({"type": "inner_invalid", "genid": genid, "reason": reason, "detail": detail[:300]})
+        self._finalize_invalid_node(node, reason, detail, outer, inner)
         return node
 
     def _write_invalid(self, genid: Any, reason: str, detail: str = "",
@@ -1058,14 +1074,11 @@ class GanLoop:
                     child.meta["invalid"] = True
                     child.meta["invalid_reason"] = "evaluator_failed"
                     child.meta["invalid_detail"] = str(e)[:500]
-                    self.task_tree.add_node(child)
-                    try:
-                        shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
-                    except Exception as e:
-                        soft_fail(f"work dir cleanup failed for genid {genid}: {e}")
-                    self._write_invalid(genid, "evaluator_failed", str(e), outer, inner)
-                    self.log_event({"type": "inner_invalid", "genid": genid,
-                                    "reason": "evaluator_failed", "detail": str(e)[:300]})
+                    # A2 (batch 32): same invalid tail as _archive_invalid --
+                    # one shared helper so both paths (and their scores row)
+                    # can never drift apart.
+                    self._finalize_invalid_node(child, "evaluator_failed", str(e),
+                                                outer, inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
 
@@ -1093,10 +1106,9 @@ class GanLoop:
                     shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
 
                 # sanitized diff summary + text digest for the previous round
-                diff_summary = build_diff_summary(
-                    plan_result.get("records"),
-                    [child.meta.get("report_path")] if child.meta.get("report_path") else None,
-                )
+                # B9 (batch 32): ops-only -- the report_path feed and the files
+                # bag are gone (the parameter no longer exists to be misused).
+                diff_summary = build_diff_summary(plan_result.get("records"))
                 digest = self._settle_feedback_digest(
                     plan_result, ctx, diff_summary, genid,
                     parent_feedback=parent_feedback, parent_meta=parent_meta)

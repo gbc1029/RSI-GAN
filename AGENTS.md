@@ -380,7 +380,9 @@ batch-8 isolation), one subprocess each.
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - **Planner→evaluator isolation (batch 8): facts flow, rhetoric does not.** Every
   evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) —
-  `build_diff_summary` (ops/files), `receipt.design.ops` (`_ops_summary`),
+  `build_diff_summary` (ops-only since B9: `files` exited — changed files are
+  an outcome fact owned by `meta_view.task_patch_files`, grant facts ride
+  `ops[].paths`), `receipt.design.ops` (`_ops_summary`),
   `run_summary.meta` (`_EVALUATOR_META_KEYS`), `run_summary.receipt`
   (`_receipt_for_evaluator`: outcomes only, no `rejected_reason` full text which
   quotes the planner's artifacts), and `feedback_digest.responses`
