@@ -16,13 +16,12 @@ SCHEMA_VERSION = "v1"
 class RewardPacket:
     # benchmark score / delta / cost / fail rate
     numeric: Dict[str, Any] = field(default_factory=dict)
-    # weaknesses / other qualitative audit surface (B36 revision, batch 24)
+    # weaknesses / other qualitative audit surface
     textual: Dict[str, Any] = field(default_factory=dict)
     # cannot_run / reward_hacking_suspect / rule_violation
     penalties: Dict[str, Any] = field(default_factory=dict)
     schema_version: str = SCHEMA_VERSION
-    # B37 (batch 24): the `evaluator_reward` field was deleted -- never set,
-    # never read in the entire history (ghost slot of the packet schema).
+
 
     # -- convenience -------------------------------------------------------
     @property

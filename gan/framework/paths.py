@@ -29,7 +29,7 @@ Everything a run writes lives under ONE of the main buckets:
         scores.jsonl
       runs/<genid>/   small evidence (packet.json, eval.json, feedback_digest.md,
                       patch_receipt.json, patch_proposed.diff)
-      work/<genid>/   EPHEMERAL run dir (repo copy, skills) -> pruned after run
+      work/<genid>/   EPHEMERAL run dir (repo copy, with .gan_runtime/{tools,knowledge}) -> pruned after run
       workspaces/<role>/...  granted source copies (cleared per outer)
 
 This module is the single place that knows these paths; other framework modules

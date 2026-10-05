@@ -35,8 +35,8 @@ def _const_string(node: ast.AST) -> Optional[str]:
 class _Checker(ast.NodeVisitor):
     def __init__(self) -> None:
         self.issues: List[str] = []
-        # B47-R1: same judgments, kept as per-category flags so the advisory
-        # report (check_source_report) and the reject gate cannot drift apart.
+        # The per-category flags below come from the SAME visit as ``issues``,
+        # so the advisory report and the reject gate cannot drift apart.
         self.observed = {"mutating": False, "subprocess": False, "dynamic_exec": False}
 
     def _issue(self, node: ast.AST, text: str, category: Optional[str] = None) -> None:
@@ -109,7 +109,7 @@ def policy_reason(path: str, relpath: str = "") -> Optional[str]:
 
 
 def check_source_report(text: str, relpath: str = "") -> dict:
-    """B47-R1 (advisory): structured observed-capability profile of tool source.
+    """Advisory: structured observed-capability profile of tool source.
 
     The SAME static judgments the commit/load gate makes, exposed as a per-tool
     report field instead of a reject decision -- it exists because

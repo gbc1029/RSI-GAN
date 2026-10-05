@@ -5,7 +5,7 @@ reconstructs node state by replay. It supports a **DAG** (a node may have
 multiple parents, e.g. produced by a crossover operator) while staying
 backward-compatible with the old single-parent ``parent_genid`` field.
 
-It enforces the task constraints (branch limit / depth limit / stagnation) and
+It enforces the task constraints (branch limit / depth limit) and
 offers a UCB-based parent selection, optionally returning ``k`` parents for
 crossover. Can bootstrap from a DGM-H ``archive.jsonl`` via
 :meth:`TreeStore.import_from_dgm_archive`.

@@ -3,29 +3,31 @@
 Outer loop = one meta generation (planner + evaluator self-improve).
 Inner loop = one task-agent generation (plan -> task run -> evaluate -> commit).
 
-Collaborators are duck-typed so the loop can be smoke-tested offline:
+Collaborators are duck-typed so the loop can be smoke-tested offline; every
+call is made by KEYWORD (see ``run``), so the lists below only name the main
+inputs:
     planner.plan(parent_summary, parents, parent_feedback, evaluator_issues, config, node_id, broker)
         -> {"records": [...], "responses": [...], "config": Config, "patch": str}
-    task_runner(plan, parent, genid) -> Node
+    task_runner(plan, parent, genid, base) -> Node
     evaluator.evaluate(run_summary, parent_feedback, benchmark_score, node_id, broker) -> EvalContext-like
     planner.self_improve(recent) / evaluator.self_improve(recent)
 
 Evaluator feedback is TEXT (a digest), not a numeric reward.
 
-Failure semantics (v4):
+Failure semantics:
 - planner / task / evaluator execution failure => the round is INVALID: archived
   but never a parent.
 - bench score completely missing => imputed from same-parent siblings' median
   (else the parent's score); imputed scores are NOT used as the evaluator's anchor.
 - partial coverage => score kept, ``score_status="partial"``, ``coverage`` recorded.
 
-Checkpointing (v5): ``checkpoint.json`` is the latest snapshot; outer boundaries
-additionally write an immutable numbered ``checkpoints/outer_<N>.json``. An outer
+Checkpointing: ``checkpoint.json`` is the latest snapshot; outer boundaries
+additionally write an immutable numbered ``ckpt/outer_<N>.json``. An outer
 checkpoint is written after that outer's self-improvement, so it carries the design
 used by the next outer. ``resume=True`` continues and ``rollback_to_outer()`` reverts
 to the last outer boundary (append-only ``op=reset`` marker, no log truncation).
 
-Instances (v5): planner/evaluator are refreshed every outer generation
+Instances: planner/evaluator are refreshed every outer generation
 (``_refresh_roles``) from the active design, with a cleared source workspace; task
 agents are refreshed every inner generation. Scheduling is a **single chain** — no
 accept/reject and no parent selection for roles; ``outer_improved`` is logged only.
@@ -49,7 +51,7 @@ from gan.framework.reward.packet import RewardPacket
 from gan.summary import build_diff_summary, make_feedback, project_responses_for_evaluator
 from gan.framework.tree.store import Node, NodeValue, TreeStore
 
-# B11 (batch 8): the allowlist of node-meta keys the EVALUATOR may see in its
+# The allowlist of node-meta keys the EVALUATOR may see in its
 # run summary. Everything else in `child.meta` is the planner's decision
 # paperwork — notably `records`, which carries the planner's respond_issue
 # free text (its argumentation to the evaluator). Default-deny: a new meta key
@@ -59,8 +61,8 @@ _EVALUATOR_META_KEYS = (
     "patch_applied",
     "task_code_commit", "code_commit", "base_commit",
     "task_patch_rejected",     # patch outcome
-    "toolset_report",          # design-claims vs assembly (B7)
-    "design_stripped",         # healing record (B24)
+    "toolset_report",          # design-claims vs assembly
+    "design_stripped",         # healing record
     "harness_rc", "invalid_reason", "score_status", "imputed",
     "modify_depth",
     # deliberately NOT here: "records" (planner rationale), "receipt" (projected
@@ -71,7 +73,7 @@ _EVALUATOR_META_KEYS = (
 
 
 def _receipt_for_evaluator(receipt):
-    """B14 (batch 8): the evaluator's projection of the plan receipt — outcomes only.
+    """The evaluator's projection of the plan receipt — outcomes only.
 
     The FULL receipt is the planner's decision input (``render_receipt``) and
     must not reach the evaluator wholesale: ``code_patch.rejected_reason``
@@ -84,10 +86,10 @@ def _receipt_for_evaluator(receipt):
         return {}
     cp = receipt.get("code_patch") or {}
     return {
-        # B40 (batch 33, user decision): the lagged facts below describe the
-        # PARENT round -- label them with the receipt's own genid so the
-        # evaluator cannot misread them as current-round events. toolset stays
-        # IN (decision: do not exit; its role is inherited-baseline context).
+        # The lagged facts below describe the PARENT round -- label them with
+        # the receipt's own genid so the evaluator cannot misread them as
+        # current-round events. ``toolset`` stays: it is inherited-baseline
+        # context, not a current-round event.
         "round": receipt.get("genid"),
         "budget": receipt.get("budget") or {},
         "design_stripped": receipt.get("design_stripped") or [],
@@ -136,24 +138,23 @@ class GanLoop:
         # the instance attribute through Role.run).
         self.tool_call_timeout_s = int(cfg.get("loop.tool_call_timeout_s", 600))
         self.code_root = os.path.abspath(code_root) if code_root else None
-        # batch20: the rolling mirrors below carry PARENT-CHILD semantics only --
+        # The rolling mirrors below carry PARENT-CHILD semantics only --
         # they are refreshed at parent selection (from parent.meta) and are NEVER
         # written at settle time. The durable per-round record lives on the child
         # node meta (``feedback`` / ``feedback_digest`` / ``receipt``), which the
         # next selection reads back -- so nothing here needs checkpointing.
         self._parent_receipt: Optional[Dict[str, Any]] = None
-        # batch21: per-role self receipts -- the formerly shared single variable
-        # mixed roles (evaluator rendered planner's receipt, planner rendered
-        # evaluator's; docs/6 F3/F4 registered the overwrite, L3②).
+        # Per-role self receipts: one entry per role, so a role can never render
+        # another role's receipt.
         self._self_receipts: Dict[str, Dict[str, Any]] = {}
-        # B15: names stripped from a role design by the STARTUP repair; merged
+        # Names stripped from a role design by the STARTUP repair; merged
         # into that role's first self receipt so the actionable note reaches it
         self.preflight_design_stripped: Dict[str, list] = {}
         # run-attempt id: identifies THIS loop instantiation (one per outer worker /
         # in-process run). Outer-level trajectory files are keyed by it so that
         # re-running an outer never truncates or mixes a previous attempt's traces.
         self._attempt = uuid.uuid4().hex[:8]
-        # role self-edit commits made by this run (audit; G2-lite)
+        # role self-edit commits made by this run (audit)
         self._role_commits: Dict[str, str] = {}
         os.makedirs(self.output_dir, exist_ok=True)
         self.task_tree = TreeStore(self.output_dir, "task").load()
@@ -163,8 +164,8 @@ class GanLoop:
         # rolling state
         self._parent_feedback: Optional[Dict[str, Any]] = None
         self._parent_digest: Optional[str] = None
-        # retired by batch20 (digest now reads the selected parent's meta);
-        # kept assigned + checkpointed only for state-file back-compat.
+        # Kept assigned + checkpointed only for state-file back-compat; the
+        # digest reads the selected parent's meta instead.
         self._prev_predicted: Optional[float] = None
         self._prev_benchmark: Optional[float] = None
         self._digests: List[str] = []
@@ -178,7 +179,7 @@ class GanLoop:
             try:
                 self.task_brief = resolve_domain(load_registry(), self.domains[0]).get("task_brief") or ""
             except Exception as e:
-                # C3: a resolution failure (broken registry / schema) must abort the
+                # A resolution failure (broken registry / schema) must abort the
                 # run — silently degrading the whole run to an empty task brief
                 # would strip every prompt of its task definition with zero signal.
                 # (Domains may legitimately declare no task_brief: an empty value
@@ -226,7 +227,7 @@ class GanLoop:
     def _parent_config(self, parent: Optional[Node]) -> Dict[str, Any]:
         cd = parent.meta.get("config_dict") if (parent is not None and parent.meta) else None
         cfg = deepcopy(cd) if cd else self._initial_task_config()
-        # batch 6: fold legacy slot names so a resumed pre-unification checkpoint
+        # Fold legacy slot names so a resumed pre-unification checkpoint
         # cannot pass ``skills``/``eval_points`` down the inheritance chain
         from gan.design.schema import normalize_config
         return normalize_config(cfg)
@@ -256,14 +257,14 @@ class GanLoop:
         parent_meta: Optional[Dict[str, Any]],
     ) -> Optional[str]:
         """Build the TEXT digest pairing THIS round's planner responses with the
-        SELECTED parent's issues (batch20: parent-child semantics; the planner
+        SELECTED parent's issues (parent-child semantics; the planner
         session whose ``plan_result`` we are settling responded to exactly these
         issues). Calibration reads the parent's persisted predicted/benchmark
-        (per-node, batch-v5) instead of loop-local rolling values.
+        (per-node) instead of loop-local rolling values.
 
-        B33: ``diff_summary`` is no longer an input -- the planner-action
-        inventory rides the named projection (``feedback.diff_summary`` JSON
-        block, written by the caller alongside this digest), not the narrative."""
+        ``diff_summary`` is NOT an input: the planner-action inventory rides its
+        own named projection (the ``feedback.diff_summary`` JSON block, written
+        by the caller alongside this digest), not the calibration narrative."""
         if not parent_feedback:
             return None
         prev_issues = parent_feedback.get("issues") or []
@@ -271,20 +272,20 @@ class GanLoop:
             return None
         digest = build_feedback_digest(
             issues=prev_issues,
-            # B13 (batch 8): the ONLY planner→evaluator projection of issue
+            # The ONLY planner→evaluator projection of issue
             # responses — free-text `feedback` never reaches the reward module.
             responses=project_responses_for_evaluator(plan_result.get("responses") or []),
             verdicts=getattr(ctx, "fix_verdicts", []) or [],
             predicted_score=(parent_meta or {}).get("predicted_score"),
             benchmark_score=(parent_meta or {}).get("benchmark_score"),
-            # G1: the patch outcome is session-level fact; a rejected patch means
+            # The patch outcome is session-level fact; a rejected patch means
             # "acted" stances above may not have materialized (rendered as a tail
             # line by the digest builder).
             patch_outcome={"rejected": bool(plan_result.get("patch_rejection")),
                            "attempts": plan_result.get("attempts", 0)},
-            # B9 (batch 32) -> B33: the label rides the digest HEADER -- the
-            # self_improve view concatenates the last digests, and without it
-            # they cannot be attributed to their planner rounds (隔代错位).
+            # The label rides the digest HEADER: the self_improve view
+            # concatenates the last digests, and without it they cannot be
+            # attributed to their planner rounds.
             round_label=str(genid),
         )
         run_dir = paths.runs_dir(self.output_dir, genid)
@@ -335,7 +336,7 @@ class GanLoop:
 
     def _finalize_invalid_node(self, node: Node, reason: str, detail: str,
                                outer: Optional[int], inner: Optional[int]) -> None:
-        """Shared tail of EVERY invalid-child path (A2, batch 32): archive the
+        """Shared tail of EVERY invalid-child path: archive the
         node, clean the work dir, persist the invalid record, log loudly -- and
         append a scores row so the generation is visible to score consumers.
         Authority evidence stays in ``runs/<genid>/``; the row (score None,
@@ -386,12 +387,12 @@ class GanLoop:
     def _state_dict(self, outer: int, inner: int) -> Dict[str, Any]:
         return {
             "gen_counter": self._gen_counter,
-            # batch20: parent_feedback / parent_digest / parent_receipt are NOT
+            # parent_feedback / parent_digest / parent_receipt are NOT
             # checkpointed -- they are rebuilt from parent.meta at the next
             # selection; the per-round record lives on the tree.
             "digests": self._digests,
-            # batch21: per-role self receipts ride the checkpoint (consumed by
-            # the next outer's self_improve; cannot be rebuilt from the tree).
+            # Per-role self receipts ride the checkpoint (consumed by the next
+            # outer's self_improve; cannot be rebuilt from the tree).
             "self_receipts": dict(self._self_receipts),
             "advantages": self._advantages,
             "prev_predicted": self._prev_predicted,
@@ -404,9 +405,9 @@ class GanLoop:
 
     def _load_state(self, state: Dict[str, Any]) -> None:
         self._gen_counter = int(state.get("gen_counter", self._gen_counter))
-        # batch20: ``last_feedback`` / ``last_digest`` keys of PRE-batch20 state
-        # files are deliberately ignored (the mirrors are rebuilt from
-        # parent.meta at the next selection).
+        # Legacy ``last_feedback`` / ``last_digest`` state keys are deliberately
+        # ignored (the mirrors are rebuilt from parent.meta at the next
+        # selection).
         self._digests = list(state.get("digests") or [])
         self._self_receipts = dict(state.get("self_receipts") or {})
         self._advantages = list(state.get("advantages") or [])
@@ -420,7 +421,7 @@ class GanLoop:
         code = None
         if self.code_root:
             from gan.framework import code_repo
-            # C1: a git-layer failure must NOT be recorded as "no code layer" —
+            # A git-layer failure must NOT be recorded as "no code layer" —
             # the resume path would then silently skip code-state restoration and
             # run on an undefined baseline. Let RepoIntegrityError abort the run.
             code = {"commit": code_repo.current_commit(self.code_root)}
@@ -453,7 +454,7 @@ class GanLoop:
             except Exception as e:
                 soft_fail(f"attempt_id assignment failed for "
                           f"{getattr(inst, 'role', '?')}: {e}")
-            # C1: stamp the per-call tool budget (Role.run picks the attribute
+            # Stamp the per-call tool budget (Role.run picks the attribute
             # up when the caller does not pass tool_timeout_s explicitly).
             try:
                 inst.tool_timeout_s = self.tool_call_timeout_s
@@ -465,15 +466,15 @@ class GanLoop:
                 try:
                     self.broker.clear_workspace(role)
                 except Exception as e:
-                    # n3: the broker has already dropped this role's grants, so
-                    # the next grant recopies pristine bytes -- the stale-copy
-                    # window is bounded to deep edits in THIS outer only.
+                    # The broker dropped this role's grants, so stale copies
+                    # cannot enter a patch -- but their bytes stay on disk, and a
+                    # later default grant keeps them (if_absent). Do not continue
+                    # this outer unattended.
                     soft_fail(f"clear_workspace failed for {role}: {e} — stale "
-                              f"copies may linger until the next resync; the "
-                              f"role's grants were dropped, so the next grant "
-                              f"recopies pristine repo bytes "
-                              f"(stale bytes can only win if_absent within THIS "
-                              f"outer — do not continue this outer unattended)")
+                              f"copies may linger on disk; the role's grants were "
+                              f"dropped so they cannot enter a patch, but a "
+                              f"default (if_absent) re-grant keeps them — do not "
+                              f"continue this outer unattended")
         self.log_event({"type": "role_refresh", "outer": outer})
 
     def _source_access_log(self, outer: Any) -> List[Dict[str, Any]]:
@@ -527,7 +528,7 @@ class GanLoop:
             self._role_commits[role] = sha
             self.log_event({"type": "self_improve_commit", "role": role,
                             "outer": outer, "commit": sha})
-            # batch 13 (B26 phase 1): the successful commit makes the committed
+            # The successful commit makes the committed
             # registry the new authority, so any dangling name in the just-saved
             # self design (e.g. an unregister whose deselect was forgotten) is
             # stripped and the file re-saved -- "persisted design == committed
@@ -557,7 +558,7 @@ class GanLoop:
         # RepoIntegrityError (git-layer failure during apply/rollback) and any
         # other unexpected error propagate: the outer worker exits non-zero and
         # the driver aborts the run — continuing on an undefined code tree would
-        # poison the lineage (C1/C5).
+        # poison the lineage.
 
     def _resync_workspace(self, outer: Any, files: List[str], drop_missing: bool = False) -> None:
         """Keep granted workspace copies in sync with the code baseline.
@@ -599,7 +600,7 @@ class GanLoop:
                       f"(outer_{outer}): " + "; ".join(sync_failures[:5]))
 
     def _component_drift(self, patch: str, applied: bool) -> List[Dict[str, Any]]:
-        """B30 (b): registered components whose MODULE this patch changed.
+        """Registered components whose MODULE this patch changed.
 
         ``module_changed`` restates what ``task_patch_files`` already tells the
         planner; the added value is the catalog annotation, computed with the SAME
@@ -637,7 +638,7 @@ class GanLoop:
         return out
 
     def _catalog_stale(self, role: str) -> List[Dict[str, Any]]:
-        """B30 (c-L4): this role's stale catalog entries, for its own receipt."""
+        """This role's stale catalog entries, for its own receipt."""
         try:
             from gan.framework.preflight import catalog_stale
             return catalog_stale(role, code_root=self.code_root)
@@ -670,11 +671,11 @@ class GanLoop:
             commit=child.meta.get("task_code_commit"),
             rejected_reason=rejected, budget=budget,
             grants=self._source_access_log(outer), trajectory_refs=refs,
-            # B7: the planner (the task agent's designer) sees the "design
+            # The planner (the task agent's designer) sees the "design
             # selected vs actually assembled" gap for the just-executed child in
             # the receipt it consumes at its next plan session.
             toolset=child.meta.get("toolset_report"),
-            # B30 (b): registered components whose module this patch changed, with
+            # Registered components whose module this patch changed, with
             # the catalog annotation ((c) makes its source of truth the same stamp,
             # and the evaluator's projection deliberately excludes both it and the
             # startup stale list -- bookkeeping, not a task fact).
@@ -682,7 +683,7 @@ class GanLoop:
                 plan_result.get("patch_proposed", ""), 
                 bool(child.meta.get("patch_applied"))),
             catalog_stale=self._catalog_stale("planner"),
-            # H11/B24 (batch 5): the dangling slot names the framework stripped
+            # The dangling slot names the framework stripped
             # from the design right before persisting it.
             design_stripped=child.meta.get("design_stripped"),
         )
@@ -717,16 +718,16 @@ class GanLoop:
             genid=f"outer_{outer}", role=role, stage="self_improve",
             records=r.get("records"), patch=r.get("patch_proposed", ""),
             patch_applied=bool(r.get("patch")), rejected_reason=rejected, budget=budget,
-            # batch 13: the successful-exit heal strips dangling names from the
+            # The successful-exit heal strips dangling names from the
             # self design; the role sees its own heal at the next self-improve.
-            # B15: merge the STARTUP repair for this role (consumed once, so a
+            # Merge the STARTUP repair for this role (consumed once, so a
             # one-off startup event does not repeat every outer).
             design_stripped=((r.get("design_stripped") or [])
                              + self.preflight_design_stripped.pop(role, [])),
             component_drift=self._component_drift(r.get("patch_proposed", ""),
                                                   bool(r.get("patch"))),
             catalog_stale=self._catalog_stale(role),
-            # B7: this outer's own instance assembly — carried into the NEXT
+            # This outer's own instance assembly — carried into the NEXT
             # outer's self-improve receipt (this outer already injects it via
             # the self-improve `recent` payload).
             toolset=getattr(getattr(self, role, None), "assembly_report", None),
@@ -757,7 +758,7 @@ class GanLoop:
                 "fix_verdicts": getattr(ctx, "fix_verdicts", []),
                 "penalties": dict(getattr(packet, "penalties", {}) or {}),
                 "weaknesses": list(getattr(ctx, "weaknesses", []) or []),
-                # B28 (batch 25): the eval-point verdicts (point/rating/comment)
+                # The eval-point verdicts (point/rating/comment)
                 # join the generation's evidence card -- a structured sink (not
                 # just the trajectory replay) for the four shipped eval points;
                 # audit-file only, no evaluator-projection key is added.
@@ -791,7 +792,7 @@ class GanLoop:
             self.log_event({"type": "rollback", "boundary": "outer"})
         return ok
 
-    # -- branch-per-node blood lineage (v5) ---------------------------------
+    # -- branch-per-node blood lineage ---------------------------------
     def _pin_outer_base(self, outer: int) -> None:
         """Anchor the outer's entry HEAD as ``outer_<O>_base`` (once per outer).
 
@@ -867,7 +868,7 @@ class GanLoop:
         n_parents = int(cfg.get("tree.num_parents", 1))  # >1 enables crossover
 
         if self.resume and len(self.task_tree):
-            # resume_boundary: "outer" (P1 — never resume from a crashed outer's
+            # resume_boundary: "outer" (never resume from a crashed outer's
             # partial inner checkpoint) or "latest" (legacy, --force re-runs).
             boundary = getattr(self, "resume_boundary", "latest")
             if self._restore(boundary):
@@ -944,7 +945,7 @@ class GanLoop:
                 parent_meta = parent.meta or {}
                 parent_feedback = parent_meta.get("feedback")
                 parent_receipt = parent_meta.get("receipt")
-                # batch20: mirrors carry parent-child semantics; the per-round
+                # Mirrors carry parent-child semantics; the per-round
                 # record lands on the child meta at settle (feedback /
                 # feedback_digest / receipt) and the next selection reads it.
                 self._parent_feedback = parent_feedback
@@ -1013,7 +1014,7 @@ class GanLoop:
 
                 # archive the current generation's task trajectory BEFORE evaluation,
                 # so the evaluator can read it (current generation).
-                # B1: a failure here may NOT be swallowed — the trajectory is the
+                # A failure here may NOT be swallowed — the trajectory is the
                 # evaluator's anti-reward-hacking evidence AND the durable audit
                 # record for this generation. Silently continuing would evaluate
                 # blind on missing evidence while looking identical to a normal
@@ -1043,7 +1044,7 @@ class GanLoop:
                 benchmark_for_eval = None if child.meta.get("imputed") else child.value.score
                 # BLIND hygiene: never expose the objective score/accuracy in the
                 # blind-phase run summary (score is revealed separately).
-                # B11 (batch 8): ALLOWLIST, not denylist — the planner's node meta
+                # ALLOWLIST, not denylist — the planner's node meta
                 # is mostly the planner's own paperwork, and `records` carries the
                 # planner's respond_issue free text (its argumentation to the
                 # evaluator). Any NEW meta key must be added here explicitly:
@@ -1061,7 +1062,7 @@ class GanLoop:
                             "report_summary": report_view,
                             "score_status": child.value.score_status,
                             "imputed": bool(child.meta.get("imputed")),
-                            # B14 (batch 8): projection, not the whole receipt —
+                            # Projection, not the whole receipt —
                             # `code_patch.rejected_reason` quotes the planner's own
                             # artifacts, `grants` carries agent free text, and
                             # `design.ops` duplicate the diff_summary channel.
@@ -1081,7 +1082,7 @@ class GanLoop:
                     child.meta["invalid"] = True
                     child.meta["invalid_reason"] = "evaluator_failed"
                     child.meta["invalid_detail"] = str(e)[:500]
-                    # A2 (batch 32): same invalid tail as _archive_invalid --
+                    # Same invalid tail as _archive_invalid --
                     # one shared helper so both paths (and their scores row)
                     # can never drift apart.
                     self._finalize_invalid_node(child, "evaluator_failed", str(e),
@@ -1113,16 +1114,16 @@ class GanLoop:
                     shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
 
                 # sanitized diff summary + text digest for the previous round
-                # B9 (batch 32): ops-only -- the report_path feed and the files
-                # bag are gone (the parameter no longer exists to be misused).
-                # B33: the digest no longer takes diff_summary -- the inventory's
-                # single E-face carrier is the feedback.diff_summary JSON block.
+                # Ops-only: the report_path feed and the files bag are gone (the
+                # parameter no longer exists to be misused), and the digest takes
+                # no diff_summary -- the inventory's single evaluator-facing
+                # carrier is the feedback.diff_summary JSON block.
                 diff_summary = build_diff_summary(plan_result.get("records"))
                 digest = self._settle_feedback_digest(
                     plan_result, ctx, genid,
                     parent_feedback=parent_feedback, parent_meta=parent_meta)
                 if digest:
-                    # batch20: land the parent-scoped digest on the node so the
+                    # Land the parent-scoped digest on the node so the
                     # next selection can serve it as ``_parent_digest``.
                     child.meta["feedback_digest"] = digest
 
@@ -1147,7 +1148,7 @@ class GanLoop:
                 })
 
                 # feedback for next round: planner gets issues + diff summary.
-                # batch20: the durable record is the child node meta only; the
+                # The durable record is the child node meta only; the
                 # loop-local mirror is refreshed at SELECTION (parent.meta), so
                 # a branching re-selection can never inherit the wrong branch's
                 # feedback.
@@ -1156,9 +1157,9 @@ class GanLoop:
                     diff_summary=diff_summary,
                     penalties=packet.penalties,
                 )
-                # The node was added before evaluator results and receipt were
-                # available; append a durable meta update so replayed trees
-                # retain all parent-context fields.
+                # receipt / feedback_digest / feedback are attached AFTER
+                # add_node, so persist the updated meta explicitly to keep
+                # replayed trees complete.
                 self.task_tree.update(child.genid, meta=child.meta)
                 self._prev_predicted = getattr(ctx, "predicted_score", None)
                 self._prev_benchmark = cs
@@ -1170,11 +1171,11 @@ class GanLoop:
                     break
 
             # ---------------- outer self-improvement ----------------
-            # B7: each role's own instance assembly rides its self-improve
+            # Each role's own instance assembly rides its self-improve
             # payload — the CURRENT outer's assembly state is visible at the
             # decision point (kept/adjusted eval_points / planner prompt).
-            # batch20: ``last_feedback`` dropped -- evaluator.self_improve never
-            # consumed it; the digests list remains the experience stream.
+            # The digests list is the experience stream; ``last_feedback`` is not
+            # part of this payload.
             recent_eval = {"digests": self._digests[-I_max:],
                            "toolset_report": getattr(self.evaluator, "assembly_report", None)}
             recent_plan = {"advantages": self._advantages[-I_max:],

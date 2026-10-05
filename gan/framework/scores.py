@@ -50,7 +50,7 @@ def read_scores(output_dir: str) -> List[Dict[str, Any]]:
                 try:
                     out.append(json.loads(line))
                 except json.JSONDecodeError as e:
-                    # A-level sweep: a dropped row can skew stagnation stats --
+                    # A dropped row can skew stagnation stats --
                     # never silent
                     from utils.soft_fail import soft_fail
                     soft_fail(f"scores.jsonl corrupt line skipped: {e} — "

@@ -58,7 +58,7 @@ def persist_design(design_store: DesignStore, config: Dict[str, Any], genid: Any
 
 def heal_design_slots(config: Dict[str, Any], role: str,
                       code_root: Optional[str]) -> List[Dict[str, str]]:
-    """Strip slot names the committed tree cannot deliver (H11/B24, batch 5).
+    """Strip slot names the committed tree cannot deliver.
 
     A design can reference a component that only exists in the session workspace
     (selected before the patch landed) or was inherited from a parent whose patch
@@ -78,21 +78,19 @@ def heal_design_slots(config: Dict[str, Any], role: str,
     persisted design file, the node meta and the parent->child chain together.
     Returns the stripped ``[{"name", "reason"}]`` (empty = untouched).
 
-    Only the task design was healed before batch 13: role self-designs selected
-    against the committed registry only, so no NEW dangling name could enter
-    them. Batch 13 retires that restriction: role self-designs now select
-    against the effective (workspace-first) registry too, so they accumulate
-    dangling names exactly like the task design -- the loop's
-    ``_apply_self_patch`` runs this heal at the SUCCESSFUL apply exit (where
-    the committed registry is the new authority) and re-saves the design file
-    when anything was stripped. The exhausted/rejected exit keeps the old file
-    for now (registered backlog: docs/7 section 6.1).
+    Every role's design is healed. Role self-designs select against the
+    effective (workspace-first) registry, so they accumulate dangling names
+    exactly like the task design -- the loop's ``_apply_self_patch`` runs this
+    heal at the SUCCESSFUL apply exit (where the committed registry is the new
+    authority) and re-saves the design file when anything was stripped. The
+    exhausted/rejected exit persists the session's un-healed design draft; an
+    exit heal there remains backlog (docs/7 section 6.1).
     """
     if not isinstance(config, dict):
         return []
-    # batch 6: the single component slot is ``tools`` for every role; batch 13:
-    # every role's design is healed (loader resolves each role's own registry;
-    # entry_reason's role-directory binding applies as usual)
+    # The single component slot is ``tools`` for every role; every role's design
+    # is healed (loader resolves each role's own registry; entry_reason's
+    # role-directory binding applies as usual)
     slot = "tools"
     if role not in ("task", "planner", "evaluator"):
         return []
@@ -103,7 +101,7 @@ def heal_design_slots(config: Dict[str, Any], role: str,
     from gan.tools.assembly import always_on_index, gan_roots
     _tools, rdir, cdir = gan_roots(code_root)
     reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
-    # B15 report fidelity: an always-on tool needs no selection (it is assembled
+    # An always-on tool needs no selection (it is assembled
     # regardless), so "not registered" would read as a lost capability. Name it.
     always_on = set(always_on_index(role, code_root=code_root)) if role != "task" else set()
     kept: List[str] = []
@@ -146,7 +144,7 @@ def assemble_task_env(
     shutil.copy2(design_path, os.path.join(runtime_dir, "design.json"))
 
     tools_dir = os.path.join(runtime_dir, "tools")
-    # B7: report what the design selected vs what actually got assembled, PER
+    # Report what the design selected vs what actually got assembled, PER
     # inner generation (the task toolset is re-assembled here, not only at
     # outer startup). The report rides the runtime dir; task_runner surfaces it
     # into node meta + the task_toolset_assembled event. Assembly gaps in the
@@ -156,7 +154,7 @@ def assemble_task_env(
         "task", tools_dir, config=config, include_always_on=False,
         code_root=code_root)
 
-    # knowledge base (batch 6): materialize the COMMITTED base whole -- the base
+    # Knowledge base: materialize the COMMITTED base whole -- the base
     # is the base; the planner curates it by authoring/removing md files through
     # the deep patch channel, not by toggling a config list. Text-only data,
     # per-file and total caps, skips reported like assembly gaps.
@@ -198,7 +196,7 @@ def assemble_task_env(
                   f, ensure_ascii=False, indent=2)
     env["GAN_TASK_DESIGN"] = "/workspace/.gan_runtime/design.json"
     env["GAN_TASK_TOOLS_DIR"] = "/workspace/.gan_runtime/tools"
-    # B27: the child writes the LOAD outcome of every tool file here (relative to
+    # The child writes the LOAD outcome of every tool file here (relative to
     # its cwd = run_dir, so it resolves identically with or without a container
     # mount). The assembly report only proves a file was copied; without this the
     # parent could not distinguish "assembled" from "actually loadable".
@@ -216,7 +214,9 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
     Builds a **minimal allowlist copy** of the code (agent runtime + the domain
     package, minus datasets) from ``source_root`` (the per-run code tree), so a
     task run cannot see benchmark labels and is far smaller than a full repo
-    copy. A deep patch, if any, is applied inside the copy only.
+    copy. With a per-run code tree the patch is already committed there and the
+    copy is materialized from it; the copy-side apply is the no-code-tree
+    fallback.
     """
     run_dir = os.path.join(node_dir, "repo")
     if os.path.exists(run_dir):

@@ -148,9 +148,8 @@ def expand_roots(root_dir: str, roots: List[str], cap: int = 500) -> List[str]:
             if not os.path.isfile(m):
                 continue
             rel = os.path.relpath(m, root_dir).replace(os.sep, "/")
-            # n2: compiled caches are not editable/readable source -- offering
-            # them (or granting/patch-diffing them) is noise the agent must
-            # never see.
+            # Compiled caches are not editable/readable source -- offering them
+            # (or granting/patch-diffing them) is noise the agent must never see.
             if "/__pycache__/" in f"/{rel}" or rel.endswith((".pyc", ".pyo")):
                 continue
             if rel not in seen:

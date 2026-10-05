@@ -1,12 +1,12 @@
-"""On-demand source-code access gating (design v1.2).
+"""On-demand source-code access gating.
 
 Default surface for planner/evaluator is **config + operators**. Source code is
 only *transferred* into a role workspace after the agent explicitly calls the
-``request_source_access`` tool. Because the files are physically absent from the
-workspace until granted, a plain ``bash`` cannot read them (real isolation, not
-a prompt convention).
+``request_source_access`` tool. Because the files are physically absent from any
+role workspace until granted, isolation is real (path absence + workspace
+confinement), not a prompt convention.
 
-v1.2 changes:
+Current rules:
 - **Allowlist by role** (``gan/framework/frozen.py``): only paths inside the
   role's read/write roots may be granted; everything else is denied by default.
 - **Anti-recursion / anti-blowup guard**: refuse the repo root, refuse any source
@@ -57,11 +57,9 @@ class AccessBroker:
         self.max_files = int(max_files)
         self.max_bytes = int(max_bytes)
         self.grants: Dict[tuple, List[Dict[str, Any]]] = {}
-        # B10 (batch 11): the result of the LAST grant call, empty before any
-        # grant. Readers must not depend on grant() having run first -- the
-        # attribute is part of the documented audit surface (see the ``grant``
-        # docstring), and a bare read before the first grant used to raise
-        # AttributeError (every current reader happened to getattr-guard it).
+        # The result of the LAST grant call, empty before any grant. Readers
+        # must not depend on grant() having run first: the attribute is part of
+        # the documented audit surface (see the ``grant`` docstring).
         self.last_result: Dict[str, Any] = {}
 
     # -- workspace ---------------------------------------------------------
@@ -81,13 +79,10 @@ class AccessBroker:
         Granted source is copied into the workspace on demand, so clearing it is
         safe: it is never the only copy.
 
-        n3: a FAILED clear was previously silent (``ignore_errors=True``); a
-        stale copy that survived would then silently win the next session's
-        ``if_absent`` re-grant -- the agent would keep reading LAST outer's
-        bytes with no event. A failed clear now drops the role's grants too and
-        RE-RAISES (the caller logs it loudly), so the next resync recopies
-        pristine bytes and the stale window becomes a loud, recoverable failure
-        instead of a silent wrong inheritance.
+        A failed clear drops the role's grants and RE-RAISES so the caller can
+        log it loudly: stale copies can no longer enter a patch. Their bytes do
+        stay on disk, though -- a later default grant keeps the existing copy
+        (``if_absent``), so recovery needs ``refresh=true`` or a manual clean-up.
         """
         p = os.path.join(self.workspaces_dir, role)
         if os.path.isdir(p):
@@ -123,7 +118,7 @@ class AccessBroker:
             elif full == ws_real or full.startswith(ws_real + os.sep):
                 ign.append(n)
             elif n == "__pycache__":
-                # n2: never pull compiled caches into a granted workspace copy
+                # Never pull compiled caches into a granted workspace copy
                 # (byte-identical to the repo side, so no patch diff — pure
                 # workspace noise).
                 ign.append(n)
@@ -292,8 +287,8 @@ class AccessBroker:
         directories -- was granted. The **single definition** of that predicate:
         ``register_component`` refuses to register an uncovered new module with it,
         and ``list_components`` reports ``patch_covered`` per orphan so the agent
-        learns the same fact *before* the registration is attempted (H8's family:
-        "file exists in the workspace" is not "file reaches the commit").
+        learns the same fact *before* the registration is attempted: "file exists
+        in the workspace" is not "file reaches the commit".
         """
         rel = str(rel).replace("\\", "/").strip("/")
         if not rel:

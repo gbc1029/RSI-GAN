@@ -26,7 +26,7 @@ from gan.framework import paths
 
 _TREE_NAMES = ("task", "planner", "evaluator")
 _OUTER_RE = re.compile(r"^outer_(\d+)\.json$")            # canonical (first write)
-_OUTER_ARCH_RE = re.compile(r"^outer_(\d+)_(\d+)\.json$")  # archival re-run snapshot (F5)
+_OUTER_ARCH_RE = re.compile(r"^outer_(\d+)_(\d+)\.json$")  # archival re-run snapshot
 
 
 def _ckpt_path(output_dir: str) -> str:
@@ -110,7 +110,7 @@ def list_outer_checkpoints(output_dir: str) -> List[int]:
 def snapshot_designs(output_dir: str, roles: List[str]) -> Dict[str, Any]:
     """Snapshot role designs, only for roles that already have a design file.
 
-    B3 (outer-boundary atomicity): a design file that EXISTS but cannot be
+    A design file that EXISTS but cannot be
     parsed must abort the save. Silently omitting the role here would produce a
     checkpoint that looks complete while missing that role's design -- a later
     ``restore_designs`` would then silently drop / regress that role's evolved
@@ -159,9 +159,9 @@ def save_checkpoint(
     ``ckpt/outer_<index>.json`` so per-generation history is never lost:
     the canonical name is written once (skip-if-exists); a RE-RUN of the same
     outer writes an archival copy ``outer_<index>_<ms>.json`` instead, so no
-    snapshot is ever overwritten (F5).
+    snapshot is ever overwritten.
 
-    ``code`` (optional, G2-lite) records the code baseline the state was
+    ``code`` (optional) records the code baseline the state was
     produced against — ``{"commit": <code_root HEAD>}`` — so a resume can
     verify/restore the code tree to the checkpointed state.
     """
@@ -195,7 +195,7 @@ def load_checkpoint(output_dir: str, boundary: str = "latest") -> Optional[Dict[
         if newest is not None:
             path = newest["path"]
         else:
-            # legacy fallback: pre-numbering runs wrote checkpoints/outer.json
+            # legacy fallback: pre-numbering runs used the fixed outer.json name
             path = _boundary_path(output_dir, "outer")
     else:
         path = _boundary_path(output_dir, boundary)
@@ -205,7 +205,7 @@ def load_checkpoint(output_dir: str, boundary: str = "latest") -> Optional[Dict[
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        # C2: a checkpoint that EXISTS but cannot be parsed must abort the run.
+        # A checkpoint that EXISTS but cannot be parsed must abort the run.
         # Returning None would let the resume path silently treat it as absent
         # (restart from scratch / skip code-state restoration on a wrong base).
         raise RuntimeError(

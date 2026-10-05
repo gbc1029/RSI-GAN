@@ -34,7 +34,7 @@ class PlanContext:
 
     def add_response(self, issue_id: str, accepted: bool, feedback: str = "",
                      response_kind: str = "unspecified") -> None:
-        # B13 (batch 8): responses carry the structured stance; `feedback` stays
+        # Responses carry the structured stance; `feedback` stays
         # for the session record only — the evaluator-facing projection drops it.
         self.responses.append({"issue_id": issue_id, "accepted": bool(accepted),
                                "feedback": feedback or "",
@@ -66,10 +66,8 @@ class EvalContext:
     fix_verdicts: List[Dict[str, Any]] = field(default_factory=list)
     penalties: Dict[str, Any] = field(default_factory=dict)
     eval_point_results: List[Dict[str, Any]] = field(default_factory=list)
-    # B36 revision (batch 24): `summary`/`suggestions` were GHOST fields (no
-    # producer tool, no reader) -- deleted. `weaknesses` STAYS: it is the
-    # structured comment carrier of the `trajectory_quality` eval point
-    # (an audit surface; the batch-11 "no producer" claim was half-wrong).
+    # `weaknesses` is the structured comment carrier of the `trajectory_quality`
+    # eval point (an audit surface).
     weaknesses: List[str] = field(default_factory=list)
 
     def add_issue(self, issue: Dict[str, Any]) -> None:
@@ -110,7 +108,7 @@ class DesignContext:
     def record(self, op: str, **detail: Any) -> None:
         """Append one structured record; the framework stamps ``target_role``.
 
-        B29 (batch 16): ``target_role`` is the design this session EDITS
+        ``target_role`` is the design this session EDITS
         (``self.role``) -- not who edits it. It is written AFTER ``detail`` so a
         caller cannot shadow it, and it is framework-owned: no design operator can
         write ``ctx.role``. Stamping it here rather than at each call site makes it
@@ -173,18 +171,16 @@ def session_overlay_root():
     """The access session's workspace root when it carries a ``gan/`` overlay.
 
     A session edits a **workspace copy** of the paths it granted; the deep tools
-    scan that copy workspace-first (S1/P3), so selection-time validation must see
+    scan that copy workspace-first, so selection-time validation must see
     the same effective registry or the read side and the write side disagree.
     Returns the workspace root (``broker.src_dir``) when it exists and contains a
     ``gan/`` directory, else ``None`` -- callers pass it to
     ``load_registry_for_role(overlay_root=...)``.
 
-    Callers decide WHICH design may use the overlay: since batch 13 every role's
-    design does (the task design is healed right before persist via
-    ``task_execution.heal_design_slots``; role self-designs get the same
-    calibration at the successful patch-exit heal, with the exhausted-exit
-    healing registered as backlog -- docs/7 section 6.1). Before batch 13 the
-    role self-designs kept the committed-only authority.
+    Every role's design may use the overlay: the task design is healed right
+    before persist via ``task_execution.heal_design_slots``; role self-designs
+    get the same treatment at the successful patch-exit heal, with the
+    exhausted-exit healing still backlog (docs/7 section 6.1).
     """
     actx = get_access_context()
     if actx is None:

@@ -1,9 +1,9 @@
-"""Evaluator feedback as TEXT (v2).
+"""Evaluator feedback as TEXT.
 
 Design (agreed):
 - The evaluator finds problems benchmark-only scoring cannot see.
 - The planner's response ("accepted?/reason") and the evaluator's own fix verdict
-  are organised as a **qualitative label** (the old 2x2), NOT a weighted numeric
+  are organised as a **qualitative label**, NOT a weighted numeric
   reward.
 - The evaluator receives a **text digest** of what happened to its issues, and
   self-improves by narrative reflection over those digests. Blind-score
@@ -21,9 +21,8 @@ CELL_REJECTED_WITH_FEEDBACK = "rejected_with_feedback"
 CELL_REJECTED_NO_FEEDBACK = "rejected_no_feedback"
 CELL_UNJUDGED = "unjudged"          # accepted, but no judge_fix verdict was given
 
-# B38 (batch 22): stances that constitute "the planner stated a position" on a
-# rejected issue. This is the structured (projectable) replacement of the old
-# free-text feedback read -- see classify_issue.
+# Stances that constitute "the planner stated a position" on a rejected issue:
+# the structured, projectable carrier of that fact (see classify_issue).
 _GENUINE_STANCES = frozenset({
     "acted", "acted_differently", "out_of_scope", "disputed", "deferred",
 })
@@ -42,7 +41,7 @@ class EvaluatorIssue:
 class PlannerResponse:
     issue_id: str
     accepted: bool
-    # B13 (batch 8): the structured stance (acted/acted_differently/out_of_scope/
+    # The structured stance (acted/acted_differently/out_of_scope/
     # disputed/deferred). NOTE: `feedback` is the planner's rationale — it is an
     # audit-only field and is dropped by summary.project_responses_for_evaluator
     # BEFORE the digest builder runs; it must never be rendered to the evaluator.
@@ -100,7 +99,7 @@ def verdicts_from_dicts(items: Optional[List[Dict[str, Any]]]) -> List[FixVerdic
 
 
 # ---------------------------------------------------------------------------
-# Qualitative classification (the old 2x2, now label-only)
+# Qualitative classification (five cells, label-only)
 # ---------------------------------------------------------------------------
 def classify_issue(
     issue: EvaluatorIssue,
@@ -108,15 +107,13 @@ def classify_issue(
     verdict: Optional[FixVerdict],
 ) -> IssueOutcome:
     accepted = bool(response.accepted) if response is not None else False
-    # B38: the ONLY production caller feeds B13-projected responses
+    # The production caller feeds PROJECTED responses
     # (loop -> project_responses_for_evaluator), whose free-text `feedback` is
-    # dropped at the channel boundary BY DESIGN. Deriving "did the planner state
-    # a position" from that text made the cell blind to the channel it runs on:
-    # every reasoned rebuttal was rendered as "silently ignored" (the
-    # rejected_with_feedback cell was unreachable in production). The structured
-    # stance is the projected carrier of that fact. `feedback` is still read as
-    # a backward-compat fallback for RAW (unprojected) callers (regression
-    # smoke); its TEXT itself never enters the cell (rationale stays audit-only).
+    # dropped at the channel boundary BY DESIGN, so "did the planner state a
+    # position" must come from the structured stance, not from that text.
+    # `feedback` is still read as a backward-compat fallback for RAW
+    # (unprojected) callers (regression smoke); its TEXT never enters the cell
+    # (rationale stays audit-only).
     if response is None:
         has_feedback = False
     else:
@@ -192,21 +189,20 @@ def build_feedback_digest(
     No scores/weights are attached to outcomes; the blind-vs-actual calibration
     is also stated textually.
 
-    B13 (batch 8): ``responses`` must arrive ALREADY PROJECTED through
+    ``responses`` must arrive ALREADY PROJECTED through
     ``summary.project_responses_for_evaluator`` — the free-text planner
     rationale is dropped at the channel boundary, so this builder receives and
     renders only structured facts (accepted / stance). ``patch_outcome`` is the
     session-level code-patch result ({"rejected", "attempts"}); a rejected patch
     is rendered as a tail line because it discounts every "acted" stance above.
 
-    B9 (batch 32) -> B33: the digest's design role is the CALIBRATION NARRATIVE
-    (issue -> projected stance -> fix verdict -> prediction bias -> patch
-    discount). The planner-action inventory is a different surface with its own
-    named carrier (the ``diff_summary`` JSON block, rendered in the same call),
-    so the former "planner changes (sanitized)" line -- a strict subset of that
-    block -- EXITED here; ``diff_summary`` param with it. Attribution moves to
-    the header: the self_improve view concatenates the last digests, and the
-    ``round_label`` header keeps them attributable.
+    The digest's design role is the CALIBRATION NARRATIVE (issue -> projected
+    stance -> fix verdict -> prediction bias -> patch discount). The
+    planner-action inventory is a different surface with its own named carrier
+    (the ``diff_summary`` JSON block, rendered in the same call) and is not part
+    of this digest. Attribution rides the header: the self_improve view
+    concatenates the last digests, and the ``round_label`` header keeps them
+    attributable.
     """
     header = "# Feedback digest for your previous issues"
     if round_label:
@@ -230,7 +226,7 @@ def build_feedback_digest(
     if not outcomes:
         lines.append("- (no issues were raised in that round)")
     else:
-        # B13/G3: a planner may respond to the same issue more than once
+        # A planner may respond to the same issue more than once
         # (a composite stance); render every response instead of collapsing to
         # the first.
         responses_by_id: Dict[str, List[Dict[str, Any]]] = {}
@@ -247,9 +243,9 @@ def build_feedback_digest(
                 for resp in resp_list:
                     kind = str(resp.get("response_kind") or "unspecified")
                     line = f"    planner: accepted={bool(resp.get('accepted'))}, stance: {kind}"
-                    # G2: name the contradiction explicitly — the planner claims
+                    # Name the contradiction explicitly — the planner claims
                     # to have acted but the fix verdict says otherwise. This is
-                    # the strongest self-calibration signal in the 2x2 grid.
+                    # the strongest self-calibration signal in the grid.
                     if (o.cell == CELL_ACCEPTED_UNFIXED
                             and kind in ("acted", "acted_differently")):
                         line += (" — claimed handled but not verified; check whether "
@@ -260,15 +256,9 @@ def build_feedback_digest(
             if o.evidence:
                 lines.append(f"    your evidence: {o.evidence}")
 
-    # B33: the "planner changes (sanitized)" inventory line EXITED -- it was a
-    # strict subset of the diff_summary JSON block delivered in the same call,
-    # and the inventory is a different design surface (the named projection),
-    # not part of the calibration narrative. The G1 tail below STAYS: it is
-    # interpretive (discounts the "acted" stances above), not inventory.
-
     po = patch_outcome or {}
     if po.get("rejected"):
-        # G1: session-level fact — a rejected patch discounts "acted" stances
+        # Session-level fact — a rejected patch discounts "acted" stances
         attempts = po.get("attempts", 0)
         lines.append(
             f"- NOTE: the planner's code patch was REJECTED this round "

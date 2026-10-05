@@ -3,7 +3,7 @@
 Per-generation task-agent trajectories are archived out of the run dir into the
 per-instance JSONL layout, redacted, and indexed. Which generations a role may
 read is decided by the loop and passed explicitly per session via
-``AccessContext.trajectory_genids`` (v4.20; planner = direct parent, evaluator =
+``AccessContext.trajectory_genids`` (planner = direct parent, evaluator =
 current + parent, self-improvement = this outer's generations + the last
 generation's direct parent).
 
@@ -69,7 +69,7 @@ def redact_record(rec: Dict[str, Any]) -> Dict[str, Any]:
 def collect(run_dir: str, run_id: str, output_dir: str, outer: Any, genid: Any) -> str:
     """Archive + redact the task trajectories of one generation into JSONL.
 
-    B1 — "no evidence" is a PIPELINE failure, not an empty archive: a missing
+    "No evidence" is a PIPELINE failure, not an empty archive: a missing
     ``agent_evals`` directory, no ``chat_history_*`` files or zero records all
     raise (the task run necessarily produced per-question chat histories, so an
     empty source means the run-dir handling/spotting drifted upstream and the
@@ -163,7 +163,7 @@ def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: 
     """Read a role's own session trajectory for a given outer/genid.
 
     A quarantined (unredactable) session is NEVER served: an explicit refusal
-    replaces its content (B2, fail-closed)."""
+    replaces its content (fail-closed)."""
     path = paths.session_traj_file(output_dir, outer, genid, role)
     if not os.path.isfile(path):
         quarantined = sorted(glob.glob(path + ".unredacted-*"))
@@ -197,11 +197,9 @@ def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str
 def redact_file(path: str) -> None:
     """Redact a JSONL trajectory file in place (parts merged, then removed).
 
-    B2: the replace is ATOMIC (tmp file + ``os.replace``) and the final write no
-    longer swallows ``OSError`` — previously a write failure could both silently
-    skip redaction AND destroy the original (in-place "w" truncate), the worst
-    combination. Failures now raise so the caller can quarantine the unredacted
-    file (fail-closed) instead of leaving it servable.
+    The replace is ATOMIC (tmp file + ``os.replace``) and the final write does
+    not swallow ``OSError``: a failure raises so the caller can quarantine the
+    unredacted file (fail-closed) instead of leaving it servable.
     """
     if not path or not os.path.exists(path):
         return
@@ -243,7 +241,7 @@ def redact_file(path: str) -> None:
 
 
 def quarantine_unredacted(path: str, reason: str = "") -> str:
-    """Move an UNREDACTED trajectory file out of every consumer's reach (B2).
+    """Move an UNREDACTED trajectory file out of every consumer's reach.
 
     All readers judge by exact file-name existence (``read_session``, ``outer_session_index``,
     ``_session_file``), so RENAMING is the fail-closed primitive: the raw file stays

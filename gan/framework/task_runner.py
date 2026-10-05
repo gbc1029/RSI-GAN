@@ -8,9 +8,11 @@ invocation and the objective ``report_summary``) lives in the frozen framework:
 label-domain scoring in the parent process before returning a task-tree
 ``Node``. The task agent is **design-driven**: its design config
 (shallow, from the planner) is persisted by the framework and passed to the
-harness through ``GAN_TASK_DESIGN``; selected skills are exposed via
-``GAN_TASK_SKILLS_DIR``. Deep changes (``code_edit``) are applied to a throwaway
-repo copy for that generation only.
+harness through ``GAN_TASK_DESIGN``; the selected tools are exposed via
+``GAN_TASK_TOOLS_DIR`` (``GAN_TASK_SKILLS_DIR`` is read only as a legacy
+fallback). Deep changes are validated and committed to the per-run code tree,
+and the generation's minimal repo copy is materialized from that tree; the
+throwaway copy is the fallback when no code tree is in play.
 """
 from __future__ import annotations
 
@@ -36,11 +38,10 @@ def _modify_depth(records: List[Dict[str, Any]]) -> int:
     return 0
 
 
-# A1 (batch 31): only a PROPOSED patch that produced no new code commit is a
-# rejection. "No patch proposed this round" is the normal case and used to set
-# the same string, so every no-patch generation reported rejected:true to the
-# receipt / events / evaluator surfaces and the planner got a phantom
-# "fix the reported problem" hint (docs/7 §2.1 A1).
+# Only a PROPOSED patch that produced no new code commit is a rejection.
+# "No patch proposed this round" is the normal case and must not masquerade as
+# one (it would report rejected:true to the receipt / events / evaluator
+# surfaces and hand the planner a phantom "fix the reported problem" hint).
 TASK_PATCH_REJECTED_NO_COMMIT = "no new code commit (patch rejected or absent)"
 
 
@@ -135,8 +136,8 @@ class DomainTaskRunner:
             patch_applied = bool(res["applied"])
             if patch_applied:
                 task_patch_files = code_repo.changed_files(patch_str)
-            # A1 (batch 31): only a PROPOSED patch with no new commit is a
-            # rejection -- "no patch proposed" must not masquerade as one.
+            # Only a PROPOSED patch with no new commit is a rejection --
+            # "no patch proposed" must not masquerade as one.
             task_patch_rejected = task_patch_rejection(patch_str, task_code_commit, base_commit)
         elif (patch_str or "").strip() and self.code_root:
             # legacy path (no base resolved): pre-branch time-line HEAD behaviour
@@ -147,11 +148,11 @@ class DomainTaskRunner:
                 task_patch_files = code_repo.changed_files(patch_str)
                 patch_applied = True
             except code_repo.PatchRejected as e:
-                # B35 (batch 31): the exception text quotes the planner's own
-                # artifacts (comments/identifiers inside the rejected diff) and
-                # this field rides _EVALUATOR_META_KEYS -- meta carries the SAME
-                # fixed generic string as the main path; the full text stays on
-                # the local audit log only.
+                # The exception text quotes the planner's own artifacts
+                # (comments/identifiers inside the rejected diff) and this field
+                # rides _EVALUATOR_META_KEYS -- meta carries the SAME fixed
+                # generic string as the main path; the full text stays on the
+                # local audit log only.
                 task_patch_rejected = TASK_PATCH_REJECTED_NO_COMMIT
                 try:
                     with open(self.log_path, "a", encoding="utf-8") as lf:
@@ -160,7 +161,7 @@ class DomainTaskRunner:
                     pass  # best-effort local audit line; the meta string is durable
             patch_str = ""  # applied to code_root (or rejected -> nothing to apply)
 
-        # H11/B24 (batch 5): heal the design BEFORE it is persisted. The patch has
+        # Heal the design BEFORE it is persisted. The patch has
         # now either committed or rolled back to the parent's code, so
         # ``source_root`` is the authority for what this generation can assemble.
         # The design object is shared with the loop (``config_dict``), so healing
@@ -193,10 +194,10 @@ class DomainTaskRunner:
         )
         patch_applied = patch_applied or patch_applied_copy
 
-        # B7: surface the per-inner task toolset assembly report (written by
+        # Surface the per-inner task toolset assembly report (written by
         # assemble_task_env into the runtime dir). Recorded as node meta (so the
         # planner's next-round receipt and the evaluator's meta view carry it)
-        # and as a task_toolset_assembled event. Skill-assembly gaps merely
+        # and as a task_toolset_assembled event. Assembly gaps merely
         # degrade the child's capability — they must never silently vanish.
         toolset_report: Dict[str, Any] = {}
         toolset_report_path = os.path.join(run_dir, ".gan_runtime", "toolset_report.json")
@@ -240,7 +241,7 @@ class DomainTaskRunner:
                         predictions_path, report_path, self.domain, ground_truth_by_id,
                     )
                 except Exception as e:
-                    # B6 (adapted): a parent-scoring failure must not degrade
+                    # A parent-scoring failure must not degrade
                     # silently; score reads None -> score_status="failed".
                     report = None
                     from utils.soft_fail import soft_fail
@@ -248,7 +249,7 @@ class DomainTaskRunner:
                               event_path=paths.events_path(self.output_dir),
                               event_type="parent_scoring_failed", genid=str(genid))
         else:
-            # Preserve independent harness/evaluator domains outside G6a's scope.
+            # Preserve independent harness/evaluator domains.
             rc, _out = tx.run_harness_and_report(
                 self.python, run_dir, self.domain, run_id, self.subset,
                 self.num_samples, model, env, self.timeout,
@@ -257,13 +258,13 @@ class DomainTaskRunner:
             try:
                 report = tx.run_existing_domain_report(self.domain, output_path, model)
             except Exception as e:
-                # B6 (adapted): same visibility contract as the parent-scoring path.
+                # Same visibility contract as the parent-scoring path.
                 report = None
                 from utils.soft_fail import soft_fail
                 soft_fail(f"existing-domain report failed for genid {genid}: {e}",
                           event_path=paths.events_path(self.output_dir),
                           event_type="existing_domain_report_failed", genid=str(genid))
-        # B27: merge the CHILD-reported load outcome into the toolset report (the
+        # Merge the CHILD-reported load outcome into the toolset report (the
         # assembly stage can only report what it copied). Failures are classified
         # by owner: a component (or a role-owned always-on tool) is an agent-fixable
         # fact that rides into node meta -> the planner's next instruction; a

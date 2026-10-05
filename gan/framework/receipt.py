@@ -10,11 +10,11 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
-# B29 (batch 15): the STRUCTURAL vocabulary of a prompt rewrite. Deliberately
+# The STRUCTURAL vocabulary of a prompt rewrite. Deliberately
 # numbers/hashes only -- never text, never a substring, never a reversible
 # encoding. This is the *artifact* being evolved (like source code, for which
-# `files`/diffstat are already exposed), NOT the planner's rationale: the batch-8
-# rule that even derived statistics of `respond_issue.feedback` stay out is NOT
+# `files`/diffstat are already exposed), NOT the planner's rationale: the rule
+# that even derived statistics of `respond_issue.feedback` stay out is NOT
 # relaxed by this list.
 PROMPT_FACT_KEYS = (
     "target_role", "changed", "chars", "prev_chars", "lines", "prev_lines",
@@ -24,7 +24,7 @@ PROMPT_FACT_KEYS = (
 
 
 def prompt_change_facts(prev: Any, new: Any, seed: Any = None) -> Dict[str, Any]:
-    """Structural facts of a prompt rewrite (B29).
+    """Structural facts of a prompt rewrite.
 
     Computed AT RECORD TIME on purpose: the projections only receive ``records``
     (no design config, no previous value), so the facts must be self-contained.
@@ -86,7 +86,7 @@ def _ops_summary(records: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]
         for k in ("slot", "name", "key", "intent", "paths"):
             if k in r:
                 entry[k] = r[k]
-        # B29: prompt facts are copied ONLY when a producer recorded them
+        # Prompt facts are copied ONLY when a producer recorded them
         # (default-deny by presence, like every other projection here)
         for k in PROMPT_FACT_KEYS:
             if k in r:
@@ -95,7 +95,7 @@ def _ops_summary(records: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]
     return out
 
 
-# B12 (batch 8): grants ride into the receipt WITHOUT agent-authored free text.
+# Grants ride into the receipt WITHOUT agent-authored free text.
 # The allowlist of structural fields kept for the receipt's consumers.
 _GRANT_KEYS_FOR_RECEIPT = ("role", "paths", "skipped", "missing", "intent")
 
@@ -123,7 +123,7 @@ def _grants_summary(grants: Optional[List[Dict[str, Any]]]) -> List[Dict[str, An
 def _design_diff(config: Optional[Dict[str, Any]], parent_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     cfg = config if isinstance(config, dict) else {}
     par = parent_config if isinstance(parent_config, dict) else {}
-    # batch 6: one ``tools`` slot per role; accept the legacy keys so a diff
+    # One ``tools`` slot per role; accept the legacy keys so a diff
     # against an older run's parent config still reports its selections
     def _tools(d):
         v = d.get("tools")
@@ -186,12 +186,12 @@ def build_receipt(
         "stage": stage,
         "design": design,
         "toolset": toolset or {},
-        # B30 (b)/(c-L4): catalog bookkeeping for the role that can act on it.
+        # Catalog bookkeeping for the role that can act on it.
         # Deliberately NOT in _receipt_for_evaluator: a stale description cannot
         # change this generation's capability or score, so it is not a task fact.
         "component_drift": list(component_drift or []),
         "catalog_stale": list(catalog_stale or []),
-        # H11/B24 (batch 5): slot names the framework removed from the design
+        # Slot names the framework removed from the design
         # right before persisting, because the committed tree cannot deliver them
         # (a patch that was rejected, or an inherited dangling reference).
         "design_stripped": design_stripped or [],
@@ -243,7 +243,7 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
     ts = receipt.get("toolset") or {}
     skipped = ts.get("skipped") or []
     if skipped:
-        # B7: the role must see the design-vs-assembly gap in the channel it
+        # The role must see the design-vs-assembly gap in the channel it
         # consumes every decision round — the receipt.
         names = ", ".join(f"'{s.get('name')}' ({str(s.get('reason'))[:60]})"
                           for s in skipped)
@@ -252,7 +252,7 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
                      f"select_component / deselect_component")
     stripped = receipt.get("design_stripped") or []
     if stripped:
-        # H11/B24: the design must never keep claiming what the tree cannot
+        # The design must never keep claiming what the tree cannot
         # deliver; the role sees exactly what was dropped and why.
         snames = ", ".join(f"'{s.get('name')}' ({str(s.get('reason'))[:60]})"
                            for s in stripped)
@@ -277,10 +277,10 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
                if f.get("kind") in ("component", "always_on_owned")]
     frozen = [f for f in load_failed if f.get("kind") == "always_on_frozen"]
     if fixable:
-        # B27 second half (batch 19): runtime load failures belong in the same
-        # per-decision channel as the B7 capability note — otherwise the design
-        # can look intact while the tool is absent, and the agent misdiagnoses
-        # "registration/selection lost" when the real cause is module code.
+        # Runtime load failures belong in the same per-decision channel as the
+        # capability note — otherwise the design can look intact while the tool
+        # is absent, and the agent misdiagnoses "registration/selection lost"
+        # when the real cause is module code.
         names = ", ".join(f"'{f.get('name')}' ({str(f.get('reason'))[:60]})"
                           for f in fixable)
         parts.append(f"toolset note: design-selected tools DID NOT LOAD at runtime: "
@@ -292,11 +292,11 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"framework note: {len(frozen)} FROZEN tool(s) failed to load "
                      f"— escalated to framework owners; do NOT attempt to repair, "
                      f"selection/registration changes cannot help")
-    # A1 (batch 31): the hint is a REJECTION remedy -- only a session that
-    # actually proposed a patch can carry one. Belt-and-braces against a future
-    # producer re-conflating "no patch proposed" with "rejected" (the producer
-    # gate is task_runner.task_patch_rejection); build_receipt's next_hint data
-    # field is untouched. Mirrors the `proposed` gate the "code patch REJECTED"
+    # The hint is a REJECTION remedy -- only a session that actually proposed a
+    # patch can carry one. Belt-and-braces against a future producer
+    # re-conflating "no patch proposed" with "rejected" (the producer gate is
+    # task_runner.task_patch_rejection); build_receipt's next_hint data field is
+    # untouched. Mirrors the `proposed` gate the "code patch REJECTED"
     # line above already had.
     if receipt.get("next_hint") and (receipt.get("code_patch") or {}).get("proposed"):
         parts.append(f"hint: {receipt['next_hint']}")

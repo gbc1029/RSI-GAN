@@ -7,12 +7,12 @@ fast instead of degrading silently at runtime:
   minimal call and report availability. It NEVER substitutes a fallback model — a
   failure is reported (and callers may choose to abort), consistent with the
   no-fallback model policy.
-- ``preflight_tools`` : registry + toolset integrity — validates each role's merged
-  registry (invalid entries, duplicates, orphans), the always-on tool files (B7,
-  split by OWNER: frozen plumbing is fatal, a role's own tools are reported and
+- ``preflight_tools`` : registry + toolset integrity — validates each role's own
+  registry (invalid entries, duplicates, orphans), the always-on tool files
+  (split by OWNER: frozen plumbing is fatal, a role's own tools are reported and
   handed back to that role) and the basename collisions a real assembly would
   silently resolve by overwrite.
-- ``repair_dangling_designs`` : B15 — a persisted design (planner/evaluator) whose
+- ``repair_dangling_designs`` : a persisted design (planner/evaluator) whose
   ``tools`` slot names something the committed tree cannot deliver is REPAIRED at
   startup: the unreachable names are stripped, the previous file is kept aside as
   a forensic ``config.json.dangling-<ts>`` copy, and the fact is logged and
@@ -70,8 +70,9 @@ def assemble_collisions(
 
     ``assemble_tools_dir`` copies every source file to ``<dest>/<basename>``, so two
     different sources with the same file name end up fighting for one destination
-    slot (last writer wins). Nothing in the framework detects this today, and the
-    loser simply disappears from the toolset.
+    slot (last writer wins). This probe reports that pre-existing state; the
+    commit gate refuses only NEW collisions, and registration refuses a colliding
+    stem up front.
 
     Checks every source that *could* be assembled for this role — the always-on
     directories plus ALL registered component modules (not only the currently
@@ -102,8 +103,8 @@ def assemble_collisions(
 
     by_name: Dict[str, List[str]] = {}
     # de-dup by realpath first: the SAME module declared twice within a file is one
-    # file, not a collision with itself (cross-file duplicates are impossible since
-    # batch 6 -- one single-writer registry per role)
+    # file, not a collision with itself (cross-file duplicates are impossible:
+    # one single-writer registry per role)
     for s in sorted({os.path.realpath(s) for s in sources}):
         by_name.setdefault(os.path.basename(s), []).append(s)
     return {k: v for k, v in by_name.items() if len(v) > 1}
@@ -120,7 +121,8 @@ def preflight_tools(
     broken registry would otherwise degrade silently — an unregistered or
     invalid component is skipped by selection/assembly/loading without any error.
 
-    Returns ``{role: {"problems": [...], "collisions": {...}}}``.
+    Returns a per-role dict with ``problems`` / ``capability_policy`` /
+    ``collisions`` / ``catalog_stale`` / ``always_on`` / ``observed_capabilities``.
     """
     from pathlib import Path
     from gan.registries.loader import validate_registry
@@ -134,16 +136,16 @@ def preflight_tools(
             "problems": validate_registry(role, registry_dir=reg_dir, components_dir=comp_dir),
             "capability_policy": capability_policy_problems(role, code_root=croot),
             "collisions": assemble_collisions(role, code_root=croot),
-            # B30 (L4): catalog-metadata drift -- NON-fatal (bookkeeping, not a
-            # capability loss and not something an interrupted run would silently
-            # get wrong); reported here and on the planner's own receipt.
+            # Catalog-metadata drift -- NON-fatal (bookkeeping, not a capability
+            # loss and not something an interrupted run would silently get
+            # wrong); reported here and on the planner's own receipt.
             "catalog_stale": catalog_stale(role, code_root=croot),
-            # B7: always-on API exposure, split by owner (frozen = fatal below,
+            # Always-on API exposure, split by owner (frozen = fatal below,
             # owned = reported and handed back to the role)
             "always_on": always_on_problems(role, code_root=croot),
-            # B47-R1 (advisory): observed-capability profiles for agent-owned
-            # tool sources -- the counterpart to self-reported tool_info
-            # descriptions. Never gating; the operator reads this at startup.
+            # Advisory observed-capability profiles for agent-owned tool
+            # sources -- the counterpart to self-reported tool_info descriptions.
+            # Never gating; the operator reads this at startup.
             "observed_capabilities": observed_capabilities(role, code_root=croot),
         }
     return out
@@ -151,7 +153,7 @@ def preflight_tools(
 
 def observed_capabilities(role: str, code_root: Optional[str] = None
                          ) -> List[Dict[str, Any]]:
-    """B47-R1 (advisory): observed-capability profiles for agent-owned tools.
+    """Advisory observed-capability profiles for agent-owned tools.
 
     Walks the same surface as ``capability_policy_problems`` (always-on +
     registered components) but reports instead of gating: for every tool whose
@@ -222,7 +224,7 @@ def capability_policy_problems(role: str, code_root: Optional[str] = None) -> Li
 
 def always_on_problems(role: str, code_root: Optional[str] = None
                        ) -> Dict[str, List[Dict[str, str]]]:
-    """B7: API-exposure check for the always-on tool files of ``role``.
+    """API-exposure check for the always-on tool files of ``role``.
 
     ``always_on_dirs``/``py_files_in`` decide WHICH files land in the toolset, and
     this check goes through the same two helpers, so it cannot drift from the real
@@ -255,7 +257,7 @@ def always_on_problems(role: str, code_root: Optional[str] = None
 
 def catalog_stale(role: str, code_root: Optional[str] = None,
                   registry_dir=None, components_dir=None) -> List[Dict[str, str]]:
-    """B30 (L4): entries whose description predates the current module bytes.
+    """Entries whose description predates the current module bytes.
 
     Advisory by construction: the consumer is the OPERATOR (startup report) and the
     planner's own receipt -- never the evaluator, and never ``tools_ok``. A stale
@@ -275,7 +277,7 @@ def catalog_stale(role: str, code_root: Optional[str] = None,
 def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
                             roles: Iterable[str] = ("planner", "evaluator")
                             ) -> Dict[str, Any]:
-    """B15: strip unreachable ``tools`` names from role designs, keep forensics.
+    """Strip unreachable ``tools`` names from role designs, keep forensics.
 
     The committed tree is the authority for what a design can deliver
     (``heal_design_slots`` semantics: REMOVE only, never add or restore source).
@@ -289,7 +291,7 @@ def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
 
     Scope note: only ROLE designs are repaired. Task designs are per-generation
     artifacts (``design/task/<genid>/config.json``) whose authoritative copy
-    travels in the tree meta and is already healed at persist time (B24); a
+    travels in the tree meta and is already healed at persist time; a
     startup pass must not rewrite that history.
 
     Returns ``{"checked": [{role, path}], "stripped": [{role, path, name, reason,
@@ -334,7 +336,7 @@ def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
 
 def tools_ok(results: Dict[str, Dict[str, Any]]) -> bool:
     """True when nothing FATAL is wrong: registry problems, assembly collisions,
-    or a broken FROZEN always-on file (B7).
+    or a broken FROZEN always-on file.
 
     Role-owned always-on problems are deliberately excluded: they are an agent's
     own artifact, reported in ``always_on.owned`` and fed back to that role, so

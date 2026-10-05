@@ -120,7 +120,7 @@ def current_commit(code_root: str) -> str:
     Raises :class:`RepoIntegrityError` instead of returning an empty string:
     git-infra failure must not be conflated with "no commit" — every caller
     treats that SHA as the code baseline, so an empty string here silently
-    disabled rollback/restore/checkpoint lineage (C1).
+    disabled rollback/restore/checkpoint lineage.
     """
     try:
         return _git(code_root, "rev-parse", "HEAD").stdout.strip()
@@ -139,7 +139,7 @@ def checkout(code_root: str, sha: Optional[str]) -> None:
 
     Raises :class:`RepoIntegrityError` on failure: callers use this to restore a
     pinned state (resume / self-patch recovery) — silently continuing after a
-    failed checkout would run on the wrong base (C1/E3).
+    failed checkout would run on the wrong base.
     """
     if not sha:
         return
@@ -151,7 +151,7 @@ def checkout(code_root: str, sha: Optional[str]) -> None:
         ) from e
 
 
-# -- branch-per-node blood lineage (v5) ---------------------------------------
+# -- branch-per-node blood lineage --------------------------------------------
 def task_ref_name(genid: Any) -> str:
     """Persistent lightweight branch ref for a task generation's code state."""
     return f"task_{genid}"
@@ -272,7 +272,7 @@ def _apply_infra_error(*stds: str) -> bool:
 def apply_patch_detail(code_root: str, patch: str) -> Tuple[bool, str]:
     """Apply a unified diff to the code tree. Returns ``(ok, detail)``.
 
-    B4 — failure semantics are layered instead of one blurred ``False``:
+    Failure semantics are layered instead of one blurred ``False``:
 
     - ``ok`` with empty detail            : applied;
     - ``(False, <applier stderr>)``       : the patch CONTENT was refused (bad
@@ -308,8 +308,8 @@ def apply_patch(code_root: str, patch: str) -> bool:
         return apply_patch_detail(code_root, patch)[0]
     except RepoIntegrityError:
         # the throwaway task run-dir has no .git tree to trust/restore: degrade
-        # to "patch not applied" exactly as before this change (the child run is
-        # then evaluated without the patch, still recorded as applied=False)
+        # to "patch not applied" (the child run is then evaluated without the
+        # patch, still recorded as applied=False)
         return False
 
 
@@ -350,7 +350,7 @@ def _hard_rollback(code_root: str, sha: Optional[str]) -> None:
 
     Raises :class:`RepoIntegrityError` on failure: a failed rollback leaves the
     tree holding partially applied patch content, so the run must abort instead
-    of continuing on an undefined baseline (C5).
+    of continuing on an undefined baseline.
     """
     try:
         if sha:
@@ -375,10 +375,10 @@ def registry_report(code_root: str) -> Dict[str, Any]:
     - ``invalid``    : entries failing ``entry_reason`` (incl. the identity contract
       name==stem, the role-directory binding, and tool_info/tool_function exposure);
     - ``duplicate``  : ``(role, name)`` declared twice **within one registry file**
-      (batch 6: one single-writer file per role -- cross-file duplicates are
-      structurally impossible, so there is no merged view to check);
+      (one single-writer file per role: cross-file duplicates are structurally
+      impossible, so there is no merged view to check);
     - ``orphan``     : component files declared by NO registry file.
-    - ``collision``  : toolset basename fights (batch 10 / B17) -- a registered
+    - ``collision``  : toolset basename fights -- a registered
       component whose file stem equals an always-on tool's (or another registered
       component's) stem makes the assembly copy two files onto one toolset
       basename; last writer wins and one tool silently disappears. Keyed as
@@ -423,7 +423,7 @@ def registry_report(code_root: str) -> Dict[str, Any]:
     # orphan: reuse the loader's single definition (component-looking file declared
     # by no registry) so the gate and selection-time validation cannot disagree
     orphan = set(orphan_modules(Path(reg_dir), comp_dir))
-    # collision (batch 10 / B17): the same universe the assembly copies from --
+    # The same universe the assembly copies from --
     # always-on tool files + registered component modules -- fighting for one
     # toolset basename. Sources are stored repo-relative so the differential keys
     # stay stable within a run's before/after snapshots.
@@ -463,7 +463,7 @@ def _registry_worsened(before: Dict[str, Any], after: Dict[str, Any], strict: bo
         items = "; ".join(sorted(new_orph))
         return (f"component file(s) not registered in any registry: {items} "
                 f"(register them with register_component, or remove the files)")
-    # batch 10 / B17: a NEW toolset basename collision means the patch registered
+    # A NEW toolset basename collision means the patch registered
     # (or hand-declared) a component whose file stem fights an always-on tool or
     # another registered component for one toolset slot -- one of the two would
     # silently disappear at the next assembly. Pre-existing collisions never
