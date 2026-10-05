@@ -89,7 +89,8 @@ class Evaluator(Role):
         tok_eval = set_eval_context(ctx)
         akey = self.access_key(node_id)
         tok_access = (set_access_context(broker, "evaluator", akey,
-                                         trajectory_genids=trajectory_genids)
+                                         trajectory_genids=trajectory_genids,
+                                         seat="evaluate")
                       if broker is not None else None)
         try:
             hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief),
@@ -120,7 +121,8 @@ class Evaluator(Role):
         dctx = DesignContext(role="evaluator", config=cfg, node_id="self")
         tok = set_design_context(dctx)
         tok_access = (set_access_context(broker, "evaluator", self.access_key("self"),
-                                         trajectory_genids=trajectory_genids)
+                                         trajectory_genids=trajectory_genids,
+                                         seat="self_improve")
                       if broker is not None else None)
         traj = self.session_trajectory(None)
         attempts = 0
@@ -160,7 +162,7 @@ class Evaluator(Role):
                 if not patch_str or not self.code_root:
                     rejected = None
                     break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str)
+                ok, reason = code_repo.check_patch(self.code_root, patch_str, role="evaluator", seat="self_improve")
                 if ok:
                     rejected = None
                     break

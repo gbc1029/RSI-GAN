@@ -500,7 +500,7 @@ class GanLoop:
         from gan.framework import code_repo
         prev = code_repo.current_commit(self.code_root)
         try:
-            sha = code_repo.apply_self_patch(self.code_root, role, patch)
+            sha = code_repo.apply_self_patch(self.code_root, role, patch, seat="self_improve")
             self._role_commits[role] = sha
             self.log_event({"type": "self_improve_commit", "role": role,
                             "outer": outer, "commit": sha})

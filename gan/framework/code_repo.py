@@ -489,7 +489,8 @@ def _needs_registry_check(files: Iterable[str]) -> bool:
     return True
 
 
-def check_patch(code_root: str, patch: str, strict_unparseable: bool = True) -> Tuple[bool, str]:
+def check_patch(code_root: str, patch: str, strict_unparseable: bool = True,
+                role: Optional[str] = None, seat: str = "legacy") -> Tuple[bool, str]:
     """Dry-run: apply + validate + registry-compare, then ALWAYS roll back (no commit).
 
     Returns (ok, reason). Used for in-session retry before committing.
@@ -497,6 +498,10 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True) -> 
     if not (patch or "").strip():
         return True, ""
     files = changed_files(patch)
+    if role is not None:
+        for f in files:
+            if not frozen.is_allowed(role, f, "modify", seat=seat):
+                return False, f"patch touches non-editable path for {role}: {f}"
     prev = current_commit(code_root)
     before = registry_report(code_root)
     ok, apply_err = apply_patch_detail(code_root, patch)
@@ -507,6 +512,11 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True) -> 
     if not ok:
         _hard_rollback(code_root, prev)
         return False, f"compile failed: {err}"
+    from gan.framework.ast_checker import validate_files as validate_ast_policy
+    policy_issues = validate_ast_policy(code_root, files)
+    if policy_issues:
+        _hard_rollback(code_root, prev)
+        return False, "unsafe capability in agent source: " + "; ".join(policy_issues[:8])
     reason = ""
     if _needs_registry_check(files):
         reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
@@ -515,7 +525,7 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True) -> 
 
 
 def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
-                     strict_unparseable: bool = True) -> str:
+                     strict_unparseable: bool = True, seat: str = "legacy") -> str:
     """Allowlist + compile + registry validation, then commit (or raise PatchRejected).
 
     The single shared entry for BOTH self-edits and task (t) edits.
@@ -524,7 +534,7 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
     if not files:
         raise PatchRejected("empty patch")
     for f in files:
-        if not frozen.is_allowed(role, f, "modify"):
+        if not frozen.is_allowed(role, f, "modify", seat=seat):
             raise PatchRejected(f"patch touches non-editable path for {role}: {f}")
     prev = current_commit(code_root)
     before = registry_report(code_root)
@@ -536,6 +546,11 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
     if not ok:
         _hard_rollback(code_root, prev)
         raise PatchRejected(f"compile failed: {err}")
+    from gan.framework.ast_checker import validate_files as validate_ast_policy
+    policy_issues = validate_ast_policy(code_root, files)
+    if policy_issues:
+        _hard_rollback(code_root, prev)
+        raise PatchRejected("unsafe capability in agent source: " + "; ".join(policy_issues[:8]))
     if _needs_registry_check(files):
         reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
         if reason:
@@ -544,13 +559,13 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
     return commit(code_root, commit_msg)
 
 
-def apply_self_patch(code_root: str, role: str, patch: str) -> str:
+def apply_self_patch(code_root: str, role: str, patch: str, seat: str = "self_improve") -> str:
     """Validate and commit a role self-edit patch (thin wrapper over apply_code_patch)."""
-    return apply_code_patch(code_root, role, patch, f"self-improve {role}")
+    return apply_code_patch(code_root, role, patch, f"self-improve {role}", seat=seat)
 
 
 def apply_task_patch(code_root: str, role: str, patch: str, genid: Any,
-                     parent_genid: Any, base: str) -> Dict[str, Any]:
+                     parent_genid: Any, base: str, seat: str = "plan") -> Dict[str, Any]:
     """Branch-per-node task patch: align to ``base``, validate+commit, pin the ref.
 
     The code state of a generation is a git commit whose parent is its selected
@@ -566,7 +581,8 @@ def apply_task_patch(code_root: str, role: str, patch: str, genid: Any,
     if (patch or "").strip():
         try:
             sha = apply_code_patch(code_root, role, patch,
-                                   f"task gen {genid} parent {parent_genid}")
+                                   f"task gen {genid} parent {parent_genid}",
+                                   seat=seat)
             applied = True
         except PatchRejected:
             _hard_rollback(code_root, base_commit)

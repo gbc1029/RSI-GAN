@@ -56,7 +56,8 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
     # hold this session's edit_source edits or unregister_component deletions. refresh=True
     # is the explicit escape hatch that discards them and re-copies the repo version.
     granted = actx.broker.grant(actx.role, actx.node_id, paths or [], intent=intent,
-                                reason=reason, if_absent=not refresh)
+                                reason=reason, if_absent=not refresh,
+                                 seat=getattr(actx, "seat", "legacy"))
     kept = list((getattr(actx.broker, "last_result", None) or {}).get("skipped") or [])
     if dctx is not None:
         dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)

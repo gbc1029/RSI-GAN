@@ -81,7 +81,7 @@ def tool_function(name, **kwargs):
              if isinstance(e, dict) and e.get("name") == name]
     if not match:
         return f"Error: tool not found: '{name}' in {rel}"
-    if not frozen.is_allowed(role, rel, "modify"):
+    if not frozen.is_allowed(role, rel, "modify", seat=getattr(actx, "seat", "legacy")):
         return f"Error: registry not editable for {role}: {rel}"
     mod = str(match[0].get("module") or "").replace("\\", "/").strip("/")
     # A registry entry is DATA, and with the workspace-first scan above it can come
@@ -92,7 +92,7 @@ def tool_function(name, **kwargs):
     if mod and (not mod.endswith(".py") or any(p == ".." for p in mod.split("/"))):
         return f"Error: unsafe module path in registry entry: {mod!r}"
     module_rel = f"gan/components/{mod}" if mod else ""
-    if module_rel and not frozen.is_allowed(role, module_rel, "modify"):
+    if module_rel and not frozen.is_allowed(role, module_rel, "modify", seat=getattr(actx, "seat", "legacy")):
         return f"Error: component source not editable for {role}: {module_rel}"
     if mod and not mod.startswith(f"{_OWNING_DIR.get(role, role)}/"):
         return (f"Error: module '{mod}' is outside the designed role's component tree "

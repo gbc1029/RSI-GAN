@@ -153,7 +153,20 @@ batch-8 isolation), one subprocess each.
   (registered in `gan/registries/` and selected by the design config). Plumbing
   tools (`deep/`, `design/`, `work/common/`) are frozen; only `work/<role>/` and
   the task components/registry are evolvable.
-- **Access boundary**: `gan/framework/frozen.py` declares a **per-role allowlist**
+- **Session permissions (role + seat)**: `AccessContext` carries both the role and
+  session seat. Reads remain role-wide; writes are seat-specific: planner `plan`
+  may write the task surface, planner/evaluator `self_improve` may write its own
+  role surface, and evaluator `evaluate`/task sessions are read-only. The frozen
+  matrix is enforced at grants, source edits, patch checks, and commits. The
+  `legacy` seat exists only for direct framework callers and compatibility tests.
+- **Front-loaded write policy**: `edit_source` is the only official source-edit
+  entry and uses the centralized frozen authorization helper before mutation.
+  Dispatch validates declared `edit_source` inputs before invoking tool code.
+  Commit and load/preflight layers also apply a conservative AST policy rejecting
+  raw writes, subprocesses, and dynamic execution in agent-owned Python. Framework
+  plumbing is explicitly exempt because it legitimately writes state; this AST
+  check is defense in depth, not a replacement for a real sandbox.
+- **Access boundary**: the frozen role allowlist also defines the read surface
   (read/write) — `task`: none; `planner`: read+write t-set ∪ p-set; `evaluator`:
   read t-set (read-only) + read/write e-set. Everything else is frozen by default;
   there is no persisted deny list. `AccessBroker` enforces it and refuses the repo

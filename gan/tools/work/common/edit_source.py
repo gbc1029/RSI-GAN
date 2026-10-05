@@ -16,6 +16,7 @@ from typing import Optional
 
 from agent.tools import edit as _edit
 from gan.framework.context import get_access_context, get_design_context
+from gan.framework.write_auth import authorize_write, resolve_workspace_path
 
 
 def tool_info():
@@ -50,14 +51,7 @@ def _root(actx) -> str:
 
 
 def _resolve(actx, path: str) -> str:
-    root = _root(actx)
-    p = str(path or "").replace("\\", "/")
-    cand = os.path.realpath(p) if os.path.isabs(p) else os.path.realpath(
-        os.path.join(root, p.lstrip("/"))
-    )
-    if cand != root and not cand.startswith(root + os.sep):
-        raise ValueError(f"path escapes the granted workspace: {path}")
-    return cand
+    return resolve_workspace_path(actx, path)
 
 
 def _registered_component_note(abs_path: str) -> str:
@@ -114,20 +108,9 @@ def tool_function(command, path, file_text=None, view_range=None,
     # with intent="modify" keeps the workspace copy (if_absent), so edits
     # survive and the modify record flips the patch gate.
     if mutating:
-        if get_design_context() is None:
-            return ("Error: edit refused: this session has no patch channel "
-                    "(read-only); source edits cannot reach any commit.")
-        ci = _covering_intent(actx, abs_path)
-        if ci != "modify":
-            hint = "request_source_access(paths=[<the same paths>], intent='modify')"
-            if ci == "view":
-                why = "only covered by a VIEW grant"
-            else:
-                why = "not covered by any grant in this session"
-            return (f"Error: edit refused: this path is {why}, so this edit "
-                    f"would NOT reach the session patch. Re-request the same "
-                    f"paths as {hint} -- your current session edits are KEPT "
-                    f"(no refresh needed) -- then re-apply this edit.")
+        denied = authorize_write(actx, abs_path, operation="edit")
+        if denied:
+            return denied
     out = _edit.tool_function(
         command=command, path=abs_path, file_text=file_text, view_range=view_range,
         old_str=old_str, new_str=new_str, insert_line=insert_line,

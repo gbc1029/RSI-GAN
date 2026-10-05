@@ -146,14 +146,19 @@ class AccessContext:
     broker: Any
     role: str
     node_id: Any
+    # The session seat controls which write roots this role may use.  It is
+    # explicit because role-wide access is too broad for plan/evaluate/self_improve.
+    seat: str = "legacy"
     # Explicit set of task generations whose trajectory this session may read
     # (resolved by the loop; avoids relying on the node already being in the tree).
     trajectory_genids: List[Any] = field(default_factory=list)
 
 
-def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None):
+def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None,
+                       seat: str = "legacy"):
     return _ACCESS_CTX.set(AccessContext(broker, role, node_id,
-                                         list(trajectory_genids or [])))
+                                          seat=str(seat or "legacy"),
+                                          trajectory_genids=list(trajectory_genids or [])))
 
 
 def get_access_context() -> Optional[AccessContext]:

@@ -205,7 +205,9 @@ class AccessBroker:
         intent: str = "view",
         reason: str = "",
         if_absent: bool = False,
+        seat: str = "legacy",
     ) -> List[str]:
+
         """Copy requested repo paths into the role workspace ``src/``.
 
         Returns the list of actually granted (relative) paths. Denied paths are
@@ -231,7 +233,7 @@ class AccessBroker:
             if self.deny_paths and any(fnmatch.fnmatch(rel, pat) for pat in self.deny_paths):
                 denied_list.append(rel)
                 continue
-            if not frozen.is_allowed(role, rel, intent):
+            if not frozen.is_allowed(role, rel, intent, seat=seat):
                 denied_list.append(rel)
                 continue
             if frozen.has_glob(rel):
@@ -244,7 +246,7 @@ class AccessBroker:
                     missing.append(rel)
                     continue
                 for m in matches:
-                    if not frozen.is_allowed(role, m, intent):
+                    if not frozen.is_allowed(role, m, intent, seat=seat):
                         denied_list.append(m)
                         continue
                     self._grant_concrete(m, src_root, granted, denied_list, missing,
@@ -262,6 +264,7 @@ class AccessBroker:
             "denied": denied_list,
             "missing": missing,
             "intent": intent,
+            "seat": seat,
             "reason": reason,
             "ts": time.time(),
             "workspace": src_root,

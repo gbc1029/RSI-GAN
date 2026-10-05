@@ -106,7 +106,8 @@ class Planner(Role):
         tok_design = set_design_context(design_ctx)
         akey = self.access_key(node_id)
         tok_access = (set_access_context(broker, "planner", akey,
-                                         trajectory_genids=trajectory_genids)
+                                         trajectory_genids=trajectory_genids,
+                                         seat="plan")
                       if broker is not None else None)
         traj = self.session_trajectory(node_id)
         attempts = 0
@@ -138,7 +139,7 @@ class Planner(Role):
                 if not patch_str or not self.code_root:
                     rejected = None
                     break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str)
+                ok, reason = code_repo.check_patch(self.code_root, patch_str, role="planner", seat="plan")
                 if ok:
                     rejected = None
                     break
@@ -183,7 +184,8 @@ class Planner(Role):
         dctx = DesignContext(role="planner", config=cfg, node_id="self")
         tok = set_design_context(dctx)
         tok_access = (set_access_context(broker, "planner", self.access_key("self"),
-                                         trajectory_genids=trajectory_genids)
+                                         trajectory_genids=trajectory_genids,
+                                         seat="self_improve")
                       if broker is not None else None)
         traj = self.session_trajectory(None)
         attempts = 0
@@ -219,7 +221,7 @@ class Planner(Role):
                 if not patch_str or not self.code_root:
                     rejected = None
                     break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str)
+                ok, reason = code_repo.check_patch(self.code_root, patch_str, role="planner", seat="self_improve")
                 if ok:
                     rejected = None
                     break

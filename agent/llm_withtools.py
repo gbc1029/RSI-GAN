@@ -119,6 +119,27 @@ def _audit_text(proxy) -> "str | None":
         return None
 
 
+def _dispatch_precheck(tool_name, tool_input):
+    """Validate declared source-edit calls before entering tool code."""
+    if tool_name != "edit_source":
+        return None
+    if not isinstance(tool_input, dict):
+        return "Error: edit_source input must be an object"
+    command = tool_input.get("command")
+    path = tool_input.get("path")
+    if command not in {"create", "str_replace", "insert", "undo_edit", "view"}:
+        return "Error: edit_source command is invalid"
+    if not isinstance(path, str) or not path.strip():
+        return "Error: edit_source requires a non-empty string path"
+    if command == "str_replace" and not isinstance(tool_input.get("old_str"), str):
+        return "Error: edit_source str_replace requires old_str"
+    if command == "insert" and not isinstance(tool_input.get("insert_line"), int):
+        return "Error: edit_source insert requires integer insert_line"
+    if command == "create" and not isinstance(tool_input.get("file_text"), str):
+        return "Error: edit_source create requires file_text"
+    return None
+
+
 def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
     """Execute one tool call with the dispatch-level safety net.
 
@@ -135,6 +156,9 @@ def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
     read their session state via contextvars, and a bare executor thread would
     start with an empty context and break every context-dependent tool.
     """
+    denied = _dispatch_precheck(tool_name, tool_input)
+    if denied:
+        return denied, {"dispatch_rejected": True}
     timeout_s = int(timeout_s or _TOOL_CALL_TIMEOUT_S)
     if tool_name not in tools_dict:
         return f"Error: Tool '{tool_name}' not found", {}

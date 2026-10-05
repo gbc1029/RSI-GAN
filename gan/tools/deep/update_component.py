@@ -99,7 +99,7 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     if description is None and params_schema is None:
         return "Error: nothing to update (pass description= and/or params_schema=)"
 
-    if not frozen.is_allowed(role, rel, "modify"):
+    if not frozen.is_allowed(role, rel, "modify", seat=getattr(actx, "seat", "legacy")):
         return f"Error: registry not editable for {role}: {rel}"
 
     # -- find the entry with the session's authority (workspace copy first,

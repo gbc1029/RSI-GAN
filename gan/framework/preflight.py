@@ -132,6 +132,7 @@ def preflight_tools(
     for role in roles:
         out[role] = {
             "problems": validate_registry(role, registry_dir=reg_dir, components_dir=comp_dir),
+            "capability_policy": capability_policy_problems(role, code_root=croot),
             "collisions": assemble_collisions(role, code_root=croot),
             # B30 (L4): catalog-metadata drift -- NON-fatal (bookkeeping, not a
             # capability loss and not something an interrupted run would silently
@@ -143,6 +144,28 @@ def preflight_tools(
         }
     return out
 
+
+def capability_policy_problems(role: str, code_root: Optional[str] = None) -> List[Dict[str, str]]:
+    """AST policy findings for agent-owned always-on and registered tools."""
+    from gan.tools.assembly import always_on_index, gan_roots
+    from gan.registries.loader import load_registry_for_role
+    from gan.framework.ast_checker import policy_reason
+    out = []
+    for name, info in always_on_index(role, code_root=code_root).items():
+        reason = policy_reason(str(info["path"]))
+        if reason:
+            out.append({"name": name, "path": str(info["path"]), "reason": reason})
+    _tools, rdir, cdir = gan_roots(code_root)
+    reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
+    for entry in reg.entries:
+        if not isinstance(entry, dict):
+            continue
+        path = reg.module_path(str(entry.get("name")))
+        if path:
+            reason = policy_reason(path)
+            if reason:
+                out.append({"name": str(entry.get("name")), "path": path, "reason": reason})
+    return out
 
 def always_on_problems(role: str, code_root: Optional[str] = None
                        ) -> Dict[str, List[Dict[str, str]]]:

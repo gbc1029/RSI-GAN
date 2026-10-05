@@ -159,7 +159,13 @@ def module_api_reason(path: Path) -> Optional[str]:
     except SyntaxError as e:
         return f"unparseable: {str(e)[:100]}"
     missing = [n for n in ("tool_info", "tool_function") if n not in _exposed_names(tree)]
-    return ("missing " + "/".join(missing)) if missing else None
+    if missing:
+        return "missing " + "/".join(missing)
+    # Static capability policy shared with startup and commit validation.  Keep
+    # this after the API check so malformed modules retain the useful API error.
+    from gan.framework.ast_checker import policy_reason
+    policy = policy_reason(str(path))
+    return ("unsafe capability: " + policy) if policy else None
 
 
 def _exposes_tool_api(path: Path) -> bool:

@@ -48,6 +48,22 @@ EVALUATOR_SELF: List[str] = [
     "gan/design/seeds/evaluator.md",
 ]
 
+# Seat-specific write roots.  Reads remain role-wide; only writes are narrowed.
+# ``legacy`` preserves direct callers until every session constructor supplies a seat.
+SEAT_WRITE: Dict[str, Dict[str, List[str]]] = {
+    "planner": {
+        "plan": TASK_SOURCE,
+        "self_improve": PLANNER_SELF,
+        "legacy": TASK_SOURCE + PLANNER_SELF,
+    },
+    "evaluator": {
+        "evaluate": [],
+        "self_improve": EVALUATOR_SELF,
+        "legacy": EVALUATOR_SELF,
+    },
+    "task": {"task": [], "legacy": []},
+}
+
 # role -> {"read": [...], "write": [...]}
 ACCESS: Dict[str, Dict[str, List[str]]] = {
     "task": {"read": [], "write": []},
@@ -89,18 +105,16 @@ def read_roots(role: str) -> List[str]:
     return list(ACCESS.get(role, {}).get("read", []))
 
 
-def write_roots(role: str) -> List[str]:
-    return list(ACCESS.get(role, {}).get("write", []))
+def write_roots(role: str, seat: str = "legacy") -> List[str]:
+    return list(SEAT_WRITE.get(role, {}).get(str(seat or "legacy"),
+                                             ACCESS.get(role, {}).get("write", [])))
 
 
-def is_allowed(role: str, rel: str, intent: str = "view") -> bool:
-    """Allowlist check. intent 'view' -> read roots; anything else -> write roots.
+def is_allowed(role: str, rel: str, intent: str = "view", seat: str = "legacy") -> bool:
+    """Allowlist check with an optional session seat.
 
-    Traversal is never legitimate: no allowlist rule contains ``..``, and because
-    the rules are matched as **prefix globs** (``fnmatch`` lets ``*`` cross ``/``)
-    a path like ``gan/components/task/../../../<outside>`` would otherwise satisfy
-    ``gan/components/task/**``. Rejecting it here closes the whole class at the one
-    gate every consumer (grant / register / unregister / commit) goes through.
+    Reads remain role-wide. Modifying requests use seat-specific write roots;
+    ``legacy`` preserves direct callers until every session supplies a seat.
     """
     if not rel:
         return False
@@ -108,7 +122,7 @@ def is_allowed(role: str, rel: str, intent: str = "view") -> bool:
     if raw.startswith("/") or any(part == ".." for part in raw.split("/")):
         return False
     rel = raw
-    roots = read_roots(role) if intent == "view" else write_roots(role)
+    roots = read_roots(role) if intent == "view" else write_roots(role, seat)
     if not _matches(rel, roots):
         return False
     return not _matches(rel, TRUST_ANCHOR)

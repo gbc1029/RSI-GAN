@@ -102,7 +102,8 @@ class DomainTaskRunner:
         if self.code_root and base:
             res = code_repo.apply_task_patch(
                 self.code_root, "planner", patch_str, genid,
-                (parent.genid if parent is not None else "initial"), base)
+                (parent.genid if parent is not None else "initial"), base,
+                seat="plan")
             task_code_commit = res["code_commit"]
             base_commit = res["base_commit"]
             code_ref_ok = bool(res["ref_ok"])
@@ -116,7 +117,8 @@ class DomainTaskRunner:
             # legacy path (no base resolved): pre-branch time-line HEAD behaviour
             try:
                 task_code_commit = code_repo.apply_code_patch(
-                    self.code_root, "planner", patch_str, f"task gen {genid}")
+                    self.code_root, "planner", patch_str, f"task gen {genid}",
+                    seat="plan")
                 task_patch_files = code_repo.changed_files(patch_str)
                 patch_applied = True
             except code_repo.PatchRejected as e:

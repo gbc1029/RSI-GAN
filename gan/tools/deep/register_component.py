@@ -170,9 +170,9 @@ def tool_function(name, module, description=None, **kwargs):
                 f"reference gan/components/{_OWNING_DIR.get(role, role)}/**")
 
     # 2) permission gate (same rule and order as unregister_component)
-    if not frozen.is_allowed(role, reg_rel, "modify"):
+    if not frozen.is_allowed(role, reg_rel, "modify", seat=getattr(actx, "seat", "legacy")):
         return f"Error: registry not editable for {role}: {reg_rel}"
-    if not frozen.is_allowed(role, module_rel, "modify"):
+    if not frozen.is_allowed(role, module_rel, "modify", seat=getattr(actx, "seat", "legacy")):
         return f"Error: component source not editable for {role}: {module_rel}"
 
     # 2) the module must already exist -- in the repo (committed) OR in the workspace
