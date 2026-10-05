@@ -277,8 +277,9 @@ batch-8 isolation), one subprocess each.
   A component whose file stem equals an always-on tool's (or another registered
   component's) stem would make the assembly copy two files onto one toolset
   basename, silently shadowing one of them: `register_component` refuses such a
-  stem up front, and the differential commit gate refuses a NEW collision
-  (pre-existing ones never block).
+  stem up front, and the differential commit gate refuses a NEW collision for
+  **every non-empty patch** (including patches that only add/modify
+  `gan/tools/work/**`; pre-existing collisions never block).
   Patch visibility follows `granted_paths`: a file the agent created in the
   workspace reaches the patch only when a grant covers it (grant the parent
   **directory** to have new files inside it captured). `AccessBroker.covers` is the

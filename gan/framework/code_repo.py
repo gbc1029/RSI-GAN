@@ -477,22 +477,16 @@ def _registry_worsened(before: Dict[str, Any], after: Dict[str, Any], strict: bo
     return ""
 
 
-def _patch_touches_registry(files: Iterable[str]) -> bool:
-    return any(str(f).replace("\\", "/").startswith("gan/registries/") for f in files)
-
-
-def _patch_touches_components(files: Iterable[str]) -> bool:
-    """A patch that adds/edits component files must keep the registry consistent.
-
-    Without this, adding ``gan/components/**/foo.py`` and forgetting the registry
-    entry produced a silently-unselectable component (the gate only ran when the
-    patch itself touched ``gan/registries/``).
-    """
-    return any(str(f).replace("\\", "/").startswith("gan/components/") for f in files)
-
-
 def _needs_registry_check(files: Iterable[str]) -> bool:
-    return _patch_touches_registry(files) or _patch_touches_components(files)
+    """Every non-empty code patch must validate the assembly namespace.
+
+    Collision and registry health are properties of the resulting code tree, not
+    of which directory a patch happened to touch.  In particular, a patch that
+    only adds an always-on file under ``gan/tools/work/**`` can collide with an
+    already-registered component.  Keep this helper as a named policy point, but
+    do not make the check conditional on patch paths.
+    """
+    return True
 
 
 def check_patch(code_root: str, patch: str, strict_unparseable: bool = True) -> Tuple[bool, str]:
