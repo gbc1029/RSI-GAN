@@ -57,6 +57,10 @@ class Evaluator(Role):
             # decision), and an unlabeled block invited cross-round misattribution.
             parts.append(
                 "\n## Diff summary of the planner's changes in the parent round (no rationale)\n"
+                "Op vocabulary: `add_config_key` rows are declared design-config keys "
+                "(key/value_type/consumer — judge whether the declared consumer makes "
+                "the key real, not the description wording); `add_config_value` rows "
+                "extend a declared key's value enum (key/value).\n"
                 f"```json\n{json.dumps(parent_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
             )
         return "\n".join(parts)
@@ -140,7 +144,11 @@ class Evaluator(Role):
             instruction = (
                 "Improve YOURSELF (the evaluator's own design) using only design operators "
                 "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
-                "deep changes need `request_source_access`). Reflect on the TEXT feedback "
+                "deep changes need `request_source_access`). You may also extend your own "
+                "config's keys: `add_config_key` declares a new evaluator-config key (its "
+                "`consumer` must be a registered evaluator tool that reads it; declaration "
+                "and consumer land in the same patch) and `add_config_value` extends a "
+                "declared enum key. Reflect on the TEXT feedback "
                 "digests below to judge "
                 "your issues more accurately and usefully — do NOT fit the benchmark score. "
                 "Do not repeat the same tool call; when done, stop.\n"

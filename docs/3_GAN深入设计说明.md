@@ -22,7 +22,7 @@
 
 3. **“配置化”= agent 的浅层设计（单一 config JSON），非框架配置**
    - 新增 `gan/design/`：`schema.py`（各角色**极小** schema：task={prompt,skills,memory,params}、planner={prompt,memory,params}、evaluator={prompt,eval_points,memory,params}）、`store.py`（`design/<role|task-node>/config.json`）、`registry.py`（分角色 `registries/<role>_registry.json` + `components/` 代码）、`composer.py`、`context.py`（`DesignContext`）。
-   - **浅层边界=代码定义的 schema**：只能改**已有键的值** + 从注册表**选择组件**；**新增配置键/新增或修改组件实现 = 源码级（深）**。
+   - **浅层边界=代码定义的 schema + 已声明动态键**：改**已有键的值**、改**已声明动态键**的值、从注册表**选择组件**；**新增配置键**经 `add_config_key`（声明落 `gan/design/schema_ext/<role>.json`，与消费者组件同补丁原子进退，未声明/无消费者的键被 key-heal 清除）；**新增或修改组件实现 = 源码级（深）**。【已变】原"新增配置键 = 源码级（深）"的契约在动态键扩展落地后收窄为上述形态。
    - `gan/config/gan_loop.yaml` 保留为**隐藏超参**（进化不可见）。
    - task agent 变为**设计驱动**：`task_agent.py` 从 `GAN_TASK_DESIGN` 读取 config（prompt+skills），技能由 `GAN_TASK_SKILLS_DIR` 加载。
 

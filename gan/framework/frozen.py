@@ -31,6 +31,7 @@ TASK_SOURCE: List[str] = [
     "task_agent.py",
     "gan/components/task/**",
     "gan/registries/task.json",
+    "gan/design/schema_ext/task.json",
 ]
 
 PLANNER_SELF: List[str] = [
@@ -39,6 +40,7 @@ PLANNER_SELF: List[str] = [
     "gan/components/planner/**",
     "gan/registries/planner.json",
     "gan/design/seeds/planner.md",
+    "gan/design/schema_ext/planner.json",
 ]
 
 EVALUATOR_SELF: List[str] = [
@@ -47,6 +49,7 @@ EVALUATOR_SELF: List[str] = [
     "gan/components/evaluator/**",
     "gan/registries/evaluator.json",
     "gan/design/seeds/evaluator.md",
+    "gan/design/schema_ext/evaluator.json",
 ]
 
 # Seat-specific write roots.  Reads remain role-wide; only writes are narrowed.

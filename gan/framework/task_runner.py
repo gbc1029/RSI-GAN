@@ -169,7 +169,9 @@ class DomainTaskRunner:
         # node meta and the parent->child inheritance chain together; the stripped
         # names are recorded (event + meta) so the planner's next receipt shows
         # what was dropped and why.
+        design_keys_stripped = tx.heal_design_keys(config, "task", source_root)
         design_stripped = tx.heal_design_slots(config, "task", source_root)
+        design_stripped = design_keys_stripped + design_stripped
         if design_stripped:
             try:
                 from gan.framework import paths as _paths

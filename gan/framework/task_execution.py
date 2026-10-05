@@ -51,7 +51,22 @@ _PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
 
 
-# -- design persistence -----------------------------------------------------
+def heal_design_keys(config: Dict[str, Any], role: str,
+                     code_root: Optional[str]) -> List[Dict[str, str]]:
+    """Strip dynamic config keys not declared by the committed schema catalog."""
+    if not isinstance(config, dict) or role not in ("task", "planner", "evaluator"):
+        return []
+    from gan.design.schema import allowed_keys
+    known = allowed_keys(role, code_root=code_root)
+    stripped = []
+    for key in list(config):
+        if key not in known:
+            stripped.append({"name": str(key), "reason": "not declared in schema"})
+            del config[key]
+    return stripped
+
+
+
 def persist_design(design_store: DesignStore, config: Dict[str, Any], genid: Any) -> str:
     return design_store.save(config or {}, "task", node_id=genid)
 

@@ -538,10 +538,11 @@ class GanLoop:
             # stripped names ride the self receipt (design_stripped) so the
             # role's next self-improve sees its own heal.
             from gan.design.store import DesignStore
-            from gan.framework.task_execution import heal_design_slots
+            from gan.framework.task_execution import heal_design_slots, heal_design_keys
             store = DesignStore(paths.design_root(self.output_dir))
             cfg = store.load(role)
-            stripped = heal_design_slots(cfg, role, self.code_root)
+            stripped = heal_design_keys(cfg, role, self.code_root)
+            stripped += heal_design_slots(cfg, role, self.code_root)
             if stripped:
                 store.save(cfg, role)
                 self.log_event({"type": "design_dangling_stripped", "role": role,

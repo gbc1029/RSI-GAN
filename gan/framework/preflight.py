@@ -300,7 +300,7 @@ def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
     from pathlib import Path
     import time
     from gan.design.store import DesignStore
-    from gan.framework.task_execution import heal_design_slots
+    from gan.framework.task_execution import heal_design_slots, heal_design_keys
 
     out: Dict[str, Any] = {"checked": [], "stripped": [], "errors": []}
     store = DesignStore(design_root)
@@ -311,7 +311,8 @@ def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
         out["checked"].append({"role": role, "path": path})
         try:
             cfg = store.load(role)
-            stripped = heal_design_slots(cfg, role, code_root)
+            stripped = heal_design_keys(cfg, role, code_root)
+            stripped += heal_design_slots(cfg, role, code_root)
         except Exception as e:  # noqa: BLE001 -- a broken design file is not a
             # startup fatality here: _seed_self_designs owns that repair and the
             # run continues on the seed; report and move on.

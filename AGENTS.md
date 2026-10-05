@@ -87,7 +87,11 @@ batch-8 isolation), one subprocess each.
 - **Shallow vs deep**: each agent's *shallow design* is a single config JSON in
   `gan/design/` (one component slot, `tools`, per role — batch 6; the legacy
   `skills`/`eval_points` slot names are aliases). Shallow operators live in
-  `gan/tools/design/` and may only set **existing** keys or select/deselect
+  `gan/tools/design/` and may set **existing** keys, **declared dynamic keys**
+  (`gan/design/schema_ext/<role>.json`, declared via `add_config_key` with a
+  registered `consumer` — declaration and consumer land in the SAME patch and
+  roll back together; undeclared/consumerless keys are stripped by the key heal
+  at persist), or select/deselect
   **registered** tools (`select_component` / `deselect_component` / the `tools`
   key of `set_config`). Tool add/delete/modify is classified by what it
   touches: **shallow** = edit the design config list only; **deep delete** =

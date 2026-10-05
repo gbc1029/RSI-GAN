@@ -232,13 +232,22 @@ _FALLBACK_SHALLOW = frozenset({
     "select_component", "deselect_component",
 })
 
+# Design-directory operators that are deep BY NATURE: they write a CODE-TREE
+# file (``gan/design/schema_ext/<role>.json``), so their changes reach the
+# committed tree only through the patch channel. Left in the auto-derived
+# shallow set, a declaration-only session would build no patch and the schema_ext
+# edit would be dropped at the outer boundary. (The normal flow still pairs the
+# declaration with a deep op — the consumer component — but the lone-declaration
+# session must patch too.)
+_DEEP_BY_NATURE = frozenset({"add_config_key", "add_config_value"})
+
 
 def _shallow_design_ops() -> frozenset:
     try:
         stems = {p.stem for p in _DESIGN_DIR.glob("*.py") if p.stem != "__init__"}
     except OSError:
         stems = set()
-    return frozenset(stems) or _FALLBACK_SHALLOW
+    return (frozenset(stems) - _DEEP_BY_NATURE) or _FALLBACK_SHALLOW
 
 
 _SHALLOW_DESIGN_OPS = _shallow_design_ops()

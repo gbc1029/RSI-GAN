@@ -364,6 +364,32 @@ def _hard_rollback(code_root: str, sha: Optional[str]) -> None:
 
 
 # -- registry validation (field-agnostic; keys are (file, kind, name)) --------
+def schema_ext_report(code_root: str) -> Dict[str, Any]:
+    """Report malformed dynamic design-key catalogs for differential gating."""
+    import json
+    from gan.design.schema import _valid_spec, MAX_DYNAMIC_KEYS
+    invalid = set()
+    base = os.path.join(code_root, "gan", "design", "schema_ext")
+    for role in ("task", "planner", "evaluator"):
+        p = os.path.join(base, f"{role}.json")
+        try:
+            with open(p, encoding="utf-8") as f: raw = json.load(f)
+            if not isinstance(raw, dict) or len(raw) > MAX_DYNAMIC_KEYS:
+                invalid.add((role, "catalog"))
+                continue
+            for key, spec in raw.items():
+                if not isinstance(key, str) or not isinstance(spec, dict) or not _valid_spec(key, spec):
+                    invalid.add((role, str(key)))
+        except (OSError, ValueError, TypeError):
+            invalid.add((role, "unparseable"))
+    return {"invalid": invalid}
+
+
+def _schema_ext_worsened(before, after) -> str:
+    new = after["invalid"] - before["invalid"]
+    return f"schema extension became invalid: {sorted(new)}" if new else ""
+
+
 def registry_report(code_root: str) -> Dict[str, Any]:
     """Snapshot of registry health for a code tree (used for *differential* gating).
 
@@ -504,6 +530,7 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True,
                 return False, f"patch touches non-editable path for {role}: {f}"
     prev = current_commit(code_root)
     before = registry_report(code_root)
+    before_schema = schema_ext_report(code_root)
     ok, apply_err = apply_patch_detail(code_root, patch)
     if not ok:
         _hard_rollback(code_root, prev)
@@ -520,6 +547,8 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True,
     reason = ""
     if _needs_registry_check(files):
         reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
+        if not reason:
+            reason = _schema_ext_worsened(before_schema, schema_ext_report(code_root))
     _hard_rollback(code_root, prev)
     return (reason == ""), reason
 
@@ -538,6 +567,7 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
             raise PatchRejected(f"patch touches non-editable path for {role}: {f}")
     prev = current_commit(code_root)
     before = registry_report(code_root)
+    before_schema = schema_ext_report(code_root)
     ok, apply_err = apply_patch_detail(code_root, patch)
     if not ok:
         _hard_rollback(code_root, prev)
@@ -553,6 +583,8 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
         raise PatchRejected("unsafe capability in agent source: " + "; ".join(policy_issues[:8]))
     if _needs_registry_check(files):
         reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
+        if not reason:
+            reason = _schema_ext_worsened(before_schema, schema_ext_report(code_root))
         if reason:
             _hard_rollback(code_root, prev)
             raise PatchRejected(reason)

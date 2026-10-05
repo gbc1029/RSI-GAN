@@ -48,6 +48,13 @@ def build_diff_summary(
         elif op in ("select_component", "deselect_component"):
             entry["slot"] = r.get("slot")
             entry["name"] = r.get("name")
+        elif op == "add_config_key":
+            entry["key"] = r.get("key")
+            entry["value_type"] = r.get("value_type")
+            entry["consumer"] = r.get("consumer")
+        elif op == "add_config_value":
+            entry["key"] = r.get("key")
+            entry["value"] = r.get("value")
         elif op == "request_source_access":
             entry["paths"] = list(r.get("paths", []) or [])  # reason intentionally stripped
         elif op == "edit_source":

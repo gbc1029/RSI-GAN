@@ -88,7 +88,10 @@ def tool_info():
             "register_component, with 'patch_covered' telling you whether the file can "
             "reach the commit at all). 'design_role' is the catalog this lists; "
             "'access_role' owns the workspace. 'selectable' mirrors exactly what "
-            "select_component will accept right now. Pass the reported 'name' verbatim "
+            "select_component will accept right now. 'declared_keys' lists the "
+            "role's declared dynamic config keys (schema_ext) with their type, "
+            "value enum and consumer, and whether that consumer is selectable "
+            "right now. Pass the reported 'name' verbatim "
             "to select_component: the registered name, the module file stem and the "
             "callable tool name are the same string."
         ),
@@ -253,6 +256,25 @@ def tool_function(**kwargs):
         value = cfg.get("tools")
         selected["tools"] = [str(x) for x in value] if isinstance(value, (list, tuple)) else []
 
+    # -- declared dynamic config keys (schema_ext, workspace-first) ---------
+    # Keys are data like the registry: a session that declared a key this outer
+    # must see it here, exactly as add_config_key / set_config will treat it.
+    from gan.design.schema import load_dynamic_specs
+    dynamic_keys = load_dynamic_specs(design_role, overlay_root=overlay)
+    declared_keys = [
+        {
+            "key": k,
+            "type": spec.get("type"),
+            "consumer": spec.get("consumer"),
+            "enum": spec.get("enum"),
+            "consumer_selectable": (
+                spec.get("consumer") in eff_by_key
+                and _selectable(str(spec.get("consumer")))[0]
+            ),
+        }
+        for k, spec in sorted(dynamic_keys.items())
+    ]
+
     # -- unregistered (orphan candidates) ----------------------------------
     _covers = getattr(broker, "covers", None)
 
@@ -331,6 +353,12 @@ def tool_function(**kwargs):
     if not patch_channel:
         notes.append("no patch channel in this session (evaluate): deep registry/source "
                      "changes made now would be discarded -- do not attempt them")
+    unconsumed = [d["key"] for d in declared_keys if not d["consumer_selectable"]]
+    if unconsumed:
+        notes.append("declared config key(s) whose consumer is NOT selectable now: "
+                     + ", ".join(sorted(unconsumed))
+                     + " -- values set on them are dropped by the key heal unless the "
+                       "consumer lands in this session's patch (register_component)")
 
     return json.dumps({
         # `role` is kept as the back-compat alias of `design_role` (the catalog owner)
@@ -341,6 +369,7 @@ def tool_function(**kwargs):
         "roots": {"code": str(root), "workspace": overlay},
         "registry_sources": sources,
         "selected": selected,
+        "declared_keys": declared_keys,
         "registered": registered,
         "unregistered": unregistered,
         "problems": problems,

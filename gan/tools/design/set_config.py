@@ -16,7 +16,7 @@ if ANY name fails, the whole call is refused and the design is untouched.
 """
 from gan.framework.context import get_design_context, session_overlay_root
 from gan.framework.receipt import prompt_change_facts
-from gan.design.schema import allowed_keys
+from gan.design.schema import allowed_keys, dynamic_key_spec, validate_dynamic_value
 from gan.registries.loader import load_registry_for_role
 
 _SLOT_ALIASES = {"skills": "tools", "eval_points": "tools"}
@@ -27,8 +27,8 @@ def tool_info():
     return {
         "name": "set_config",
         "description": (
-            "Set an existing design-config key (e.g. 'prompt', 'tools', 'params'). "
-            "Adding a NEW key is not allowed here (requires a source-level change). "
+            "Set an existing design-config key (including a declared dynamic key). "
+            "Declare a new key with add_config_key; add enum values with add_config_value. "
             "For the component slot ('tools'; legacy 'skills'/'eval_points' aliases) "
             "every name must be a registered, valid tool (same check as "
             "select_component); the whole call is refused otherwise."
@@ -45,9 +45,14 @@ def tool_function(key, value, **kwargs):
     if ctx is None:
         return "Error: no design context"
     key = _SLOT_ALIASES.get(str(key), str(key))
-    if key not in allowed_keys(ctx.role):
+    if key not in allowed_keys(ctx.role, session_overlay_root()):
         return (f"Error: '{key}' is not in the {ctx.role} design schema; "
-                f"adding new keys requires a source-level (deep) change")
+                "declare it with add_config_key first")
+    dyn = dynamic_key_spec(ctx.role, key, session_overlay_root())
+    if dyn:
+        err = validate_dynamic_value(dyn, value)
+        if err:
+            return f"Error: dynamic key '{key}' rejected: {err}"
     extra: dict = {}
     if key == _COMPONENT_SLOT:
         # B25/H12: the component slot holds tool references, not free values.

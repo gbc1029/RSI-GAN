@@ -5,7 +5,13 @@
 
 ## 修改深度（默认面 + 门控面）
 1. **默认可用（浅层修改）**：
-   - **配置层**：`set_prompt`（改提示词）、`set_config`（改已有配置键）、`set_param`（改参数）。
+   - **配置层**：`set_prompt`（改提示词）、`set_config`（改已有键或已声明动态键）、`set_param`（改参数）。
+   - **键扩展**：`add_config_key(key, value_type, consumer, description[, enum][, initial_value])`
+     为设计 config **声明新键**。硬约束：`consumer` 必须是**已注册且有效**的目标角色工具
+     （键没有真实消费者就没有意义，会被拒绝/被 heal 清除）；声明与消费者组件**同补丁**原子进退
+     （补丁被拒则两者一起回滚）；键名限 `^[a-z][a-z0-9_]{0,31}$`；每角色动态键 ≤16；
+     `description` ≤200 字符。`add_config_value(key, value)` 给已声明的 enum 键**追加一个可选值**
+     （value 是 ≤64 字符的结构化 token，enum ≤32 项，重复追加会被拒绝）。
    - **组件层**：`select_component`（把一个已注册组件选入配置）/ `deselect_component`（从配置移除）。
    - **原则**：能用配置/组件表达改进的，不要动源码。
 2. **源码层（需显式声明，深层修改）**：
@@ -18,10 +24,12 @@
    - **新建文件必须授权父目录**：要通过补丁**新建**文件（新组件/新知识/新 README），先
      `request_source_access(paths=[<父目录 glob 根>], intent="modify")` 授权**目录**——
      只有位于已授权路径下的新文件才会进补丁；授权面之外的文件在 outer 边界被**丢弃**。
-     对已存在文件反之用精确路径（不要传 glob）。
+     对已存在文件反之用精确路径（不要传 glob）。`add_config_key` 前先对
+     `gan/design/schema_ext/<目标角色>.json` 做精确路径授权。
    - **记录约定（新增/修改工具或算子时必守）**：让它生效时调用 `ctx.record(op, **结构化字段)`
-     （`slot`/`name`/`key`/`paths`/`intent` 等），**不得把自由文本 rationale 写进 record**——
-     `records` 既决定补丁是否生成，也是评估者可见摘要的唯一来源；不记录的改动对循环不可见。
+     （`slot`/`name`/`key`/`value_type`/`consumer`/`paths`/`intent` 等），**不得把自由文本
+     rationale 写进 record**——`records` 既决定补丁是否生成，也是评估者可见摘要的唯一来源；
+     不记录的改动对循环不可见。
 
 ## 知识库（md，DATA）
 - 给 task agent 的长期笔记写在 `gan/components/task/knowledge/*.md`：先用 `request_source_access`

@@ -83,7 +83,7 @@ def _ops_summary(records: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]
             continue
         op = r.get("op")
         entry: Dict[str, Any] = {"op": op}
-        for k in ("slot", "name", "key", "intent", "paths"):
+        for k in ("slot", "name", "key", "intent", "paths", "value_type", "consumer", "value"):
             if k in r:
                 entry[k] = r[k]
         # Prompt facts are copied ONLY when a producer recorded them
@@ -136,6 +136,9 @@ def _design_diff(config: Optional[Dict[str, Any]], parent_config: Optional[Dict[
         "prompt_changed": (cfg.get("prompt") != par.get("prompt")),
         "tools_added": sorted(after - before),
         "tools_removed": sorted(before - after),
+        "dynamic_keys_added": sorted(set(cfg) - set(par)
+                                     - {"prompt", "tools", "params",
+                                        "skills", "eval_points"}),
     }
 
 
@@ -150,6 +153,10 @@ def _next_hint(reason: Optional[str]) -> str:
         return "Fix the newly-invalid component(s) or `unregister_component` them."
     if "unparseable" in r:
         return "The registry JSON is not parseable; restore valid JSON."
+    if "schema extension" in r:
+        return "Fix the schema_ext JSON declaration: valid key specs only, then retry the patch."
+    if "dynamic key" in r or "config key" in r:
+        return "Use add_config_key for a declared key, or add_config_value only for an enum key."
     if "compile" in r or "syntax" in r:
         return "Fix the compile/syntax error in the changed files."
     if "non-editable" in r:
@@ -234,6 +241,8 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
             parts.append(f"tools added: {design['tools_added']}")
         if design.get("tools_removed"):
             parts.append(f"tools removed: {design['tools_removed']}")
+        if design.get("dynamic_keys_added"):
+            parts.append(f"config keys added: {design['dynamic_keys_added']}")
     if cp.get("applied"):
         parts.append(f"code patch applied (commit {str(cp.get('commit'))[:8]})")
     elif cp.get("proposed") and not cp.get("applied"):
@@ -254,11 +263,14 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
     if stripped:
         # The design must never keep claiming what the tree cannot
         # deliver; the role sees exactly what was dropped and why.
+        # Covers BOTH heal dimensions: dangling slot names (tools) and
+        # config keys no longer declared by the schema catalog.
         snames = ", ".join(f"'{s.get('name')}' ({str(s.get('reason'))[:60]})"
                            for s in stripped)
-        parts.append(f"design note: dangling slot names STRIPPED before persist: {snames} "
-                     f"— re-add only after the component is committed "
-                     f"(register_component + patch)")
+        parts.append(f"design note: dangling design entries STRIPPED before persist: {snames} "
+                     f"— re-add tools only after the component is committed "
+                     f"(register_component + patch); re-declare keys via add_config_key "
+                     f"(with a committed consumer)")
     drift = receipt.get("component_drift") or []
     if drift:
         names = ", ".join(

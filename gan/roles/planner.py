@@ -45,8 +45,15 @@ class Planner(Role):
         parts.append(
             "\n## Shallow surface (design config)\n"
             "Edit the task design ONLY via design operators: `set_prompt`, `set_config`, "
-            "`select_component`, `deselect_component`, `set_param`. Adding a NEW config key, "
-            "a NEW component, or component LOGIC requires a DEEP change: call "
+            "`select_component`, `deselect_component`, `set_param`. Config keys are "
+            "extensible: `add_config_key(key, value_type, consumer, description, "
+            "[enum], [initial_value])` declares a NEW key for the task config -- the "
+            "`consumer` must be a registered, valid task tool that actually reads the "
+            "key, and the declaration lands in the SAME patch as that consumer (a "
+            "rejected patch rolls back both). `add_config_value(key, value)` extends "
+            "the value enum of a declared enum key. Undeclared or consumer-less keys "
+            "are stripped by the key heal before persist. Adding a NEW component or "
+            "component LOGIC still requires a DEEP change: call "
             "`request_source_access` (gated) then edit the granted copies with `edit_source`."
         )
         if parents and len(parents) > 1:
@@ -200,7 +207,11 @@ class Planner(Role):
             instruction = (
                 "Improve YOURSELF (the planner's own design) using only design operators "
                 "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
-                "deep changes need `request_source_access`). Goal: plan better task agents over "
+                "deep changes need `request_source_access`). You may also extend your own "
+                "config's keys: `add_config_key` declares a new planner-config key (its "
+                "`consumer` must be a registered planner tool that reads it; declaration "
+                "and consumer land in the same patch) and `add_config_value` extends a "
+                "declared enum key. Goal: plan better task agents over "
                 "the long run. "
                 "Do not repeat the same tool call; when done, stop.\n"
                 f"\n## Your session trajectories this outer (use read_session_trajectory)\n{sess_line}\n"
