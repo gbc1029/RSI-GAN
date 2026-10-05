@@ -37,6 +37,7 @@ PLANNER_SELF: List[str] = [
     "gan/roles/planner.py",
     "gan/tools/work/planner/**",
     "gan/components/planner/**",
+    "gan/registries/planner.json",
     "gan/design/seeds/planner.md",
 ]
 

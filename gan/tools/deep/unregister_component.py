@@ -25,6 +25,18 @@ from gan.registries.loader import parse_registry_file, write_registry_json
 # role -> the registry it designs (single-writer file, batch 6)
 _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
 _OWNING_DIR = {"planner": "task", "evaluator": "evaluator"}
+_SEAT_OWNERSHIP = {
+    ("planner", "plan"): ("task.json", "task"),
+    ("planner", "self_improve"): ("planner.json", "planner"),
+    ("evaluator", "self_improve"): ("evaluator.json", "evaluator"),
+    ("planner", "legacy"): ("task.json", "task"),
+    ("evaluator", "legacy"): ("evaluator.json", "evaluator"),
+}
+
+
+def _ownership(actx):
+    return _SEAT_OWNERSHIP.get((actx.role, getattr(actx, "seat", "legacy")),
+                               (_OWN_REGISTRY.get(actx.role), _OWNING_DIR.get(actx.role, actx.role)))
 
 
 def tool_info():
@@ -62,7 +74,7 @@ def tool_function(name, **kwargs):
         return ("Error: deep registry changes are currently unavailable in this "
                 "session; use `request_source_access` to view source. Do not retry.")
 
-    fn = _OWN_REGISTRY.get(role)
+    fn, owning_dir = _ownership(actx)
     if not fn:
         return f"Error: role '{role}' has no designable registry"
     rel = f"gan/registries/{fn}"
@@ -94,9 +106,9 @@ def tool_function(name, **kwargs):
     module_rel = f"gan/components/{mod}" if mod else ""
     if module_rel and not frozen.is_allowed(role, module_rel, "modify", seat=getattr(actx, "seat", "legacy")):
         return f"Error: component source not editable for {role}: {module_rel}"
-    if mod and not mod.startswith(f"{_OWNING_DIR.get(role, role)}/"):
+    if mod and not mod.startswith(f"{owning_dir}/"):
         return (f"Error: module '{mod}' is outside the designed role's component tree "
-                f"({_OWNING_DIR.get(role, role)}/...)")
+                f"({owning_dir}/...)")
 
     # bring the registry (and module, if present) into the workspace.
     # ``if_absent`` never overwrites an existing workspace copy: re-granting the
@@ -104,10 +116,11 @@ def tool_function(name, **kwargs):
     # this session, and the resulting patch (entry restored, module still deleted)
     # is rejected by the registry gate. The MODULE is granted even when it is
     # absent from the workspace, so the deletion stays visible to the patch builder.
-    broker.grant(role, node, [rel], intent="modify", reason="unregister", if_absent=True)
+    broker.grant(role, node, [rel], intent="modify", reason="unregister", if_absent=True,
+                 seat=getattr(actx, "seat", "legacy"))
     if module_rel:
         broker.grant(role, node, [module_rel], intent="modify", reason="unregister",
-                     if_absent=True)
+                     if_absent=True, seat=getattr(actx, "seat", "legacy"))
 
     ws_mod = os.path.join(src, module_rel) if module_rel else ""
     if ws_mod:

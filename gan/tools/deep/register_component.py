@@ -37,6 +37,18 @@ _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
 # role -> the component directory its registry may reference (role-directory
 # binding; the allowlist already enforces the same split, this is the message)
 _OWNING_DIR = {"planner": "task", "evaluator": "evaluator"}
+_SEAT_OWNERSHIP = {
+    ("planner", "plan"): ("task.json", "task"),
+    ("planner", "self_improve"): ("planner.json", "planner"),
+    ("evaluator", "self_improve"): ("evaluator.json", "evaluator"),
+    ("planner", "legacy"): ("task.json", "task"),
+    ("evaluator", "legacy"): ("evaluator.json", "evaluator"),
+}
+
+
+def _ownership(actx):
+    return _SEAT_OWNERSHIP.get((actx.role, getattr(actx, "seat", "legacy")),
+                               (_OWN_REGISTRY.get(actx.role), _OWNING_DIR.get(actx.role, actx.role)))
 
 _DESCRIPTION_CAP = 300  # catalog metadata, not rhetoric (mirrors the B15' discipline)
 
@@ -148,7 +160,7 @@ def tool_function(name, module, description=None, **kwargs):
                 "session; use `request_source_access` to view source. Do not retry.")
 
     # batch 6: the registry is the one this role designs (single writer per file)
-    reg_name = _OWN_REGISTRY.get(role)
+    reg_name, owning_dir = _ownership(actx)
     if not reg_name:
         return f"Error: role '{role}' has no designable registry"
     reg_rel = f"gan/registries/{reg_name}"
@@ -164,10 +176,10 @@ def tool_function(name, module, description=None, **kwargs):
     # 1) role-directory binding (batch 6, checked FIRST so the agent gets the most
     #     specific error): a registry entry may only reference its own role's
     #     component tree
-    if not mod.startswith(f"{_OWNING_DIR.get(role, role)}/"):
+    if not mod.startswith(f"{owning_dir}/"):
         return (f"Error: module '{mod}' is outside the designed role's component tree "
-                f"({_OWNING_DIR.get(role, role)}/...); {reg_name} entries must "
-                f"reference gan/components/{_OWNING_DIR.get(role, role)}/**")
+                f"({owning_dir}/...); {reg_name} entries must "
+                f"reference gan/components/{owning_dir}/**")
 
     # 2) permission gate (same rule and order as unregister_component)
     if not frozen.is_allowed(role, reg_rel, "modify", seat=getattr(actx, "seat", "legacy")):
@@ -217,7 +229,7 @@ def tool_function(name, module, description=None, **kwargs):
     comp_dir = Path(src) / "gan" / "components"
     if not (comp_dir / mod).is_file():
         comp_dir = Path(code_root) / "gan" / "components"
-    reason = entry_reason(candidate, comp_dir, _OWNING_DIR.get(role, role))
+    reason = entry_reason(candidate, comp_dir, owning_dir)
     if reason:
         return f"Error: invalid entry ({reason})"
 
@@ -248,7 +260,7 @@ def tool_function(name, module, description=None, **kwargs):
             same_name_exists = True
             break
     if not same_name_exists:
-        holders = _collision_sources(_OWNING_DIR.get(role, role), code_root,
+        holders = _collision_sources(owning_dir, code_root,
                                      f"{Path(mod).stem}.py")
         if holders:
             return (f"Error: cannot register '{name}': {Path(mod).stem}.py would "
@@ -281,10 +293,11 @@ def tool_function(name, module, description=None, **kwargs):
     #      genuinely unwritable (denied/oversized) and the tool refuses loudly with
     #      the gate's own reason instead of writing a registration it cannot commit.
     if not broker.covers(role, node, reg_rel):
-        broker.grant(role, node, [reg_rel], intent="modify", reason="register")
+        broker.grant(role, node, [reg_rel], intent="modify", reason="register",
+                     seat=getattr(actx, "seat", "legacy"))
     if not os.path.isfile(ws_reg):
         broker.grant(role, node, [reg_rel], intent="modify", reason="register",
-                     if_absent=True)
+                     if_absent=True, seat=getattr(actx, "seat", "legacy"))
     if not broker.covers(role, node, reg_rel):
         denied = (getattr(broker, "last_result", {}) or {}).get("denied") or []
         why = f" (denied: {', '.join(denied[:3])})" if reg_rel in [str(d) for d in denied] else ""
@@ -348,18 +361,12 @@ def tool_function(name, module, description=None, **kwargs):
     comps.append(new_entry)
     write_registry_json(ws_reg, data)
     dctx.record("register_component", name=name, module=mod, registry=reg_name)
-    # batch 13 (B42 companion note, text only): when the designed role differs
-    # from the registry's owning role (planner's self-improve session, whose
-    # design target is planner but whose writable registry is task.json), say so
-    # -- the entry cannot be selected in THIS session (the design target's slot
-    # resolves against the designed role's own registry).
-    cross_note = ""
+    # A planner self-improve session designs planner, while plan designs task.
     designed = getattr(dctx, "role", None)
-    if designed is not None and designed != _OWNING_DIR.get(role, role):
-        cross_note = (f" NOTE: registered into {reg_name} (the {role} session's "
-                      f"writable registry), but your current design target is "
-                      f"'{designed}' -- this tool is not selectable in THIS "
-                      f"session; task-side changes belong to your plan sessions.")
+    cross_note = ""
+    if designed is not None and designed != owning_dir:
+        cross_note = (f" NOTE: registered into {reg_name} for seat '{getattr(actx, 'seat', 'legacy')}' "
+                      f"but the current design target is '{designed}'.")
     return (f"Registered tool '{name}' ({module_rel}) in {reg_rel}{note}. It will "
             f"be committed with this session's patch after validation. You can "
             f"select_component it right away (task design); the task agent actually "

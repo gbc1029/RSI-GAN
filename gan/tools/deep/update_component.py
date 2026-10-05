@@ -33,6 +33,18 @@ from gan.registries.loader import (entry_reason, parse_registry_file,
 # role -> the registry it designs (single-writer file, batch 6)
 _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
 _OWNING_DIR = {"planner": "task", "evaluator": "evaluator"}
+_SEAT_OWNERSHIP = {
+    ("planner", "plan"): ("task.json", "task"),
+    ("planner", "self_improve"): ("planner.json", "planner"),
+    ("evaluator", "self_improve"): ("evaluator.json", "evaluator"),
+    ("planner", "legacy"): ("task.json", "task"),
+    ("evaluator", "legacy"): ("evaluator.json", "evaluator"),
+}
+
+
+def _ownership(actx):
+    return _SEAT_OWNERSHIP.get((actx.role, getattr(actx, "seat", "legacy")),
+                               (_OWN_REGISTRY.get(actx.role), _OWNING_DIR.get(actx.role, actx.role)))
 # mirrors register_component's cap: catalog metadata, not rhetoric
 _DESCRIPTION_CAP = 300
 
@@ -81,7 +93,7 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
         return ("Error: deep registry changes are currently unavailable in this "
                 "session; use `request_source_access` to view source. Do not retry.")
 
-    fn = _OWN_REGISTRY.get(role)
+    fn, owning_dir = _ownership(actx)
     if not fn:
         return f"Error: role '{role}' has no designable registry"
     rel = f"gan/registries/{fn}"
@@ -119,10 +131,11 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     #    identical to register_component (``broker.covers`` is the single
     #    definition of patch visibility; ``if_absent`` protects in-session edits)
     if not broker.covers(role, node, rel):
-        broker.grant(role, node, [rel], intent="modify", reason="update")
+        broker.grant(role, node, [rel], intent="modify", reason="update",
+                     seat=getattr(actx, "seat", "legacy"))
     if not os.path.isfile(ws_reg):
         broker.grant(role, node, [rel], intent="modify", reason="update",
-                     if_absent=True)
+                     if_absent=True, seat=getattr(actx, "seat", "legacy"))
     if not broker.covers(role, node, rel):
         return (f"Error: cannot write {rel}: the path is not patch-visible. "
                 f"Nothing was updated. Inspect it with request_source_access and "
@@ -171,7 +184,7 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     reason = entry_reason(entry,
                           [Path(src) / "gan" / "components",
                            Path(code_root) / "gan" / "components"],
-                          _OWNING_DIR.get(role, role))
+                          owning_dir)
     if reason:
         return f"Error: update would produce an invalid entry ({reason})"
     write_registry_json(ws_reg, data)

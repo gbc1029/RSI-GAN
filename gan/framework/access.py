@@ -275,9 +275,12 @@ class AccessBroker:
                             "missing": missing, "skipped": skipped}
         return granted
 
-    def granted_paths(self, role: str, node_id: Any) -> List[str]:
+    def granted_paths(self, role: str, node_id: Any, intent: Optional[str] = None) -> List[str]:
+        """Return granted paths, optionally filtered by grant intent."""
         out: List[str] = []
         for rec in self.grants.get((role, str(node_id)), []):
+            if intent is not None and rec.get("intent", "view") != intent:
+                continue
             out.extend(rec.get("paths", []))
         return out
 
@@ -295,7 +298,7 @@ class AccessBroker:
         rel = str(rel).replace("\\", "/").strip("/")
         if not rel:
             return False
-        for g in self.granted_paths(role, node_id) or []:
+        for g in self.granted_paths(role, node_id, intent="modify") or []:
             g = str(g).replace("\\", "/").rstrip("/")
             if g and (rel == g or rel.startswith(g + "/")):
                 return True

@@ -167,7 +167,7 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
     removed from the workspace, e.g. by ``unregister_component``).
     """
     src_root = broker.src_dir(role, node_id)
-    granted = rel_paths if rel_paths is not None else broker.granted_paths(role, node_id)
+    granted = rel_paths if rel_paths is not None else broker.granted_paths(role, node_id, intent="modify")
     chunks: List[str] = []
     seen = set()
     for rel in granted:
@@ -178,6 +178,15 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
         a_root = os.path.join(broker.repo_root, rel)
         b_root = os.path.join(src_root, rel)
         if not os.path.exists(a_root):
+            # A granted path may be a newly-created file/directory.  It is
+            # patch-visible when the workspace contains it; do not silently
+            # discard it merely because the repo baseline lacks it.
+            if os.path.exists(b_root):
+                for b_file in _iter_files(b_root):
+                    rel_file = os.path.relpath(b_file, src_root).replace(os.sep, "/")
+                    b_lines = _read_lines(b_file)
+                    chunks.append(_no_newline_marker_diff(
+                        [], b_lines, fromfile=f"a/{rel_file}", tofile=f"b/{rel_file}"))
             continue
         if not os.path.exists(b_root):
             # the whole granted file/dir was deleted in the workspace
