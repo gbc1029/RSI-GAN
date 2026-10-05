@@ -292,7 +292,13 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"framework note: {len(frozen)} FROZEN tool(s) failed to load "
                      f"— escalated to framework owners; do NOT attempt to repair, "
                      f"selection/registration changes cannot help")
-    if receipt.get("next_hint"):
+    # A1 (batch 31): the hint is a REJECTION remedy -- only a session that
+    # actually proposed a patch can carry one. Belt-and-braces against a future
+    # producer re-conflating "no patch proposed" with "rejected" (the producer
+    # gate is task_runner.task_patch_rejection); build_receipt's next_hint data
+    # field is untouched. Mirrors the `proposed` gate the "code patch REJECTED"
+    # line above already had.
+    if receipt.get("next_hint") and (receipt.get("code_patch") or {}).get("proposed"):
         parts.append(f"hint: {receipt['next_hint']}")
     if not parts:
         return ""

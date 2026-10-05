@@ -36,6 +36,30 @@ def _modify_depth(records: List[Dict[str, Any]]) -> int:
     return 0
 
 
+# A1 (batch 31): only a PROPOSED patch that produced no new code commit is a
+# rejection. "No patch proposed this round" is the normal case and used to set
+# the same string, so every no-patch generation reported rejected:true to the
+# receipt / events / evaluator surfaces and the planner got a phantom
+# "fix the reported problem" hint (docs/7 §2.1 A1).
+TASK_PATCH_REJECTED_NO_COMMIT = "no new code commit (patch rejected or absent)"
+
+
+def task_patch_rejection(patch_str: str, task_code_commit: Optional[str],
+                         base_commit: Optional[str]) -> Optional[str]:
+    """Classify the task-patch outcome: the rejection reason, or None.
+
+    None covers BOTH success (a new commit landed) and "no patch was proposed";
+    the two are distinguishable downstream via ``patch_applied`` and the
+    receipt's ``code_patch.proposed`` -- never via this field. A proposed patch
+    whose diff turns out empty also lands here (acted, produced nothing).
+    """
+    if not (patch_str or "").strip():
+        return None
+    if task_code_commit and base_commit and task_code_commit == base_commit:
+        return TASK_PATCH_REJECTED_NO_COMMIT
+    return None
+
+
 class DomainTaskRunner:
     def __init__(
         self,
@@ -111,8 +135,9 @@ class DomainTaskRunner:
             patch_applied = bool(res["applied"])
             if patch_applied:
                 task_patch_files = code_repo.changed_files(patch_str)
-            if task_code_commit == base_commit and task_code_commit:
-                task_patch_rejected = "no new code commit (patch rejected or absent)"
+            # A1 (batch 31): only a PROPOSED patch with no new commit is a
+            # rejection -- "no patch proposed" must not masquerade as one.
+            task_patch_rejected = task_patch_rejection(patch_str, task_code_commit, base_commit)
         elif (patch_str or "").strip() and self.code_root:
             # legacy path (no base resolved): pre-branch time-line HEAD behaviour
             try:
@@ -122,7 +147,17 @@ class DomainTaskRunner:
                 task_patch_files = code_repo.changed_files(patch_str)
                 patch_applied = True
             except code_repo.PatchRejected as e:
-                task_patch_rejected = str(e)
+                # B35 (batch 31): the exception text quotes the planner's own
+                # artifacts (comments/identifiers inside the rejected diff) and
+                # this field rides _EVALUATOR_META_KEYS -- meta carries the SAME
+                # fixed generic string as the main path; the full text stays on
+                # the local audit log only.
+                task_patch_rejected = TASK_PATCH_REJECTED_NO_COMMIT
+                try:
+                    with open(self.log_path, "a", encoding="utf-8") as lf:
+                        lf.write(f"[genid {genid}] task patch rejected (legacy path): {e}\n")
+                except OSError:
+                    pass  # best-effort local audit line; the meta string is durable
             patch_str = ""  # applied to code_root (or rejected -> nothing to apply)
 
         # H11/B24 (batch 5): heal the design BEFORE it is persisted. The patch has
