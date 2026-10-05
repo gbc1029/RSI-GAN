@@ -141,7 +141,60 @@ def preflight_tools(
             # B7: always-on API exposure, split by owner (frozen = fatal below,
             # owned = reported and handed back to the role)
             "always_on": always_on_problems(role, code_root=croot),
+            # B47-R1 (advisory): observed-capability profiles for agent-owned
+            # tool sources -- the counterpart to self-reported tool_info
+            # descriptions. Never gating; the operator reads this at startup.
+            "observed_capabilities": observed_capabilities(role, code_root=croot),
         }
+    return out
+
+
+def observed_capabilities(role: str, code_root: Optional[str] = None
+                         ) -> List[Dict[str, Any]]:
+    """B47-R1 (advisory): observed-capability profiles for agent-owned tools.
+
+    Walks the same surface as ``capability_policy_problems`` (always-on +
+    registered components) but reports instead of gating: for every tool whose
+    source statically shows a flagged capability (raw write / subprocess /
+    dynamic exec) or has findings, its profile is listed. ``tool_info()``
+    descriptions are self-reported; this is the observed counterpart an
+    operator (and, via the assembly report, the agent) can compare against.
+    Heuristic by construction -- dynamic dispatch, ctypes and runtime-generated
+    code are invisible. Framework-owned plumbing is not profiled.
+    """
+    from gan.tools.assembly import always_on_index, gan_roots
+    from gan.registries.loader import load_registry_for_role
+    from gan.framework.ast_checker import check_file_report
+    out: List[Dict[str, Any]] = []
+
+    def _keep(name: str, path: str) -> None:
+        # always_on_index keys by the toolset basename ("x.py"); the assembly
+        # report profiles by the dispatch stem ("x") -- report the stem so the
+        # two mounts cannot disagree on the same tool's identity.
+        if name.endswith(".py"):
+            name = name[:-3]
+        prof = check_file_report(path, path)
+        if prof.get("framework_owned"):
+            return
+        if (prof.get("observed_mutating") or prof.get("observed_subprocess")
+                or prof.get("observed_dynamic_exec") or prof.get("findings")):
+            out.append({"name": name, "path": path, "observed": {
+                "mutating": prof.get("observed_mutating", False),
+                "subprocess": prof.get("observed_subprocess", False),
+                "dynamic_exec": prof.get("observed_dynamic_exec", False),
+            }, "findings": prof.get("findings", [])})
+
+    for name, info in always_on_index(role, code_root=code_root).items():
+        _keep(str(name), str(info["path"]))
+    _tools, rdir, cdir = gan_roots(code_root)
+    reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
+    for entry in reg.entries:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name"))
+        path = reg.module_path(name)
+        if path:
+            _keep(name, path)
     return out
 
 

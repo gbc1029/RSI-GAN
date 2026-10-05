@@ -18,6 +18,7 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional, Tuple
 
+from gan.framework.ast_checker import check_file_report
 from gan.framework.loader import config_dir
 from gan.registries.loader import load_registry_for_role
 
@@ -226,10 +227,20 @@ def assemble_tools_dir_reported(
     Report: ``{"role", "dest", "always_on", "selected_requested",
     "selected_assembled", "skipped": [{"name", "reason"}]}`` — the single point
     of truth for "what the design selected vs what assembly actually delivered".
+
+    B47-R1 (advisory): ``"observed": {tool_stem: profile}`` lists ONLY the
+    assembled tools whose source statically shows a capability the gate would
+    flag anywhere (raw write / subprocess / dynamic exec) or has findings on —
+    absence from this map means "no observed capability findings". Descriptions
+    in ``tool_info()`` are self-reported; this is the observed counterpart,
+    surfaced next to the tool list so a description/behavior mismatch is
+    visible where the agent picks tools. Never gating: selection and assembly
+    are unchanged, and the commit/load AST gate remains the enforcement point.
     """
     os.makedirs(dest_dir, exist_ok=True)
     if clear:
         _clear_tools_dir(dest_dir)
+    observed: Dict[str, Dict[str, Any]] = {}
     always_on: List[str] = []
     if include_always_on:
         for src in always_on_dirs(role, code_root=code_root):
@@ -249,12 +260,38 @@ def assemble_tools_dir_reported(
             continue
         bn = shutil.copy2(p, os.path.join(dest_dir, os.path.basename(p)))
         selected_assembled.append(os.path.basename(bn))
+
+    def _profile_source(src_path: str) -> None:
+        """B47-R1: keep only non-empty profiles (positive-signal map)."""
+        stem = os.path.basename(src_path).rsplit(".", 1)[0]
+        if stem in observed:
+            return
+        prof = check_file_report(src_path, src_path)
+        if prof.get("framework_owned"):
+            return
+        if (prof.get("observed_mutating") or prof.get("observed_subprocess")
+                or prof.get("observed_dynamic_exec") or prof.get("findings")):
+            observed[stem] = {
+                "observed_mutating": prof.get("observed_mutating", False),
+                "observed_subprocess": prof.get("observed_subprocess", False),
+                "observed_dynamic_exec": prof.get("observed_dynamic_exec", False),
+                "findings": prof.get("findings", []),
+            }
+
+    if include_always_on:
+        for src in always_on_dirs(role, code_root=code_root):
+            for f in py_files_in(src):
+                _profile_source(f)
+    for p in paths:
+        if os.path.isfile(p):
+            _profile_source(p)
     return {
         "role": role, "dest": dest_dir,
         "always_on": sorted(os.path.basename(f) for f in always_on),
         "selected_requested": selected_requested,
         "selected_assembled": selected_assembled,
         "skipped": skipped,
+        "observed": observed,
     }
 
 

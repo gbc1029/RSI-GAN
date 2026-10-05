@@ -132,7 +132,7 @@
 **实现**：
 - **算子即工具**：每个算子是 `op_info() + op_function()` 的 py 文件，注册机制完全复刻 `agent/tools/__init__.py` 的自动发现（新增 `gan/operators/registry.py`，同一套约定）。agent 侧只需知道算子签名与说明，无需读算子源码。
 - **避免重复**：凡"纯参数改动"一律实现为"写配置"的薄封装（`apply_config(key,value)`）；真正做结构性代码操作只有 `swap_module`（模块重组）与 `code_edit`（门控兜底）。
-- **新算子提出**：planner 自改时可以往 `gan/config/op_proposals.yaml` 写提案（名称+语义+参数 schema）；加载器扫描 proposals，若匹配到已有算子则映射参数，否则标记为待人工/后续实现的占位（v0 不自动生成代码，避免算子与配置重复膨胀）。
+- **新算子提出**：planner 自改时可以往 `gan/config/op_proposals.yaml` 写提案（名称+语义+参数 schema）；加载器扫描 proposals，若匹配到已有算子则映射参数，否则标记为待人工/后续实现的占位（v0 不自动生成代码，避免算子与配置重复膨胀）。 **[已变]** 算子提案体系在 v4 已移除，`gan/config/op_proposals.yaml` 全仓不存在（本节为 v1 历史计划）；现行机制为「算子即工具 + `gan/registries/` 每角色注册表」，见 `docs/3`/`AGENTS.md`。
 - planner 算子 v0：`set_prompt(section,text)`、`tune_param(key,value)`、`apply_config`、`add_config(key,value,rationale)`、`set_tool_enabled(name,bool)`、`swap_module(a,b)`、`code_edit`（门控后）。
 - evaluator 评估点 v0（注册表 `gan/config/eval_points.yaml`）：`benchmark_score`（数值透传）、`trajectory_quality`（过程打分）、`hard_failure`（强惩罚）、`reward_hacking`（对照规则检查，触发源码授权）、`rule_violation`。evaluator 自进化=增删改评估点+改评估提示词。
 
@@ -208,7 +208,7 @@
 | `gan/config/gan_loop.yaml` | 双循环参数：I_max/S_in/B/D/N_op/成本预算/门控策略/schema_version | — |
 | `gan/config/prompts/{planner,evaluator}.md` | 三角色提示词（从代码抽出，成为可被算子修改的"配置"） | — |
 | `gan/config/eval_points.yaml` | evaluator 评估点注册表（v0 五个评估点） | evaluator_ops |
-| `gan/config/op_proposals.yaml` | planner 提出的新算子提案池 | planner 自改 |
+| `gan/config/op_proposals.yaml` | planner 提出的新算子提案池 **[已变]**：v4 已移除，该文件全仓不存在（历史计划；现行机制见 `docs/3`/`AGENTS.md`） | planner 自改 |
 | `gan/access.py` | **源码门控**：`request_source_access` 工具实现、grant 会话、工作区源码复制/回收、审计写 events.jsonl | git_utils, v1.1 修订 |
 | `gan/tree/store.py` | 三棵树读写（jsonl 追加）、约束检查（B/D/停滞）、UCB+惩罚选择、节点价值三元组、兼容读 archive.jsonl | gl_utils |
 | `gan/reward/packet.py` | RewardPacket schema（dataclass+校验）、聚合、版本化、落盘 | llm.py cost hook |

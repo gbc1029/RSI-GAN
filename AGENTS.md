@@ -369,7 +369,12 @@ batch-8 isolation), one subprocess each.
   report / the role `assembly_report` and classified by owner, so a component that
   failed to load becomes an agent-fixable item in the next instruction while a
   broken frozen tool is escalated (`framework_failed`) and never handed to an agent
-  that cannot touch it. General rule these implement: **abort only when nobody can
+  that cannot touch it. Since B47-R1 the assembly and preflight reports also carry per-tool
+   **observed-capability profiles** (static, advisory-only: raw writes / subprocess /
+   dynamic exec, keyed by the dispatch stem) — the observed counterpart to self-reported
+   `tool_info()` descriptions; capability-flagged modules cannot ride the registry path
+   at all, so the live positive-signal surface is always-on owned tools. General rule
+   these implement: **abort only when nobody can
   repair the state OR continuing would produce a silently wrong result; otherwise
   strip/repair, record, and feed the owner.**
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.

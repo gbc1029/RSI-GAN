@@ -35,19 +35,24 @@ def _const_string(node: ast.AST) -> Optional[str]:
 class _Checker(ast.NodeVisitor):
     def __init__(self) -> None:
         self.issues: List[str] = []
+        # B47-R1: same judgments, kept as per-category flags so the advisory
+        # report (check_source_report) and the reject gate cannot drift apart.
+        self.observed = {"mutating": False, "subprocess": False, "dynamic_exec": False}
 
-    def _issue(self, node: ast.AST, text: str) -> None:
+    def _issue(self, node: ast.AST, text: str, category: Optional[str] = None) -> None:
         self.issues.append(f"line {getattr(node, 'lineno', '?')}: {text}")
+        if category:
+            self.observed[category] = True
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             if alias.name == "subprocess" or alias.name.startswith("subprocess."):
-                self._issue(node, "subprocess import")
+                self._issue(node, "subprocess import", "subprocess")
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module == "subprocess" or (node.module or "").startswith("subprocess."):
-            self._issue(node, "subprocess import")
+            self._issue(node, "subprocess import", "subprocess")
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -56,11 +61,11 @@ class _Checker(ast.NodeVisitor):
         attr = fn.attr if isinstance(fn, ast.Attribute) else None
         root = fn.value.id if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name) else None
         if name in {"eval", "exec"}:
-            self._issue(node, f"dynamic execution: {name}()")
+            self._issue(node, f"dynamic execution: {name}()", "dynamic_exec")
         elif root == "subprocess" or name in {"Popen", "run", "call", "check_call", "check_output"}:
-            self._issue(node, "subprocess execution")
+            self._issue(node, "subprocess execution", "subprocess")
         elif attr in {"write_text", "write_bytes"}:
-            self._issue(node, f"raw file write: .{attr}()")
+            self._issue(node, f"raw file write: .{attr}()", "mutating")
         elif name in {"open", "io_open"}:
             mode = _const_string(node.args[1]) if len(node.args) > 1 else None
             for kw in node.keywords:
@@ -71,9 +76,9 @@ class _Checker(ast.NodeVisitor):
                     # open() defaults to read-only; this is an explicit exemption.
                     pass
                 else:
-                    self._issue(node, f"raw file write: open(mode={mode!r})")
+                    self._issue(node, f"raw file write: open(mode={mode!r})", "mutating")
         elif root in {"os", "pathlib", "Path"} and attr in {"open", "write_text", "write_bytes"}:
-            self._issue(node, f"raw file write: {root}.{attr}()")
+            self._issue(node, f"raw file write: {root}.{attr}()", "mutating")
         self.generic_visit(node)
 
 
@@ -101,6 +106,48 @@ def check_file(path: str, relpath: str = "") -> List[str]:
 def policy_reason(path: str, relpath: str = "") -> Optional[str]:
     issues = check_file(path, relpath)
     return "; ".join(issues[:4]) if issues else None
+
+
+def check_source_report(text: str, relpath: str = "") -> dict:
+    """B47-R1 (advisory): structured observed-capability profile of tool source.
+
+    The SAME static judgments the commit/load gate makes, exposed as a per-tool
+    report field instead of a reject decision -- it exists because
+    ``tool_info()`` descriptions are self-reported and the gate outcome never
+    reaches the agent's tool-selection view. Heuristic by construction:
+    dynamic dispatch, ctypes and runtime-generated code are invisible, so the
+    flags are observations about the committed bytes, not promises about runs.
+
+    ``framework_owned`` sources are not profiled (not agent artifacts; the gate
+    already fail-fasts on them).
+    """
+    out = {"observed_mutating": False, "observed_subprocess": False,
+           "observed_dynamic_exec": False, "findings": [], "framework_owned": False}
+    if framework_owned(relpath):
+        out["framework_owned"] = True
+        return out
+    try:
+        tree = ast.parse(text, filename=relpath or "<source>")
+    except SyntaxError as exc:
+        out["findings"] = [f"unparseable: {exc}"]
+        return out
+    checker = _Checker()
+    checker.visit(tree)
+    out["findings"] = list(checker.issues)
+    out["observed_mutating"] = checker.observed["mutating"]
+    out["observed_subprocess"] = checker.observed["subprocess"]
+    out["observed_dynamic_exec"] = checker.observed["dynamic_exec"]
+    return out
+
+
+def check_file_report(path: str, relpath: str = "") -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return check_source_report(fh.read(), relpath or path)
+    except OSError as exc:
+        return {"observed_mutating": False, "observed_subprocess": False,
+                "observed_dynamic_exec": False, "findings": [f"unreadable: {exc}"],
+                "framework_owned": False}
 
 
 def validate_files(code_root: str, rel_files) -> List[str]:

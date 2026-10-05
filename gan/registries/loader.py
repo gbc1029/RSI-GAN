@@ -320,7 +320,14 @@ def entry_reason(entry: Any, components_dir, owning_role: Optional[str] = None) 
     if str(entry["name"]) != stem:
         return (f"name '{entry['name']}' != module file stem '{stem}' "
                 f"(tools are keyed by file stem; the component would never load)")
-    if not _exposes_tool_api(p):
+    api_reason = module_api_reason(p)
+    if api_reason is not None:
+        if api_reason.startswith("unsafe capability"):
+            # B47-R1 companion: keep the loader's two failure families distinct.
+            # ``_exposes_tool_api`` collapses both into one bool, which made a
+            # capability-policy refusal look like a missing tool API. Same
+            # verdict, precise cause.
+            return api_reason
         return f"module does not expose tool_info/tool_function: {mod}"
     return None
 

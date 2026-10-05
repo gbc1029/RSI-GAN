@@ -74,8 +74,10 @@ ACCESS: Dict[str, Dict[str, List[str]]] = {
                   "write": EVALUATOR_SELF},
 }
 
-# Explicit trust anchor (documentation / defence-in-depth). NOT used for the
-# allowlist decision, but the gate asserts nothing here is ever granted.
+# Explicit trust anchor. NOT part of the ACCESS allowlist (no role lists it), but
+# enforced as an extra deny filter in is_allowed() below and passed to the broker
+# as the runtime deny list (deny_paths()). Currently redundant (defence-in-depth):
+# none of these paths appear in any role's roots.
 TRUST_ANCHOR: List[str] = [
     "gan/framework/*",
     "agent/llm.py",
