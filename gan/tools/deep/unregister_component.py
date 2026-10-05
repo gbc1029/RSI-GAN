@@ -6,7 +6,7 @@ entry removed, module file deleted) rather than committing immediately — the
 change is folded into the session's patch and goes through the normal commit
 validation (allowlist + compile + registry) together with the rest of the edits.
 
-Batch 6: name-keyed, and the scan targets exactly the registry this role designs
+Name-keyed, and the scan targets exactly the registry this role designs
 (planner -> task.json, evaluator -> evaluator.json) — with one single-writer
 registry per role there is no other file the tool could be declared in, so the
 old "scan all registry files" behaviour had no remaining purpose. The workspace
@@ -22,7 +22,7 @@ from gan.framework import frozen
 from gan.framework.context import get_access_context, get_design_context
 from gan.registries.loader import parse_registry_file, write_registry_json
 
-# role -> the registry it designs (single-writer file, batch 6)
+# role -> the registry it designs (single-writer file)
 _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
 _OWNING_DIR = {"planner": "task", "evaluator": "evaluator"}
 _SEAT_OWNERSHIP = {
@@ -68,7 +68,7 @@ def tool_function(name, **kwargs):
     # A deep write is only meaningful in a session that has a patch channel. The
     # design context is set exactly in the sessions that turn the workspace into a
     # patch (plan / self_improve); without it the edit would land in the workspace
-    # and then be silently discarded (R1). Refuse loudly instead.
+    # and then be silently discarded. Refuse loudly instead.
     dctx = get_design_context()
     if dctx is None:
         return ("Error: deep registry changes are currently unavailable in this "
@@ -142,7 +142,7 @@ def tool_function(name, **kwargs):
     if ws_mod and os.path.isfile(ws_mod):
         os.remove(ws_mod)
     dctx.record("unregister_component", name=name, registry=fn, module=(mod or None))
-    # batch 13 (U'): a still-selected name means the design claims a capability
+    # A still-selected name means the design claims a capability
     # whose removal is only SCHEDULED -- the two facts live on different
     # timelines (registry entry: patched; design slot: immediate) and are
     # calibrated only at the patch-exit heal / assembly report. Detection and

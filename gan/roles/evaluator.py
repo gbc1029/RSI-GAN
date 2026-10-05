@@ -1,4 +1,4 @@
-"""Evaluator role: judge the task agent (blind score then reveal), 2x2-aware."""
+"""Evaluator role: judge the task agent (blind score first, then reveal)."""
 from __future__ import annotations
 
 import json
@@ -52,7 +52,7 @@ class Evaluator(Role):
                 f"```json\n{json.dumps(parent_feedback.get('issues'), ensure_ascii=False, indent=2)[:3000]}\n```"
             )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
-            # B9 (batch 32): the block is scoped to the parent round explicitly --
+            # The block is scoped to the parent round explicitly --
             # the ops list LAGS one round by design (kept滞后, per the ledger
             # decision), and an unlabeled block invited cross-round misattribution.
             parts.append(
@@ -161,7 +161,7 @@ class Evaluator(Role):
             def _build_patch() -> str:
                 if broker is None or not has_deep_write(dctx.records):
                     return ""
-                # B6: no catch — see the planner _build_patch comment; a patch
+                # No catch — see the planner _build_patch comment; a patch
                 # build failure propagates (session -> evaluator_failed), never
                 # masquerades as a legitimate empty patch.
                 from gan.patch import build_patch_from_workspace

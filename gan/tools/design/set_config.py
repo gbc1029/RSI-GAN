@@ -3,16 +3,15 @@
 Only keys already defined in the role schema may be set. Adding a NEW key is a
 source-level (deep) change, not a shallow operator.
 
-The ``tools`` slot (batch 6: one component slot per role; legacy ``skills``/
+The ``tools`` slot (one component slot per role; legacy ``skills``/
 ``eval_points`` names are aliases) goes through the SAME tool validation as
-``select_component`` -- a raw list write here used to bypass the registry check
-entirely, so an unregistered name could enter the design without any rejection
-and silently lose the capability at assembly. The authority is the same one
-``select_component`` uses: the effective (workspace-first) registry, and since
-batch 13 FOR EVERY ROLE (role self-designs included; the batch-5 committed-only
-exception is retired -- safety rests on the successful-exit heal, the B7
-assembly report and the ability to re-select next outer). The write is atomic:
-if ANY name fails, the whole call is refused and the design is untouched.
+``select_component`` -- a raw list write here would otherwise bypass the
+registry check entirely, letting an unregistered name enter the design and
+silently lose the capability at assembly. The authority is the same effective
+(workspace-first) registry for EVERY ROLE, role self-designs included; safety
+rests on the successful-exit heal, the assembly report and the ability to
+re-select next outer. The write is atomic: if ANY name fails, the whole call is
+refused and the design is untouched.
 """
 from gan.framework.context import get_design_context, session_overlay_root
 from gan.framework.receipt import prompt_change_facts
@@ -55,13 +54,13 @@ def tool_function(key, value, **kwargs):
             return f"Error: dynamic key '{key}' rejected: {err}"
     extra: dict = {}
     if key == _COMPONENT_SLOT:
-        # B25/H12: the component slot holds tool references, not free values.
+        # The component slot holds tool references, not free values.
         # Validate exactly like select_component (same authority, same errors).
         if not isinstance(value, list) or any(not isinstance(x, str) for x in value):
             return f"Error: '{key}' must be a list of tool names (strings)"
         if key not in ctx.config:
             return f"Error: slot '{key}' not in {ctx.role} design schema"
-        # batch 13: the effective (workspace-first) registry for ALL roles --
+        # The effective (workspace-first) registry for ALL roles --
         # mirrors select_component (same authority, same errors)
         overlay = session_overlay_root()
         reg = load_registry_for_role(ctx.role, overlay_root=overlay)
@@ -78,9 +77,9 @@ def tool_function(key, value, **kwargs):
         # Frozen framework setting: role model is not an evolvable design value.
         value = {k: v for k, v in value.items() if k != "model"}
     if key == "prompt":
-        # B29: ``set_config(key="prompt")`` is the same act as set_prompt and had
-        # the same blind spot (it recorded only the key). Capture the replaced
-        # value BEFORE the assignment and record the same structural facts.
+        # ``set_config(key="prompt")`` is the same act as set_prompt. Capture the
+        # replaced value BEFORE the assignment and record the same structural
+        # facts.
         from gan.tools.design.set_prompt import _seed_prompt
         prev = (ctx.config or {}).get("prompt") or ""
         extra.update(prompt_change_facts(prev, value, seed=_seed_prompt(ctx.role)))

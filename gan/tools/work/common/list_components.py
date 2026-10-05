@@ -12,7 +12,7 @@ prompt data. ``list_components`` answers, in one read-only call:
   registry declares (orphans) -- candidates for ``register_component``, NOT
   selectable until registered.
 
-**Which role's catalog** (H10). The registry that matters is the one
+**Which role's catalog**. The registry that matters is the one
 ``select_component`` consults -- the **design target** (``DesignContext.role``), not
 the access role. In the planner's *plan* session those differ (access ``planner``,
 design target ``task``); keying the catalog off the access role made the planner
@@ -20,12 +20,12 @@ list its own (empty) catalog while every task tool it may select stayed invisibl
 Both roles are reported: ``design_role`` (catalog) and ``access_role``
 (session/workspace).
 
-**Two roots** (B18/P3 residue). A session edits a **workspace** copy of the paths it
+**Two roots**. A session edits a **workspace** copy of the paths it
 granted; that copy is what the patch commits. So the registry file and each tool
 module resolve **workspace-first, committed-tree second** -- the same rule the deep
 tools scan with -- and the output says which copy each item came from. The
 workspace is only a *partial* copy, so the committed tree is the fallback and never
-disappears from the listing. (Batch 6: one registry file per role -- no shared file,
+disappears from the listing. (One registry file per role -- no shared file,
 no cross-file merging -- so the "origin" is simply which copy of that one file won.)
 
 Per-entry fields (``registered``):
@@ -36,13 +36,16 @@ Per-entry fields (``registered``):
 - ``valid`` / ``reason`` : validity of the copy the agent will act on (workspace
   copy when one exists, else the committed copy); for ``pending:"removed"`` it
   describes the committed copy, which is the one that still exists;
-- ``selectable`` : **exactly what ``select_component`` will do now** (batch 13:
+- ``selectable`` : **exactly what ``select_component`` will do now** (the
   the effective, workspace-first registry FOR EVERY ROLE -- task designs are
   healed against the committed tree before persist, role self-designs are healed
-  at the successful patch exit and repaired at startup by B15, so same-session
+  at the successful patch exit and repaired at startup, so same-session
   selection is safe everywhere), so a tool registered this session IS selectable,
   and a tool scheduled for removal is no longer accepted;
-- ``note``       : the human-readable form of any tension between the above.
+- ``note``       : the human-readable form of any tension between the above;
+- ``selectable_reason`` : why ``selectable`` is false (``None`` when true);
+- ``description_stale`` / ``description_note`` : ADVISORY catalog-drift state --
+  whether the module changed after its description was written.
 
 ``patch_covered`` on an ``unregistered`` candidate is the same predicate
 ``register_component`` enforces: a NEW file reaches the commit only if it (or an
@@ -112,7 +115,7 @@ def tool_function(**kwargs):
         return "Error: no code root available"
 
     dctx = get_design_context()
-    # H10: the catalog that matters is the one `select_component` consults, i.e. the
+    # The catalog that matters is the one `select_component` consults, i.e. the
     # DESIGN TARGET role -- not the access role. The planner's plan session designs
     # the task agent, so its catalog is task.json; keying this off the access role
     # listed planner.json instead and hid every task tool.
@@ -178,8 +181,8 @@ def tool_function(**kwargs):
         "modified": "this outer's workspace copy differs from the committed one",
     }
 
-    # Batch 5, extended batch 13: `selectable` mirrors exactly what
-    # select_component accepts. Since batch 13 EVERY design selects against the
+    # `selectable` mirrors exactly what select_component accepts: EVERY design
+    # selects against the
     # effective (workspace-first) registry -- the mirror is the effective view
     # for the task design and for role self-designs alike.
     _sel_effective = True
@@ -204,7 +207,7 @@ def tool_function(**kwargs):
         ok, sreason = _selectable(name)
         reason = entry_reason(entry, eff_reg.components_dir if pending != "removed"
                               else code_reg.components_dir, design_role)
-        # B30 (L2): catalog-metadata drift, ADVISORY only -- it never feeds
+        # Catalog-metadata drift, ADVISORY only -- it never feeds
         # `valid`/`selectable` (a stale description is a bookkeeping fact, not a
         # capability fact). `None` = no stamp = unknown (never a false alarm).
         _stamped = entry.get("source_sha")

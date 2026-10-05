@@ -2,13 +2,13 @@
 
 The evaluator must NOT receive the planner's free-text rationale (prompt
 injection channel). It only receives a structural summary: which operators were
-applied (ops-only since B9, batch 32).
+applied (ops-only).
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from gan.framework.receipt import PROMPT_FACT_KEYS  # B29 prompt facts
+from gan.framework.receipt import PROMPT_FACT_KEYS  # prompt facts
 
 FEEDBACK_SCHEMA_VERSION = "v1"
 
@@ -16,7 +16,7 @@ FEEDBACK_SCHEMA_VERSION = "v1"
 def build_diff_summary(
     plan_records: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """B9 (batch 32): the summary is OPS-ONLY.
+    """The summary is OPS-ONLY.
 
     ``files`` exited and the embedded ``schema_version`` dead key with it:
     - "which files changed" is an OUTCOME fact owned by ``task_patch_files``
@@ -24,14 +24,14 @@ def build_diff_summary(
       projection -- a second copy here could only diverge;
     - grant paths under a "changes" label told the evaluator that VIEWED
       paths (often whole directories) and the evidence file (``report.json``)
-      were "changed" -- active misinformation, not just redundancy (B32).
+      were "changed" -- active misinformation, not just redundancy.
     Grant facts ride ``ops[].paths`` under the op's own semantics; the caller
-    no longer feeds ``report_path`` (the parameter is gone, not merely unused).
+    does not feed ``report_path`` (the parameter is gone, not merely unused).
     """
     ops: List[Dict[str, Any]] = []
-    # L4 (batch 24): the six dead-operator parsers (tune_param / apply_config /
+    # The six dead-operator parsers (tune_param / apply_config /
     # add_config / set_tool_enabled / swap_module / code_edit) are DELETED --
-    # no producer exists since the registry unification (batches 6/10), so the
+    # no producer exists after the registry unification, so the
     # branches could only ever render `{"op": <dead>, "key": null}`-style ghost
     # rows. Unknown ops fall through to the passthrough below ({"op": name}),
     # and structured fields ride explicitly-named branches only (extend for
@@ -41,7 +41,7 @@ def build_diff_summary(
         op = r.get("op")
         entry: Dict[str, Any] = {"op": op}
         if op == "set_config":
-            # B14 minimal subset (batch 5): the live operator's structured fields.
+            # The live operator's structured fields.
             entry["key"] = r.get("key")
             if r.get("selected") is not None:
                 entry["selected"] = list(r.get("selected") or [])
@@ -58,7 +58,7 @@ def build_diff_summary(
         elif op == "request_source_access":
             entry["paths"] = list(r.get("paths", []) or [])  # reason intentionally stripped
         elif op == "edit_source":
-            # Batch 23: the deep edit surface now records its mutations. Same
+            # The deep edit surface now records its mutations. Same
             # branch shape as request_source_access: structured position facts
             # only (workspace REL -- the口径 the patch builder and covers()
             # already consume); the free text/grep evidence channels stay out.
@@ -66,7 +66,7 @@ def build_diff_summary(
                 entry["command"] = r["command"]
             if r.get("path"):
                 entry["path"] = r["path"]
-        # B29: prompt facts ride whichever op produced them (set_prompt, or
+        # Prompt facts ride whichever op produced them (set_prompt, or
         # set_config with key="prompt"); copied by presence, default-deny.
         for k in PROMPT_FACT_KEYS:
             if k in r:
@@ -75,7 +75,7 @@ def build_diff_summary(
     return {"ops": ops}
 
 
-# B13 (batch 8): the ONLY planner→evaluator projection of issue responses.
+# The ONLY planner→evaluator projection of issue responses.
 # `feedback` is the planner's rationale (audit-only: it stays in the planner's
 # session record and events) and is dropped HERE — before the reward module
 # sees the data — so the digest builder physically cannot leak it, no matter

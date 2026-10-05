@@ -6,7 +6,7 @@ The driver runs on the real repo (labels live here) and only orchestrates:
 - audit everything to ``logs/events.jsonl``.
 
 Role self-edit patches are NOT applied here: they are applied + committed **by the
-worker itself** (option B, v4.22 — ``loop._apply_self_patch`` ->
+worker itself** (``loop._apply_self_patch`` ->
 ``code_repo.apply_self_patch``, allowlist + compile validated, rolled back on
 failure; events ``self_improve_commit`` / ``self_improve_apply_failed``).
 """
@@ -51,7 +51,7 @@ def run_gan_driver(
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Re-entry policy (G1-A, P1). The resume lineage follows the chronologically
+    # Re-entry policy. The resume lineage follows the chronologically
     # NEWEST outer snapshot (canonical or archival re-run copy): start =
     # that snapshot's outer index + 1 — NOT max(index), which would wrongly jump
     # to the tail of the previous run when a re-run started from the middle.
@@ -87,9 +87,9 @@ def run_gan_driver(
 
     code_root = ensure_code_root(repo_root, output_dir)
 
-    # P1 resume: the workers restore the newest OUTER-boundary checkpoint (by
+    # Resume: the workers restore the newest OUTER-boundary checkpoint (by
     # completed_ts, following the newest attempt's lineage); verify the code tree
-    # matches that snapshot's commit (G2-lite) BEFORE spawning.
+    # matches that snapshot's commit BEFORE spawning.
     start = (int(newest["index"]) + 1) if (resume and newest) else 1
     _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
                             "outer_generations": G,
@@ -141,7 +141,7 @@ def run_gan_driver(
         if inner is not None:
             cmd.extend(["--inner", str(inner)])
         if resume:
-            # P1: worker restores the latest OUTER-boundary checkpoint, never a
+            # The worker restores the latest OUTER-boundary checkpoint, never a
             # crashed outer's partial inner state.
             cmd += ["--resume-boundary", "outer"]
         proc = subprocess.run(cmd, cwd=code_root, env=env)

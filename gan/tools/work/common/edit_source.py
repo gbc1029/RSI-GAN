@@ -4,7 +4,8 @@ Deep changes mean editing granted source. To keep the gate meaningful, edits are
 CONFINED to the instance's granted workspace ``<workspace>/src`` (the files the
 role explicitly obtained via ``request_source_access``). Any path that escapes
 that root is rejected. The resulting diff is turned into a patch by
-``gan/patch.py`` and applied to the next task generation.
+``gan/patch.py``: a plan session's patch lands on the next task generation, a
+self_improve session's patch is committed to the code tree for the next outer.
 
 Raw ``bash`` is intentionally NOT granted to roles: it cannot be confined to the
 workspace. Only the base ``editor`` capabilities are exposed, path-checked here.
@@ -55,12 +56,12 @@ def _resolve(actx, path: str) -> str:
 
 
 def _registered_component_note(abs_path: str) -> str:
-    """One-line NOTE when the edited file IS a registered component (B30 a/L3).
+    """One-line NOTE when the edited file IS a registered component.
 
     Advisory, best-effort, and READ-ONLY: an exception here must never break the
     edit. Scans ALL role registries rather than the caller's own -- "is this file
     a catalog entry?" is a catalog fact, independent of who is editing (and this
-    avoids re-introducing the role-vs-target mismatch the S family is about).
+    avoids re-introducing the role-vs-target mismatch).
     """
     try:
         from gan.framework.context import session_overlay_root
@@ -125,7 +126,7 @@ def tool_function(command, path, file_text=None, view_range=None,
         if dctx is not None:
             rel = os.path.relpath(abs_path, _root(actx)).replace(os.sep, "/")
             dctx.record("edit_source", command=cmd, path=rel)
-        # B30 (a/L3): a MUTATING edit of a registered component is the moment
+        # A MUTATING edit of a registered component is the moment
         # the catalog metadata may go stale -- say so here, where the actor
         # still has the context. Reads (view) deliberately produce no pressure.
         out = f"{out}{_registered_component_note(abs_path)}"

@@ -14,7 +14,7 @@ from gan.tools.assembly import assemble_tools_dir_reported
 
 
 def _load_failures(report: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Failure entries of a load report, classified by owner (B27).
+    """Failure entries of a load report, classified by owner.
 
     Delegates to the single predicate/classifier source
     (``gan.tools.assembly.load_failures``); the ``_role``/``_code_root`` keys
@@ -28,15 +28,15 @@ def _load_failures(report: Dict[str, Any]) -> List[Dict[str, Any]]:
 def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_dir: str,
                                  patch_str: str, *, exhausted: bool = False,
                                  rejected: Optional[str] = None) -> None:
-    """Loud safety net for the silent-drop class (R1).
+    """Loud safety net for the silent-drop class.
 
-    Two independent probes (batch 24 / P2-A):
+    Two independent probes:
 
     1. **granted-root leftover** -- a session that left edits UNDER a granted
        path but built no patch has dropped them. The known cause was a deep
        tool that forgot to record its op; ``has_deep_write`` now covers the
        tools we ship, and this probe makes any future omission visible (one
-       ``deep_edit_dropped`` event) instead of silent. Batch 13 (B41): the
+       ``deep_edit_dropped`` event) instead of silent. The
        retry-exhausted / abandoned patch path is its own silent drop --
        ``patch_str`` is non-empty but DISCARDED wholesale, so when
        ``exhausted``/``rejected`` is passed the probe runs regardless of the
@@ -80,7 +80,7 @@ def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_di
                 event_type="deep_edit_dropped", role=role,
                 phase=("exhausted" if forced else "no_record"),
             )
-    # -- probe 2: gan/** files outside every granted path (batch 24) ---------
+    # -- probe 2: gan/** files outside every granted path --------------------
     # Runs ALWAYS: the whole point is mixed sessions where the record-based
     # gates above are already closed.
     try:
@@ -91,7 +91,7 @@ def warn_dropped_workspace_edits(broker, role: str, key: Any, records, output_di
 
 def _warn_uncovered_gan_files(broker, role: str, key: Any, output_dir: str,
                               patch_str: str) -> None:
-    """Report ``gan/**`` workspace files that NO granted path covers (P2-A).
+    """Report ``gan/**`` workspace files that NO granted path covers.
 
     The batch-23 edit guard protects edits ON granted copies; this closes the
     complementary hole: files created OUTSIDE every granted path never enter
@@ -153,7 +153,7 @@ class Role(AgentSystem):
         # Run-attempt id (set by GanLoop._refresh_roles); keys the OUTER-level
         # trajectory file so re-running an outer never truncates a prior attempt.
         self.attempt_id = None
-        self.assembly_report: Optional[dict] = None  # B7: last assembly report
+        self.assembly_report: Optional[dict] = None  # last assembly report
         self.outer = None
         if instance and str(instance).startswith("outer_"):
             try:
@@ -203,10 +203,10 @@ class Role(AgentSystem):
     def refresh_tools(self) -> str:
         """(Re)assemble this instance's toolset from the current design.
 
-        Rebuilds from scratch so that deselected components actually disappear.
-        This is the fix for "eval_points changed but tools_dir not synced".
+        Rebuilds from scratch so that deselected components actually disappear
+        from ``tools_dir``.
 
-        B7: every assembly also produces a REPORT (design claims vs actual),
+        Every assembly also produces a REPORT (design claims vs actual),
         attached to the instance (``self.assembly_report`` — consumed by the
         loop's self-improve receipts) and audited as a ``toolset_assembled``
         event. An assembly gap is information for the role's NEXT design
@@ -234,7 +234,7 @@ class Role(AgentSystem):
         return cfg.get("prompt") or self.prompt_text
 
     def _merge_load_report(self, path: str) -> None:
-        """B27: fold the session's load outcome into ``assembly_report``.
+        """Fold the session's load outcome into ``assembly_report``.
 
         Best-effort and never fatal: the report is advisory evidence about the
         session's REAL toolset. When anything failed to load, the role also gets a
@@ -282,7 +282,7 @@ class Role(AgentSystem):
     ):
         full_msg = f"{self.current_prompt()}\n\n# Task\n{instruction}"
         path = trajectory_file or getattr(self, "trajectory_file", None)
-        # B27: sink for the LOAD outcome of this session's toolset. The assembly
+        # Sink for the LOAD outcome of this session's toolset. The assembly
         # report only proves what was copied; this catches the files that never
         # imported (or lost their tool API) and folds them into `assembly_report`
         # so the role's next session sees the real capability set.
@@ -301,7 +301,7 @@ class Role(AgentSystem):
                 tools_dir=self.tools_dir,
                 max_tool_calls=max_tool_calls,
                 trajectory_file=path,
-                # C1: per-CALL budget. Resolution order: explicit arg -> the
+                # Per-CALL budget. Resolution order: explicit arg -> the
                 # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
                 # -> the dispatch default (agent.llm_withtools, 600).
                 tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
@@ -317,7 +317,7 @@ class Role(AgentSystem):
         # expose the last run's outcome (truncated/tool_calls) to callers
         self.last_run_info = info
         # redact the just-written session (frozen policy; consistent with task).
-        # B2: a redaction failure must NEVER leave the raw session file servable.
+        # A redaction failure must NEVER leave the raw session file servable.
         # Semantics: one immediate retry (transient IO), then QUARANTINE -- the
         # raw file is renamed out of every reader's exact-name reach -- plus an
         # audit event and a stderr line. Deliberately NOT raised: the session's

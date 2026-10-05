@@ -15,7 +15,7 @@ Beyond presence, an entry must satisfy two contracts:
   (``agent/tools/__init__.py`` keys tools by ``tool_file.stem`` and filters by
   that name), and the module actually exposes ``tool_info`` + ``tool_function``
   (defined **or** re-exported), which ``load_tools`` requires;
-- **role-directory binding** (batch 6): the module must live under
+- **role-directory binding**: the module must live under
   ``gan/components/<owning_role>/...``. Each registry file is owned by exactly
   one role with exactly one writer, so a registry file cannot reference another
   role's component tree -- cross-role dead declarations and shared-file shadowing
@@ -62,7 +62,7 @@ REGISTRY_DIR = _GAN_DIR / "registries"
 COMPONENTS_DIR = _GAN_DIR / "components"
 KINDS = ("skill", "eval_point")  # legacy descriptive tags only (see module docstring)
 _REQUIRED = ("name", "module")
-# the per-role registry files, one single-writer catalog each (batch 6: no
+# the per-role registry files, one single-writer catalog each (no
 # shared.json -- role-directory binding makes the merged view unnecessary)
 _REGISTRY_FILES = ("task.json", "planner.json", "evaluator.json")
 # registry file -> the owning role (also the role-directory binding root)
@@ -98,12 +98,12 @@ def write_registry_json(path, data: Dict[str, Any]) -> None:
     every register/unregister. Writing through this one helper keeps the invariant
     in a single place.
 
-    B4 (batch 11): the write goes through tmp + ``os.replace`` like every other
-    durable writer in the repo (``checkpoint.py``, ``trajectory.py``,
-    ``design/store.py``). The old truncate-in-place left HALF a registry JSON
-    behind on a mid-write crash; a half-written workspace copy then made every
-    later register/unregister fail with "workspace registry is not parseable",
-    and a half-written committed copy blinded the role's whole assembly. The
+    The write goes through tmp + ``os.replace`` like every other durable writer in
+    the repo (``checkpoint.py``, ``trajectory.py``, ``design/store.py``): a
+    truncate-in-place would leave HALF a registry JSON behind on a mid-write
+    crash, and a half-written workspace copy would then make every later
+    register/unregister fail with "workspace registry is not parseable" (a
+    half-written committed copy would blind the role's whole assembly). The
     accepted residue: a crash between the tmp write and the replace leaves a
     ``.write-tmp`` sibling behind -- it never enters a patch through the deep
     tools' file-level grants (verified) and is overwritten by the next write.
@@ -142,11 +142,11 @@ def _exposed_names(tree) -> set:
 
 
 def module_api_reason(path: Path) -> Optional[str]:
-    """Why ``path`` cannot serve as a tool module -- ``None`` when it can (B7).
+    """Why ``path`` cannot serve as a tool module -- ``None`` when it can.
 
     Single definition shared by every STATIC consumer: ``entry_reason`` (registry
     entries), the startup always-on check (``gan/framework/preflight``) and the
-    runtime load-report classification (B27). Distinguishes the two failure
+    runtime load-report classification. Distinguishes the two failure
     families so a report can name the real cause: the file cannot be read/parsed
     at all, versus it parses but does not bind both required names.
     """
@@ -177,7 +177,7 @@ def _exposes_tool_api(path: Path) -> bool:
     is ``tool_info`` / ``tool_function``:
 
     - ``def tool_info(): ...`` (and ``async def``);
-    - ``from x import tool_info, tool_function`` (the shared-skill re-export form);
+    - ``from x import tool_info, tool_function`` (the re-export form);
     - ``import x as tool_info`` / ``tool_info = <callable>`` (a top-level binding).
 
     Aliasing is judged by the *bound* name, not the imported one: Python binds
@@ -245,7 +245,7 @@ def resolve_module(components_dir, mod: Any) -> Optional[Path]:
 
 
 def module_sha12(path: Any) -> Optional[str]:
-    """Content stamp of a module file: sha256 hex, first 12 chars (B30).
+    """Content stamp of a module file: sha256 hex, first 12 chars.
 
     Single definition of the ``source_sha`` entry field. It means "the catalog
     description was written against THIS version of the module": the writers
@@ -265,7 +265,7 @@ def module_sha12(path: Any) -> Optional[str]:
 
 
 def stale_metadata(reg: "ComponentRegistry") -> List[Dict[str, str]]:
-    """Entries whose stamp disagrees with the current module bytes (B30).
+    """Entries whose stamp disagrees with the current module bytes.
 
     Only STAMPED entries can be stale: a missing stamp means "unknown" and is
     never reported (back-compat with entries written before the field existed, and
@@ -292,9 +292,9 @@ def entry_reason(entry: Any, components_dir, owning_role: Optional[str] = None) 
 
     ``components_dir`` is a single ``Path`` or an ordered search path (session
     workspace copy first, committed tree second) -- see :func:`_as_dirs`.
-    ``owning_role`` turns on the **role-directory binding** (batch 6): the module
+    ``owning_role`` turns on the **role-directory binding**: the module
     must live under ``gan/components/<owning_role>/...``. The registry is per-role
-    with a single writer, so this replaces the old kind-vs-directory contract --
+    with a single writer, so there is no kind-vs-directory contract to reconcile --
     a registry file can only reference its own role's component tree, which makes
     cross-role dead declarations structurally impossible.
     """
@@ -323,7 +323,7 @@ def entry_reason(entry: Any, components_dir, owning_role: Optional[str] = None) 
     api_reason = module_api_reason(p)
     if api_reason is not None:
         if api_reason.startswith("unsafe capability"):
-            # B47-R1 companion: keep the loader's two failure families distinct.
+            # Keep the loader's two failure families distinct.
             # ``_exposes_tool_api`` collapses both into one bool, which made a
             # capability-policy refusal look like a missing tool API. Same
             # verdict, precise cause.
@@ -443,7 +443,7 @@ def load_registry_for_role(
     tolerant: bool = True,
     overlay_root=None,
 ) -> ComponentRegistry:
-    """Load ONE role's registry (tolerant by default) -- no merging since batch 6.
+    """Load ONE role's registry (tolerant by default) -- one file per role, no merging.
 
     Each role has exactly one registry file (``<role>.json``) with exactly one
     writer, so there is no shared file to merge and no cross-file shadowing. The
@@ -544,7 +544,7 @@ def validate_registry(
       role-directory binding);
     - ``duplicate``   : the same ``name`` appears twice **within the file**
       (``ComponentRegistry.get`` returns the first, so the later one is silently
-      shadowed; cross-file duplicates are impossible since batch 6 -- one file,
+      shadowed; cross-file duplicates are impossible -- one file,
       one role, one writer);
     - ``orphan``      : a component-looking file that NO registry file declares (see
       ``orphan_modules``) -- it can never be selected until it is registered;

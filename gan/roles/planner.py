@@ -132,7 +132,7 @@ class Planner(Role):
                     return ""
                 if not has_deep_write(design_ctx.records + plan_ctx.records):
                     return ""
-                # B6: no catch — a patch-BUILD failure must never masquerade as
+                # No catch — a patch-BUILD failure must never masquerade as
                 # a legitimate empty patch. Any failure (unreadable workspace /
                 # repo file, a builder defect) propagates and fails the session;
                 # the loop then marks the generation planner_failed (B-level)
@@ -223,7 +223,7 @@ class Planner(Role):
             def _build_patch() -> str:
                 if broker is None or not has_deep_write(dctx.records):
                     return ""
-                # B6: no catch — see the plan-session _build_patch comment.
+                # No catch — see the plan-session _build_patch comment.
                 return build_patch_from_workspace(broker, "planner", self.access_key("self"))
 
             last_hash = None

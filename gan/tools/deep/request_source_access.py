@@ -1,10 +1,10 @@
 """DEEP gate: the single entry for source-level changes (gated + audited).
 
-Merges the former ``request_source_access`` (view/modify) and ``code_edit``
-operators: any change that is NOT expressible by shallow config/design operators
-(new config keys, new/edited component implementations, new operator logic)
-must go through here. Requested paths are copied into the role workspace
-``src/`` so they can then be edited with the ``editor``/``bash`` skills.
+Any change that is NOT expressible by shallow config/design operators (new
+config keys, new/edited component implementations, new operator logic) must go
+through here: request ``view``/``modify`` access, then edit the granted copies.
+Requested paths are copied into the role workspace ``src/`` so they can then be
+edited with the ``edit_source`` work tool.
 """
 from gan.framework.context import get_access_context, get_design_context
 

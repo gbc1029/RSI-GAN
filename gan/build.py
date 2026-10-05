@@ -24,7 +24,7 @@ def _seed_self_designs(output_dir: str) -> None:
     """First-time initialization of planner/evaluator self-designs.
 
     An existing design file is AUTHORITATIVE — including deliberately empty
-    selections (``eval_points: []``) or an empty prompt — and is never rewritten.
+    selections (``tools: []``) or an empty prompt — and is never rewritten.
     Only a MISSING file is seeded. An UNPARSEABLE file is kept aside as
     ``config.json.corrupt-<ts>`` (forensics) and then re-seeded (self-heal, so a
     corrupt file cannot crash-loop the per-outer worker). Safe to call any number
@@ -38,7 +38,7 @@ def _seed_self_designs(output_dir: str) -> None:
                 store.load(role)
                 continue  # valid existing design: authoritative, do not touch
             except Exception as e:
-                # B5: the reseed is a deliberate availability trade-off (a
+                # The reseed is a deliberate availability trade-off (a
                 # corrupt config must not crash-loop the per-outer worker), but
                 # it silently RESETS this role's evolution -- that must be LOUD:
                 # one structured event + one stderr line, with the corrupt file
@@ -59,7 +59,7 @@ def _seed_self_designs(output_dir: str) -> None:
         # guard, so a missing/blank seed can no longer blank the prompt.
         cfg = initial_config(role)
         # capability tools are optional but selected by default (evolvable later);
-        # batch 6: the single ``tools`` slot, name-keyed registry
+        # The single ``tools`` slot, name-keyed registry
         if role == "evaluator":
             from gan.registries.loader import load_registry_for_role
             reg = load_registry_for_role("evaluator")
@@ -73,7 +73,7 @@ def ensure_code_root(repo_root: str, output_dir: str) -> str:
     Raises when the tree was deleted externally (``.git`` gone while the code
     manifest is still present): silently re-materializing an initial tree would
     lose every evolution commit and pin invisible dead refs; the resume checkout
-    would then fail silently and run on the wrong base (C1/E3). The operator must
+    would then fail silently and run on the wrong base. The operator must
     either restore the tree or explicitly reset the run.
     """
     from gan.framework import code_repo as code_repo_mod
@@ -167,7 +167,7 @@ def build_gan_loop(
                     **model_registry.describe(["gan.task", "gan.planner", "gan.evaluator"])})
     if code_root:
         loop.log_event({"type": "code_init", "code_root": code_root})
-    # B15: repair a persisted role design that names something the committed tree
+    # Repair a persisted role design that names something the committed tree
     # cannot deliver (strip + forensic copy + report), BEFORE the integrity probe
     # so that probe sees the repaired tree. Non-fatal by design: the design file
     # is an agent-authored, losslessly repairable object, and it outlives the
@@ -185,7 +185,7 @@ def build_gan_loop(
     # so unlike the optional model probe it runs by default — a broken registry
     # otherwise degrades silently: invalid/orphan components are skipped by
     # selection/assembly/loading without any error. Set `loop.toolset_preflight: false`
-    # to log-only (escape hatch for an already-dirty code tree). Since B7 the
+    # to log-only (escape hatch for an already-dirty code tree). The
     # always-on files are checked too, split by owner: a broken FROZEN plumbing
     # file is fatal here, a role's own tool is reported and handed back to it.
     tool_results = preflight_mod.preflight_tools(code_root=code_root)

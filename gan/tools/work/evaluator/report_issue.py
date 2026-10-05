@@ -1,7 +1,7 @@
-"""report_issue - record a discovered issue (tracked through the 2x2 matrix)."""
+"""report_issue - record a discovered issue (tracked through the issue-outcome classification)."""
 from gan.framework.context import get_eval_context
 
-# B15' (registered batch 8; soft constraint by design): evidence is a POINTER,
+# Soft constraint by design: evidence is a POINTER,
 # not an argument -- the issue list rides json-sums directly into the planner's
 # instruction (the evaluator-issues injection with its 4000-char budget), so
 # reasoning prose here consumes the planner's decision surface the same way

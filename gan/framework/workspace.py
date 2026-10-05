@@ -1,6 +1,6 @@
 """Workspace confinement helpers (FRAMEWORK, frozen).
 
-Shared by the role work tools (edit_source / read_file / list_dir / grep) so
+Shared by the role work tools (read_file / list_dir / grep) so
 every source access is confined to the instance's granted workspace ``src``.
 """
 from __future__ import annotations

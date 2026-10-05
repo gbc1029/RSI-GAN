@@ -18,7 +18,7 @@ What it deliberately does NOT do:
   session's source of truth (the same authority ``unregister_component`` scans
   with); a name missing from it is "not found", never re-added from the
   committed tree;
-- touch anything but the designed role's own registry file (batch 6: one
+- touch anything but the designed role's own registry file (one
   single-writer catalog per role).
 """
 import json
@@ -30,7 +30,7 @@ from gan.framework.context import get_access_context, get_design_context
 from gan.registries.loader import (entry_reason, parse_registry_file,
                                    resolve_module, write_registry_json)
 
-# role -> the registry it designs (single-writer file, batch 6)
+# role -> the registry it designs (single-writer file)
 _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
 _OWNING_DIR = {"planner": "task", "evaluator": "evaluator"}
 _SEAT_OWNERSHIP = {
@@ -87,7 +87,7 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     code_root = broker.repo_root
 
     # A deep write is only meaningful in a session that has a patch channel
-    # (R1 -- same guard as register_component / unregister_component).
+    # (Same guard as register_component / unregister_component.)
     dctx = get_design_context()
     if dctx is None:
         return ("Error: deep registry changes are currently unavailable in this "
@@ -170,7 +170,7 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     # backstop (entries are DATA): the updated entry must still be a valid one.
     # A metadata edit cannot break the identity/role contracts, but validate the
     # result anyway across the workspace-first search path.
-    # B30 (L1): updating the metadata is the act of declaring "this description
+    # Updating the metadata is the act of declaring "this description
     # matches the CURRENT module", so refresh the stamp here -- this is the only
     # way the drift flag clears. If the module cannot be resolved the entry is
     # already invalid (reported by preflight); leave the previous stamp alone.

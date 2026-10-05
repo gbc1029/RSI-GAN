@@ -1,7 +1,7 @@
 """Design layer: the SHALLOW, evolvable design surface.
 
 - ``schema.py``   : minimal per-role config schema (code-defined shape).
-- ``store.py``    : read/write ``design/<role|task-node>/config.json``.
+- ``store.py``    : read/write ``<output_dir>/ckpt/design/<role|task-node>/config.json``.
 - ``seeds/``      : generation-0 prompts for ALL roles (via ``initial_config``).
 
 The design layer holds **data** (config/selection/params), not implementations;
@@ -40,7 +40,7 @@ def initial_config(role: str) -> Dict[str, Any]:
     (seed prompt). Both the planner/evaluator self-design seeding
     (``gan/build.py``) and the task agent's initial config
     (``gan/framework/loop.py``) MUST go through here so the three roles cannot
-    drift apart again (the task role used to skip its seed entirely).
+    drift apart again.
 
     The seed is applied only when non-empty after ``strip()``: a missing or blank
     seed file must never yield an empty system prompt

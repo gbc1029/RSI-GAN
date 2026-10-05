@@ -4,11 +4,11 @@ Two activation modes (agreed design):
   * **always-on** (``gan/tools/...``): work tools + design operators + deep gate,
     loaded for every session of a design-editing role;
   * **opt-in** (``gan/components/...``): tools selected by the role's design config
-    (the single ``tools`` slot; batch 6 one per-role registry, name-keyed),
+    (the single ``tools`` slot; one per-role registry, name-keyed),
     resolved via the per-role registry.
 
 The task agent has **no always-on tools** — its capabilities are all opt-in
-skills. Planner/evaluator get always-on work tools + design ops + deep gate,
+tools. Planner/evaluator get always-on work tools + design ops + deep gate,
 plus any opt-in components they selected.
 """
 from __future__ import annotations
@@ -65,7 +65,7 @@ def always_on_dirs(role: str, code_root: Optional[str] = None) -> List[str]:
 
 
 def always_on_owner(role: str, path: str, root_dir: Optional[str] = None) -> Optional[str]:
-    """Which role may modify ``path``, or None when it is FROZEN plumbing (B7).
+    """Which role may modify ``path``, or None when it is FROZEN plumbing.
 
     The always-on set mixes two very different owners (``always_on_dirs``): the
     role's OWN evolvable tools (``work/<role>/**``, inside that role's write
@@ -93,8 +93,8 @@ def always_on_index(role: str, code_root: Optional[str] = None) -> Dict[str, Dic
 
     Built from the same ``always_on_dirs``/``py_files_in`` helpers the real
     assembly copies with, so the classification cannot drift from what lands in
-    the toolset. Used by the startup always-on check (B7) and by the runtime
-    load-report classification (B27).
+    the toolset. Used by the startup always-on check and by the runtime
+    load-report classification.
     """
     out: Dict[str, Dict[str, Any]] = {}
     for d in always_on_dirs(role, code_root=code_root):
@@ -107,7 +107,7 @@ def always_on_index(role: str, code_root: Optional[str] = None) -> Dict[str, Dic
 
 def classify_tool_file(role: str, basename: str,
                        code_root: Optional[str] = None) -> Dict[str, Any]:
-    """Where an assembled tool file came from, and who owns it (B27).
+    """Where an assembled tool file came from, and who owns it.
 
     ``{"kind": "always_on_frozen" | "always_on_owned" | "component", "owner": ...}``.
     A load failure must be routed accordingly: a component (or a role-owned
@@ -126,13 +126,13 @@ def classify_tool_file(role: str, basename: str,
 
 def load_failures(report: Optional[Dict[str, Any]], role: str,
                   code_root: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Failure entries of a load report, classified by owner (B27; batch 19/n1).
+    """Failure entries of a load report, classified by owner.
 
     Single source of the failure predicate previously duplicated in
     ``task_runner`` and ``base_role._load_failures``: ``"not selected by the
     design"`` is NOT a failure (expected state of every non-selected file); the
     fixable/reportable classes are ``import failed``, ``missing tool_info``,
-    ``tool_info failed`` and ``name mismatch`` (n1, runtime identity gate),
+    ``tool_info failed`` and ``name mismatch`` (the runtime identity gate),
     each classified via :func:`classify_tool_file` so a consumer can route
     agent-fixable items vs frozen-framework bugs.
     """
@@ -155,7 +155,7 @@ def selected_module_paths_reported(role: str, config: Optional[Dict[str, Any]],
 
                                    code_root: Optional[str] = None
                                    ) -> Tuple[List[str], List[Dict[str, str]]]:
-    """B7: resolve the design's selected components AND report every skip.
+    """Resolve the design's selected components AND report every skip.
 
     Returns ``(paths, skipped)``; ``skipped`` is a list of ``{"name", "reason"}``
     for each selected component that would have been silently dropped here
@@ -169,7 +169,7 @@ def selected_module_paths_reported(role: str, config: Optional[Dict[str, Any]],
     cfg = config or {}
     out: List[str] = []
     skipped: List[Dict[str, str]] = []
-    # batch 6: one ``tools`` slot per role; legacy keys are normalized upstream
+    # One ``tools`` slot per role; legacy keys are normalized upstream
     # (schema.normalize_config), but accept them here too so a raw config dict
     # from an older checkpoint still assembles its selections
     names = list(cfg.get("tools") or [])
@@ -217,7 +217,7 @@ def assemble_tools_dir_reported(
     clear: bool = False,
     code_root: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Materialize a role's toolset AND return the assembly report (B7).
+    """Materialize a role's toolset AND return the assembly report.
 
     ``clear=True`` rebuilds the directory from scratch (removing previously
     assembled ``*.py`` files) so that deselected components actually disappear.
@@ -228,7 +228,7 @@ def assemble_tools_dir_reported(
     "selected_assembled", "skipped": [{"name", "reason"}]}`` — the single point
     of truth for "what the design selected vs what assembly actually delivered".
 
-    B47-R1 (advisory): ``"observed": {tool_stem: profile}`` lists ONLY the
+    Advisory: ``"observed": {tool_stem: profile}`` lists ONLY the
     assembled tools whose source statically shows a capability the gate would
     flag anywhere (raw write / subprocess / dynamic exec) or has findings on —
     absence from this map means "no observed capability findings". Descriptions
@@ -262,7 +262,7 @@ def assemble_tools_dir_reported(
         selected_assembled.append(os.path.basename(bn))
 
     def _profile_source(src_path: str) -> None:
-        """B47-R1: keep only non-empty profiles (positive-signal map)."""
+        """Keep only non-empty profiles (positive-signal map)."""
         stem = os.path.basename(src_path).rsplit(".", 1)[0]
         if stem in observed:
             return

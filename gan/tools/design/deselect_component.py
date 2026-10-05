@@ -8,8 +8,8 @@ Removing a tool from the registry and deleting its source file is a DEEP
 change (component removal, e.g. ``unregister_component``); adding or modifying
 tool *logic* is also DEEP (source edit). See the design decision record.
 
-Batch 6: one ``tools`` slot per role; the former ``skills``/``eval_points``
-names are accepted as aliases.
+One ``tools`` slot per role; the legacy ``skills``/``eval_points`` names are
+accepted as aliases.
 """
 from gan.framework.context import get_design_context
 

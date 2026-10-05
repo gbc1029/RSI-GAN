@@ -4,7 +4,7 @@
 """
 from gan.framework.context import get_eval_context
 
-# B15' (batch 25): same evidence discipline as report_issue -- the verdict
+# Same evidence discipline as report_issue -- the verdict
 # evidence feeds the digest's "your evidence:" line and is fetched back by the
 # evaluator itself each round; pointer discipline keeps it as a position fact.
 # Soft constraint on purpose: evidence doubles as a work-assignment surface.

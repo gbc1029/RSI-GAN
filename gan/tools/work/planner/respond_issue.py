@@ -1,10 +1,10 @@
 """respond_issue - planner's explicit response to an evaluator issue.
 
-Required for the acceptance half of the 2x2 matrix. A missing response is
-treated by the check step as "silently ignored" (rejected_no_feedback).
+Required for the acceptance side of the issue-outcome classification. A missing
+response is treated by the check step as "silently ignored" (rejected_no_feedback).
 
-B13 (batch 8): the response carries a REQUIRED structured ``response_kind``
-stance. The free-text ``feedback`` stays in the schema for the planner's own
+The response carries a REQUIRED structured ``response_kind`` stance. The
+free-text ``feedback`` stays in the schema for the planner's own
 session record and human audit, but is deliberately NOT put into
 ``ctx.record`` — the recorded op is what every planner→evaluator channel
 projects from, so rationale is structurally out of that surface (facts flow,
@@ -12,8 +12,8 @@ rhetoric does not).
 """
 from gan.framework.context import get_plan_context
 
-# B13 stance buckets (renamed in batch 8 to not collide with the evaluator's
-# fix verdicts and to say the planner's side, not a ruling):
+# Stance buckets (distinct from the evaluator's fix verdicts; they state the
+# planner's side, not a ruling):
 _STANCES = ("acted", "acted_differently", "out_of_scope", "disputed", "deferred")
 
 

@@ -278,7 +278,7 @@ def apply_patch_detail(code_root: str, patch: str) -> Tuple[bool, str]:
     - ``(False, <applier stderr>)``       : the patch CONTENT was refused (bad
       diff format / context mismatch / empty input). This is agent-attributable:
       the in-session retry should act on the concrete cause, which is why the
-      detail is carried instead of the old blur "patch failed to apply";
+      detail is carried instead of a blurred "patch failed to apply";
     - :class:`RepoIntegrityError`         : infrastructure failure (broken git,
       locks, disk) — the tree state is unknowable, the run must abort rather
       than mislead the agent into editing a correct patch.

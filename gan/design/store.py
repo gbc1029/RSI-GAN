@@ -30,8 +30,8 @@ class DesignStore:
     def save(self, config: Dict[str, Any], role: str, node_id: Any = None) -> str:
         p = self.path(role, node_id)
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        # B5: atomic write. The design file is authoritative and every role
-        # session writes through here; a crash mid-write previously left HALF a
+        # Atomic write. The design file is authoritative and every role
+        # session writes through here; a crash mid-write could leave HALF a
         # JSON behind -- which _seed_self_designs would then treat as corrupt
         # and re-seed (erasing the role's evolved design). tmp + os.replace
         # keeps the previous version intact on any write failure.

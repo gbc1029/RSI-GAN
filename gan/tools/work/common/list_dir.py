@@ -4,7 +4,7 @@ import os
 from gan.framework.context import get_access_context
 from gan.framework.workspace import resolve
 
-# B19 (batch 11): an output cap, mirroring ``grep``'s max_results -- a big
+# An output cap, mirroring ``grep``'s max_results -- a big
 # directory (a granted component tree, or a mistyped path) must not flood the
 # context with thousands of bare names in one call.
 _MAX_ENTRIES = 200

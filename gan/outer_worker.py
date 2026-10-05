@@ -20,7 +20,7 @@ def main() -> None:
                         "multi-value inputs are rejected here before any work).")
     p.add_argument("--resume-boundary", dest="resume_boundary", default="latest",
                    choices=["latest", "outer"],
-                   help="'outer' (P1): restore the latest OUTER-boundary checkpoint and "
+                   help="'outer': restore the latest OUTER-boundary checkpoint and "
                         "never resume from a crashed outer's partial inner state.")
     p.add_argument("--subset", default="_filtered_100_train")
     p.add_argument("--num_samples", type=int, default=2)

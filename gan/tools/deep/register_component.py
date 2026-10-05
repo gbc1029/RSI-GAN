@@ -12,7 +12,7 @@ restores or deletes source, it only records an entry for source that already
 exists (so it is deliberately NOT the inverse of ``unregister_component``, which
 deletes the file).
 
-Batch 6: one registry per role (no shared file), name-keyed entries, and the
+One registry per role (no shared file), name-keyed entries, and the
 role-directory binding -- a registry entry may only reference the designed role's
 own component tree, so the entry lands where its writer can write and its reader
 can read.
@@ -30,7 +30,7 @@ from gan.registries.loader import (
     entry_reason, parse_registry_file, resolve_module, write_registry_json,
 )
 
-# batch 6: one registry per role, and each role designs exactly one --
+# One registry per role, and each role designs exactly one --
 # planner designs the TASK agent -> registers task tools; evaluator designs
 # itself -> registers evaluator tools. planner.json has no writer (no slots).
 _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
@@ -50,13 +50,13 @@ def _ownership(actx):
     return _SEAT_OWNERSHIP.get((actx.role, getattr(actx, "seat", "legacy")),
                                (_OWN_REGISTRY.get(actx.role), _OWNING_DIR.get(actx.role, actx.role)))
 
-_DESCRIPTION_CAP = 300  # catalog metadata, not rhetoric (mirrors the B15' discipline)
+_DESCRIPTION_CAP = 300  # catalog metadata, not rhetoric
 
 
 def _collision_sources(role_designed: str, code_root: str, base: str) -> str:
     """Repo-relative sources that already produce basename ``base`` ("" = none).
 
-    B16 (batch 10): ``assemble_tools_dir`` copies this role's always-on files and
+    ``assemble_tools_dir`` copies this role's always-on files and
     its registered components into ONE flat toolset directory keyed by file name
     (last writer wins, nothing detects the fight), so a component whose stem
     equals an always-on tool's stem would silently shadow that frozen plumbing
@@ -153,13 +153,13 @@ def tool_function(name, module, description=None, **kwargs):
     # A deep write is only meaningful in a session that has a patch channel. The
     # design context is set exactly in the sessions that turn the workspace into a
     # patch (plan / self_improve); without it the edit would land in the workspace
-    # and then be silently discarded (R1). Refuse loudly instead.
+    # and then be silently discarded. Refuse loudly instead.
     dctx = get_design_context()
     if dctx is None:
         return ("Error: deep registry changes are currently unavailable in this "
                 "session; use `request_source_access` to view source. Do not retry.")
 
-    # batch 6: the registry is the one this role designs (single writer per file)
+    # The registry is the one this role designs (single writer per file)
     reg_name, owning_dir = _ownership(actx)
     if not reg_name:
         return f"Error: role '{role}' has no designable registry"
@@ -173,7 +173,7 @@ def tool_function(name, module, description=None, **kwargs):
         return "Error: module must be a .py path relative to gan/components"
     module_rel = f"gan/components/{mod}"
 
-    # 1) role-directory binding (batch 6, checked FIRST so the agent gets the most
+    # 1) role-directory binding (checked FIRST so the agent gets the most
     #     specific error): a registry entry may only reference its own role's
     #     component tree
     if not mod.startswith(f"{owning_dir}/"):
@@ -204,7 +204,7 @@ def tool_function(name, module, description=None, **kwargs):
                 f"so it would not be part of this session's patch. Grant its directory "
                 f"first: request_source_access(paths=['{hint}'], intent='modify').")
 
-    # B30 (L1): stamp the module version this entry's metadata is written
+    # Stamp the module version this entry's metadata is written
     # against. Only a METADATA write stamps (register/update) -- a module edited
     # on its own must NOT refresh the stamp, or the drift check could never fire.
     # The stamped file is the same one the validity checks below read
@@ -222,7 +222,7 @@ def tool_function(name, module, description=None, **kwargs):
     # 4) validate the entry as it would appear in the registry (role/dir + tool API).
     #    Validate the WORKSPACE copy whenever there is one: that is the version this
     #    session's patch commits, so validating the repo copy instead would reject a
-    #    module the agent just extended with tool_info/tool_function (P3/H3a) and
+    #    module the agent just extended with tool_info/tool_function and
     #    would accept one the agent just broke. ``entry_reason`` at commit time is the
     #    backstop for both directions.
     candidate = {"name": name, "module": mod}
@@ -233,7 +233,7 @@ def tool_function(name, module, description=None, **kwargs):
     if reason:
         return f"Error: invalid entry ({reason})"
 
-    # 4.5) metadata validation (B3, batch 10): the description is catalog
+    # 4.5) metadata validation: the description is catalog
     # metadata, not rhetoric -- refuse wrong type / over-length BEFORE anything
     # is granted or written (zero side effects on refusal).
     if description is not None and not isinstance(description, str):
@@ -242,7 +242,7 @@ def tool_function(name, module, description=None, **kwargs):
         return (f"Error: description too long ({len(description)} chars; "
                 f"cap {_DESCRIPTION_CAP})")
 
-    # 4.6) collision precheck (B16, batch 10). ``assemble_tools_dir`` copies this
+    # 4.6) collision precheck. ``assemble_tools_dir`` copies this
     # role's always-on tools and its registered components into ONE flat toolset
     # directory keyed by file name (last writer wins, nothing detects the fight),
     # so a NEW component whose stem equals an always-on tool's stem would
@@ -273,11 +273,11 @@ def tool_function(name, module, description=None, **kwargs):
     # 5) bring the registry into the workspace and append the entry (read-modify-write
     #    on the workspace copy; the rest of the file is preserved).
     #
-    #    H8/B1 (batch 7): the OLD local guard ``if not isfile(ws_reg): grant`` conflated
+    #    An ``if not isfile(ws_reg): grant`` guard would conflate
     #    "file exists in the workspace" with "path is patch-visible"
-    #    (``build_patch_from_workspace`` walks ``granted_paths`` only) -- a workspace
-    #    copy that was never granted (an ``edit_source`` scratch) made the tool report
-    #    success while the patch builder silently dropped the whole registration.
+    #    (``build_patch_from_workspace`` walks ``granted_paths`` only): a workspace
+    #    copy that was never granted (an ``edit_source`` scratch) would report
+    #    success while the patch builder silently drops the whole registration.
     #    The grant decision now follows ``broker.covers`` (the single definition of
     #    patch visibility) and distinguishes three cases:
     #
@@ -285,8 +285,8 @@ def tool_function(name, module, description=None, **kwargs):
     #      edits -- this is what ``if_absent`` protects);
     #    - covered but the workspace copy is absent: ``grant(if_absent=True)`` copies
     #      the committed version in and keeps it patch-visible (normal first-touch);
-    #    - NOT covered: the registry exists in the committed tree (batch 6 guarantees
-    #      the designed registry is part of the repo skeleton, so a plain grant copies
+    #    - NOT covered: the registry exists in the committed tree (the designed
+    #      registry is part of the repo skeleton, so a plain grant copies
     #      the TRUTH over any scratch copy -- the resulting patch carries only the
     #      appended entry, not "delete every existing entry"). After the grant the
     #      path is patch-visible; if even then ``broker.covers`` says no, the state is
@@ -318,7 +318,7 @@ def tool_function(name, module, description=None, **kwargs):
                 return f"Already registered: '{name}' in {reg_rel}"
             return (f"Error: '{name}' already registered in {reg_rel} with a "
                     f"different module ({c.get('module')})")
-    # B3 (batch 10): metadata preservation. A bare {"name","module"} append
+    # Metadata preservation. A bare {"name","module"} append
     # silently strips the catalog description on every unregister->re-register
     # round trip. Carry the committed entry's description/params_schema over --
     # but ONLY when the implementation is unchanged (same module path,

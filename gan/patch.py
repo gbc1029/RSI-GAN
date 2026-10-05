@@ -1,8 +1,9 @@
 """Patch helpers for the gated source-editing path.
 
 When a planner requests source access and edits the copied files under
-``<workspace>/src``, the loop turns the workspace diff into a unified patch and
-the TaskRunner applies it (to a throwaway repo copy) for that generation.
+``<workspace>/src``, the loop turns the workspace diff into a unified patch. The
+TaskRunner commits it to the per-run code tree by default; only when no code tree
+is in play is it applied to the generation's minimal repo copy instead.
 """
 from __future__ import annotations
 
@@ -16,14 +17,14 @@ from typing import List, Optional
 def _read_lines(path: str, *, missing_ok: bool = False) -> List[str]:
     """Read a file for diffing.
 
-    B6: "unreadable" must NEVER be silently translated into "empty file" —
+    "Unreadable" must NEVER be silently translated into "empty file" —
     that produced whole-file add/delete patches from plain read failures
     (permission / disk hiccups), i.e. semantically wrong diffs handed to the
     applier. Only a genuinely ABSENT file may read as empty, and only where the
     caller's semantics say absence is meaningful (the repo side of a
     modification diff: absent => the workspace file is an ADDITION).
     Any other OSError propagates -> the session's patch build fails explicitly
-    (B6 containment chosen: the generation fails via the existing
+    (Containment chosen: the generation fails via the existing
     planner_failed / evaluator_failed channel instead of a wrong patch).
     """
     try:
@@ -42,7 +43,7 @@ def _iter_files(root: str):
     else:
         for dirpath, _dirs, files in os.walk(root):
             for name in files:
-                # n2: compiled caches are not source; diffing workspace-vs-repo
+                # Compiled caches are not source; diffing workspace-vs-repo
                 # copies of them (or proposing their deletion when a copy is
                 # absent) is pure patch noise, not a session edit.
                 if name.endswith((".pyc", ".pyo")):
@@ -52,7 +53,7 @@ def _iter_files(root: str):
 
 def _no_newline_marker_diff(a_lines: List[str], b_lines: List[str],
                             fromfile: str, tofile: str) -> str:
-    """Unified diff that can express "no newline at end of file" (B22, batch 13).
+    """Unified diff that can express "no newline at end of file".
 
     ``difflib.unified_diff`` cannot: it reads line objects with their terminators
     (``readlines`` keepends), so a file whose LAST line lacks ``\\n`` produces a
@@ -79,7 +80,7 @@ def _no_newline_marker_diff(a_lines: List[str], b_lines: List[str],
 
     Edits far from EOF never touch the last lines, so the padded diff equals
     the plain one and no marker is inserted. A misplaced marker is rejected by
-    ``git apply`` -- the same loud rejection as before this fix, so the change
+    ``git apply`` -- the same loud rejection as an unmarked diff, so the change
     can only improve applyability, never regress it.
     """
     MARK = "\\ No newline at end of file\n"
@@ -200,7 +201,7 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
             rel_file = os.path.relpath(b_file, src_root).replace(os.sep, "/")
             b_files.add(rel_file)
             # repo side ABSENT => the workspace file is a genuine ADDITION;
-            # repo side PRESENT but unreadable => raise (B6)
+            # repo side PRESENT but unreadable => raise
             a_lines = _read_lines(os.path.join(broker.repo_root, rel_file), missing_ok=True)
             b_lines = _read_lines(b_file)
             if a_lines == b_lines:
@@ -263,10 +264,10 @@ def has_deep_write(records) -> bool:
     - ``request_source_access`` counts only with ``intent == "modify"`` (a ``view``
       grant copies a read-only file and must not schedule a patch);
     - **everything else** (``register_component`` / ``unregister_component`` /
-      ``code_edit`` / future deep tools) counts.
+      ``update_component`` / ``edit_source`` / future deep tools) counts.
 
     Unknown ops defaulting to "deep" is deliberate: a deep tool that forgets to be
-    listed here still gets its workspace edits patched (the R1 bug class), while a
+    listed here still gets its workspace edits patched, while a
     forgotten shallow operator only costs one empty diff.
     """
     for r in records or []:

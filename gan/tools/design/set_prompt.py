@@ -6,7 +6,7 @@ from gan.framework.receipt import prompt_change_facts
 
 
 def _seed_prompt(role: str) -> Optional[str]:
-    """The generation-0 prompt for ``role`` (B29 ``equals_seed``), or None.
+    """The generation-0 prompt for ``role`` (``equals_seed``), or None.
 
     Uses the SAME authority the loop seeds with (``gan.design.initial_config``:
     schema default + non-empty seed file), so "reset to the seed" is judged
@@ -36,7 +36,7 @@ def tool_function(text="", **kwargs):
     ctx = get_design_context()
     if ctx is None:
         return "Error: no design context"
-    # B29: capture the value being replaced BEFORE the overwrite -- this is the
+    # Capture the value being replaced BEFORE the overwrite -- this is the
     # only point that sees both sides (the projections receive records only).
     # The record carries structural facts only: never the prompt text, which
     # stays in the design file + session trajectory (audit evidence), and never
