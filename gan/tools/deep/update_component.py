@@ -26,7 +26,8 @@ import os
 from pathlib import Path
 
 from gan.framework import frozen
-from gan.framework.context import get_access_context, get_design_context
+from gan.framework.context import (get_access_context, get_design_context,
+                                   illegal_seat_error)
 from gan.registries.loader import (entry_reason, parse_registry_file,
                                    resolve_module, write_registry_json)
 
@@ -37,13 +38,11 @@ _SEAT_OWNERSHIP = {
     ("planner", "plan"): ("task.json", "task"),
     ("planner", "self_improve"): ("planner.json", "planner"),
     ("evaluator", "self_improve"): ("evaluator.json", "evaluator"),
-    ("planner", "legacy"): ("task.json", "task"),
-    ("evaluator", "legacy"): ("evaluator.json", "evaluator"),
 }
 
 
 def _ownership(actx):
-    return _SEAT_OWNERSHIP.get((actx.role, getattr(actx, "seat", "legacy")),
+    return _SEAT_OWNERSHIP.get((actx.role, actx.seat),
                                (_OWN_REGISTRY.get(actx.role), _OWNING_DIR.get(actx.role, actx.role)))
 # mirrors register_component's cap: catalog metadata, not rhetoric
 _DESCRIPTION_CAP = 300
@@ -81,6 +80,9 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     actx = get_access_context()
     if actx is None or getattr(actx, "broker", None) is None:
         return "Error: no access context"
+    _bad_seat = illegal_seat_error(actx, "update_component")
+    if _bad_seat:
+        return _bad_seat
     role = actx.role
     broker = actx.broker
     node = actx.node_id
@@ -111,7 +113,7 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     if description is None and params_schema is None:
         return "Error: nothing to update (pass description= and/or params_schema=)"
 
-    if not frozen.is_allowed(role, rel, "modify", seat=getattr(actx, "seat", "legacy")):
+    if not frozen.is_allowed(role, rel, "modify", seat=actx.seat):
         return f"Error: registry not editable for {role}: {rel}"
 
     # -- find the entry with the session's authority (workspace copy first,
@@ -132,10 +134,10 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     #    definition of patch visibility; ``if_absent`` protects in-session edits)
     if not broker.covers(role, node, rel):
         broker.grant(role, node, [rel], intent="modify", reason="update",
-                     seat=getattr(actx, "seat", "legacy"))
+                     seat=actx.seat)
     if not os.path.isfile(ws_reg):
         broker.grant(role, node, [rel], intent="modify", reason="update",
-                     if_absent=True, seat=getattr(actx, "seat", "legacy"))
+                     if_absent=True, seat=actx.seat)
     if not broker.covers(role, node, rel):
         return (f"Error: cannot write {rel}: the path is not patch-visible. "
                 f"Nothing was updated. Inspect it with request_source_access and "

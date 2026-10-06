@@ -363,7 +363,6 @@ def _hard_rollback(code_root: str, sha: Optional[str]) -> None:
         ) from e
 
 
-# -- registry validation (field-agnostic; keys are (file, kind, name)) --------
 def schema_ext_report(code_root: str) -> Dict[str, Any]:
     """Report malformed dynamic design-key catalogs for differential gating."""
     import json
@@ -390,6 +389,10 @@ def _schema_ext_worsened(before, after) -> str:
     return f"schema extension became invalid: {sorted(new)}" if new else ""
 
 
+# -- registry validation: differential problem classes (see registry_report).
+# Key shapes differ per class: invalid=(file,kind,name,reason),
+# unparseable=filename, duplicate=(role|file,kind,name), orphan=path,
+# collision=(role,basename,sources).
 def registry_report(code_root: str) -> Dict[str, Any]:
     """Snapshot of registry health for a code tree (used for *differential* gating).
 
@@ -516,7 +519,7 @@ def _needs_registry_check(files: Iterable[str]) -> bool:
 
 
 def check_patch(code_root: str, patch: str, strict_unparseable: bool = True,
-                role: Optional[str] = None, seat: str = "legacy") -> Tuple[bool, str]:
+                role: Optional[str] = None, *, seat: str) -> Tuple[bool, str]:
     """Dry-run: apply + validate + registry-compare, then ALWAYS roll back (no commit).
 
     Returns (ok, reason). Used for in-session retry before committing.
@@ -554,7 +557,7 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True,
 
 
 def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
-                     strict_unparseable: bool = True, seat: str = "legacy") -> str:
+                     strict_unparseable: bool = True, *, seat: str) -> str:
     """Allowlist + compile + registry validation, then commit (or raise PatchRejected).
 
     The single shared entry for BOTH self-edits and task (t) edits.
@@ -591,13 +594,13 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
     return commit(code_root, commit_msg)
 
 
-def apply_self_patch(code_root: str, role: str, patch: str, seat: str = "self_improve") -> str:
+def apply_self_patch(code_root: str, role: str, patch: str, *, seat: str) -> str:
     """Validate and commit a role self-edit patch (thin wrapper over apply_code_patch)."""
     return apply_code_patch(code_root, role, patch, f"self-improve {role}", seat=seat)
 
 
 def apply_task_patch(code_root: str, role: str, patch: str, genid: Any,
-                     parent_genid: Any, base: str, seat: str = "plan") -> Dict[str, Any]:
+                     parent_genid: Any, base: str, *, seat: str) -> Dict[str, Any]:
     """Branch-per-node task patch: align to ``base``, validate+commit, pin the ref.
 
     The code state of a generation is a git commit whose parent is its selected

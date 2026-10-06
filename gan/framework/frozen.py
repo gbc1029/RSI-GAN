@@ -53,20 +53,41 @@ EVALUATOR_SELF: List[str] = [
 ]
 
 # Seat-specific write roots.  Reads remain role-wide; only writes are narrowed.
-# ``legacy`` preserves direct callers until every session constructor supplies a seat.
+# There is deliberately NO fallback seat: an unknown (role, seat) pair raises
+# (``assert_seat``) instead of widening to a union, because role/seat are supplied
+# by framework code (never by the agent), so an illegal pair is a bug and a silent
+# widening would grant more than the session asked for.
 SEAT_WRITE: Dict[str, Dict[str, List[str]]] = {
     "planner": {
         "plan": TASK_SOURCE,
         "self_improve": PLANNER_SELF,
-        "legacy": TASK_SOURCE + PLANNER_SELF,
     },
     "evaluator": {
         "evaluate": [],
         "self_improve": EVALUATOR_SELF,
-        "legacy": EVALUATOR_SELF,
     },
-    "task": {"task": [], "legacy": []},
+    "task": {"task": []},
 }
+
+
+def legal_seats(role: str) -> List[str]:
+    """Sorted seats a session of ``role`` may declare (empty list = unknown role)."""
+    return sorted(SEAT_WRITE.get(role, {}))
+
+
+def assert_seat(role: str, seat: str) -> str:
+    """Validate a (role, seat) pair and return the normalised seat.
+
+    Raises ``ValueError`` for anything not in ``SEAT_WRITE``.  There is no
+    fallback by design: an illegal seat means a framework bug, and silently
+    widening it to the role's union would grant more than the session asked for.
+    """
+    s = str(seat or "")
+    if s not in SEAT_WRITE.get(role, {}):
+        raise ValueError(
+            f"illegal session seat {seat!r} for role {role!r}; "
+            f"legal seats: {legal_seats(role) or '(unknown role)'}")
+    return s
 
 # role -> {"read": [...], "write": [...]}
 ACCESS: Dict[str, Dict[str, List[str]]] = {
@@ -111,17 +132,33 @@ def read_roots(role: str) -> List[str]:
     return list(ACCESS.get(role, {}).get("read", []))
 
 
-def write_roots(role: str, seat: str = "legacy") -> List[str]:
-    return list(SEAT_WRITE.get(role, {}).get(str(seat or "legacy"),
-                                             ACCESS.get(role, {}).get("write", [])))
+def write_roots(role: str, seat: str) -> List[str]:
+    """Seat-specific write roots (validated; no fallback -- see ``assert_seat``)."""
+    return list(SEAT_WRITE[role][assert_seat(role, seat)])
 
 
-def is_allowed(role: str, rel: str, intent: str = "view", seat: str = "legacy") -> bool:
-    """Allowlist check with an optional session seat.
+def any_seat_roots(role: str) -> List[str]:
+    """Union of ``role``'s write roots over every seat -- a CLASSIFICATION query.
 
-    Reads remain role-wide. Modifying requests use seat-specific write roots;
-    ``legacy`` preserves direct callers until every session supplies a seat.
+    Only for "which role could own this path" questions (assembly attribution).
+    Never use it for authorization: the union is deliberately wider than any
+    single session may write.
     """
+    out: List[str] = []
+    for roots in SEAT_WRITE.get(role, {}).values():
+        for r in roots:
+            if r not in out:
+                out.append(r)
+    return out
+
+
+def is_allowed(role: str, rel: str, intent: str = "view", *, seat: str) -> bool:
+    """Allowlist check for ONE session.
+
+    Reads stay role-wide; modifying requests use the seat-specific write roots.
+    ``seat`` is required and validated (no fallback) -- see ``assert_seat``.
+    """
+    seat = assert_seat(role, seat)
     if not rel:
         return False
     raw = str(rel).replace("\\", "/")
@@ -132,6 +169,23 @@ def is_allowed(role: str, rel: str, intent: str = "view", seat: str = "legacy") 
     if not _matches(rel, roots):
         return False
     return not _matches(rel, TRUST_ANCHOR)
+
+
+def any_seat_allows(role: str, rel: str) -> bool:
+    """CLASSIFICATION query: could ANY seat of ``role`` modify ``rel``?
+
+    Mirrors ``is_allowed(intent="modify")`` against the seat union; used by the
+    assembly to attribute an always-on path to a role. It is NOT an authorization
+    check -- authorization always goes through ``is_allowed`` with a real seat.
+    """
+    if not rel:
+        return False
+    raw = str(rel).replace("\\", "/")
+    if raw.startswith("/") or any(part == ".." for part in raw.split("/")):
+        return False
+    if not _matches(raw, any_seat_roots(role)):
+        return False
+    return not _matches(raw, TRUST_ANCHOR)
 
 
 def has_glob(rel: str) -> bool:
@@ -165,7 +219,12 @@ def expand_roots(root_dir: str, roots: List[str], cap: int = 500) -> List[str]:
 
 # -- back-compat ------------------------------------------------------------
 def deny_paths() -> List[str]:
-    """Legacy deny list = the explicit trust anchor (kept for audit/tests)."""
+    """Read-only view of the explicit trust anchor (``TRUST_ANCHOR``).
+
+    ``build.py`` passes it to ``AccessBroker(deny_paths=...)`` as the broker's
+    runtime deny list, and ``is_allowed`` enforces it directly. Currently
+    redundant with the role roots (defence-in-depth).
+    """
     return list(TRUST_ANCHOR)
 
 

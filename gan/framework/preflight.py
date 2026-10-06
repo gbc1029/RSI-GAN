@@ -110,6 +110,32 @@ def assemble_collisions(
     return {k: v for k, v in by_name.items() if len(v) > 1}
 
 
+def seat_matrix_problems(role: str) -> List[Dict[str, str]]:
+    """Startup check of the frozen session-seat matrix for ``role`` (no I/O).
+
+    Fail-fast companion to the registry checks: a missing seat, or a seat whose
+    write roots escape the role's own write surface, would make every session of
+    that role either impossible to construct or accidentally over-broad.  The two
+    read-only seats are pinned on purpose -- they are policy, not an accident.
+    """
+    from gan.framework import frozen as fz
+    seats = fz.SEAT_WRITE.get(role) or {}
+    if not seats:
+        return [{"problem": "no session seats declared for this role"}]
+    problems: List[Dict[str, str]] = []
+    role_write = set(fz.ACCESS.get(role, {}).get("write", []))
+    for seat, roots in sorted(seats.items()):
+        outside = sorted(r for r in roots if r not in role_write)
+        if outside:
+            problems.append({"seat": seat,
+                             "problem": f"write roots outside the role surface: {outside}"})
+    for seat in ("evaluate", "task"):
+        if seat in seats and seats[seat]:
+            problems.append({"seat": seat,
+                             "problem": f"read-only seat has write roots: {seats[seat]}"})
+    return problems
+
+
 def preflight_tools(
     roles: Iterable[str] = ("task", "planner", "evaluator"),
     code_root: Optional[str] = None,
@@ -147,6 +173,9 @@ def preflight_tools(
             # sources -- the counterpart to self-reported tool_info descriptions.
             # Never gating; the operator reads this at startup.
             "observed_capabilities": observed_capabilities(role, code_root=croot),
+            # Session-seat matrix (frozen policy data, no I/O): a missing seat or a
+            # seat wider than the role surface breaks every session of that role.
+            "seat_matrix": seat_matrix_problems(role),
         }
     return out
 
@@ -345,7 +374,7 @@ def tools_ok(results: Dict[str, Dict[str, Any]]) -> bool:
     can repair).
     """
     for r in results.values():
-        if r.get("problems") or r.get("collisions"):
+        if r.get("problems") or r.get("collisions") or r.get("seat_matrix"):
             return False
         if (r.get("always_on") or {}).get("frozen"):
             return False

@@ -6,7 +6,7 @@ explicit context argument, so per-session state travels via contextvars:
 - ``PlanContext``   - planner's planning session (records + issue responses)
 - ``EvalContext``   - evaluator's evaluation session (issues/verdicts/scores)
 - ``DesignContext`` - the *target* design config that design operators edit
-- ``AccessContext`` - source-access session (broker + role + node)
+- ``AccessContext`` - source-access session (broker + role + node + seat)
 """
 from __future__ import annotations
 
@@ -145,17 +145,24 @@ class AccessContext:
     role: str
     node_id: Any
     # The session seat controls which write roots this role may use.  It is
-    # explicit because role-wide access is too broad for plan/evaluate/self_improve.
-    seat: str = "legacy"
+    # explicit because role-wide access is too broad for plan/evaluate/self_improve,
+    # and it is REQUIRED + validated below: role/seat are supplied by framework code
+    # (never by the agent), so a missing or misspelled seat is a bug that must
+    # surface loudly instead of silently widening access to the role's union.
+    seat: str
     # Explicit set of task generations whose trajectory this session may read
     # (resolved by the loop; avoids relying on the node already being in the tree).
     trajectory_genids: List[Any] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        from gan.framework.frozen import assert_seat
+        self.seat = assert_seat(self.role, self.seat)
 
-def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None,
-                       seat: str = "legacy"):
+
+def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None, *,
+                       seat: str):
     return _ACCESS_CTX.set(AccessContext(broker, role, node_id,
-                                          seat=str(seat or "legacy"),
+                                          seat=seat,
                                           trajectory_genids=list(trajectory_genids or [])))
 
 
@@ -165,6 +172,31 @@ def get_access_context() -> Optional[AccessContext]:
 
 def reset_access_context(token) -> None:
     _ACCESS_CTX.reset(token)
+
+
+def illegal_seat_error(actx: Any, tool: str) -> Optional[str]:
+    """Return an error string when ``actx`` has no usable session seat, else None.
+
+    The tool-layer counterpart of ``frozen.assert_seat``: role/seat are set by
+    framework code, so a missing/illegal seat is a framework bug.  Tools must not
+    raise (that would abort the agent session), so they return this string and
+    refuse -- never guessing a (necessarily wider) write surface.  A best-effort
+    audit event is recorded so the bug is visible.
+    """
+    from gan.framework.frozen import legal_seats
+    role = getattr(actx, "role", "") if actx is not None else ""
+    seat = getattr(actx, "seat", "") if actx is not None else ""
+    if str(seat or "") in legal_seats(role):
+        return None
+    broker = getattr(actx, "broker", None) if actx is not None else None
+    if broker is not None:
+        try:
+            broker.log_event({"type": "illegal_session_seat", "tool": tool,
+                              "role": role, "seat": seat})
+        except Exception:  # audit must never break the tool
+            pass
+    return (f"Error: illegal session seat {seat!r} for role {role!r} "
+            f"(framework bug; legal: {legal_seats(role) or 'unknown role'})")
 
 
 def session_overlay_root():

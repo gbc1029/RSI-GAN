@@ -200,7 +200,8 @@ class AccessBroker:
         intent: str = "view",
         reason: str = "",
         if_absent: bool = False,
-        seat: str = "legacy",
+        *,
+        seat: str,
     ) -> List[str]:
 
         """Copy requested repo paths into the role workspace ``src/``.
@@ -215,6 +216,7 @@ class AccessBroker:
         """
         if not self.auto_approve:
             raise PermissionError("source access requires approval (auto_approve=False)")
+        seat = frozen.assert_seat(role, seat)
         granted: List[str] = []
         denied_list: List[str] = []
         missing: List[str] = []

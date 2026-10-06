@@ -6,7 +6,8 @@ through here: request ``view``/``modify`` access, then edit the granted copies.
 Requested paths are copied into the role workspace ``src/`` so they can then be
 edited with the ``edit_source`` work tool.
 """
-from gan.framework.context import get_access_context, get_design_context
+from gan.framework.context import (get_access_context, get_design_context,
+                                   illegal_seat_error)
 
 
 def tool_info():
@@ -44,6 +45,9 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
     dctx = get_design_context()
     if actx is None:
         return "Error: no access context"
+    _bad_seat = illegal_seat_error(actx, "request_source_access")
+    if _bad_seat:
+        return _bad_seat
     if isinstance(paths, str):
         paths = [paths]
     # A deep WRITE verb needs a session with a patch channel; evaluate builds
@@ -57,7 +61,7 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
     # is the explicit escape hatch that discards them and re-copies the repo version.
     granted = actx.broker.grant(actx.role, actx.node_id, paths or [], intent=intent,
                                 reason=reason, if_absent=not refresh,
-                                 seat=getattr(actx, "seat", "legacy"))
+                                 seat=actx.seat)
     kept = list((getattr(actx.broker, "last_result", None) or {}).get("skipped") or [])
     if dctx is not None:
         dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)

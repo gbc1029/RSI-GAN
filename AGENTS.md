@@ -161,8 +161,19 @@ batch-8 isolation), one subprocess each.
   session seat. Reads remain role-wide; writes are seat-specific: planner `plan`
   may write the task surface, planner/evaluator `self_improve` may write its own
   role surface, and evaluator `evaluate`/task sessions are read-only. The frozen
-  matrix is enforced at grants, source edits, patch checks, and commits. The
-  `legacy` seat exists only for direct framework callers and compatibility tests.
+  matrix is enforced at grants, source edits, patch checks, and commits.
+  **The seat is a closed, validated set** (`frozen.SEAT_WRITE`: `planner/{plan,
+  self_improve}`, `evaluator/{evaluate, self_improve}`, `task/{task}`): it is
+  REQUIRED (no default) on `set_access_context` / `frozen.write_roots` /
+  `frozen.is_allowed` / `AccessBroker.grant` / `code_repo.check_patch|apply_*`,
+  and an unknown `(role, seat)` pair raises `ValueError` instead of falling back
+  to the role's union — role/seat are supplied by framework code, never by the
+  agent, so a missing or misspelled seat is a bug that must fail loudly. There is
+  no `legacy` seat. The only deliberate union query is
+  `frozen.any_seat_allows` (assembly path→role **classification**, never
+  authorization); the tool layer returns an error string (plus an
+  `illegal_session_seat` audit event) rather than raising, so a bad context
+  cannot abort a session.
 - **Front-loaded write policy**: `edit_source` is the only official source-edit
   entry and uses the centralized frozen authorization helper before mutation.
   Dispatch validates declared `edit_source` inputs before invoking tool code.

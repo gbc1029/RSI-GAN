@@ -24,15 +24,16 @@ from pathlib import Path
 from typing import Any, Dict
 
 from gan.framework import frozen
-from gan.framework.context import get_access_context, get_design_context
+from gan.framework.context import (get_access_context, get_design_context,
+                                   illegal_seat_error)
 from gan.registries.loader import (
     module_sha12,
     entry_reason, parse_registry_file, resolve_module, write_registry_json,
 )
 
-# One registry per role, and each role designs exactly one --
-# planner designs the TASK agent -> registers task tools; evaluator designs
-# itself -> registers evaluator tools. planner.json has no writer (no slots).
+# One registry per role; which file a session writes depends on its seat (see
+# _SEAT_OWNERSHIP). planner's plan seat designs the TASK agent -> task.json;
+# its self_improve seat writes planner.json; evaluator writes evaluator.json.
 _OWN_REGISTRY = {"planner": "task.json", "evaluator": "evaluator.json"}
 # role -> the component directory its registry may reference (role-directory
 # binding; the allowlist already enforces the same split, this is the message)
@@ -41,13 +42,11 @@ _SEAT_OWNERSHIP = {
     ("planner", "plan"): ("task.json", "task"),
     ("planner", "self_improve"): ("planner.json", "planner"),
     ("evaluator", "self_improve"): ("evaluator.json", "evaluator"),
-    ("planner", "legacy"): ("task.json", "task"),
-    ("evaluator", "legacy"): ("evaluator.json", "evaluator"),
 }
 
 
 def _ownership(actx):
-    return _SEAT_OWNERSHIP.get((actx.role, getattr(actx, "seat", "legacy")),
+    return _SEAT_OWNERSHIP.get((actx.role, actx.seat),
                                (_OWN_REGISTRY.get(actx.role), _OWNING_DIR.get(actx.role, actx.role)))
 
 _DESCRIPTION_CAP = 300  # catalog metadata, not rhetoric
@@ -117,8 +116,10 @@ def tool_info():
             "it cannot be committed). This tool never creates or restores source. "
             "Applied to your workspace; committed with this session's patch after "
             "validation. The module must live under your designed role's component "
-            "tree (planner -> gan/components/task/** via task.json; evaluator -> "
-            "gan/components/evaluator/** via evaluator.json). A stem that would "
+            "tree (per seat: planner plan -> gan/components/task/** via task.json, "
+            "planner self_improve -> gan/components/planner/** via planner.json, "
+            "evaluator -> gan/components/evaluator/** via evaluator.json). A stem "
+            "that would "
             "collide with an always-on tool or another registered component at "
             "assembly is refused (both would fight for one toolset basename). Pass "
             "description= to author the catalog line (<=300 chars); re-registering "
@@ -145,6 +146,9 @@ def tool_function(name, module, description=None, **kwargs):
     actx = get_access_context()
     if actx is None or getattr(actx, "broker", None) is None:
         return "Error: no access context"
+    _bad_seat = illegal_seat_error(actx, "register_component")
+    if _bad_seat:
+        return _bad_seat
     role = actx.role
     broker = actx.broker
     node = actx.node_id
@@ -182,9 +186,9 @@ def tool_function(name, module, description=None, **kwargs):
                 f"reference gan/components/{owning_dir}/**")
 
     # 2) permission gate (same rule and order as unregister_component)
-    if not frozen.is_allowed(role, reg_rel, "modify", seat=getattr(actx, "seat", "legacy")):
+    if not frozen.is_allowed(role, reg_rel, "modify", seat=actx.seat):
         return f"Error: registry not editable for {role}: {reg_rel}"
-    if not frozen.is_allowed(role, module_rel, "modify", seat=getattr(actx, "seat", "legacy")):
+    if not frozen.is_allowed(role, module_rel, "modify", seat=actx.seat):
         return f"Error: component source not editable for {role}: {module_rel}"
 
     # 2.5) the module must already exist -- in the repo (committed) OR in the workspace
@@ -294,10 +298,10 @@ def tool_function(name, module, description=None, **kwargs):
     #      the gate's own reason instead of writing a registration it cannot commit.
     if not broker.covers(role, node, reg_rel):
         broker.grant(role, node, [reg_rel], intent="modify", reason="register",
-                     seat=getattr(actx, "seat", "legacy"))
+                     seat=actx.seat)
     if not os.path.isfile(ws_reg):
         broker.grant(role, node, [reg_rel], intent="modify", reason="register",
-                     if_absent=True, seat=getattr(actx, "seat", "legacy"))
+                     if_absent=True, seat=actx.seat)
     if not broker.covers(role, node, reg_rel):
         denied = (getattr(broker, "last_result", {}) or {}).get("denied") or []
         why = f" (denied: {', '.join(denied[:3])})" if reg_rel in [str(d) for d in denied] else ""
@@ -365,7 +369,7 @@ def tool_function(name, module, description=None, **kwargs):
     designed = getattr(dctx, "role", None)
     cross_note = ""
     if designed is not None and designed != owning_dir:
-        cross_note = (f" NOTE: registered into {reg_name} for seat '{getattr(actx, 'seat', 'legacy')}' "
+        cross_note = (f" NOTE: registered into {reg_name} for seat '{actx.seat}' "
                       f"but the current design target is '{designed}'.")
     return (f"Registered tool '{name}' ({module_rel}) in {reg_rel}{note}. It will "
             f"be committed with this session's patch after validation. You can "

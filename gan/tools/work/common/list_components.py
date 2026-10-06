@@ -184,19 +184,11 @@ def tool_function(**kwargs):
     # `selectable` mirrors exactly what select_component accepts: EVERY design
     # selects against the effective (workspace-first) registry -- the mirror is
     # the effective view for the task design and for role self-designs alike.
-    _sel_effective = True
-
     def _selectable(name):
-        if _sel_effective:
-            e = eff_by_key.get(name)
-            if e is None:
-                return False, "not in the effective registry (select_component would reject it)"
-            r = entry_reason(e, eff_reg.components_dir, design_role)
-        else:
-            e = code_by_key.get(name)
-            if e is None:
-                return False, "not in the committed registry (select_component would reject it)"
-            r = entry_reason(e, code_reg.components_dir, design_role)
+        e = eff_by_key.get(name)
+        if e is None:
+            return False, "not in the effective registry (select_component would reject it)"
+        r = entry_reason(e, eff_reg.components_dir, design_role)
         return (r is None), (r or "")
 
     # -- registered (union: effective first, then pending removals) ---------
@@ -339,22 +331,16 @@ def tool_function(**kwargs):
         notes.append(f"{len(uncovered)} unregistered file(s) lie outside every granted "
                      f"path: registering them cannot reach the commit until their parent "
                      f"directory is granted")
-    sel_by_key = eff_by_key if _sel_effective else code_by_key
-    dangling = [f"tools:{n}" for n in (selected.get("tools") or []) if n not in sel_by_key]
+    dangling = [f"tools:{n}" for n in (selected.get("tools") or [])
+                if n not in eff_by_key]
     if dangling:
-        if _sel_effective:
-            notes.append("selected but NOT resolvable from the effective registry -- the "
-                         "framework strips these from the design before persisting "
-                         "(design_dangling_stripped): " + ", ".join(sorted(dangling)))
-        else:
-            notes.append("selected but NOT in the committed registry (assembly will skip "
-                         "them; for role designs a successful patch heals this at "
-                         "commit; a rejected/exhausted one leaves it dangling until "
-                         "the next assembly reports it): "
-                         + ", ".join(sorted(dangling)))
+        notes.append("selected but NOT resolvable from the effective registry -- the "
+                     "framework strips these from the design before persisting "
+                     "(design_dangling_stripped): " + ", ".join(sorted(dangling)))
     if not patch_channel:
         notes.append("no patch channel in this session (evaluate): deep registry/source "
-                     "changes made now would be discarded -- do not attempt them")
+                     "changes are REFUSED up front (no patch could carry them) -- do not "
+                     "attempt them")
     unconsumed = [d["key"] for d in declared_keys if not d["consumer_selectable"]]
     if unconsumed:
         notes.append("declared config key(s) whose consumer is NOT selectable now: "

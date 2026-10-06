@@ -6,8 +6,9 @@ entry removed, module file deleted) rather than committing immediately — the
 change is folded into the session's patch and goes through the normal commit
 validation (allowlist + compile + registry) together with the rest of the edits.
 
-Name-keyed, and the scan targets exactly the registry this role designs
-(planner -> task.json, evaluator -> evaluator.json) — with one single-writer
+Name-keyed, and the scan targets exactly the registry this role's seat designs
+(planner plan -> task.json, planner self_improve -> planner.json, evaluator ->
+evaluator.json) — with one single-writer
 registry per role there is no other file the tool could be declared in, so the
 old "scan all registry files" behaviour had no remaining purpose. The workspace
 copy stays this session's source of truth (scanning the repo copy would still
@@ -19,7 +20,8 @@ import os
 from pathlib import Path
 
 from gan.framework import frozen
-from gan.framework.context import get_access_context, get_design_context
+from gan.framework.context import (get_access_context, get_design_context,
+                                   illegal_seat_error)
 from gan.registries.loader import parse_registry_file, write_registry_json
 
 # role -> the registry it designs (single-writer file)
@@ -29,13 +31,11 @@ _SEAT_OWNERSHIP = {
     ("planner", "plan"): ("task.json", "task"),
     ("planner", "self_improve"): ("planner.json", "planner"),
     ("evaluator", "self_improve"): ("evaluator.json", "evaluator"),
-    ("planner", "legacy"): ("task.json", "task"),
-    ("evaluator", "legacy"): ("evaluator.json", "evaluator"),
 }
 
 
 def _ownership(actx):
-    return _SEAT_OWNERSHIP.get((actx.role, getattr(actx, "seat", "legacy")),
+    return _SEAT_OWNERSHIP.get((actx.role, actx.seat),
                                (_OWN_REGISTRY.get(actx.role), _OWNING_DIR.get(actx.role, actx.role)))
 
 
@@ -60,6 +60,9 @@ def tool_function(name, **kwargs):
     actx = get_access_context()
     if actx is None or getattr(actx, "broker", None) is None:
         return "Error: no access context"
+    _bad_seat = illegal_seat_error(actx, "unregister_component")
+    if _bad_seat:
+        return _bad_seat
     role = actx.role
     broker = actx.broker
     node = actx.node_id
@@ -93,7 +96,7 @@ def tool_function(name, **kwargs):
              if isinstance(e, dict) and e.get("name") == name]
     if not match:
         return f"Error: tool not found: '{name}' in {rel}"
-    if not frozen.is_allowed(role, rel, "modify", seat=getattr(actx, "seat", "legacy")):
+    if not frozen.is_allowed(role, rel, "modify", seat=actx.seat):
         return f"Error: registry not editable for {role}: {rel}"
     mod = str(match[0].get("module") or "").replace("\\", "/").strip("/")
     # A registry entry is DATA, and with the workspace-first scan above it can come
@@ -104,7 +107,7 @@ def tool_function(name, **kwargs):
     if mod and (not mod.endswith(".py") or any(p == ".." for p in mod.split("/"))):
         return f"Error: unsafe module path in registry entry: {mod!r}"
     module_rel = f"gan/components/{mod}" if mod else ""
-    if module_rel and not frozen.is_allowed(role, module_rel, "modify", seat=getattr(actx, "seat", "legacy")):
+    if module_rel and not frozen.is_allowed(role, module_rel, "modify", seat=actx.seat):
         return f"Error: component source not editable for {role}: {module_rel}"
     if mod and not mod.startswith(f"{owning_dir}/"):
         return (f"Error: module '{mod}' is outside the designed role's component tree "
@@ -117,10 +120,10 @@ def tool_function(name, **kwargs):
     # is rejected by the registry gate. The MODULE is granted even when it is
     # absent from the workspace, so the deletion stays visible to the patch builder.
     broker.grant(role, node, [rel], intent="modify", reason="unregister", if_absent=True,
-                 seat=getattr(actx, "seat", "legacy"))
+                 seat=actx.seat)
     if module_rel:
         broker.grant(role, node, [module_rel], intent="modify", reason="unregister",
-                     if_absent=True, seat=getattr(actx, "seat", "legacy"))
+                     if_absent=True, seat=actx.seat)
 
     ws_mod = os.path.join(src, module_rel) if module_rel else ""
     if ws_mod:

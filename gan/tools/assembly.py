@@ -83,7 +83,9 @@ def always_on_owner(role: str, path: str, root_dir: Optional[str] = None) -> Opt
         root_dir = os.path.dirname(os.path.dirname(tools_dir))
     rel = str(os.path.relpath(path, root_dir)).replace(os.sep, "/")
     for r in ("planner", "evaluator"):
-        if frozen.is_allowed(r, rel, intent="modify", seat="legacy"):
+        # CLASSIFICATION, not authorization: "could any seat of this role modify
+        # the path?" -- so it deliberately uses the seat union, never a session seat.
+        if frozen.any_seat_allows(r, rel):
             return r
     return None
 

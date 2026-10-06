@@ -146,9 +146,10 @@ def module_api_reason(path: Path) -> Optional[str]:
 
     Single definition shared by every STATIC consumer: ``entry_reason`` (registry
     entries), the startup always-on check (``gan/framework/preflight``) and the
-    runtime load-report classification. Distinguishes the two failure
-    families so a report can name the real cause: the file cannot be read/parsed
-    at all, versus it parses but does not bind both required names.
+    runtime load-report classification. Distinguishes the failure families so a
+    report can name the real cause: the file cannot be read/parsed at all; it
+    parses but does not bind both required names; or it binds them yet the static
+    capability policy refuses it (``unsafe capability: ...``).
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -323,7 +324,7 @@ def entry_reason(entry: Any, components_dir, owning_role: Optional[str] = None) 
     api_reason = module_api_reason(p)
     if api_reason is not None:
         if api_reason.startswith("unsafe capability"):
-            # Keep the loader's two failure families distinct.
+            # Keep the loader's failure families distinct.
             # ``_exposes_tool_api`` collapses both into one bool, which made a
             # capability-policy refusal look like a missing tool API. Same
             # verdict, precise cause.
