@@ -22,6 +22,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -49,6 +50,61 @@ _HARNESS_FILES = [
 ]
 _PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
+
+
+# Keep this probe deliberately small. It runs under the exact credentials and
+# interpreter used for the questions-only harness, so an inaccessible venv or
+# conda prefix is reported before Python emits an opaque init_fs_encoding error.
+_SANDBOX_RUNTIME_PREFLIGHT = r"""
+import json
+import os
+import sys
+
+expected_euid = int(sys.argv[1])
+expected_egid = int(sys.argv[2])
+errors = []
+if os.geteuid() != expected_euid:
+    errors.append("euid=%s (expected %s)" % (os.geteuid(), expected_euid))
+if os.getegid() != expected_egid:
+    errors.append("egid=%s (expected %s)" % (os.getegid(), expected_egid))
+
+no_new_privs = None
+try:
+    with open("/proc/self/status", encoding="ascii") as status_file:
+        for line in status_file:
+            if line.startswith("NoNewPrivs:"):
+                no_new_privs = line.split(":", 1)[1].strip()
+                break
+except OSError as exc:
+    errors.append("cannot read /proc/self/status: %s" % exc)
+if no_new_privs != "1":
+    errors.append("NoNewPrivs=%s (expected 1)" % no_new_privs)
+
+try:
+    import encodings  # noqa: F401
+except Exception as exc:
+    errors.append("cannot import encodings: %s" % exc)
+
+if not os.path.isabs(sys.executable):
+    errors.append("sys.executable is not absolute: %s" % sys.executable)
+elif not os.path.isfile(sys.executable) or not os.access(sys.executable, os.X_OK):
+    errors.append("sys.executable is not executable: %s" % sys.executable)
+
+if not sys.prefix or not os.path.isdir(sys.prefix):
+    errors.append("sys.prefix is not a directory: %s" % sys.prefix)
+elif not os.access(sys.prefix, os.R_OK | os.X_OK):
+    errors.append("sys.prefix is not accessible: %s" % sys.prefix)
+
+print(json.dumps({
+    "euid": os.geteuid(),
+    "egid": os.getegid(),
+    "no_new_privs": no_new_privs,
+    "executable": sys.executable,
+    "prefix": sys.prefix,
+    "errors": errors,
+}, sort_keys=True))
+raise SystemExit(1 if errors else 0)
+"""
 
 
 # -- design persistence -----------------------------------------------------
@@ -325,6 +381,97 @@ def _sandbox_identity(run_dir: str, run_id: str) -> Tuple[str, int, int]:
     return setpriv, uid, gid
 
 
+def _python_prefix_hint(python_executable: str) -> str:
+    try:
+        executable = os.path.abspath(python_executable)
+        bin_dir = os.path.dirname(executable)
+        if os.path.basename(bin_dir) == "bin":
+            return os.path.dirname(bin_dir)
+    except OSError:
+        pass
+    return str(getattr(sys, "prefix", "<unknown>"))
+
+
+def _sandbox_runtime_preflight(
+    setpriv: str,
+    uid: int,
+    gid: int,
+    username: str,
+    python_executable: str,
+    run_dir: str,
+    env: Dict[str, str],
+    timeout: int,
+) -> None:
+    """Fail early if the sandbox uid cannot start the selected Python."""
+    prefix_hint = _python_prefix_hint(python_executable)
+    probe_cmd = [
+        setpriv,
+        "--reuid", str(uid),
+        "--regid", str(gid),
+        "--clear-groups",
+        "--no-new-privs",
+        "--",
+        python_executable,
+        "-c", _SANDBOX_RUNTIME_PREFLIGHT,
+        str(uid),
+        str(gid),
+    ]
+    descriptor = (
+        f"sandbox username={username!r}, uid={uid}, gid={gid}, "
+        f"Python executable={python_executable!r}, Python prefix={prefix_hint!r}"
+    )
+    try:
+        probe = subprocess.run(
+            probe_cmd,
+            cwd=run_dir,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(1, min(int(timeout), 30)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"G6b sandbox runtime preflight failed ({descriptor}): timed out"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"G6b sandbox runtime preflight failed ({descriptor}): "
+            f"could not launch probe: {exc}"
+        ) from exc
+
+    stdout = (probe.stdout or "").strip()
+    stderr = (probe.stderr or "").strip()
+    payload: Dict[str, Any] = {}
+    for line in reversed(stdout.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+
+    prefix = str(payload.get("prefix") or prefix_hint)
+    probe_errors = payload.get("errors")
+    if isinstance(probe_errors, list):
+        reason = "; ".join(str(item) for item in probe_errors if str(item))
+    else:
+        reason = ""
+    if probe.returncode != 0:
+        reason = reason or stderr or stdout or f"probe exited with rc={probe.returncode}"
+    elif not payload:
+        reason = stderr or stdout or "probe returned no diagnostic payload"
+    if probe.returncode != 0 or not payload or reason:
+        raise RuntimeError(
+            f"G6b sandbox runtime preflight failed ("
+            f"sandbox username={username!r}, uid={uid}, gid={gid}, "
+            f"Python executable={python_executable!r}, Python prefix={prefix!r}"
+            f"): {reason[-2000:]}"
+        )
+
+
 def run_harness_and_report(
     python: str,
     run_dir: str,
@@ -374,6 +521,12 @@ def run_harness_and_report(
         harness_cmd.extend(["--dataset_root", os.path.abspath(dataset_root)])
     child_env = dict(env)
     child_env.pop(_SANDBOX_USER_ENV, None)
+    if questions_path:
+        username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
+        _sandbox_runtime_preflight(
+            setpriv, uid, gid, username, python_executable,
+            run_dir, child_env, timeout,
+        )
     proc = subprocess.run(
         harness_cmd, cwd=run_dir, env=child_env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
