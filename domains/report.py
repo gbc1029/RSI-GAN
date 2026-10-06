@@ -24,7 +24,12 @@ def _report_columns(domain):
 def compute_report(df, domain, ground_truth_key, question_id_col):
     """Compute the legacy label report from an in-memory dataframe."""
     df = df.copy()
-    df = df[df["prediction"] != ""].copy()  # Filter out rows with NA predictions
+    # Drop rows with no usable prediction. `read_csv(dtype=str)` keeps missing
+    # cells as NaN (dtype does not disable NA recognition), and `NaN != ""` is
+    # True, so the old `!= ""` filter silently kept every missing prediction and
+    # counted it as a wrong answer. Drop NaN and whitespace-only values.
+    df = df[df["prediction"].notna()
+            & (df["prediction"].astype(str).str.strip() != "")].copy()
     df["prediction"] = df["prediction"].str.strip().str.lower()
     df[ground_truth_key] = df[ground_truth_key].str.strip().str.lower()
     df["match"] = df[ground_truth_key] == df["prediction"]

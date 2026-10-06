@@ -11,7 +11,6 @@ Raw ``bash`` is intentionally NOT granted to roles: it cannot be confined to the
 workspace. Only the base ``editor`` capabilities are exposed, path-checked here.
 """
 import os
-from typing import Optional
 
 from agent.tools import edit as _edit
 from gan.framework.context import get_access_context, get_design_context
@@ -128,26 +127,6 @@ def tool_function(command, path, file_text=None, view_range=None,
         # still has the context. Reads (view) deliberately produce no pressure.
         out = f"{out}{_registered_component_note(abs_path)}"
     return out
-
-
-def _covering_intent(actx, abs_path: str) -> Optional[str]:
-    """Intent of the grant covering ``abs_path`` ("modify" | "view" | None).
-
-    Mirrors ``AccessBroker.covers``' walk (exact rel first, then ancestor
-    directories) but reads the per-grant intent the broker already stores in
-    its records (``access.py`` grant()); "modify" wins wherever it appears.
-    """
-    broker = actx.broker
-    rel = os.path.relpath(abs_path, _root(actx)).replace(os.sep, "/")
-    best = None
-    for rec in broker.grants.get((actx.role, str(actx.node_id)), []):
-        for g in rec.get("paths", []):
-            g = str(g).replace("\\", "/").rstrip("/")
-            if g and (rel == g or rel.startswith(g + "/")):
-                if rec.get("intent") == "modify":
-                    return "modify"
-                best = best or "view"
-    return best
 
 
 op_info = tool_info
