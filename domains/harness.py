@@ -9,6 +9,7 @@ import importlib
 import importlib.util
 import json
 import shutil
+import stat
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,19 @@ from hydra import compose, initialize_config_dir
 
 
 QUESTION_TIMEOUT = 300
+
+_TASK_ENV_NAMES = {
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
+    "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
+    "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+}
+
+def _task_child_env(base_env):
+    """Return a non-secret allowlist for the trusted worker and agent child."""
+    return {key: value for key, value in base_env.items()
+            if key in _TASK_ENV_NAMES or key.startswith("LC_")}
+
 
 
 def get_dataset(domain, subset="", dataset_root=None):
@@ -60,7 +74,7 @@ def _add_empty_parents(command, path, created):
         created.add(item)
 
 
-def _sandbox_command(run_root, agent_path, trajectory_path):
+def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
     """Create a fail-closed Bubblewrap command for one TaskAgent question."""
     bwrap = shutil.which("bwrap")
     if not bwrap:
@@ -94,13 +108,17 @@ def _sandbox_command(run_root, agent_path, trajectory_path):
             raise RuntimeError(
                 f"Sandbox bind source for {label} is missing or not a {expected_type}: {source}"
             )
+    if proxy_socket:
+        proxy_socket = os.path.realpath(proxy_socket)
+        if not os.path.exists(proxy_socket) or not stat.S_ISSOCK(os.stat(proxy_socket).st_mode):
+            raise RuntimeError(f"Task proxy socket is missing or not a socket: {proxy_socket}")
 
     command = [
         bwrap,
         "--die-with-parent",
         "--new-session",
         "--unshare-all",
-        "--share-net",
+        "--unshare-net",
         "--cap-drop", "ALL",
     ]
 
@@ -136,6 +154,8 @@ def _sandbox_command(run_root, agent_path, trajectory_path):
         "--ro-bind", os.path.join(run_root, "domains", "task_worker.py"),
         "/workspace/domains/task_worker.py",
     ])
+    if proxy_socket:
+        command.extend(["--ro-bind", proxy_socket, "/workspace/.llm.sock"])
     # .gan_runtime only exists inside a GAN run copy (assembled by
     # gan.framework.task_execution). Legacy direct-harness sandbox runs do not
     # set GAN_TASK_DESIGN, so binding it must be conditional, not fatal.
@@ -161,7 +181,7 @@ def _sandbox_command(run_root, agent_path, trajectory_path):
     return command
 
 
-def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
+def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None):
     run_root = os.path.realpath(os.getcwd())
     trajectory_path = os.path.realpath(trajectory_path)
     os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
@@ -171,15 +191,17 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
     with open(trajectory_path, "a", encoding="utf-8"):
         pass
 
+    if proxy_socket and not proxy_token:
+        raise RuntimeError("Task sandbox proxy socket requires a scoped token")
     payload = {
         "model": model,
         "inputs": inputs,
         "agent_path": "/workspace/task_agent.py",
         "trajectory_path": "/workspace/trajectory.jsonl",
+        "proxy_socket": "/workspace/.llm.sock" if proxy_socket else None,
+        "proxy_token": proxy_token,
     }
-    child_env = dict(os.environ)
-    for name in ("GAN_DATASET_ROOT", "PYTHONHOME", "PYTHONPATH", "OLDPWD"):
-        child_env.pop(name, None)
+    child_env = _task_child_env(os.environ)
 
     # The result channel is an anonymous temporary file. Only the trusted
     # task_worker receives its fd; the TaskAgent child is spawned later with
@@ -188,7 +210,7 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
         result_fd = result_file.fileno()
         payload["result_fd"] = result_fd
         proc = subprocess.run(
-            _sandbox_command(run_root, agent_path, trajectory_path),
+            _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket),
             input=json.dumps(payload, ensure_ascii=False, default=str),
             text=True,
             stdout=subprocess.PIPE,
@@ -216,12 +238,13 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
 
 
 def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
-              question_id_col, sandbox_task_agent=False, agent_path="./task_agent.py"):
+              question_id_col, sandbox_task_agent=False, agent_path="./task_agent.py",
+              proxy_socket=None, proxy_token=None):
     question_id = row[question_id_col]
     chat_history_path = os.path.join(evals_folder, f"chat_history_{question_id}.jsonl")
     inputs = format_input_dict(row)
     if sandbox_task_agent:
-        return _run_sandboxed_agent(model, inputs, agent_path, chat_history_path)
+        return _run_sandboxed_agent(model, inputs, agent_path, chat_history_path, proxy_socket, proxy_token)
     agent = TaskAgent(model=model, chat_history_file=chat_history_path)
     prediction, _ = agent.forward(inputs)
     return prediction
@@ -266,6 +289,8 @@ def harness(
     model=None,
     dataset_root=None,
     questions_path=None,
+    proxy_socket=None,
+    proxy_token=None,
 ):
     # Dynamically import functions based on the domain
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
@@ -354,6 +379,7 @@ def harness(
                         TaskAgent, model, row, evals_folder,
                         format_input_dict, question_id_col,
                         sandbox_task_agent, agent_path,
+                        proxy_socket, proxy_token,
                     ),
                 )
             )
@@ -481,6 +507,8 @@ if __name__ == "__main__":
         "--questions_path", type=str, default=None,
         help="Questions-only CSV prepared by the GAN parent process.",
     )
+    parser.add_argument("--proxy_socket", type=str, default=None)
+    parser.add_argument("--proxy_token", type=str, default=None)
     args = parser.parse_args()
 
     domain = args.domain
@@ -504,6 +532,8 @@ if __name__ == "__main__":
             model=args.model,
             dataset_root=args.dataset_root,
             questions_path=args.questions_path,
+            proxy_socket=args.proxy_socket,
+            proxy_token=args.proxy_token,
         )
 
     # Balrog game domains

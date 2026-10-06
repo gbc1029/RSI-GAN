@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from gan.framework import paths
@@ -24,6 +26,81 @@ from gan.framework import paths
 def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
     from utils import trajectory_log
     trajectory_log.append(paths.events_path(output_dir), event)
+
+
+def _outer_env(base: Dict[str, str], *, proxy_socket: str,
+               planner_token: str, evaluator_token: str,
+               control_token: str, code_root: str) -> Dict[str, str]:
+    """Return the small non-secret environment inherited by outer_worker."""
+    allowed = {
+        "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+        "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "GAN_TASK_SANDBOX_USER",
+        "CUDA_VISIBLE_DEVICES",
+    }
+    env = {k: v for k, v in base.items()
+           if k in allowed or k.startswith("LC_")}
+    env["PYTHONPATH"] = code_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["GAN_LLM_PROXY_UNIX"] = proxy_socket
+    env["GAN_PROXY_PLANNER_TOKEN"] = planner_token
+    env["GAN_PROXY_EVALUATOR_TOKEN"] = evaluator_token
+    env["GAN_PROXY_CONTROL_TOKEN"] = control_token
+    return env
+
+
+def _add_empty_parents(command: List[str], path: str, created: set) -> None:
+    parent = os.path.dirname(path)
+    pending = []
+    while parent and parent != "/" and parent not in created:
+        pending.append(parent)
+        next_parent = os.path.dirname(parent)
+        if next_parent == parent:
+            break
+        parent = next_parent
+    for item in reversed(pending):
+        command.extend(["--dir", item])
+        created.add(item)
+
+
+def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
+                          code_root: str, proxy_socket: str) -> List[str]:
+    """Run outer_worker in a no-network view with only its run inputs mounted."""
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise RuntimeError(
+            "GAN outer_worker network isolation requires bubblewrap ('bwrap'); "
+            "refusing to run planner/evaluator with host networking")
+    command = [
+        bwrap, "--die-with-parent", "--new-session",
+        "--unshare-all", "--unshare-net", "--cap-drop", "ALL",
+    ]
+    created = {"/"}
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
+        if os.path.exists(path):
+            command.extend(["--ro-bind", path, path])
+            created.add(path)
+    prefix = os.path.realpath(sys.prefix)
+    if not any(prefix == root or prefix.startswith(root + os.sep)
+               for root in ("/usr", "/bin", "/sbin", "/lib", "/lib64")):
+        _add_empty_parents(command, prefix, created)
+        command.extend(["--ro-bind", prefix, prefix])
+        created.add(prefix)
+    for source, target, mode in (
+        (repo_root, repo_root, "--ro-bind"),
+        (output_dir, output_dir, "--bind"),
+        (code_root, code_root, "--bind"),
+        (proxy_socket, proxy_socket, "--ro-bind"),
+    ):
+        if not os.path.exists(source):
+            raise RuntimeError(f"outer sandbox bind source is missing: {source}")
+        _add_empty_parents(command, target, created)
+        command.extend([mode, source, target])
+    command.extend([
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+        "--chdir", code_root, "--setenv", "HOME", "/tmp",
+    ])
+    command.extend(cmd)
+    return command
 
 
 def run_gan_driver(
@@ -127,29 +204,57 @@ def run_gan_driver(
         if not preflight_mod.all_ok(results):
             raise RuntimeError(f"model preflight failed: {results}")
 
-    env = dict(os.environ)
-    env["PYTHONPATH"] = code_root + os.pathsep + env.get("PYTHONPATH", "")
-    env["PYTHONDONTWRITEBYTECODE"] = "1"  # keep code_root clean (no __pycache__)
-
-    for outer in range(start, G + 1):
-        cmd = [
-            sys.executable, "-m", "gan.outer_worker",
-            "--repo_root", repo_root, "--output_dir", output_dir,
-            "--outer", str(outer), "--domains", domain,
-            "--subset", subset, "--num_samples", str(num_samples),
-        ]
-        if inner is not None:
-            cmd.extend(["--inner", str(inner)])
-        if resume:
-            # P1: worker restores the latest OUTER-boundary checkpoint, never a
-            # crashed outer's partial inner state.
-            cmd += ["--resume-boundary", "outer"]
-        proc = subprocess.run(cmd, cwd=code_root, env=env)
-        if proc.returncode != 0:
-            _log_event(output_dir, {"type": "outer_worker_failed", "outer": outer,
-                                    "rc": proc.returncode})
-            raise RuntimeError(f"outer worker failed at outer {outer} (rc={proc.returncode})")
-        # role self-edits are applied+committed by the worker itself (option B)
-
-    _log_event(output_dir, {"type": "driver_done", "code_root": code_root})
-    return code_root
+    proxy_dir = tempfile.mkdtemp(prefix="rsi-gan-proxy-")
+    proxy_socket = os.path.join(proxy_dir, "p.sock")
+    from gan.framework import models as model_registry
+    from gan.framework.llm_proxy import ParentLLMProxy
+    proxy = ParentLLMProxy(
+        output_dir, proxy_socket,
+        models={
+            "task": model_registry.resolve("gan.task"),
+            "planner": model_registry.resolve("gan.planner"),
+            "evaluator": model_registry.resolve("gan.evaluator"),
+        },
+    )
+    proxy.start()
+    try:
+        for outer in range(start, G + 1):
+            tokens = {
+                "planner": proxy.issue_scope(
+                    "planner", str(outer), model_registry.resolve("gan.planner")),
+                "evaluator": proxy.issue_scope(
+                    "evaluator", str(outer), model_registry.resolve("gan.evaluator")),
+                "control": proxy.issue_framework_scope(outer),
+            }
+            cmd = [
+                os.path.abspath(sys.executable), "-m", "gan.outer_worker",
+                "--repo_root", repo_root, "--output_dir", output_dir,
+                "--outer", str(outer), "--domains", domain,
+                "--subset", subset, "--num_samples", str(num_samples),
+            ]
+            if inner is not None:
+                cmd.extend(["--inner", str(inner)])
+            if resume:
+                cmd += ["--resume-boundary", "outer"]
+            env = _outer_env(
+                os.environ, proxy_socket=proxy_socket,
+                planner_token=tokens["planner"],
+                evaluator_token=tokens["evaluator"],
+                control_token=tokens["control"],
+                code_root=code_root,
+            )
+            proc = subprocess.run(
+                _outer_worker_command(
+                    cmd, repo_root, output_dir, code_root, proxy_socket),
+                cwd=code_root, env=env,
+            )
+            if proc.returncode != 0:
+                _log_event(output_dir, {"type": "outer_worker_failed", "outer": outer,
+                                        "rc": proc.returncode})
+                raise RuntimeError(f"outer worker failed at outer {outer} (rc={proc.returncode})")
+            # role self-edits are applied+committed by the worker itself (option B)
+        _log_event(output_dir, {"type": "driver_done", "code_root": code_root})
+        return code_root
+    finally:
+        proxy.close()
+        shutil.rmtree(proxy_dir, ignore_errors=True)

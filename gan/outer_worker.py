@@ -7,6 +7,7 @@ changes therefore take effect for the next outer only.
 from __future__ import annotations
 
 import argparse
+import os
 
 
 def main() -> None:
@@ -53,7 +54,23 @@ def main() -> None:
     )
     loop.resume = True  # load trees/state produced by previous outers
     loop.resume_boundary = args.resume_boundary
-    loop.run(only_outer=args.outer)
+
+    # The driver mounts only the parent proxy Unix socket into this worker.
+    # A loopback relay keeps planner/evaluator inside the worker's no-network
+    # namespace while preserving the existing OpenAI-compatible client API.
+    relay = None
+    proxy_socket = os.environ.get("GAN_LLM_PROXY_UNIX")
+    if proxy_socket:
+        from gan.framework.llm_relay import LocalLLMRelay
+        relay = LocalLLMRelay(proxy_socket)
+        port = relay.start()
+        os.environ["OPENAI_API_BASE"] = f"http://127.0.0.1:{port}/v1"
+        os.environ.pop("OPENAI_API_KEY", None)
+    try:
+        loop.run(only_outer=args.outer)
+    finally:
+        if relay is not None:
+            relay.close()
 
 
 if __name__ == "__main__":

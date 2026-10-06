@@ -51,6 +51,27 @@ _HARNESS_FILES = [
 _PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
 
+_TASK_ENV_NAMES = {
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
+    "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
+    "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+}
+_TASK_PARENT_ENV_NAMES = _TASK_ENV_NAMES | {
+    "GAN_LLM_PROXY_UNIX", "GAN_PROXY_CONTROL_TOKEN",
+}
+
+def _task_safe_env(base_env: Dict[str, str]) -> Dict[str, str]:
+    """Keep only non-secret runtime configuration for the task child."""
+    return {key: value for key, value in base_env.items()
+            if key in _TASK_ENV_NAMES or key.startswith("LC_")}
+
+def _task_parent_env(base_env: Dict[str, str]) -> Dict[str, str]:
+    """Keep framework-only proxy metadata for the trusted harness parent."""
+    return {key: value for key, value in base_env.items()
+            if key in _TASK_PARENT_ENV_NAMES or key.startswith("LC_")}
+
+
 
 # Keep this probe deliberately small. It runs under the exact credentials and
 # interpreter used for the questions-only harness, so an inaccessible venv or
@@ -294,9 +315,6 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
         src = os.path.join(source_root, "domains", dom)
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(run_dir, "domains", dom), ignore=_DOMAIN_IGNORE)
-    envf = os.path.join(source_root, ".env")
-    if os.path.isfile(envf):
-        shutil.copy2(envf, os.path.join(run_dir, ".env"))
 
     applied = bool(apply_patch(run_dir, patch_str)) if (patch_str or "").strip() else False
     return run_dir, applied
@@ -484,6 +502,7 @@ def run_harness_and_report(
     timeout: int,
     questions_path: Optional[str] = None,
     dataset_root: Optional[str] = None,
+    scope_id: Optional[str] = None,
     log_path: Optional[str] = None,
 ) -> Tuple[int, str]:
     """Run the frozen harness; parent-side reporting happens separately."""
@@ -495,6 +514,17 @@ def run_harness_and_report(
         "--subset", subset,
         "--num_samples", str(num_samples),
     ]
+    proxy_socket = env.get("GAN_LLM_PROXY_UNIX")
+    proxy_token = None
+    if proxy_socket:
+        if not scope_id:
+            raise RuntimeError("LLM proxy task scope requires a generation id")
+        control_token = env.get("GAN_PROXY_CONTROL_TOKEN")
+        if not control_token:
+            raise RuntimeError("LLM proxy task scope requires framework control capability")
+        from gan.framework.llm_proxy import request_task_token
+        proxy_token = request_task_token(
+            proxy_socket, control_token, str(scope_id), model)
     if questions_path:
         setpriv, uid, gid = _sandbox_identity(run_dir, run_id)
         python_executable = python if os.path.isabs(python) else shutil.which(python)
@@ -519,8 +549,12 @@ def run_harness_and_report(
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
         harness_cmd.extend(["--dataset_root", os.path.abspath(dataset_root)])
-    child_env = dict(env)
-    child_env.pop(_SANDBOX_USER_ENV, None)
+    if proxy_token:
+        harness_cmd.extend([
+            "--proxy_socket", os.path.abspath(proxy_socket),
+            "--proxy_token", proxy_token,
+        ])
+    child_env = _task_safe_env(env)
     if questions_path:
         username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
         _sandbox_runtime_preflight(
