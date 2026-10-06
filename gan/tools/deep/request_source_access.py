@@ -63,7 +63,7 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
         dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)
     # NOTE: denied/missing paths are audited (events.jsonl + broker.last_result) but are
     # intentionally NOT surfaced here. Telling the agent which paths are frozen would steer
-    # it toward the trust anchor / the gate itself (see DGM-H drift analysis). The agent
+    # it toward the trust anchor / the gate itself. The agent
     # only learns what it actually received.
     if granted:
         try:

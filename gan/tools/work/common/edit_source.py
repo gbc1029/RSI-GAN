@@ -11,8 +11,6 @@ Raw ``bash`` is intentionally NOT granted to roles: it cannot be confined to the
 workspace. Only the base ``editor`` capabilities are exposed, path-checked here.
 """
 import os
-
-import os
 from typing import Optional
 
 from agent.tools import edit as _edit
@@ -117,11 +115,10 @@ def tool_function(command, path, file_text=None, view_range=None,
         old_str=old_str, new_str=new_str, insert_line=insert_line,
     )
     if mutating and not str(out).startswith("Error"):
-        # Record the mutation: `path` is the workspace-relative form (the
-        # 口径 the patch builder and covers() consume) so the projection and
-        # the patch gate share one position fact. Sessions without a design
-        # context (evaluate) skip it rather than write into a ledger nothing
-        # reads.
+        # Record the mutation: `path` is the workspace-relative form the patch
+        # builder and covers() consume, so the projection and the patch gate
+        # share one position fact. Sessions without a design context (evaluate)
+        # skip it rather than write into a ledger nothing reads.
         dctx = get_design_context()
         if dctx is not None:
             rel = os.path.relpath(abs_path, _root(actx)).replace(os.sep, "/")

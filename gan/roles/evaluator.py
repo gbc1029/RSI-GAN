@@ -53,8 +53,8 @@ class Evaluator(Role):
             )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
             # The block is scoped to the parent round explicitly --
-            # the ops list LAGS one round by design (kept滞后, per the ledger
-            # decision), and an unlabeled block invited cross-round misattribution.
+            # the ops list LAGS one round by design, per the ledger decision,
+            # and an unlabeled block invited cross-round misattribution.
             parts.append(
                 "\n## Diff summary of the planner's changes in the parent round (no rationale)\n"
                 "Op vocabulary: `add_config_key` rows are declared design-config keys "

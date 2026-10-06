@@ -304,7 +304,7 @@ def prepare_questions(
 def _sandbox_identity(run_dir: str, run_id: str) -> Tuple[str, int, int]:
     """Prepare a dedicated host uid and return (setpriv, uid, gid)."""
     if os.name != "posix" or not hasattr(os, "chown"):
-        raise RuntimeError("G6b requires a POSIX host with setpriv and chown")
+        raise RuntimeError("the sandbox identity path requires a POSIX host with setpriv and chown")
 
     username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
     if not username:
@@ -319,15 +319,15 @@ def _sandbox_identity(run_dir: str, run_id: str) -> Tuple[str, int, int]:
 
     uid, gid = int(account.pw_uid), int(account.pw_gid)
     if uid == 0:
-        raise RuntimeError("G6b refuses to run TaskAgent as uid 0")
+        raise RuntimeError("refusing to run TaskAgent as uid 0")
     current_uid = int(os.geteuid())
     if current_uid not in (0, uid):
         raise RuntimeError(
-            "G6b requires root or the configured sandbox uid to chown the run copy"
+            "chown of the run copy requires root or the configured sandbox uid"
         )
     setpriv = shutil.which("setpriv")
     if not setpriv:
-        raise RuntimeError("G6b requires the util-linux setpriv executable")
+        raise RuntimeError("the sandbox identity path requires the util-linux setpriv executable")
 
     output_dir = os.path.join(run_dir, "outputs", run_id)
     os.makedirs(output_dir, exist_ok=True)
@@ -367,7 +367,7 @@ def run_harness_and_report(
         setpriv, uid, gid = _sandbox_identity(run_dir, run_id)
         python_executable = python if os.path.isabs(python) else shutil.which(python)
         if not python_executable:
-            raise RuntimeError(f"G6b cannot resolve Python executable: {python}")
+            raise RuntimeError(f"cannot resolve Python executable: {python}")
         harness_cmd = [
             setpriv,
             "--reuid", str(uid),

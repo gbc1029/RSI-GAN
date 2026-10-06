@@ -19,8 +19,9 @@ def tool_function(name, value, **kwargs):
     if ctx is None:
         return "Error: no design context"
     if str(name) == "model":
-        # Frozen framework setting: the role model is resolved from the framework
-        # config / environment, never from an evolvable design.
+        # Frozen framework setting: the role model is resolved from
+        # ``gan/framework/models.yaml`` (pure lookup), never from an evolvable
+        # design.
         return "Error: parameter 'model' is reserved and cannot be set here."
     params = ctx.config.setdefault("params", {})
     params[name] = value

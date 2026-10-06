@@ -161,9 +161,6 @@ class TreeStore:
                 payload[k] = v
         self._append({"op": "update", "genid": genid, "fields": payload})
 
-    def mark_stagnant(self, genid: Any) -> None:
-        self.update(genid, status="stagnant", valid_parent=False)
-
     def get(self, genid: Any) -> Optional[Node]:
         return self.nodes.get(_key(genid))
 

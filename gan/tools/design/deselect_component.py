@@ -6,7 +6,7 @@ or the component source files.
 
 Removing a tool from the registry and deleting its source file is a DEEP
 change (component removal, e.g. ``unregister_component``); adding or modifying
-tool *logic* is also DEEP (source edit). See the design decision record.
+tool *logic* is also DEEP (source edit); see AGENTS.md, "Shallow vs deep".
 
 One ``tools`` slot per role; the legacy ``skills``/``eval_points`` names are
 accepted as aliases.

@@ -72,7 +72,7 @@ def _no_newline_marker_diff(a_lines: List[str], b_lines: List[str],
     flag pairs). So the wrapper:
 
     1. normalises the LAST element of each side into ``(content, flag)`` and
-       pads it to ``content + "\\n"`` beforedifflib (making the hunk
+       pads it to ``content + "\\n"`` before difflib (making the hunk
        well-formed);
     2. builds the diff via ``difflib`` as usual;
     3. post-processes the LAST hunk only: appends the marker line after the

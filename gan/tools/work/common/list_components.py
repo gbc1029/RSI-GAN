@@ -3,7 +3,7 @@
 Roles do not know their options a priori: which tools exist is registry data, not
 prompt data. ``list_components`` answers, in one read-only call:
 
-- ``registered``   : the role's registry **union** the committed baseline, with
+- ``registered``   : the role's registry union with the committed baseline, with
   the exact name to pass to ``select_component``;
 - ``selected``     : what the *current* design config already selects
   (the single ``tools`` slot);
@@ -182,9 +182,8 @@ def tool_function(**kwargs):
     }
 
     # `selectable` mirrors exactly what select_component accepts: EVERY design
-    # selects against the
-    # effective (workspace-first) registry -- the mirror is the effective view
-    # for the task design and for role self-designs alike.
+    # selects against the effective (workspace-first) registry -- the mirror is
+    # the effective view for the task design and for role self-designs alike.
     _sel_effective = True
 
     def _selectable(name):

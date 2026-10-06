@@ -9,7 +9,7 @@ _DEFAULT_DESIGN = {"prompt": "You are an agent.", "tools": [], "params": {}}
 
 
 def _load_design():
-    """Load the framework-injected task design (evolved prompt + skills).
+    """Load the framework-injected task design (evolved prompt + selected tools).
 
     A design file that EXISTS but is unparseable must abort the task run (C4):
     silently falling back to ``_DEFAULT_DESIGN`` would run this generation on

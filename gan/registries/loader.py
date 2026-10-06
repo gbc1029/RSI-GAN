@@ -452,7 +452,7 @@ def load_registry_for_role(
     ``overlay_root`` is the session **workspace** root (``broker.src_dir(role,
     node)``). When given, the registry file and every component module resolve
     **workspace-first, committed-tree second** -- the same rule the deep tools use
-    to scan (S1/P3), so the read side and the write side can never disagree about
+    to scan, so the read side and the write side can never disagree about
     what the session currently declares. The workspace is only a *partial* copy
     (granted paths only, cleared at each outer boundary), which is exactly why the
     committed tree stays the fallback instead of being a competing view.

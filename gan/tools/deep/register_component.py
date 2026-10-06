@@ -187,7 +187,7 @@ def tool_function(name, module, description=None, **kwargs):
     if not frozen.is_allowed(role, module_rel, "modify", seat=getattr(actx, "seat", "legacy")):
         return f"Error: component source not editable for {role}: {module_rel}"
 
-    # 2) the module must already exist -- in the repo (committed) OR in the workspace
+    # 2.5) the module must already exist -- in the repo (committed) OR in the workspace
     #    (created this session with edit_source). Registering never creates or restores
     #    source; it only records an entry for source that exists.
     src = broker.src_dir(role, node)

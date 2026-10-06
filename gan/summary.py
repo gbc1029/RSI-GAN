@@ -60,7 +60,7 @@ def build_diff_summary(
         elif op == "edit_source":
             # The deep edit surface now records its mutations. Same
             # branch shape as request_source_access: structured position facts
-            # only (workspace REL -- the口径 the patch builder and covers()
+            # only (workspace-relative -- the form the patch builder and covers()
             # already consume); the free text/grep evidence channels stay out.
             if r.get("command"):
                 entry["command"] = r["command"]
