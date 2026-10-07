@@ -15,6 +15,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional
 
 
+def _normalize_model_name(model: Any) -> Optional[str]:
+    if not isinstance(model, str):
+        return None
+    prefix = "openai/"
+    return model[len(prefix):] if model.startswith(prefix) else model
+
+
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -200,10 +207,14 @@ class ParentLLMProxy:
             self.audit_denied(scope, "malformed chat completion request", handler.path)
             handler._reply(400, {"error": {"message": "model and messages are required"}})
             return
-        if body["model"] != scope["model"] or self.models.get(scope["role"]) != body["model"]:
+        requested_model = _normalize_model_name(body["model"])
+        scoped_model = _normalize_model_name(scope.get("model"))
+        allowed_model = _normalize_model_name(self.models.get(scope["role"]))
+        if requested_model != scoped_model or requested_model != allowed_model:
             self.audit_denied(scope, "model is not allowed for token scope", handler.path)
             handler._reply(403, {"error": {"message": "model policy denied"}})
             return
+        body["model"] = requested_model
         with self._token_lock:
             count = self._inflight.get(token, 0)
             if count >= self._max_inflight:
