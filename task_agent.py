@@ -62,7 +62,7 @@ class TaskAgent(AgentSystem):
 {inputs}
 ```
 
-Respond in JSON format with the following schema:
+Respond in JSON format with the following schema (wrap the object in <json>...</json> tags; no markdown fences; no text outside the tags; write math in plain text without LaTeX backslash escapes):
 <json>
 {{
     "response": ...
@@ -84,14 +84,24 @@ Respond in JSON format with the following schema:
             tool_timeout_s=240,
         )
 
-        # Extract the response
-        prediction = "None"
+        # Extract the response. A BLANK prediction (not the string "None") marks
+        # extraction failure: the harness resume path retries blank predictions
+        # and the report drops them, so the sentinel can never pass as an
+        # answer; the reason rides the trajectory log instead of vanishing.
+        prediction = ""
         try:
-            extracted_jsons = extract_jsons(new_msg_history[-1]['text'])
-            if extracted_jsons is not None and "response" in extracted_jsons[-1]:
+            extracted_jsons = extract_jsons(new_msg_history[-1]['text'], logging=self.log)
+            if extracted_jsons is None:
+                self.log("prediction_extract failed: no parseable JSON (see json_extract log above)")
+            elif "response" not in extracted_jsons[-1]:
+                obj = extracted_jsons[-1]
+                keys = list(obj)[:8] if isinstance(obj, dict) else "-"
+                self.log(f"prediction_extract failed: missing key 'response' "
+                         f"(got {type(obj).__name__}, keys={keys})")
+            else:
                 prediction = extracted_jsons[-1]['response']
         except Exception as e:
             self.log(f"Error extracting prediction: {e}")
-            prediction = "None"
+            prediction = ""
 
         return prediction, new_msg_history

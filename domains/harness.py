@@ -14,7 +14,9 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
+from dotenv import load_dotenv
 from hydra import compose, initialize_config_dir
+from utils.common import summarize_error
 
 
 QUESTION_TIMEOUT = 300
@@ -177,6 +179,12 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
         "agent_path": "/workspace/task_agent.py",
         "trajectory_path": "/workspace/trajectory.jsonl",
     }
+    # The sandboxed path never imports the agent (harness() skips
+    # load_task_agent), so agent.llm's module-level load_dotenv() never runs in
+    # THIS process. The sandbox binds no .env and its CWD is a tmpfs, so the
+    # child can only receive credentials through the inherited environment.
+    # Load them explicitly here (no-override: explicit exports win).
+    load_dotenv()
     child_env = dict(os.environ)
     for name in ("GAN_DATASET_ROOT", "PYTHONHOME", "PYTHONPATH", "OLDPWD"):
         child_env.pop(name, None)
@@ -251,6 +259,36 @@ def load_task_agent(agent_path: str):
     if not hasattr(mod, "TaskAgent"):
         raise AttributeError(f"No TaskAgent found in module: {agent_path}")
     return mod.TaskAgent
+
+def _failure_phase(e):
+    """Coarse isolation phase for eval_failures.jsonl (heuristic by design)."""
+    s = str(e)
+    if isinstance(e, subprocess.TimeoutExpired):
+        return "question_timeout"
+    if "Sandboxed TaskAgent failed" in s:
+        return "sandboxed_agent"
+    if "TaskAgent child" in s or "Trusted TaskAgent worker" in s:
+        return "result_channel"
+    return "unknown"
+
+
+def _dump_failure_log(evals_folder, qid, e):
+    """Sidecar forensics: full captured streams; the JSONL record stays compact."""
+    try:
+        path = os.path.join(evals_folder, f"failure_{qid}.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now().isoformat(timespec='seconds')}] {type(e).__name__}\n")
+            for attr in ("stderr", "stdout"):
+                v = getattr(e, attr, None)
+                if isinstance(v, (bytes, bytearray)):
+                    v = bytes(v).decode("utf-8", "replace")
+                if v:
+                    fh.write(f"--- {attr} ---\n{v}\n")
+            fh.write("--- repr ---\n" + repr(e) + "\n")
+    except Exception:
+        # Forensics must never break the isolation path itself.
+        pass
+
 
 def harness(
     agent_path="./task_agent.py",
@@ -388,9 +426,13 @@ def harness(
                     qid = dataset.at[idx, question_id_col]
                 except Exception:
                     qid = str(idx)
-                failures.append(
-                    {"idx": int(idx), "question_id": str(qid), "error": str(e)[:500]}
-                )
+                failures.append({
+                    "idx": int(idx), "question_id": str(qid),
+                    "error_type": type(e).__name__,
+                    "error": summarize_error(e),
+                    "phase": _failure_phase(e),
+                })
+                _dump_failure_log(evals_folder, str(qid), e)
             predictions[idx] = prediction
 
             if (idx + 1) % save_interval == 0:
