@@ -89,14 +89,23 @@ def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
         (repo_root, repo_root, "--ro-bind"),
         (output_dir, output_dir, "--bind"),
         (code_root, code_root, "--bind"),
-        (proxy_socket, proxy_socket, "--ro-bind"),
     ):
         if not os.path.exists(source):
             raise RuntimeError(f"outer sandbox bind source is missing: {source}")
         _add_empty_parents(command, target, created)
         command.extend([mode, source, target])
+    if not os.path.exists(proxy_socket):
+        raise RuntimeError(f"outer sandbox bind source is missing: {proxy_socket}")
+    if "/tmp" not in created:
+        command.extend(["--dir", "/tmp"])
+        created.add("/tmp")
     command.extend([
         "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+    ])
+    created = {path for path in created if not path.startswith("/tmp/")}
+    _add_empty_parents(command, proxy_socket, created)
+    command.extend([
+        "--ro-bind", proxy_socket, proxy_socket,
         "--chdir", code_root, "--setenv", "HOME", "/tmp",
     ])
     command.extend(cmd)
