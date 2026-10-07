@@ -8,9 +8,9 @@
 # Part 2 - DGM-H roles
 # Part 3 - domain-specific (non-task) roles
 gan:
-  task: openai/doubao-seed-2-0-mini-260428
-  planner: openai/doubao-seed-2-0-mini-260428
-  evaluator: openai/doubao-seed-2-0-mini-260428
+  task: openai/glm-5.3-flash
+  planner: openai/glm-5.3-flash
+  evaluator: openai/glm-5.3-flash
 
 dgmh:
   meta: openai/claude-sonnet-4-5-20250929

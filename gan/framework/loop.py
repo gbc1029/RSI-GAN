@@ -132,6 +132,12 @@ class GanLoop:
         self.keep_workdirs = bool(cfg.get("loop.keep_workdirs", False))
         self.self_improve_max_tool_calls = int(cfg.get("loop.self_improve_max_tool_calls", 30))
         self.plan_max_tool_calls = int(cfg.get("loop.plan_max_tool_calls", 40))
+        # The evaluate seat has its OWN budget: it must at minimum complete the
+        # seat's mandatory eval-points, so reusing the planner's (smaller) plan
+        # budget starves it. Counted per phase (blind / reveal-thirds), with the
+        # identical-call breaker (``tool_repeat_limit``) as the anti-waste net.
+        self.evaluate_max_tool_calls = int(cfg.get("loop.evaluate_max_tool_calls", 30))
+        self.tool_repeat_limit = int(cfg.get("loop.tool_repeat_limit", 3))
         self.patch_retry_k = int(cfg.get("loop.patch_retry_k", 2))
         # C batch: per-CALL tool budget stamped onto every refreshed role
         # instance (dispatch-level net lives in agent.llm_withtools; roles pass
@@ -973,6 +979,7 @@ class GanLoop:
                         parent_benchmark_score=parent_benchmark_score,
                         patch_retry_k=self.patch_retry_k,
                         max_tool_calls=self.plan_max_tool_calls,
+                        tool_repeat_limit=self.tool_repeat_limit,
                     ) or {}
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to planner_failed
@@ -1075,6 +1082,8 @@ class GanLoop:
                         broker=self.broker,
                         task_brief=self.task_brief,
                         trajectory_genids=[genid] + parent_ref,
+                        max_tool_calls=self.evaluate_max_tool_calls,
+                        tool_repeat_limit=self.tool_repeat_limit,
                     )
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to evaluator_failed
@@ -1194,6 +1203,7 @@ class GanLoop:
                 res = self.evaluator.self_improve(recent={**recent_eval, "receipt": self._self_receipts.get("evaluator")},
                                                   broker=self.broker,
                                                   max_tool_calls=self.self_improve_max_tool_calls,
+                                                  tool_repeat_limit=self.tool_repeat_limit,
                                                   trajectory_genids=si_refs,
                                                   patch_retry_k=self.patch_retry_k)
                 self._apply_self_patch("evaluator", outer, res)
@@ -1206,6 +1216,7 @@ class GanLoop:
                 res = self.planner.self_improve(recent={**recent_plan, "receipt": self._self_receipts.get("planner")},
                                                 broker=self.broker,
                                                 max_tool_calls=self.self_improve_max_tool_calls,
+                                                tool_repeat_limit=self.tool_repeat_limit,
                                                 trajectory_genids=si_refs,
                                                 patch_retry_k=self.patch_retry_k)
                 self._apply_self_patch("planner", outer, res)

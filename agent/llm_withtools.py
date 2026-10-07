@@ -324,6 +324,11 @@ def chat_with_agent(
                           # instead of hanging the whole session.
     trajectory_file=None,  # Optional structured JSONL trajectory sink
     return_info=False,  # If True, also return {"truncated", "tool_calls"}
+    tool_repeat_limit: int = 3,  # Anti-thrash: >= this many CONSECUTIVE identical
+                          # (tool, input, output) calls ends the session -- identical
+                          # input + identical output cannot produce new information.
+                          # Each tool's FIRST call is always exempt (a seat's mandatory
+                          # eval-points therefore always complete). 0 disables.
 ):
     get_response_fn = get_response_from_llm
     # Construct message
@@ -352,6 +357,9 @@ def chat_with_agent(
         tool_uses, malformed = check_for_tool_uses(response)
         retry_tool_use = should_retry_tool_use(response, tool_uses)
         malformed_feedback = 0
+        _last_fp = None
+        _repeat_count = 0
+        repeat_break = False
         while tool_uses or retry_tool_use or malformed:
             # Check for max tool calls
             if max_tool_calls > 0 and num_tool_calls >= max_tool_calls:
@@ -423,6 +431,41 @@ def chat_with_agent(
                               text=str(tool_audit["tool_stderr"])[:2000])
                     _emit(logging, trajectory_file, "tool_output", tool=tool_name,
                           output=str(tool_output))
+                    # Anti-thrash breaker: identical (tool, input, output) in a row
+                    # cannot produce new information. State-changing re-verification
+                    # is exempt automatically -- a changed workspace changes the
+                    # output hash, which resets the counter.
+                    _fp = (tool_name,
+                           json.dumps(tool_input, sort_keys=True, ensure_ascii=False,
+                                      default=str),
+                           str(tool_output))
+                    if _fp == _last_fp:
+                        _repeat_count += 1
+                    else:
+                        _last_fp = _fp
+                        _repeat_count = 1
+                    if tool_repeat_limit > 0 and _repeat_count >= tool_repeat_limit:
+                        logging("Error: identical tool call repeated "
+                                f"{_repeat_count}x with the same result; ending session.")
+                        _emit(logging, trajectory_file, "tool_repeat_break",
+                              tool=tool_name, repeats=_repeat_count)
+                        truncated = True
+                        repeat_break = True
+                        try:
+                            response, new_msg_history, info = get_response_fn(
+                                msg=(system_msg + "\n\n# Repeated identical tool call\n"
+                                     "The same tool call (same input) returned the same "
+                                     f"result {_repeat_count} times in a row. The result "
+                                     "will not change unless the state changes. Do NOT "
+                                     "call any tool. Provide your final answer/summary "
+                                     "now."),
+                                model=model, msg_history=new_msg_history)
+                            _emit(logging, trajectory_file, "output", text=response)
+                        except Exception as e:
+                            logging(f"Error during final summary turn: {e}")
+                        tool_uses, malformed = None, 0
+                        retry_tool_use = False
+                        break
                     tool_msg = f'''<json>
     {{
         "tool_name": "{tool_name}",
@@ -433,6 +476,8 @@ def chat_with_agent(
                     tool_msgs.append(tool_msg)
 
             # Check for retry
+            if repeat_break:
+                break
             if retry_tool_use:
                 logging("Error: Output context exceeded. Please try again.")
                 tool_msgs.append("Error: Output context exceeded. Please try again.")
@@ -454,7 +499,8 @@ def chat_with_agent(
         raise e
 
     if return_info:
-        return new_msg_history, {"truncated": truncated, "tool_calls": num_tool_calls}
+        return new_msg_history, {"truncated": truncated, "tool_calls": num_tool_calls,
+                                 "repeat_break": repeat_break}
     return new_msg_history
 
 if __name__ == "__main__":

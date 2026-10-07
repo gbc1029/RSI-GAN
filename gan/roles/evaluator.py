@@ -90,8 +90,18 @@ class Evaluator(Role):
         blind_enabled: bool = True,
         task_brief: Optional[str] = None,
         trajectory_genids: Optional[List[Any]] = None,
+        max_tool_calls: Optional[int] = None,
+        tool_repeat_limit: Optional[int] = None,
     ) -> EvalContext:
-        """Two-phase evaluation: blind first, then reveal benchmark (if provided)."""
+        """Two-phase evaluation: blind first, then reveal benchmark (if provided).
+
+        Budget: the blind phase gets ``max_tool_calls`` (the seat's own
+        ``evaluate_max_tool_calls`` -- NOT the planner's budget); the reveal
+        phase is a finalization pass and gets a third of it (min 6). Both
+        phases share ``tool_repeat_limit`` so a no-change re-sweep of the same
+        eval-points (observed: fixed=False throughout, byte-identical outputs)
+        cannot burn the budget.
+        """
         ctx = EvalContext()
         tok_eval = set_eval_context(ctx)
         akey = self.access_key(node_id)
@@ -99,13 +109,19 @@ class Evaluator(Role):
                                          trajectory_genids=trajectory_genids,
                                          seat="evaluate")
                       if broker is not None else None)
+        blind_cap = max_tool_calls if max_tool_calls is not None else 30
+        reveal_cap = max(6, blind_cap // 3)
         try:
             hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief),
+                            max_tool_calls=blind_cap,
+                            tool_repeat_limit=tool_repeat_limit,
                             trajectory_file=self.session_trajectory(node_id))
             if benchmark_score is not None:
                 self.run(
                     self._reveal_instruction(benchmark_score),
                     msg_history=hist,
+                    max_tool_calls=reveal_cap,
+                    tool_repeat_limit=tool_repeat_limit,
                     trajectory_file=self.session_trajectory(node_id),
                 )
         finally:
@@ -119,7 +135,7 @@ class Evaluator(Role):
 
     def self_improve(self, recent: Optional[Dict[str, Any]] = None, broker: Any = None,
                      max_tool_calls: int = 30, trajectory_genids: Optional[List[Any]] = None,
-                     patch_retry_k: int = 2):
+                     patch_retry_k: int = 2, tool_repeat_limit: Optional[int] = None):
         from gan.framework.context import DesignContext, reset_design_context, set_design_context
 
         digests = (recent or {}).get("digests") or []
@@ -156,7 +172,8 @@ class Evaluator(Role):
                 + (("\n" + rr + "\n") if rr else "")
                 + f"\n## Feedback digests\n{digest_text}"
             )
-            hist = self.run(instruction, max_tool_calls=max_tool_calls, trajectory_file=traj)
+            hist = self.run(instruction, max_tool_calls=max_tool_calls,
+                            tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
 
             def _build_patch() -> str:
                 if broker is None or not has_deep_write(dctx.records):
@@ -186,7 +203,8 @@ class Evaluator(Role):
                 hist = self.run(
                     "# Patch rejected\nYour previous patch was rejected by validation:\n"
                     f"{reason}\nFix the problem, then stop. Do not repeat the same action.",
-                    msg_history=hist, max_tool_calls=max_tool_calls, trajectory_file=traj)
+                    msg_history=hist, max_tool_calls=max_tool_calls,
+                    tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
                 attempts += 1
         finally:
             reset_design_context(tok)

@@ -13,8 +13,17 @@ loop:
   stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
   stagnation_epsilon: 0.005     # delta score threshold
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
-  self_improve_max_tool_calls: 8   # tool-call budget for role self-improvement
-  plan_max_tool_calls: 10          # tool-call budget for plan/evaluate sessions
+  self_improve_max_tool_calls: 5   # tool-call budget for role self-improvement
+  plan_max_tool_calls: 5           # tool-call budget for the PLAN seat (planner only;
+                                   # the evaluate seat has its own key below -- it must
+                                   # at minimum complete its mandatory eval-points)
+  evaluate_max_tool_calls: 10      # tool-call budget for the EVALUATE seat (blind phase;
+                                   # the reveal phase gets a third of it, min 6). Must
+                                   # cover: eval-points sweep + record/report/judge_fix.
+  tool_repeat_limit: 3             # anti-thrash: >= this many CONSECUTIVE identical
+                                   # (tool, input, output) calls ends the session (event
+                                   # tool_repeat_break). Each tool's first call is exempt,
+                                   # so mandatory eval-points always complete. 0 disables.
   patch_retry_k: 1                 # in-session retries when a produced patch is rejected
   toolset_preflight: true          # validate registry/toolset integrity at startup (fail-fast;
                                    # pure local check, no model calls). false = log-only.

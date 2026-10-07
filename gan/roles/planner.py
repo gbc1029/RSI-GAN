@@ -102,6 +102,7 @@ class Planner(Role):
         parent_benchmark_score: Optional[float] = None,
         patch_retry_k: int = 2,
         max_tool_calls: int = 40,
+        tool_repeat_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
@@ -125,7 +126,8 @@ class Planner(Role):
                 self._plan_instruction(parent_summary or {}, parent_feedback, evaluator_issues,
                                        parents, task_brief, receipt,
                                        parent_predicted_score, parent_benchmark_score),
-                max_tool_calls=max_tool_calls, trajectory_file=traj)
+                max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
+                trajectory_file=traj)
 
             def _build_patch() -> str:
                 if broker is None:
@@ -159,7 +161,8 @@ class Planner(Role):
                 hist = self.run(
                     "# Patch rejected\nYour previous code patch was rejected by validation:\n"
                     f"{reason}\nFix the problem, then stop. Do not repeat the same action.",
-                    msg_history=hist, max_tool_calls=max_tool_calls, trajectory_file=traj)
+                    msg_history=hist, max_tool_calls=max_tool_calls,
+                    tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
                 attempts += 1
         finally:
             reset_plan_context(tok_plan)
@@ -186,7 +189,7 @@ class Planner(Role):
 
     def self_improve(self, recent: Optional[Dict[str, Any]] = None, broker: Any = None,
                      max_tool_calls: int = 30, trajectory_genids: Optional[List[Any]] = None,
-                     patch_retry_k: int = 2):
+                     patch_retry_k: int = 2, tool_repeat_limit: Optional[int] = None):
         cfg = self.load_self_config()
         dctx = DesignContext(role="planner", config=cfg, node_id="self")
         tok = set_design_context(dctx)
@@ -218,7 +221,8 @@ class Planner(Role):
                 + (("\n" + rr + "\n") if rr else "")
                 + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k != 'receipt'}, ensure_ascii=False)[:2000]}"
             )
-            hist = self.run(instruction, max_tool_calls=max_tool_calls, trajectory_file=traj)
+            hist = self.run(instruction, max_tool_calls=max_tool_calls,
+                            tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
 
             def _build_patch() -> str:
                 if broker is None or not has_deep_write(dctx.records):
@@ -245,7 +249,8 @@ class Planner(Role):
                 hist = self.run(
                     "# Patch rejected\nYour previous patch was rejected by validation:\n"
                     f"{reason}\nFix the problem, then stop. Do not repeat the same action.",
-                    msg_history=hist, max_tool_calls=max_tool_calls, trajectory_file=traj)
+                    msg_history=hist, max_tool_calls=max_tool_calls,
+                    tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
                 attempts += 1
         finally:
             reset_design_context(tok)

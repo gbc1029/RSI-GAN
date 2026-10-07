@@ -279,6 +279,7 @@ class Role(AgentSystem):
         max_tool_calls: int = 40,
         trajectory_file: Optional[str] = None,
         tool_timeout_s: Optional[int] = None,
+        tool_repeat_limit: Optional[int] = None,
     ):
         full_msg = f"{self.current_prompt()}\n\n# Task\n{instruction}"
         path = trajectory_file or getattr(self, "trajectory_file", None)
@@ -291,6 +292,9 @@ class Role(AgentSystem):
             f"tools_load_{self.role}_{self.instance or 'default'}.json")
         prev_sink = os.environ.get("GAN_TOOLS_LOAD_REPORT")
         os.environ["GAN_TOOLS_LOAD_REPORT"] = load_report_path
+        chat_kwargs = {}
+        if tool_repeat_limit is not None:
+            chat_kwargs["tool_repeat_limit"] = tool_repeat_limit
         try:
             hist, info = chat_with_agent(
                 full_msg,
@@ -307,6 +311,7 @@ class Role(AgentSystem):
                 tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
                                 else getattr(self, "tool_timeout_s", None)),
                 return_info=True,
+                **chat_kwargs,
             )
         finally:
             if prev_sink is None:
