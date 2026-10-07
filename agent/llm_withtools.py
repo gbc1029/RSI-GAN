@@ -309,6 +309,27 @@ def _emit(logging, trajectory_file, kind, **fields):
     else:
         logging(f"{kind}: {json.dumps(fields, ensure_ascii=False, default=str)[:4000]}")
 
+_REASONING_CAP = 16000  # align with the C2 per-tool output cap semantics
+
+def _cap_text(txt, cap=_REASONING_CAP):
+    """Bound an optional long field in the trajectory (head+tail, explicit marker)."""
+    if not txt or len(txt) <= cap:
+        return txt
+    half = cap // 2
+    return (txt[:half] + f"\n... [reasoning truncated: {len(txt)} chars total] ...\n" + txt[-half:])
+
+def _output_fields(info):
+    """Reasoning-channel fields for an `output` trajectory row.
+
+    The reasoning TEXT is recorded (capped) for audit; `finish_reason` and
+    `reasoning_tokens` are counters that ride along on every row. Whether any
+    decision surface SEES the reasoning text is decided downstream
+    (gan/framework/trajectory.py:_render, default: omitted)."""
+    info = info or {}
+    return {"reasoning": _cap_text(info.get("reasoning")),
+            "finish_reason": info.get("finish_reason"),
+            "reasoning_tokens": info.get("reasoning_tokens")}
+
 def chat_with_agent(
     msg,
     model,
@@ -351,7 +372,7 @@ def chat_with_agent(
             model=model,
             msg_history=new_msg_history,
         )
-        _emit(logging, trajectory_file, "output", text=response)
+        _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
 
         # Tool use
         tool_uses, malformed = check_for_tool_uses(response)
@@ -374,7 +395,7 @@ def chat_with_agent(
                         model=model,
                         msg_history=new_msg_history,
                     )
-                    _emit(logging, trajectory_file, "output", text=response)
+                    _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
                 except Exception as e:
                     logging(f"Error during final summary turn: {e}")
                 break
@@ -395,7 +416,7 @@ def chat_with_agent(
                          f"call with valid JSON or stop calling tools and give your "
                          f"final answer now."),
                     model=model, msg_history=new_msg_history)
-                _emit(logging, trajectory_file, "output", text=response)
+                _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
                 tool_uses, malformed = check_for_tool_uses(response)
                 retry_tool_use = should_retry_tool_use(response, tool_uses)
                 continue
@@ -460,7 +481,7 @@ def chat_with_agent(
                                      "call any tool. Provide your final answer/summary "
                                      "now."),
                                 model=model, msg_history=new_msg_history)
-                            _emit(logging, trajectory_file, "output", text=response)
+                            _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
                         except Exception as e:
                             logging(f"Error during final summary turn: {e}")
                         tool_uses, malformed = None, 0
@@ -488,7 +509,7 @@ def chat_with_agent(
                 model=model,
                 msg_history=new_msg_history,
             )
-            _emit(logging, trajectory_file, "output", text=response)
+            _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
 
             # Check for next tool use
             tool_uses, malformed = check_for_tool_uses(response)

@@ -134,7 +134,7 @@ batch-8 isolation), one subprocess each.
   when an outer is re-run), `scores/scores.jsonl`, `runs/<genid>/` (small evidence:
   `packet.json`, `eval.json`, `feedback_digest.md`, `patch_receipt.json`,
   `patch_proposed.diff`), `work/<genid>/` (ephemeral, pruned),
-  `workspaces/<role>/outer_<O>/`. `checkpoint.json` is the latest; outer boundaries
+  `workspaces/<role>/outer_<O>/`. `ckpt/checkpoint.json` is the latest (overwritten atomically); outer boundaries
   also write an immutable `ckpt/outer_<N>.json` (atomic; archived as
   `outer_<N>_<ms>.json` when the same outer is re-run); `restore_trees` appends an
   `op=reset` event instead of truncating the log.

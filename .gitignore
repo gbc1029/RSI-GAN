@@ -37,6 +37,8 @@ scripts/local/
 # ---------------------------------------------------------------------------
 domains/paper_review/dataset.csv
 domains/paper_review/dataset_filtered_100_*.csv
+domains/search_arena/*.csv
+domains/imo/*.csv
 domains/polyglot/polyglot-benchmark/
 domains/polyglot/SWE-bench/
 domains/polyglot/polyglot_benchmark_metadata.json

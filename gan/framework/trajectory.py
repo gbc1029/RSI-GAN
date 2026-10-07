@@ -59,7 +59,7 @@ def _redact_value(v: Any) -> Any:
 
 def redact_record(rec: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(rec)
-    for k in ("text", "input", "output"):
+    for k in ("text", "input", "output", "reasoning"):
         if k in out:
             out[k] = _redact_value(out[k])
     out["redacted"] = True
@@ -130,6 +130,21 @@ def _session_file(output_dir: str, genid: Any, role: str) -> str:
     return hits[-1] if hits else ""
 
 
+def _expose_reasoning() -> bool:
+    """Decision-surface gate for reasoning text (loop.yaml, default OFF).
+
+    The reasoning text IS recorded in the raw trajectory (audit surface), but
+    `read`/`read_session` (the tools roles actually read through) omit it unless
+    this key is explicitly enabled -- the task model's chain-of-thought is the
+    strongest persuasion surface and may speculate about benchmark mechanics,
+    so the default mirrors the B29 artifact-vs-rationale rule."""
+    try:
+        from gan.framework.loader import load_gan_loop_config
+        return bool(load_gan_loop_config().get("loop.trajectory_expose_reasoning", False))
+    except Exception:
+        return False
+
+
 def _render(text: str, max_chars: int) -> str:
     parts: List[str] = []
     for line in (text or "").splitlines():
@@ -147,7 +162,23 @@ def _render(text: str, max_chars: int) -> str:
         elif kind == "tool_output":
             parts.append(f"tool_output {rec.get('tool')}: {rec.get('output')}")
         else:
-            parts.append(f"{kind}: {rec.get('text', '')}")
+            out = f"{kind}: {rec.get('text', '')}"
+            if kind == "output":
+                # Reasoning-channel METADATA is always visible (counters carry
+                # no isolation risk and are the diagnostic that explains empty
+                # content / finish_reason=length on reasoning models).
+                meta = [f"finish={rec['finish_reason']}" if rec.get("finish_reason") else None,
+                        f"reasoning_tokens={rec['reasoning_tokens']}" if rec.get("reasoning_tokens") is not None else None]
+                meta = [m for m in meta if m]
+                if meta:
+                    out += f" [{', '.join(meta)}]"
+                rsn = rec.get("reasoning")
+                if rsn:
+                    if _expose_reasoning():
+                        out += f"\n[reasoning]\n{rsn}"
+                    else:
+                        out += f" [reasoning omitted: {len(rsn)} chars]"
+            parts.append(out)
     return "\n".join(parts)[:max_chars]
 
 
