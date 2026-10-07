@@ -113,7 +113,9 @@ def _no_newline_marker_diff(a_lines: List[str], b_lines: List[str],
     out = list(difflib.unified_diff(a_pad, b_pad, fromfile=fromfile, tofile=tofile))
     if not out:
         return ""
-    a_content = a_last.rstrip("\n")
+    # a_lines empty => a_last is None (new file with a no-newline last line on
+    # the b side reaches this branch: b_missing pads b, a side stays empty).
+    a_content = a_last.rstrip("\n") if a_last is not None else ""
     # Placement (verified against `git diff --no-index` reference output):
     # - a_missing XOR b_missing with EQUAL last content: git SPLITS the shared
     #   line into '-' + marker + '+' (the two sides genuinely differ by the

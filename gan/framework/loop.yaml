@@ -13,9 +13,9 @@ loop:
   stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
   stagnation_epsilon: 0.005     # delta score threshold
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
-  self_improve_max_tool_calls: 30  # tool-call budget for role self-improvement
-  plan_max_tool_calls: 40          # tool-call budget for plan/evaluate sessions
-  patch_retry_k: 2                 # in-session retries when a produced patch is rejected
+  self_improve_max_tool_calls: 8   # tool-call budget for role self-improvement
+  plan_max_tool_calls: 10          # tool-call budget for plan/evaluate sessions
+  patch_retry_k: 1                 # in-session retries when a produced patch is rejected
   toolset_preflight: true          # validate registry/toolset integrity at startup (fail-fast;
                                    # pure local check, no model calls). false = log-only.
   tool_call_timeout_s: 600         # C batch: per-CALL tool budget in seconds (dispatch net in

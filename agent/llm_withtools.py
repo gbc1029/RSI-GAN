@@ -286,7 +286,15 @@ def check_for_tool_uses(response):
     for match in matches:
         try:
             tool_use = json.loads(match)
-            if 'tool_name' not in tool_use or 'tool_input' not in tool_use:
+            if not isinstance(tool_use, dict) or 'tool_name' not in tool_use:
+                # A JSON block that parses but carries no tool_name is NOT a
+                # malformed tool call -- it is the agent's ANSWER payload (the
+                # task template answers as <json>{"response": ...}</json>).
+                # Counting it as malformed made the tool loop nag the model
+                # until it abandoned its answer format entirely (observed
+                # pr4: the final answer "accept" arrived bare, unparsable).
+                continue
+            if 'tool_input' not in tool_use:
                 malformed += 1  # invalid shape: treated like malformed
                 continue
             tool_uses.append(tool_use)

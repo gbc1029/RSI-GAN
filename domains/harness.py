@@ -184,7 +184,14 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path):
     # THIS process. The sandbox binds no .env and its CWD is a tmpfs, so the
     # child can only receive credentials through the inherited environment.
     # Load them explicitly here (no-override: explicit exports win).
-    load_dotenv()
+    # Best-effort ONLY: in a GAN run this process executes as the non-root
+    # sandbox user, and find_dotenv walking up from the run copy reaches
+    # /root/HyperAgents/.env (mode 600, root-only) -- unreadable BY DESIGN
+    # (the credentials already ride the inherited env chain in that mode).
+    try:
+        load_dotenv()
+    except OSError:
+        pass
     child_env = dict(os.environ)
     for name in ("GAN_DATASET_ROOT", "PYTHONHOME", "PYTHONPATH", "OLDPWD"):
         child_env.pop(name, None)

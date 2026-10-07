@@ -17,6 +17,7 @@ throwaway copy is the fallback when no code tree is in play.
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import sys
 from typing import Any, Dict, List, Optional
@@ -266,6 +267,26 @@ class DomainTaskRunner:
                 soft_fail(f"existing-domain report failed for genid {genid}: {e}",
                           event_path=paths.events_path(self.output_dir),
                           event_type="existing_domain_report_failed", genid=str(genid))
+        # Persist per-question failure diagnostics into runs/<genid>/: the work
+        # dir is pruned at generation end, so anything left only under
+        # run_dir/outputs/<run_id>/agent_evals dies before it can be read
+        # (observed: trajectory_archive_failed with the actual cause sealed
+        # inside a pruned eval_failures.jsonl).
+        evals_dir = os.path.join(output_path, "agent_evals")
+        evidence_dir = paths.runs_dir(self.output_dir, genid)
+        # runs/<genid>/ may not exist yet at this point (the pre-existing
+        # report/predictions copy below is what creates it) -- create it here
+        # or the copy2 below dies with FileNotFoundError, silently swallowed.
+        os.makedirs(evidence_dir, exist_ok=True)
+        if os.path.isdir(evals_dir):
+            for name in sorted(os.listdir(evals_dir)):
+                if name == "eval_failures.jsonl" or (name.startswith("failure_")
+                                                     and name.endswith(".log")):
+                    try:
+                        shutil.copy2(os.path.join(evals_dir, name),
+                                     os.path.join(evidence_dir, name))
+                    except OSError:
+                        pass  # evidence is best-effort; never fail the run
         # Merge the CHILD-reported load outcome into the toolset report (the
         # assembly stage can only report what it copied). Failures are classified
         # by owner: a component (or a role-owned always-on tool) is an agent-fixable
