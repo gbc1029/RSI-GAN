@@ -32,7 +32,11 @@ LLM_TIMEOUT_S = float(os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
 # Transport is EXPLICIT ONLY (function argument threaded from
 # gan/framework/models.yaml through the roles / the task harness payload);
 # there is deliberately no environment fallback.
-REASONING_EFFORTS = ("low", "high", "max")
+# NOTE: the constant itself lives in agent/llm_params.py (stdlib only) --
+# importing THIS module pulls litellm, whose import-time load_dotenv crashes
+# restricted-uid processes that can see but not read the root-owned .env
+# (observed: the sandboxed task harness died on a validation-only import).
+from agent.llm_params import REASONING_EFFORTS
 
 # Usage/cost hooks: registered callbacks receive (model, usage_dict) after every
 # successful LLM call. The GAN reward layer uses this to attach token cost.

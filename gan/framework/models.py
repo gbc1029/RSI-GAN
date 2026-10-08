@@ -61,8 +61,10 @@ def _entry(key: str, full: bool) -> Any:
     effort = val.get("reasoning_effort")
     if effort is not None:
         # Base layer owns the call contract (agent/llm.py applies the value);
-        # lazy import keeps this module cheap for string-only consumers.
-        from agent.llm import REASONING_EFFORTS
+        # import the STDLIB-ONLY contract module, not agent/llm.py (whose
+        # litellm import is unsafe for restricted-uid importers), and keep it
+        # lazy so string-only consumers stay cheap.
+        from agent.llm_params import REASONING_EFFORTS
         effort = str(effort)
         if effort not in REASONING_EFFORTS:
             raise ValueError(f"models.yaml[{key}]: reasoning_effort "

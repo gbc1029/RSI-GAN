@@ -585,9 +585,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     if args.reasoning_effort is not None:
-        # Contract lives in the LLM chokepoint (agent/llm.py); imported lazily
-        # so harness startup stays free of the litellm import cost otherwise.
-        from agent.llm import REASONING_EFFORTS
+        # Contract lives in the STDLIB-ONLY module (agent/llm_params): importing
+        # agent.llm here would pull litellm, whose import-time load_dotenv
+        # crashes under the restricted sandbox uid (.env is root-owned; the
+        # sandbox can see it but not read it).
+        from agent.llm_params import REASONING_EFFORTS
         if str(args.reasoning_effort).strip().lower() not in REASONING_EFFORTS:
             parser.error(f"--reasoning_effort must be one of {list(REASONING_EFFORTS)}")
 
