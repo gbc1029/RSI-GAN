@@ -243,7 +243,8 @@ class DomainTaskRunner:
             rc, _out = tx.run_harness_and_report(
                 self.python, run_dir, self.domain, run_id, self.subset,
                 self.num_samples, model, env, self.timeout,
-                questions_path=questions_path, log_path=self.log_path,
+                questions_path=questions_path, scope_id=str(genid),
+                log_path=self.log_path,
             )
             predictions_path = os.path.join(output_path, "predictions.csv")
             report = None
