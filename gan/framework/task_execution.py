@@ -58,7 +58,7 @@ _TASK_ENV_NAMES = {
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
 }
 _TASK_PARENT_ENV_NAMES = _TASK_ENV_NAMES | {
-    "GAN_LLM_PROXY_UNIX", "GAN_PROXY_CONTROL_TOKEN",
+    "GAN_LLM_PROXY_UNIX", "GAN_TASK_BROKER_UNIX", "GAN_TASK_BROKER_TOKEN",
 }
 
 def _task_safe_env(base_env: Dict[str, str]) -> Dict[str, str]:
@@ -90,16 +90,24 @@ if os.getegid() != expected_egid:
     errors.append("egid=%s (expected %s)" % (os.getegid(), expected_egid))
 
 no_new_privs = None
+cap_eff = None
 try:
     with open("/proc/self/status", encoding="ascii") as status_file:
         for line in status_file:
             if line.startswith("NoNewPrivs:"):
                 no_new_privs = line.split(":", 1)[1].strip()
-                break
+            elif line.startswith("CapEff:"):
+                cap_eff = line.split(":", 1)[1].strip()
 except OSError as exc:
     errors.append("cannot read /proc/self/status: %s" % exc)
 if no_new_privs != "1":
     errors.append("NoNewPrivs=%s (expected 1)" % no_new_privs)
+try:
+    effective_capabilities = int(cap_eff or "-1", 16)
+except ValueError:
+    effective_capabilities = -1
+if effective_capabilities != 0:
+    errors.append("CapEff=%s (expected 0)" % cap_eff)
 
 try:
     import encodings  # noqa: F401
@@ -120,6 +128,7 @@ print(json.dumps({
     "euid": os.geteuid(),
     "egid": os.getegid(),
     "no_new_privs": no_new_privs,
+    "cap_eff": cap_eff,
     "executable": sys.executable,
     "prefix": sys.prefix,
     "errors": errors,
@@ -360,7 +369,8 @@ def prepare_questions(
     return questions_path, ground_truth_by_id
 
 
-def _sandbox_identity(run_dir: str, run_id: str) -> Tuple[str, int, int]:
+def _sandbox_identity(run_dir: str, run_id: str,
+                      expected_owner_uid: Optional[int] = None) -> Tuple[str, int, int]:
     """Prepare a dedicated host uid and return (setpriv, uid, gid)."""
     if os.name != "posix" or not hasattr(os, "chown"):
         raise RuntimeError("G6b requires a POSIX host with setpriv and chown")
@@ -387,15 +397,19 @@ def _sandbox_identity(run_dir: str, run_id: str) -> Tuple[str, int, int]:
     setpriv = shutil.which("setpriv")
     if not setpriv:
         raise RuntimeError("G6b requires the util-linux setpriv executable")
+    if expected_owner_uid is not None:
+        run_stat = os.lstat(run_dir)
+        if run_stat.st_uid != int(expected_owner_uid) or os.path.islink(run_dir):
+            raise RuntimeError("G6b task run directory has an unexpected owner or type")
 
     output_dir = os.path.join(run_dir, "outputs", run_id)
     os.makedirs(output_dir, exist_ok=True)
     for root, dirs, files in os.walk(run_dir, followlinks=False):
-        os.chown(root, uid, gid)
+        os.chown(root, uid, gid, follow_symlinks=False)
         for name in dirs + files:
             path = os.path.join(root, name)
             if not os.path.islink(path):
-                os.chown(path, uid, gid)
+                os.chown(path, uid, gid, follow_symlinks=False)
     return setpriv, uid, gid
 
 
@@ -506,6 +520,41 @@ def run_harness_and_report(
     log_path: Optional[str] = None,
 ) -> Tuple[int, str]:
     """Run the frozen harness; parent-side reporting happens separately."""
+    broker_socket = env.get("GAN_TASK_BROKER_UNIX")
+    if broker_socket:
+        broker_token = env.get("GAN_TASK_BROKER_TOKEN")
+        if not broker_token or not scope_id:
+            raise RuntimeError("task broker requires a launch capability and generation id")
+        from gan.framework.task_broker import request_task_run
+        return request_task_run(
+            broker_socket, broker_token, str(scope_id), int(timeout),
+        )
+    return _run_harness_and_report_local(
+        python, run_dir, domain, run_id, subset, num_samples, model, env, timeout,
+        questions_path=questions_path, dataset_root=dataset_root,
+        scope_id=scope_id, log_path=log_path,
+    )
+
+
+def _run_harness_and_report_local(
+    python: str,
+    run_dir: str,
+    domain: str,
+    run_id: str,
+    subset: str,
+    num_samples: int,
+    model: str,
+    env: Dict[str, str],
+    timeout: int,
+    questions_path: Optional[str] = None,
+    dataset_root: Optional[str] = None,
+    scope_id: Optional[str] = None,
+    log_path: Optional[str] = None,
+    proxy_socket: Optional[str] = None,
+    proxy_token: Optional[str] = None,
+    expected_owner_uid: Optional[int] = None,
+) -> Tuple[int, str]:
+    """Run a fixed harness command; the privileged broker is its only secure caller."""
     harness_cmd = [
         python, "-m", "domains.harness",
         "--domain", domain,
@@ -514,9 +563,8 @@ def run_harness_and_report(
         "--subset", subset,
         "--num_samples", str(num_samples),
     ]
-    proxy_socket = env.get("GAN_LLM_PROXY_UNIX")
-    proxy_token = None
-    if proxy_socket:
+    proxy_socket = proxy_socket or env.get("GAN_LLM_PROXY_UNIX")
+    if proxy_socket and proxy_token is None:
         if not scope_id:
             raise RuntimeError("LLM proxy task scope requires a generation id")
         control_token = env.get("GAN_PROXY_CONTROL_TOKEN")
@@ -526,7 +574,9 @@ def run_harness_and_report(
         proxy_token = request_task_token(
             proxy_socket, control_token, str(scope_id), model)
     if questions_path:
-        setpriv, uid, gid = _sandbox_identity(run_dir, run_id)
+        setpriv, uid, gid = _sandbox_identity(
+            run_dir, run_id, expected_owner_uid=expected_owner_uid,
+        )
         python_executable = python if os.path.isabs(python) else shutil.which(python)
         if not python_executable:
             raise RuntimeError(f"G6b cannot resolve Python executable: {python}")
