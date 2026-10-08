@@ -39,8 +39,15 @@ class LocalLLMRelay:
     def _bridge(self, client: socket.socket) -> None:
         try:
             upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            # The timeout is for the CONNECT phase only (fail fast on a dead
+            # socket path). It MUST be lifted before pumping: a real gateway
+            # call routinely takes >10s, and a socket.timeout in either pump
+            # direction silently kills the client's in-flight request while
+            # the proxy still completes and audits it (observed: planner
+            # responses lost for every call slower than 10s).
             upstream.settimeout(10)
             upstream.connect(self.unix_path)
+            upstream.settimeout(None)
             sockets = (client, upstream)
             threads = []
             for source, target in ((client, upstream), (upstream, client)):
