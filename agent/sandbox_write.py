@@ -1,4 +1,4 @@
-"""Confined file-write primitive for the task sandbox (FRAMEWORK, frozen).
+"""Confined file-write primitive for the task sandbox (BASE plumbing, frozen).
 
 Arch 2 (polyglot in the GAN loop): a registered task component must not carry
 raw file-write capability (the AST policy rejects it as agent-owned code), and

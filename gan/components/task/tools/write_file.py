@@ -4,9 +4,10 @@ Arch 2 (polyglot in GAN): the task child materializes the exercise's starter
 files under its sandbox cwd and the agent writes the solution with this tool.
 The writable set is the instance's `solution_paths` (repo-root-relative),
 armed per question via GAN_TASK_WRITE_ROOTS and enforced by the FROZEN
-framework primitive ``gan.framework.sandbox_write`` -- the AST policy rightly
-rejects raw writes in agent-owned component code, and the confinement belongs
-in the trust anchor: this component only validates arguments and delegates,
+base-layer primitive ``agent.sandbox_write`` -- the AST policy rightly rejects
+raw writes in agent-owned component code, and the confinement belongs in
+frozen plumbing outside every evolution channel (``agent/`` is in no role's
+writable source set): this component only validates arguments and delegates,
 so even an agent-edited copy cannot widen the writable set.
 
 The generated workspace diff becomes the prediction; the parent applies it
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import os
 
-from gan.framework.sandbox_write import write as _sandbox_write
+from agent.sandbox_write import write as _sandbox_write
 
 
 def tool_info():

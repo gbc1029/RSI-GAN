@@ -23,7 +23,7 @@
     {
       "name": "write_file",
       "module": "task/tools/write_file.py",
-      "description": "Create or overwrite a solution file inside the exercise workspace (polyglot): only the instance's declared solution paths are writable, enforced by the frozen framework sandbox primitive; tests/config stay read-only.",
+      "description": "Create or overwrite a solution file inside the exercise workspace (polyglot): only the instance's declared solution paths are writable, enforced by the frozen base-layer sandbox primitive (agent/sandbox_write.py); tests/config stay read-only.",
       "params_schema": {}
     }
   ]

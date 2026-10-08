@@ -51,8 +51,16 @@ class _LocalRelay:
     def _bridge(self, client):
         try:
             upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            # The timeout is for the CONNECT phase only (fail fast on a dead
+            # socket path). It MUST be lifted before pumping: a real gateway
+            # call routinely takes >10s, and a socket.timeout in the unix->
+            # client pump silently strands the client's in-flight request
+            # while the parent proxy still completes and audits it
+            # (reproduced: audit 200 / 51s, child hung until the question
+            # wall). Mirrors the fix in gan/framework/llm_relay.py.
             upstream.settimeout(10)
             upstream.connect(self.unix_path)
+            upstream.settimeout(None)
             threads = []
             for source, target in ((client, upstream), (upstream, client)):
                 thread = threading.Thread(target=self._copy, args=(source, target),
@@ -78,7 +86,12 @@ class _LocalRelay:
                         pass
                     return
                 target.sendall(data)
-        except OSError:
+        except OSError as exc:
+            # A pump death is NEVER silent: it strands the client's in-flight
+            # request (the parent proxy may still audit a clean 200), so it
+            # must be visible in the harness-captured stderr.
+            print(f"[relay] pump died ({type(exc).__name__}: {exc}); "
+                  f"client in-flight request stranded", file=sys.stderr, flush=True)
             return
 
     def close(self):
