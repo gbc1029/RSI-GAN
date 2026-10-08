@@ -120,24 +120,38 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
             *(["--model", model] if model else []),
         ]
         exec_result = container.exec_run(cmd, environment=env_vars, workdir='/testbed/')
-        log_container_output(exec_result)
+        # An in-container agent failure (missing credentials offline, provider
+        # outage, agent bug) must NOT lose the instance: continue with an empty
+        # model_patch so the eval still runs and records the outcome
+        # (empty_patch/unresolved) -- the full failure stays in this docker log.
+        log_container_output(exec_result, raise_error=False)
 
         # Copy output files back to host
         logger.info("Copying output files back to host")
-        copy_from_container(container, chat_history_file_container, chat_history_file)
+        # Artifact tolerance: a crashed agent (no credentials offline, provider
+        # outage) writes NO chat history -- record the instance as empty_patch
+        # instead of losing it. Same for the optional extra history files and
+        # the model_patch probe below.
+        try:
+            copy_from_container(container, chat_history_file_container, chat_history_file)
+        except Exception as e:
+            logger.warning(f"Chat history missing (agent likely crashed): {e}")
         # Additional chat history files
         exec_result = container.exec_run(f"find /{REPO_NAME}/ -name '{instance_id}_*.jsonl'", workdir='/')
         chat_history_files_container = exec_result.output.decode().split()
         for chat_history_file_container in chat_history_files_container:
             chat_history_file = out_dname / Path(chat_history_file_container).name
-            copy_from_container(container, chat_history_file_container, chat_history_file)
+            try:
+                copy_from_container(container, chat_history_file_container, chat_history_file)
+            except Exception as e:
+                logger.warning(f"Additional history file missing: {e}")
 
         # Get model_patch
         model_patch = ''
         logger.info("Getting model_patch")
         exec_result = container.exec_run(f"cat /{REPO_NAME}/model_patch.diff")
-        log_container_output(exec_result)
-        model_patch = exec_result.output.decode()
+        log_container_output(exec_result, raise_error=False)
+        model_patch = exec_result.output.decode() if exec_result.exit_code == 0 else ''
 
         # Additional proposed model patches
         proposed_model_patches = []

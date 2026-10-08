@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import re
 
@@ -21,12 +22,69 @@ from domains.polyglot.dockerfiles import (
     get_dockerfile_env,
     get_dockerfile_instance,
 )
-from swebench.harness.utils import (
-    get_requirements,
-    get_environment_yml,
-)
 
 DIFF_MODIFIED_FILE_REGEX = r"--- a/(.*)"
+
+
+# ---------------------------------------------------------------------------
+# Vendored from swebench 2.1.8 (princeton-nlp/SWE-bench @ dc4c087,
+# `swebench.harness.utils.get_requirements` / `.get_environment_yml`).
+#
+# Why vendored: swebench >= 3 removed both helpers from harness.utils, so the
+# module-level import above failed against modern swebench. All six polyglot
+# language specs ship `packages: ''` (see constants.MAP_REPO_VERSION_TO_SPECS),
+# so the conda/requirements branch that calls these is currently DEAD for every
+# polyglot instance -- they only need to exist for the import to resolve.
+#
+# Adaptation vs upstream: a polyglot instance's `repo` is a LOCAL exercise
+# directory (not a GitHub `owner/repo` slug), so the upstream GitHub-raw fetch
+# would KeyError on the SWE repo-path map. The vendored forms read the exercise
+# tree directly and degrade gracefully ("" = no python requirements); upstream
+# raised. Semantics for real requirements files (line filtering, env rename)
+# follow 2.1.8.
+# ---------------------------------------------------------------------------
+def _exercise_file(repo_dir: str, relative_name: str) -> str | None:
+    path = os.path.join(repo_dir, relative_name)
+    return path if os.path.isfile(path) else None
+
+
+def get_requirements(instance: dict) -> str:
+    """requirements.txt of the exercise as a string ("" when absent)."""
+    lines_all: list[str] = []
+    repo_dir = instance["repo"]
+    exclude_line = lambda line: any(  # noqa: E731  (upstream 2.1.8 form)
+        [line.strip().startswith(x) for x in ["-e .", "#", ".[test"]])
+    for rel in ("requirements.txt", "requirements/requirements.txt"):
+        path = _exercise_file(repo_dir, rel)
+        if path is None:
+            continue
+        with open(path, encoding="utf-8") as f:
+            for line in f.read().split("\n"):
+                if line.strip().startswith("-r"):
+                    inc = os.path.join(os.path.dirname(path), line[len("-r"):].strip())
+                    if os.path.isfile(inc):
+                        with open(inc, encoding="utf-8") as f2:
+                            lines_all.extend(l for l in f2.read().split("\n") if not exclude_line(l))
+                elif not exclude_line(line):
+                    lines_all.append(line)
+        break
+    return "\n".join(lines_all)
+
+
+def get_environment_yml(instance: dict, env_name: str) -> str:
+    """environment.yml of the exercise, renamed to `env_name` ("" when absent)."""
+    for rel in ("environment.yml", "environment.yaml"):
+        path = _exercise_file(instance["repo"], rel)
+        if path is not None:
+            with open(path, encoding="utf-8") as f:
+                cleaned = []
+                for line in f.read().split("\n"):
+                    if line.startswith("name:"):
+                        cleaned.append(f"name: {env_name}")
+                        continue
+                    cleaned.append(line)
+            return "\n".join(cleaned)
+    return ""
 
 
 @dataclass

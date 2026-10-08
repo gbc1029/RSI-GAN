@@ -28,7 +28,8 @@ RUN ARCH=$(uname -m) && \
     else \
         false; \
     fi && \
-    curl -L "https://golang.org/dl/go1.21.5.linux-$GOARCH.tar.gz" -o go.tar.gz && \
+    curl -fsSL --retry 2 "https://golang.org/dl/go1.21.5.linux-$GOARCH.tar.gz" -o go.tar.gz || \
+    curl -fsSL --retry 2 "https://mirrors.aliyun.com/golang/go1.21.5.linux-$GOARCH.tar.gz" -o go.tar.gz; \
     tar -C /usr/local -xzf go.tar.gz && \
     rm go.tar.gz
 ENV PATH="/usr/local/go/bin:${{PATH}}"
