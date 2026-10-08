@@ -39,6 +39,7 @@ import json
 import os
 import shutil
 import statistics
+import time
 import uuid
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
@@ -938,6 +939,7 @@ class GanLoop:
             outer_improved = False
             outer_genids: List[Any] = []
             self.log_event({"type": "outer_start", "outer": outer})
+            _outer_t0 = time.time()
             # fresh role instances (design + tools + chat + workspace) for this outer
             self._refresh_roles(outer)
             # pin the outer's entry HEAD as the base for parent=initial children
@@ -946,6 +948,7 @@ class GanLoop:
 
             inner_start = self._start_inner if (only_outer is None and outer == self._start_outer) else 1
             for inner in range(inner_start, I_max + 1):
+                _inner_t0 = time.time()
                 parents = self.task_tree.select_parents(
                     k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                     ucb_c=ucb_c, depth_penalty=depth_penalty, cost_penalty=cost_penalty,
@@ -1172,6 +1175,7 @@ class GanLoop:
                     "valid_parent": child.valid_parent,
                     "no_improve": no_improve, "penalties": packet.penalties,
                     "modify_depth": child.modify_depth,
+                    "duration_s": round(time.time() - _inner_t0, 1),
                 })
 
                 # feedback for next round: planner gets issues + diff summary.
@@ -1251,7 +1255,8 @@ class GanLoop:
 
             self.evaluator_tree.add_node(Node(genid=f"eval_{outer}", meta={"num_digests": len(self._digests)}))
             self.planner_tree.add_node(Node(genid=f"plan_{outer}", meta={"advantages": self._advantages[-I_max:]}))
-            self.log_event({"type": "outer_done", "outer": outer, "improved": outer_improved})
+            self.log_event({"type": "outer_done", "outer": outer, "improved": outer_improved,
+                            "duration_s": round(time.time() - _outer_t0, 1)})
             self._save_checkpoint("outer", outer, I_max)
 
         return self.task_tree

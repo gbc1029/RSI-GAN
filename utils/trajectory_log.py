@@ -47,11 +47,18 @@ def _rotate(path: str) -> None:
         pass
 
 
+def _readable(t: float) -> str:
+    """Human-readable local timestamp (ms precision) alongside the epoch ``ts``."""
+    base = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    return f"{base}.{int(t * 1000) % 1000:03d}"
+
+
 def append(path: str, record: Dict[str, Any], max_bytes: Optional[int] = DEFAULT_MAX_BYTES) -> None:
     if not path:
         return
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    rec = {"ts": time.time(), **record}
+    now = time.time()
+    rec = {"ts": now, "time": _readable(now), **record}
     line = json.dumps(rec, ensure_ascii=False, default=str)
     with _LOCK:
         if max_bytes and os.path.isfile(path) and os.path.getsize(path) >= int(max_bytes):

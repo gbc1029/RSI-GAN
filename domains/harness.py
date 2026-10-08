@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
@@ -19,7 +20,11 @@ from hydra import compose, initialize_config_dir
 from utils.common import summarize_error
 
 
-QUESTION_TIMEOUT = 300
+# Per-question wall budget. Default 300s; the GAN parent overrides it per
+# domain via GAN_QUESTION_TIMEOUT_S (source: gan/framework/domains.yaml
+# question_timeout_s, threaded by task_runner). Reasoning models spend
+# 150-350s on ONE long call, so hard domains override upward.
+QUESTION_TIMEOUT = int(os.environ.get("GAN_QUESTION_TIMEOUT_S", "300"))
 
 _TASK_ENV_NAMES = {
     "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -252,10 +257,16 @@ def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
     question_id = row[question_id_col]
     chat_history_path = os.path.join(evals_folder, f"chat_history_{question_id}.jsonl")
     inputs = format_input_dict(row)
+    _t0 = time.time()
     if sandbox_task_agent:
-        return _run_sandboxed_agent(model, inputs, agent_path, chat_history_path, proxy_socket, proxy_token)
+        prediction = _run_sandboxed_agent(model, inputs, agent_path, chat_history_path, proxy_socket, proxy_token)
+        print(f"[timing] question {question_id}: {time.time() - _t0:.1f}s "
+              f"(budget {QUESTION_TIMEOUT}s, {'blank' if not str(prediction).strip() else 'prediction produced'})",
+              flush=True)
+        return prediction
     agent = TaskAgent(model=model, chat_history_file=chat_history_path)
     prediction, _ = agent.forward(inputs)
+    print(f"[timing] question {question_id}: {time.time() - _t0:.1f}s (in-process)", flush=True)
     return prediction
 
 

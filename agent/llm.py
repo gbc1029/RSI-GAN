@@ -1,5 +1,6 @@
 import backoff
 import json
+import os
 from typing import Tuple
 
 import requests
@@ -13,6 +14,15 @@ load_dotenv()
 # content="") spend most of it on internal thinking BEFORE any visible
 # content -- 16k leaves nothing for the answer on hard domains.
 MAX_TOKENS = 32768
+
+# Per-call client budget, EXPLICIT (litellm's implicit default is silent and
+# untuned). Ordering contract with the other layers: client <= proxy upstream
+# timeout (gan/framework/loop.yaml llm_proxy_timeout_s, parent-side) < the
+# per-question wall budget -- the outer wall must be the ONLY thing that can
+# cut a healthy in-flight call (observed: an implicit-600s client waiting on a
+# 120s proxy that already replied 502, burning the whole question budget on
+# doomed retries).
+LLM_TIMEOUT_S = float(os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
 
 # Usage/cost hooks: registered callbacks receive (model, usage_dict) after every
 # successful LLM call. The GAN reward layer uses this to attach token cost.
@@ -73,7 +83,7 @@ litellm.drop_params = True
 
 def _completion_kwargs(model, messages, temperature, max_tokens):
     """Model-specific completion kwargs (GPT-5 / Claude-Haiku quirks)."""
-    kw = {"model": model, "messages": messages}
+    kw = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_S}
     # GPT-5 and GPT-5-mini only support default temperature (1); GPT-5.2 does.
     if model not in ["openai/gpt-5", "openai/gpt-5-mini"]:
         kw["temperature"] = temperature

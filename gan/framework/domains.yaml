@@ -24,6 +24,11 @@ default:
   stagedeval_frac: 0.1
   has_val_subset: false
   task_brief: null
+  # Per-question wall budget (seconds). Overrides loop.yaml question_timeout_s.
+  # Reasoning models spend 150-350s on a SINGLE long call (observed), and one
+  # question needs 2+ calls (tool use + final answer), so coding/proof domains
+  # need several minutes; short-answer domains fit the 300s default.
+  question_timeout_s: 300
   # Objective output contract of the task agent's answer. Used by the framework
   # (NOT by an evaluator eval point) to compute report_summary.contract_ok /
   # invalid_rate. kind: label | freeform | numeric.
@@ -62,6 +67,7 @@ domains:
     stagedeval_samples: 10
     stagedeval_frac: 0.1
     has_val_subset: true
+    question_timeout_s: 600  # single long-form call measured at 212s
 
   imo_grading:
     score_key: overall_accuracy
@@ -71,6 +77,7 @@ domains:
     test_subset: _filtered_100_test
     stagedeval_samples: 10
     stagedeval_frac: 0.1
+    question_timeout_s: 1200  # proof-grade reasoning: single call > 300s observed
     has_val_subset: true
     task_brief: >-
       Grade a student's solution to a math problem. Your final answer must be
@@ -87,6 +94,7 @@ domains:
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
+    question_timeout_s: 1200  # solve = 2-3 long calls (144-350s each observed)
     eval_task_list:
     - go__bottle-song
     - go__react
@@ -104,6 +112,7 @@ domains:
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
+    question_timeout_s: 1500  # full formal proof: longest single calls
     task_brief: >-
       Write a rigorous proof for the given math problem. Your final answer is
       the proof itself.
@@ -114,6 +123,7 @@ domains:
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
+    question_timeout_s: 1500  # grading long proofs, same latency class
     task_brief: >-
       Grade a candidate proof against the official solution. Your final answer
       must be exactly one of: incorrect, partial, almost, correct.

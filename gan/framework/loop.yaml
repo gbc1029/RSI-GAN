@@ -17,7 +17,7 @@ loop:
   plan_max_tool_calls: 40          # tool-call budget for the PLAN seat (planner only;
                                    # the evaluate seat has its own key below -- it must
                                    # at minimum complete its mandatory eval-points)
-  evaluate_max_tool_calls: 20      # tool-call budget for the EVALUATE seat (blind phase;
+  evaluate_max_tool_calls: 20     # tool-call budget for the EVALUATE seat (blind phase;
                                    # the reveal phase gets a third of it, min 6). Must
                                    # cover: eval-points sweep + record/report/judge_fix.
   tool_repeat_limit: 3             # anti-thrash: >= this many CONSECUTIVE identical
@@ -30,6 +30,17 @@ loop:
   tool_call_timeout_s: 600         # C batch: per-CALL tool budget in seconds (dispatch net in
                                    # agent.llm_withtools; a wedged call is abandoned + breaker,
                                    # not a hung session). Task child uses its own constant.
+  llm_client_timeout_s: 600       # per-LLM-call client budget (agent/llm.py via GAN_LLM_TIMEOUT_S;
+                                   # explicit: litellm's implicit default is silent). MUST stay
+                                   # <= llm_proxy_timeout_s so the proxy is never the first to
+                                   # cut a healthy in-flight call.
+  llm_proxy_timeout_s: 700        # proxy upstream budget (gan/framework/llm_proxy ParentLLMProxy;
+                                   # consumer: gan/driver.py). Reasoning models take 150-350s per
+                                   # long call (observed), so this must sit above the client.
+  question_timeout_s: 300         # DEFAULT per-question wall budget (domains/harness.py
+                                   # QUESTION_TIMEOUT via GAN_QUESTION_TIMEOUT_S; consumers:
+                                   # task_runner env + harness-total scaling). domains.yaml
+                                   # overrides per domain.
   trajectory_expose_reasoning: false  # consumer: trajectory._render (read_trajectory /
                                    # read_session_trajectory). The model's reasoning text is
                                    # RECORDED in trajectories either way; this gate decides

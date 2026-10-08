@@ -20,6 +20,7 @@ import os
 import json
 import shutil
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 from gan.framework import task_execution as tx
@@ -98,6 +99,15 @@ class DomainTaskRunner:
     # NOTE: the model is NOT read from the (evolvable) design config any more.
     # It is resolved centrally by gan/framework/models.py and passed in as
     # ``default_model`` (frozen model selection).
+
+    def _event(self, event_type: str, **fields: Any) -> None:
+        """Append a timing/outcome event to the run's events.jsonl (advisory)."""
+        try:
+            from utils import trajectory_log as _tlog
+            _tlog.append(paths.events_path(self.output_dir),
+                         {"type": event_type, "domain": self.domain, **fields})
+        except Exception as e:  # noqa: BLE001 -- audit write failure: stderr covers
+            print(f"[WARN] {event_type} event write failed: {e}")
 
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,
@@ -206,6 +216,15 @@ class DomainTaskRunner:
         )
         patch_applied = patch_applied or patch_applied_copy
 
+        # Timeout plumbing: the per-question wall budget comes from the domain
+        # registry (domains.yaml question_timeout_s; the harness defaults to
+        # 300s when the env is absent) and the harness TOTAL budget scales
+        # with it -- a fixed total silently breaks once the per-question
+        # budget rises above total/N (observed: polyglot 2x1200s > 1800s).
+        question_timeout_s = int(self.domain_cfg.get("question_timeout_s") or 300)
+        env["GAN_QUESTION_TIMEOUT_S"] = str(question_timeout_s)
+        harness_timeout = self.num_samples * question_timeout_s + 900
+
         # Surface the per-inner task toolset assembly report (written by
         # assemble_task_env into the runtime dir). Recorded as node meta (so the
         # planner's next-round receipt and the evaluator's meta view carry it)
@@ -240,19 +259,28 @@ class DomainTaskRunner:
             # applies them inside the eval container and scores resolved/total.
             questions_path = tx.prepare_polyglot_questions(
                 self.repo_root, run_dir, self.domain_cfg, self.num_samples)
+            _t_harness = time.time()
             rc, _out = tx.run_harness_and_report(
                 self.python, run_dir, self.domain, run_id, self.subset,
-                self.num_samples, model, env, self.timeout,
+                self.num_samples, model, env, harness_timeout,
                 questions_path=questions_path, scope_id=str(genid),
                 log_path=self.log_path,
             )
+            self._event("task_harness_done", genid=str(genid), rc=rc,
+                        duration_s=round(time.time() - _t_harness, 1),
+                        question_timeout_s=question_timeout_s,
+                        harness_timeout_s=harness_timeout)
             predictions_path = os.path.join(output_path, "predictions.csv")
             report = None
             if os.path.exists(predictions_path):
                 try:
+                    _t_eval = time.time()
                     report = tx.run_polyglot_eval(
                         predictions_path, self.domain_cfg, self.repo_root,
                         output_path)
+                    self._event("task_eval_done", genid=str(genid),
+                                duration_s=round(time.time() - _t_eval, 1),
+                                eval_kind="docker")
                 except Exception as e:
                     # A docker/eval failure must not degrade silently;
                     # score reads None -> score_status="failed".
@@ -266,18 +294,27 @@ class DomainTaskRunner:
                 self.repo_root, run_dir, self.domain, self.subset, self.num_samples,
             )
             # The child sees questions only; scoring remains in this parent.
+            _t_harness = time.time()
             rc, _out = tx.run_harness_and_report(
                 self.python, run_dir, self.domain, run_id, self.subset,
-                self.num_samples, model, env, self.timeout,
+                self.num_samples, model, env, harness_timeout,
                 questions_path=questions_path, scope_id=str(genid), log_path=self.log_path,
             )
+            self._event("task_harness_done", genid=str(genid), rc=rc,
+                        duration_s=round(time.time() - _t_harness, 1),
+                        question_timeout_s=question_timeout_s,
+                        harness_timeout_s=harness_timeout)
             predictions_path = os.path.join(output_path, "predictions.csv")
             report = None
             if os.path.exists(predictions_path):
                 try:
+                    _t_eval = time.time()
                     report = tx.write_parent_report(
                         predictions_path, report_path, self.domain, ground_truth_by_id,
                     )
+                    self._event("task_eval_done", genid=str(genid),
+                                duration_s=round(time.time() - _t_eval, 1),
+                                eval_kind="parent")
                 except Exception as e:
                     # A parent-scoring failure must not degrade
                     # silently; score reads None -> score_status="failed".

@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Dict, List, Optional
 
 from gan.framework import paths
@@ -43,6 +44,11 @@ def _outer_env(base: Dict[str, str], *, proxy_socket: str,
            if k in allowed or k.startswith("LC_")}
     env["PYTHONPATH"] = code_root + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Per-LLM-call client budget consumed by agent/llm.py (roles +, via the
+    # task env allowlist, the task child). Must stay <= the proxy upstream
+    # timeout so the proxy is never the first to cut a healthy call.
+    env["GAN_LLM_TIMEOUT_S"] = str(
+        os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
     env["GAN_LLM_PROXY_UNIX"] = proxy_socket
     env["GAN_PROXY_PLANNER_TOKEN"] = planner_token
     env["GAN_PROXY_EVALUATOR_TOKEN"] = evaluator_token
@@ -297,6 +303,11 @@ def run_gan_driver(
     proxy = ParentLLMProxy(
         output_dir, proxy_socket,
         models=models,
+        # Must exceed the client per-call budget (GAN_LLM_TIMEOUT_S, default
+        # 600s) so the proxy is never the first to cut a healthy call
+        # (observed: default 120s cut thinking calls at 121s -> 502 -> the
+        # question budget burned on doomed retries).
+        timeout=float(cfg.get("loop.llm_proxy_timeout_s", 700)),
     )
     proxy_control_token = proxy.issue_framework_scope(0)
     safe_broker_env = {
@@ -350,6 +361,7 @@ def run_gan_driver(
 
         code_root = ensure_code_root(repo_root, output_dir)
         start = (int(newest["index"]) + 1) if (resume and newest) else 1
+        _driver_t0 = time.time()
         _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
                                 "outer_generations": G,
                                 "domain": domain,
@@ -430,7 +442,8 @@ def run_gan_driver(
                                         "rc": proc.returncode})
                 raise RuntimeError(f"outer worker failed at outer {outer} (rc={proc.returncode})")
             # Role self-edits are applied+committed by the worker itself.
-        _log_event(output_dir, {"type": "driver_done", "code_root": code_root})
+        _log_event(output_dir, {"type": "driver_done", "code_root": code_root,
+                                "duration_s": round(time.time() - _driver_t0, 1)})
         return code_root
     finally:
         if proxy_started:

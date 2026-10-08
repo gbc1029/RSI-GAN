@@ -127,7 +127,10 @@ class ParentLLMProxy:
 
     def _audit(self, fields: Dict[str, Any]) -> None:
         os.makedirs(os.path.dirname(self.audit_path), exist_ok=True)
-        record = {"type": "llm_call", "timestamp": time.time(), **fields}
+        now = time.time()
+        readable = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) \
+            + f".{int(now * 1000) % 1000:03d}"
+        record = {"type": "llm_call", "timestamp": now, "time": readable, **fields}
         with self._audit_lock:
             with open(self.audit_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
