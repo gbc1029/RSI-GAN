@@ -315,6 +315,7 @@ def run_gan_driver(
         if key in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
                    "PYTHONDONTWRITEBYTECODE"} or key.startswith("LC_")
     }
+    domain_cfg = resolve_domain(reg, domain)
     broker_config = {
         "output_dir": output_dir,
         "repo_root": repo_root,
@@ -325,10 +326,18 @@ def run_gan_driver(
         # Same models.yaml entry as ``model``; resolve_entry() validated it at
         # startup. Rides the broker config (like the model), never the env.
         "reasoning_effort": model_registry.resolve_entry("gan.task").get("reasoning_effort"),
+        # The broker builds the task env ITSELF, so the per-question wall and
+        # the per-call client budget must be pinned here: without them the
+        # harness silently fell back to its 300s default (invisible for
+        # paper_review, whose domain value IS 300; search_arena 600 / imo 1200
+        # were being cut to 300 despite the parent-side total budget).
+        "question_timeout_s": int(domain_cfg.get("question_timeout_s")
+                                  or cfg.get("loop.question_timeout_s", 300)),
+        "llm_client_timeout_s": float(cfg.get("loop.llm_client_timeout_s", 600)),
         "python": python_executable,
         "python_prefix": python_prefix,
         "timeout": 1800,
-        "task_brief": (resolve_domain(reg, domain).get("task_brief") or ""),
+        "task_brief": (domain_cfg.get("task_brief") or ""),
         "parent_scored": task_execution.uses_parent_scoring(domain),
         "owner_uid": owner_uid,
         "owner_gid": owner_gid,

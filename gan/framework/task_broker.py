@@ -147,6 +147,13 @@ class _TaskBrokerState:
             "GAN_TASK_TOOLS_DIR": "/workspace/.gan_runtime/tools",
             "GAN_TOOLS_LOAD_REPORT": ".gan_runtime/tools_load_report.json",
             "GAN_TASK_KNOWLEDGE_DIR": "/workspace/.gan_runtime/knowledge",
+            # Per-question wall + per-call client budget, pinned at root-side
+            # registration (the outer worker cannot influence them). Without
+            # these the harness silently used its 300s default regardless of
+            # the domain's question_timeout_s (observed: search_arena 600s ran
+            # at 300s in driver mode; paper_review masked it, 300 == 300).
+            "GAN_QUESTION_TIMEOUT_S": str(int(self.config["question_timeout_s"])),
+            "GAN_LLM_TIMEOUT_S": str(float(self.config["llm_client_timeout_s"])),
         })
         task_brief = str(self.config.get("task_brief") or "")
         if task_brief:
