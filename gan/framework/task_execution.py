@@ -262,6 +262,85 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
 
 
 # -- dataset / harness / report --------------------------------------------
+def prepare_polyglot_questions(
+    dataset_root: str,
+    run_dir: str,
+    domain_cfg: Dict[str, Any],
+    num_samples: int,
+) -> str:
+    """Polyglot (Arch 2): questions.csv straight from the metadata json.
+
+    Each row embeds the exercise's starter files + the writable solution-path
+    whitelist (see domains.polyglot.gan_utils). No label column exists: the
+    objective outcome is produced by the parent-side eval container.
+    """
+    from domains.polyglot import gan_utils as pgu
+    task_list = domain_cfg.get("eval_task_list") or None
+    rows = pgu.load_instances(dataset_root, task_list=task_list,
+                              num_samples=num_samples)
+    if not rows:
+        raise ValueError("polyglot: no instances selected (check eval_task_list)")
+    input_dir = os.path.join(run_dir, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    questions_path = os.path.join(input_dir, "questions.csv")
+    pd.DataFrame(rows).to_csv(questions_path, index=False)
+    return questions_path
+
+
+def run_polyglot_eval(
+    predictions_path: str,
+    domain_cfg: Dict[str, Any],
+    dataset_root: str,
+    output_path: str,
+) -> Dict[str, Any]:
+    """Parent-side polyglot scoring (Arch 2): docker eval of the child patches.
+
+    Each non-blank prediction is a unified diff produced by the task child;
+    the eval-only container applies it to the exercise repo and runs the
+    language test command. Score = resolved/total; the harness's own
+    aggregation json stays next to the per-instance artifacts as evidence.
+    """
+    df = pd.read_csv(predictions_path, dtype=str)
+    patches: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        pred = row.get("prediction")
+        if isinstance(pred, str) and pred.strip():
+            patches[str(row["question_id"])] = pred
+    task_list = domain_cfg.get("eval_task_list") or None
+    from domains.polyglot.harness import harness as polyglot_harness
+    run_id = "gan_polyglot"
+    polyglot_harness(
+        dataset_path=os.path.join(dataset_root, "domains", "polyglot",
+                                  "polyglot_benchmark_metadata.json"),
+        test_task_list=task_list, num_samples=0,
+        model_name_or_path=run_id, model=None, model_patch_paths=None,
+        eval_only=True, patches=patches,
+        pred_dname=output_path, output_dir=output_path, root_dir=None,
+    )
+    with open(os.path.join(output_path, f"{run_id}_0.0.json"), "r",
+              encoding="utf-8") as f:
+        agg = json.load(f)
+    total = len(task_list) if task_list else int(agg.get("submitted_instances") or 0)
+    resolved = list(agg.get("resolved_ids") or [])
+    unresolved = list(agg.get("unresolved_ids") or [])
+    empty = list(agg.get("empty_patch_ids") or [])
+    incomplete = list(agg.get("incomplete_ids") or [])
+    evaluated = len(resolved) + len(unresolved)
+    score = (len(resolved) / total) if total else None
+    report = {
+        "resolved_rate": score,
+        "resolved": resolved,
+        "unresolved": unresolved,
+        "empty_patch": empty,
+        "incomplete": incomplete,
+        "total": total,
+        "coverage": (evaluated / total) if total else None,
+    }
+    with open(os.path.join(output_path, "report.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    return report
+
+
 def uses_parent_scoring(domain: str) -> bool:
     return domain in _PARENT_SCORED_DOMAINS
 

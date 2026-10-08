@@ -19,6 +19,12 @@
       "module": "task/tools/knowledge.py",
       "description": "Read the curated knowledge base (md notes the planner authored): list with name='', read with a name.",
       "params_schema": {}
+    },
+    {
+      "name": "write_file",
+      "module": "task/tools/write_file.py",
+      "description": "Create or overwrite a solution file inside the exercise workspace (polyglot): only the instance's declared solution paths are writable; tests/config stay read-only.",
+      "params_schema": {}
     }
   ]
 }

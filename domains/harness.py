@@ -316,6 +316,10 @@ def harness(
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
     domain_folder = domain.split('_')[0] if "imo_" in domain else domain
     utils_module_path = f"domains.{domain_folder}.{utils_prefix}utils"
+    if domain == "polyglot":
+        # domains/polyglot/utils.py is the pre-existing DGM docker-helper
+        # module; the GAN question contract lives in gan_utils (Arch 2).
+        utils_module_path = "domains.polyglot.gan_utils"
     utils_module = importlib.import_module(utils_module_path)
     format_input_dict = utils_module.format_input_dict
     question_id_col = utils_module.QUESTION_ID

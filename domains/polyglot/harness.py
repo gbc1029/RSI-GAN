@@ -30,7 +30,8 @@ from domains.polyglot.utils import (
 def get_eval_script(commands):
     return "\n".join(["#!/bin/bash", "set -uxo pipefail"] + commands) + "\n"
 
-def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_dir, model=None):
+def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_dir, model=None,
+                  external_patch=None):
     """
     Process a single dataset entry. This function encapsulates the main processing logic
     for each entry to make it suitable for parallel execution.
@@ -65,100 +66,121 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
         container = build_container(test_spec, client, run_id, logger, nocache, force_rebuild=False)
         container.start()
 
-        # Copy the necessary files and requirements to the container
-        root_dir = root_dir if root_dir is not None else "./"
-        copy_to_container(container, os.path.join(root_dir, 'task_agent.py'), f'/{REPO_NAME}/task_agent.py')
-        copy_to_container(container, os.path.join(root_dir, 'run_task_agent.py'), f'/{REPO_NAME}/run_task_agent.py')
-        copy_to_container(container, os.path.join(root_dir, 'requirements.txt'), f'/{REPO_NAME}/requirements.txt')
-        copy_to_container(container, os.path.join(root_dir, 'agent/'), f'/{REPO_NAME}/agent/')
-        copy_to_container(container, os.path.join(root_dir, 'utils/'), f'/{REPO_NAME}/utils/')
-        # run_task_agent.py resolves its default model via
-        # `gan.framework.models` (gan/framework/models.yaml travels with the
-        # package) -- without this the in-container agent dies on import.
-        copy_to_container(container, os.path.join(root_dir, 'gan'), f'/{REPO_NAME}/gan/')
-        copy_to_container(container, os.path.join(root_dir, 'meta_agent.py'), f'/{REPO_NAME}/meta_agent.py')
-        copy_to_container(container, os.path.join(root_dir, 'scripts', 'dgmh', 'run_meta_agent.py'), f'/{REPO_NAME}/scripts/dgmh/run_meta_agent.py')
-        copy_to_container(container, os.path.join(root_dir, 'README.md'), f'/{REPO_NAME}/README.md')
-        chat_history_file_container = f'/{REPO_NAME}/{chat_history_file.name}'
+        # Arch 2 eval_only: an externally produced patch (GAN patch channel)
+        # replaces the in-container agent entirely -- the container is used
+        # for evaluation only. A failed apply logs and proceeds unpatched
+        # (the eval then records unresolved; the error stays in this log).
+        model_patch = ''
+        if external_patch is not None:
+            model_patch = external_patch
+            if model_patch.strip():
+                safe_log("Applying external (GAN) patch to /testbed")
+                with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _pf:
+                    _pf.write(model_patch)
+                    _pf_path = _pf.name
+                try:
+                    copy_to_container(container, _pf_path, '/testbed/parent_external.patch')
+                    _res = container.exec_run(
+                        "git -C /testbed apply --whitespace=nowarn /testbed/parent_external.patch",
+                        workdir='/')
+                    log_container_output(_res, raise_error=False)
+                finally:
+                    os.unlink(_pf_path)
+        else:
+            # Copy the necessary files and requirements to the container
+            root_dir = root_dir if root_dir is not None else "./"
+            copy_to_container(container, os.path.join(root_dir, 'task_agent.py'), f'/{REPO_NAME}/task_agent.py')
+            copy_to_container(container, os.path.join(root_dir, 'run_task_agent.py'), f'/{REPO_NAME}/run_task_agent.py')
+            copy_to_container(container, os.path.join(root_dir, 'requirements.txt'), f'/{REPO_NAME}/requirements.txt')
+            copy_to_container(container, os.path.join(root_dir, 'agent/'), f'/{REPO_NAME}/agent/')
+            copy_to_container(container, os.path.join(root_dir, 'utils/'), f'/{REPO_NAME}/utils/')
+            # run_task_agent.py resolves its default model via
+            # `gan.framework.models` (gan/framework/models.yaml travels with the
+            # package) -- without this the in-container agent dies on import.
+            copy_to_container(container, os.path.join(root_dir, 'gan'), f'/{REPO_NAME}/gan/')
+            copy_to_container(container, os.path.join(root_dir, 'meta_agent.py'), f'/{REPO_NAME}/meta_agent.py')
+            copy_to_container(container, os.path.join(root_dir, 'scripts', 'dgmh', 'run_meta_agent.py'), f'/{REPO_NAME}/scripts/dgmh/run_meta_agent.py')
+            copy_to_container(container, os.path.join(root_dir, 'README.md'), f'/{REPO_NAME}/README.md')
+            chat_history_file_container = f'/{REPO_NAME}/{chat_history_file.name}'
 
-        # See the checked repo
-        exec_result = container.exec_run("ls -R /testbed", workdir='/') 
-        log_container_output(exec_result)
+            # See the checked repo
+            exec_result = container.exec_run("ls -R /testbed", workdir='/') 
+            log_container_output(exec_result)
 
-        # Get test description
-        eval_cmd = MAP_REPO_VERSION_TO_SPECS[entry['language']]['test_cmd']
-        test_description = get_test_description(eval_cmd, polyglot=True)
+            # Get test description
+            eval_cmd = MAP_REPO_VERSION_TO_SPECS[entry['language']]['test_cmd']
+            test_description = get_test_description(eval_cmd, polyglot=True)
 
-        # Apply model patch
-        if model_patch_paths:
-            safe_log("Applying model patches")
-            for model_patch_path in model_patch_paths:
-                copy_to_container(container, model_patch_path, f'/{REPO_NAME}/parent_patch.txt')
-                exec_result = container.exec_run(f"/bin/sh -c 'patch -p1 -f < /{REPO_NAME}/parent_patch.txt'", workdir=f'/{REPO_NAME}')
-                log_container_output(exec_result)
-                exec_result = container.exec_run(f"rm /{REPO_NAME}/parent_patch.txt", workdir='/')
-                log_container_output(exec_result)
+            # Apply model patch
+            if model_patch_paths:
+                safe_log("Applying model patches")
+                for model_patch_path in model_patch_paths:
+                    copy_to_container(container, model_patch_path, f'/{REPO_NAME}/parent_patch.txt')
+                    exec_result = container.exec_run(f"/bin/sh -c 'patch -p1 -f < /{REPO_NAME}/parent_patch.txt'", workdir=f'/{REPO_NAME}')
+                    log_container_output(exec_result)
+                    exec_result = container.exec_run(f"rm /{REPO_NAME}/parent_patch.txt", workdir='/')
+                    log_container_output(exec_result)
 
-        # Install this repo requirements
-        safe_log("Installing more requirements")
-        exec_result = container.exec_run(f"python -m pip install -r /{REPO_NAME}/requirements.txt", workdir='/')
-        log_container_output(exec_result)
+            # Install this repo requirements
+            safe_log("Installing more requirements")
+            exec_result = container.exec_run(f"python -m pip install -r /{REPO_NAME}/requirements.txt", workdir='/')
+            log_container_output(exec_result)
 
-        # Run the agent
-        env_vars = {
-            "ANTHROPIC_API_KEY": os.getenv('ANTHROPIC_API_KEY'),
-            "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
-            # OpenAI-compatible gateways need the base URL too (the original
-            # deployment assumed api.openai.com, where the key alone suffices).
-            "OPENAI_API_BASE": os.getenv('OPENAI_API_BASE', ''),
-            "METAGEN_ACCESS_TOKEN": os.getenv('METAGEN_ACCESS_TOKEN'),
-        }
-        safe_log("Running the agent")
-        cmd = [
-            "timeout", "600",  # 10 min timeout
-            "python", f"/{REPO_NAME}/run_task_agent.py",
-            "--problem_statement", problem_statement,
-            "--git_dir", "/testbed/",
-            "--chat_history_file", chat_history_file_container,
-            "--base_commit", base_commit,
-            "--outdir", f"/{REPO_NAME}/",
-            "--test_description", test_description,
-            "--language", entry['language'],
-            *(["--model", model] if model else []),
-        ]
-        exec_result = container.exec_run(cmd, environment=env_vars, workdir='/testbed/')
-        # An in-container agent failure (missing credentials offline, provider
-        # outage, agent bug) must NOT lose the instance: continue with an empty
-        # model_patch so the eval still runs and records the outcome
-        # (empty_patch/unresolved) -- the full failure stays in this docker log.
-        log_container_output(exec_result, raise_error=False)
+            # Run the agent
+            env_vars = {
+                "ANTHROPIC_API_KEY": os.getenv('ANTHROPIC_API_KEY'),
+                "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
+                # OpenAI-compatible gateways need the base URL too (the original
+                # deployment assumed api.openai.com, where the key alone suffices).
+                "OPENAI_API_BASE": os.getenv('OPENAI_API_BASE', ''),
+                "METAGEN_ACCESS_TOKEN": os.getenv('METAGEN_ACCESS_TOKEN'),
+            }
+            safe_log("Running the agent")
+            cmd = [
+                "timeout", "600",  # 10 min timeout
+                "python", f"/{REPO_NAME}/run_task_agent.py",
+                "--problem_statement", problem_statement,
+                "--git_dir", "/testbed/",
+                "--chat_history_file", chat_history_file_container,
+                "--base_commit", base_commit,
+                "--outdir", f"/{REPO_NAME}/",
+                "--test_description", test_description,
+                "--language", entry['language'],
+                *(["--model", model] if model else []),
+            ]
+            exec_result = container.exec_run(cmd, environment=env_vars, workdir='/testbed/')
+            # An in-container agent failure (missing credentials offline, provider
+            # outage, agent bug) must NOT lose the instance: continue with an empty
+            # model_patch so the eval still runs and records the outcome
+            # (empty_patch/unresolved) -- the full failure stays in this docker log.
+            log_container_output(exec_result, raise_error=False)
 
-        # Copy output files back to host
-        logger.info("Copying output files back to host")
-        # Artifact tolerance: a crashed agent (no credentials offline, provider
-        # outage) writes NO chat history -- record the instance as empty_patch
-        # instead of losing it. Same for the optional extra history files and
-        # the model_patch probe below.
-        try:
-            copy_from_container(container, chat_history_file_container, chat_history_file)
-        except Exception as e:
-            logger.warning(f"Chat history missing (agent likely crashed): {e}")
-        # Additional chat history files
-        exec_result = container.exec_run(f"find /{REPO_NAME}/ -name '{instance_id}_*.jsonl'", workdir='/')
-        chat_history_files_container = exec_result.output.decode().split()
-        for chat_history_file_container in chat_history_files_container:
-            chat_history_file = out_dname / Path(chat_history_file_container).name
+            # Copy output files back to host
+            logger.info("Copying output files back to host")
+            # Artifact tolerance: a crashed agent (no credentials offline, provider
+            # outage) writes NO chat history -- record the instance as empty_patch
+            # instead of losing it. Same for the optional extra history files and
+            # the model_patch probe below.
             try:
                 copy_from_container(container, chat_history_file_container, chat_history_file)
             except Exception as e:
-                logger.warning(f"Additional history file missing: {e}")
+                logger.warning(f"Chat history missing (agent likely crashed): {e}")
+            # Additional chat history files
+            exec_result = container.exec_run(f"find /{REPO_NAME}/ -name '{instance_id}_*.jsonl'", workdir='/')
+            chat_history_files_container = exec_result.output.decode().split()
+            for chat_history_file_container in chat_history_files_container:
+                chat_history_file = out_dname / Path(chat_history_file_container).name
+                try:
+                    copy_from_container(container, chat_history_file_container, chat_history_file)
+                except Exception as e:
+                    logger.warning(f"Additional history file missing: {e}")
 
-        # Get model_patch
-        model_patch = ''
-        logger.info("Getting model_patch")
-        exec_result = container.exec_run(f"cat /{REPO_NAME}/model_patch.diff")
-        log_container_output(exec_result, raise_error=False)
-        model_patch = exec_result.output.decode() if exec_result.exit_code == 0 else ''
+            # Get model_patch
+            model_patch = ''
+            logger.info("Getting model_patch")
+            exec_result = container.exec_run(f"cat /{REPO_NAME}/model_patch.diff")
+            log_container_output(exec_result, raise_error=False)
+            model_patch = exec_result.output.decode() if exec_result.exit_code == 0 else ''
 
         # Additional proposed model patches
         proposed_model_patches = []
@@ -261,6 +283,8 @@ def harness(
         max_workers=4,
         model_name_or_path=None,
         model_patch_paths=None,
+        eval_only=False,
+        patches=None,
         num_evals=1,
         num_evals_parallel=1,
         pred_dname='./outputs',
@@ -330,7 +354,10 @@ def harness(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
             future_to_entry = {
-                executor.submit(process_entry, entry, out_dname, model_name_or_path_inst, model_patch_paths, root_dir, model): entry
+                executor.submit(process_entry, entry, out_dname, model_name_or_path_inst,
+                               model_patch_paths, root_dir, model,
+                               external_patch=(patches or {}).get(entry['instance_id'])
+                               if eval_only else None): entry
                 for entry in entries
             }
             

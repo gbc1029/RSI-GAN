@@ -82,14 +82,21 @@ domains:
       strip: true
 
   polyglot:
-    score_key: accuracy_score
+    score_key: resolved_rate
     splits: [train]
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
+    eval_task_list:
+    - go__bottle-song
+    - go__react
     task_brief: >-
-      Resolve the software issue described in the problem statement by editing
-      the repository. Produce a code patch (unified diff) that fixes it.
+      You get a programming exercise: its description plus skeleton files that
+      are materialized into your workspace. Implement the exercise by writing
+      the complete solution into every file listed under solution_paths
+      (create or overwrite them with the write_file tool); leave all other
+      files untouched. Keep the declared module interfaces and naming so the
+      files drop into the existing project.
 
   imo_proof:
     score_key: points_percentage

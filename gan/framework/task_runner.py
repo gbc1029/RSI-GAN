@@ -162,6 +162,15 @@ class DomainTaskRunner:
                     pass  # best-effort local audit line; the meta string is durable
             patch_str = ""  # applied to code_root (or rejected -> nothing to apply)
 
+        # Polyglot (Arch 2): the task child needs the whitelisted file-write
+        # tool to produce its solution patch. Framework-injected capability
+        # (analogous to task_brief): added before the heal, which keeps it --
+        # the component is registered, so the slot heal never strips it.
+        if self.domain == "polyglot":
+            tools_slot = config.setdefault("tools", [])
+            if "write_file" not in tools_slot:
+                tools_slot.append("write_file")
+
         # Heal the design BEFORE it is persisted. The patch has
         # now either committed or rolled back to the parent's code, so
         # ``source_root`` is the authority for what this generation can assemble.
@@ -226,7 +235,32 @@ class DomainTaskRunner:
             os.remove(report_path)
 
         output_path = os.path.dirname(report_path)
-        if tx.uses_parent_scoring(self.domain):
+        if self.domain == "polyglot":
+            # Arch 2: the child's predictions are unified diffs; the parent
+            # applies them inside the eval container and scores resolved/total.
+            questions_path = tx.prepare_polyglot_questions(
+                self.repo_root, run_dir, self.domain_cfg, self.num_samples)
+            rc, _out = tx.run_harness_and_report(
+                self.python, run_dir, self.domain, run_id, self.subset,
+                self.num_samples, model, env, self.timeout,
+                questions_path=questions_path, log_path=self.log_path,
+            )
+            predictions_path = os.path.join(output_path, "predictions.csv")
+            report = None
+            if os.path.exists(predictions_path):
+                try:
+                    report = tx.run_polyglot_eval(
+                        predictions_path, self.domain_cfg, self.repo_root,
+                        output_path)
+                except Exception as e:
+                    # A docker/eval failure must not degrade silently;
+                    # score reads None -> score_status="failed".
+                    report = None
+                    from utils.soft_fail import soft_fail
+                    soft_fail(f"polyglot eval failed for genid {genid}: {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="polyglot_eval_failed", genid=str(genid))
+        elif tx.uses_parent_scoring(self.domain):
             questions_path, ground_truth_by_id = tx.prepare_questions(
                 self.repo_root, run_dir, self.domain, self.subset, self.num_samples,
             )

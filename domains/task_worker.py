@@ -1,6 +1,7 @@
 """Minimal TaskAgent entry point executed inside the per-question sandbox."""
 from __future__ import annotations
 
+import difflib
 import importlib
 import importlib.util
 import json
@@ -8,6 +9,60 @@ import os
 import subprocess
 import sys
 import tempfile
+
+
+def _polyglot_prepare(inputs: dict) -> None:
+    """Materialize the exercise workspace (Arch 2) and arm the write whitelist.
+
+    Starter files land at CWD under their REPO-ROOT-RELATIVE paths so the
+    generated diff applies with `patch -p1` at the polyglot-benchmark clone
+    root inside the eval container.
+    """
+    files = inputs.get("files") or {}
+    for rel, content in files.items():
+        rel = os.path.normpath(rel).lstrip(os.sep)
+        if rel.startswith(".."):
+            raise ValueError(f"polyglot starter path escapes the workspace: {rel}")
+        full = os.path.join(os.getcwd(), rel)
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+    os.environ["GAN_TASK_WRITE_ROOTS"] = json.dumps(
+        inputs.get("solution_paths") or [])
+
+
+def _polyglot_workspace_patch(inputs: dict) -> str:
+    """Unified diff (a/ b/ prefixes) of the workspace vs the starter files."""
+    files = inputs.get("files") or {}
+    cwd = os.getcwd()
+    current: dict = {}
+    for base, _dirs, names in os.walk(cwd):
+        for name in names:
+            full = os.path.join(base, name)
+            rel = os.path.relpath(full, cwd).replace(os.sep, "/")
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                current[rel] = f.read()
+    diffs: list = []
+    for rel in sorted(set(files) | set(current)):
+        old = files.get(rel)
+        new = current.get(rel)
+        if old == new:
+            continue
+        if old is None:
+            old_lines, old_label = [], "/dev/null"
+        else:
+            old_lines, old_label = old.splitlines(keepends=True), f"a/{rel}"
+        if new is None:
+            new_lines, new_label = [], "/dev/null"
+        else:
+            new_lines, new_label = new.splitlines(keepends=True), f"b/{rel}"
+        patch = difflib.unified_diff(old_lines, new_lines, fromfile=old_label,
+                                     tofile=new_label)
+        text = "".join(patch)
+        if text and not text.endswith("\n"):
+            text += "\n\\ No newline at end of file\n"
+        diffs.append(text)
+    return "".join(diffs)
 
 
 def _load_task_agent(agent_path: str):
@@ -46,7 +101,16 @@ def _run_agent_child(result_fd: int) -> None:
         model=payload["model"],
         chat_history_file=payload["trajectory_path"],
     )
-    prediction, _ = agent.forward(payload["inputs"])
+    inputs = payload["inputs"]
+    if inputs.get("domain") == "polyglot":
+        # Arch 2: rebuild the exercise workspace, let the agent write solution
+        # files through the whitelisted tool, and turn the workspace diff into
+        # the prediction (the eval container applies it with `patch -p1`).
+        _polyglot_prepare(inputs)
+        agent.forward(inputs)
+        prediction = _polyglot_workspace_patch(inputs)
+    else:
+        prediction, _ = agent.forward(inputs)
     _write_json_fd(result_fd, {"prediction": prediction})
 
 
