@@ -24,6 +24,15 @@ class LocalLLMRelay:
         self._threads.append(thread)
         return self.port
 
+    def close(self) -> None:
+        """Stop the listener. In-flight pumps (daemon threads) drain on their own."""
+        listener, self.listener = self.listener, None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
     def _serve(self) -> None:
         assert self.listener is not None
         while self.listener is not None:
