@@ -104,10 +104,15 @@ def session_traj_file(output_dir: str, outer, genid: Optional[object], role: str
 
     Per-generation files are keyed by ``genid`` (unique across re-runs because the
     gen counter is restored from checkpoints). OUTER-level files (``genid=None``,
-    i.e. self-improvement sessions) are keyed by the run ``attempt`` id so that
-    re-running an outer never truncates or mixes a previous attempt's trace —
-    a sibling FILE (not a directory) so ``outer_session_index`` (which treats
-    every subdirectory of outer_<O> as a genid) is not polluted.
+    i.e. the role's own plan/evaluate/self-improvement sessions) are keyed by the
+    loop instantiation's ``attempt`` id -- passed to the role at CONSTRUCTION so
+    every writer (session content, stop records, redaction) resolves one file --
+    so re-running an outer never truncates or mixes a previous attempt's trace.
+    It is a sibling FILE (not a directory) so ``outer_session_index`` (which
+    treats every subdirectory of outer_<O> as a genid) is not polluted; readers
+    (trajectory.read_session) merge the canonical and attempt-keyed siblings,
+    newest first. Directly-constructed roles (no attempt id) keep the bare
+    ``<role>.jsonl`` name.
     """
     base = outer_traj_dir(output_dir, outer)
     if genid is not None:

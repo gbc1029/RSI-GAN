@@ -34,6 +34,7 @@ accept/reject and no parent selection for roles; ``outer_improved`` is logged on
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
@@ -450,10 +451,26 @@ class GanLoop:
         after the previous outer's self-improvement (single chain, no revert).
         Without a factory the injected instances are reused (offline/smoke mode).
         """
-        if self.planner_factory is not None:
-            self.planner = self.planner_factory(outer)
-        if self.evaluator_factory is not None:
-            self.evaluator = self.evaluator_factory(outer)
+        # Attempt-aware construction: the loop's per-instantiation attempt id
+        # must be known BEFORE the role binds its trajectory sink (Role.__init__
+        # resolves the OUTER-level file exactly once), otherwise session content
+        # and stop records can land on different names. Signature probing keeps
+        # legacy single-arg factories (tests, injected instances) working.
+        for name, factory in (("planner", self.planner_factory),
+                              ("evaluator", self.evaluator_factory)):
+            if factory is None:
+                continue
+            try:
+                params = inspect.signature(factory).parameters
+                accepts_attempt = any(
+                    p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    for p in list(params.values())[1:]
+                ) or any(p.kind == p.VAR_POSITIONAL for p in params.values())
+            except (TypeError, ValueError):
+                accepts_attempt = False
+            setattr(self, name,
+                    factory(outer, self._attempt) if accepts_attempt
+                    else factory(outer))
         for inst in (self.planner, self.evaluator):
             try:
                 inst.attempt_id = self._attempt

@@ -195,6 +195,14 @@ def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: 
 
     A quarantined (unredactable) session is NEVER served: an explicit refusal
     replaces its content (fail-closed)."""
+    if genid is not None:
+        return _read_gen_session(output_dir, outer, genid, role, max_chars)
+    return _read_outer_sessions(output_dir, outer, role, max_chars)
+
+
+def _read_gen_session(output_dir: str, outer: Any, genid: Any, role: str,
+                      max_chars: int) -> str:
+    """Per-generation session read (genid-keyed files; attempt id irrelevant)."""
     path = paths.session_traj_file(output_dir, outer, genid, role)
     if not os.path.isfile(path):
         quarantined = sorted(glob.glob(path + ".unredacted-*"))
@@ -204,6 +212,44 @@ def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: 
                     "(session_redaction_failed).")
         return read(output_dir, genid, max_chars, role)
     return _render(trajectory_log.read_all(path), max_chars)
+
+
+def _outer_session_files(output_dir: str, outer: Any, role: str) -> List[str]:
+    """OUTER-level trajectory files for a role, newest first.
+
+    Loop-driven roles bind their sink to ``<role>__<attempt>.jsonl`` (one file
+    per loop instantiation), while directly-constructed roles (legacy runs,
+    offline smoke) use ``<role>.jsonl``. Readers accept every shape so an
+    attempt-keyed file can never become invisible behind the canonical name;
+    rotated parts (``.N``) and quarantine names are excluded by the glob."""
+    d = paths.outer_traj_dir(output_dir, outer)
+    if not os.path.isdir(d):
+        return []
+    cands = [os.path.join(d, f"{role}.jsonl")]
+    cands += sorted(glob.glob(os.path.join(d, f"{role}__*.jsonl")))
+    existing = [p for p in cands if os.path.isfile(p)]
+    existing.sort(key=os.path.getmtime, reverse=True)
+    return existing
+
+
+def _read_outer_sessions(output_dir: str, outer: Any, role: str,
+                         max_chars: int) -> str:
+    """Render a role's OUTER-level sessions: canonical + attempt files, newest
+    first. Quarantined-only attempts are reported explicitly (fail-closed)."""
+    files = _outer_session_files(output_dir, outer, role)
+    d = paths.outer_traj_dir(output_dir, outer)
+    quarantined = sorted(glob.glob(os.path.join(d, f"{role}*.jsonl.unredacted-*")))
+    if not files:
+        if quarantined:
+            return ("[unavailable] this session trajectory could not be redacted and was "
+                    "quarantined; the audit trail is in events.jsonl "
+                    "(session_redaction_failed).")
+        return ""
+    parts = [trajectory_log.read_all(p) for p in files]
+    if quarantined:
+        parts.append("[unavailable] %d attempt file(s) could not be redacted and were "
+                     "quarantined (session_redaction_failed)." % len(quarantined))
+    return _render("\n".join(t for t in parts if t.strip()), max_chars)
 
 
 def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str, Any]]:

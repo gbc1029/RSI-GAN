@@ -142,6 +142,7 @@ class Role(AgentSystem):
         chat_history_file: Optional[str] = None,
         instance: Optional[str] = None,
         code_root: Optional[str] = None,
+        attempt_id: Optional[str] = None,
     ):
         self.role = role
         self.output_dir = os.path.abspath(output_dir)
@@ -150,9 +151,13 @@ class Role(AgentSystem):
         # refreshed every outer generation: fresh design load, fresh toolset,
         # fresh chat history. None keeps the legacy single-instance layout.
         self.instance = instance
-        # Run-attempt id (set by GanLoop._refresh_roles); keys the OUTER-level
-        # trajectory file so re-running an outer never truncates a prior attempt.
-        self.attempt_id = None
+        # Run-attempt id: keys the OUTER-level trajectory file so re-running an
+        # outer never truncates a prior attempt. The GAN loop passes its per-
+        # instantiation id at CONSTRUCTION so every writer (session content,
+        # stop records, redaction) resolves the SAME attempt-keyed name; the
+        # post-construction stamp in _refresh_roles stays as an idempotent
+        # safety net for factories that ignored the argument.
+        self.attempt_id = attempt_id
         self.assembly_report: Optional[dict] = None  # last assembly report
         self.outer = None
         if instance and str(instance).startswith("outer_"):

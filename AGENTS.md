@@ -130,8 +130,10 @@ batch-8 isolation), one subprocess each.
   (recovery + `code/` per-run git tree + `code.json` manifest + `design/`), `logs/`
   (`events.jsonl`, `*_tree.jsonl`, `*.log`),
   `trajectory/outer_<O>/{planner,evaluator,<genid>/{task,planner,evaluator}}.jsonl`
-  (outer-level self-improvement files are attempt-keyed: `<role>__<attempt>.jsonl`
-  when an outer is re-run), `scores/scores.jsonl`, `runs/<genid>/` (small evidence:
+  (OUTER-level role files are attempt-keyed `<role>__<attempt>.jsonl` — one per
+  loop instantiation, assigned at role CONSTRUCTION so content and stop records
+  share one file; directly-constructed roles keep `<role>.jsonl`; readers merge
+  canonical + attempt siblings, newest first), `scores/scores.jsonl`, `runs/<genid>/` (small evidence:
   `packet.json`, `eval.json`, `feedback_digest.md`, `patch_receipt.json`,
   `patch_proposed.diff`), `work/<genid>/` (ephemeral, pruned),
   `workspaces/<role>/outer_<O>/`. `ckpt/checkpoint.json` is the latest (overwritten atomically); outer boundaries
@@ -426,6 +428,39 @@ batch-8 isolation), one subprocess each.
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator
   must not fit the benchmark score (blind score first, then reveal).
 - The task agent has **no always-on tools**; its capabilities are all opt-in tools.
+
+## Driver-mode field lessons (v5.1 real-API round)
+
+Lessons from the first driver-mode rounds run end-to-end against a real
+OpenAI-compatible gateway — each was invisible to the offline smokes:
+
+- **Latency-dependent transport bugs need slow fakes.** `LocalLLMRelay` held a
+  10s socket timeout across its whole pump lifetime: every response slower than
+  10s was silently dropped while the proxy still completed and audited it
+  (`llm_call 200`), and the C1 dispatch timeout (600s) then abandoned and
+  retried into the same wall — an infinite loop in which only <10s calls ever
+  landed. Fixed by lifting the timeout after connect. Offline smokes passed
+  because the fake upstream answers in ~0ms; smoke transports against a
+  deliberately SLOW fake (e.g. 15s) too.
+- **`driver_done` must be exercised, not assumed.** The first round ever to
+  reach `outer_done` then died at the final teardown line (`relay.close()` did
+  not exist; rc=1 AFTER every artifact — boundary snapshot, checkpoint, scores,
+  receipts, lineage refs — was durably written). Judge a round by its events
+  through `outer_done`, not by the exit code alone.
+- **Trajectory attempt-keying is construction-time.** Role instances receive
+  the loop's per-instantiation attempt id at construction (factory arg), so all
+  outer-level writers (session content, stop records, redaction) resolve ONE
+  `<role>__<attempt>.jsonl`; `read_session` merges canonical + attempt siblings
+  newest-first. Before the fix, construction bound the canonical name while
+  session content resolved the attempt name — one session's record split across
+  two files.
+- **Deployment constraints that fail fast:** `output_dir` must be owned by the
+  post-drop caller uid, outside `/tmp` (tmpfs shadowing) and outside the repo
+  tree; symlink-based venvs (python → /usr/bin/…) fail the trusted-interpreter
+  realpath check (conda or `--copies` venvs pass).
+- **`score: null` with an invalid prediction is a task-quality outcome**, not an
+  infrastructure failure — the lineage machinery records an auditable dead
+  branch and the next outer plans from the parent's commit.
 
 ## Do NOT
 

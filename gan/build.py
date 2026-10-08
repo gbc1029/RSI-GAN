@@ -131,11 +131,16 @@ def build_gan_loop(
     code_root = ensure_code_root(repo_root, output_dir) if code_repo else None
 
     # Fresh role instances per outer generation (design + tools + chat + workspace).
-    def _planner_factory(outer: int):
-        return Planner(p_model, output_dir, instance=f"outer_{outer}", code_root=code_root)
+    # The loop's per-instantiation attempt id rides along so the role binds its
+    # OUTER-level trajectory file to the attempt-keyed name at construction
+    # (session content and stop records share one file; see loop._refresh_roles).
+    def _planner_factory(outer: int, attempt: str):
+        return Planner(p_model, output_dir, instance=f"outer_{outer}",
+                       code_root=code_root, attempt_id=attempt)
 
-    def _evaluator_factory(outer: int):
-        return Evaluator(e_model, output_dir, instance=f"outer_{outer}", code_root=code_root)
+    def _evaluator_factory(outer: int, attempt: str):
+        return Evaluator(e_model, output_dir, instance=f"outer_{outer}",
+                         code_root=code_root, attempt_id=attempt)
 
     runner = DomainTaskRunner(
         repo_root=repo_root,
