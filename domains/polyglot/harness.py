@@ -72,6 +72,10 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
         copy_to_container(container, os.path.join(root_dir, 'requirements.txt'), f'/{REPO_NAME}/requirements.txt')
         copy_to_container(container, os.path.join(root_dir, 'agent/'), f'/{REPO_NAME}/agent/')
         copy_to_container(container, os.path.join(root_dir, 'utils/'), f'/{REPO_NAME}/utils/')
+        # run_task_agent.py resolves its default model via
+        # `gan.framework.models` (gan/framework/models.yaml travels with the
+        # package) -- without this the in-container agent dies on import.
+        copy_to_container(container, os.path.join(root_dir, 'gan'), f'/{REPO_NAME}/gan/')
         copy_to_container(container, os.path.join(root_dir, 'meta_agent.py'), f'/{REPO_NAME}/meta_agent.py')
         copy_to_container(container, os.path.join(root_dir, 'scripts', 'dgmh', 'run_meta_agent.py'), f'/{REPO_NAME}/scripts/dgmh/run_meta_agent.py')
         copy_to_container(container, os.path.join(root_dir, 'README.md'), f'/{REPO_NAME}/README.md')
@@ -104,6 +108,9 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
         env_vars = {
             "ANTHROPIC_API_KEY": os.getenv('ANTHROPIC_API_KEY'),
             "OPENAI_API_KEY": os.getenv('OPENAI_API_KEY'),
+            # OpenAI-compatible gateways need the base URL too (the original
+            # deployment assumed api.openai.com, where the key alone suffices).
+            "OPENAI_API_BASE": os.getenv('OPENAI_API_BASE', ''),
             "METAGEN_ACCESS_TOKEN": os.getenv('METAGEN_ACCESS_TOKEN'),
         }
         safe_log("Running the agent")
