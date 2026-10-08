@@ -6,7 +6,7 @@ The driver runs on the real repo (labels live here) and only orchestrates:
 - audit everything to ``logs/events.jsonl``.
 
 Role self-edit patches are NOT applied here: they are applied + committed **by the
-worker itself** (option B, v4.22 — ``loop._apply_self_patch`` ->
+worker itself** (``loop._apply_self_patch`` ->
 ``code_repo.apply_self_patch``, allowlist + compile validated, rolled back on
 failure; events ``self_improve_commit`` / ``self_improve_apply_failed``).
 """
@@ -333,7 +333,7 @@ def run_gan_driver(
                 f"sudo invoking user cannot read/write/traverse output_dir: {output_dir}"
             )
 
-        # Re-entry policy (G1-A, P1). Follow the newest completed attempt.
+        # Re-entry policy. Follow the newest completed attempt.
         newest = ckpt_mod.newest_outer_snapshot(output_dir)
         if newest and not (resume or force):
             raise RuntimeError(
@@ -429,7 +429,7 @@ def run_gan_driver(
                 _log_event(output_dir, {"type": "outer_worker_failed", "outer": outer,
                                         "rc": proc.returncode})
                 raise RuntimeError(f"outer worker failed at outer {outer} (rc={proc.returncode})")
-            # role self-edits are applied+committed by the worker itself (option B)
+            # Role self-edits are applied+committed by the worker itself.
         _log_event(output_dir, {"type": "driver_done", "code_root": code_root})
         return code_root
     finally:
