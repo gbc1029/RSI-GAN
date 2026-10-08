@@ -254,6 +254,7 @@ class DomainTaskRunner:
             os.remove(report_path)
 
         output_path = os.path.dirname(report_path)
+        os.makedirs(output_path, exist_ok=True)
         if self.domain == "polyglot":
             # Arch 2: the child's predictions are unified diffs; the parent
             # applies them inside the eval container and scores resolved/total.

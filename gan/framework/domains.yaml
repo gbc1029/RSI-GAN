@@ -24,11 +24,17 @@ default:
   stagedeval_frac: 0.1
   has_val_subset: false
   task_brief: null
+
   # Per-question wall budget (seconds). Overrides loop.yaml question_timeout_s.
   # Reasoning models spend 150-350s on a SINGLE long call (observed), and one
   # question needs 2+ calls (tool use + final answer), so coding/proof domains
   # need several minutes; short-answer domains fit the 300s default.
   question_timeout_s: 300
+
+  # A domain must override this with an explicit harness sandbox profile.
+  # Missing/disabled profiles fail closed before the privileged broker starts.
+  sandbox: null
+
   # Objective output contract of the task agent's answer. Used by the framework
   # (NOT by an evaluator eval point) to compute report_summary.contract_ok /
   # invalid_rate. kind: label | freeform | numeric.
@@ -52,6 +58,12 @@ domains:
       This is peer review: read the paper and decide whether it should be
       accepted or rejected. Your final answer must be exactly one word:
       accept or reject.
+    sandbox:
+      enabled: true
+      disabled_reason: null
+      network: none
+      gpu: none
+      read_only_assets: []
     output_contract:
       kind: label
       allowed_labels: [accept, reject]
@@ -67,7 +79,16 @@ domains:
     stagedeval_samples: 10
     stagedeval_frac: 0.1
     has_val_subset: true
+
     question_timeout_s: 600  # single long-form call measured at 212s
+
+    sandbox:
+      enabled: true
+      disabled_reason: null
+      network: none
+      gpu: none
+      read_only_assets: []
+
 
   imo_grading:
     score_key: overall_accuracy
@@ -82,6 +103,12 @@ domains:
     task_brief: >-
       Grade a student's solution to a math problem. Your final answer must be
       exactly one of: incorrect, partial, almost, correct.
+    sandbox:
+      enabled: true
+      disabled_reason: null
+      network: none
+      gpu: none
+      read_only_assets: []
     output_contract:
       kind: label
       allowed_labels: [incorrect, partial, almost, correct]
@@ -99,12 +126,22 @@ domains:
     - go__bottle-song
     - go__react
     task_brief: >-
+
       You get a programming exercise: its description plus skeleton files that
       are materialized into your workspace. Implement the exercise by writing
       the complete solution into every file listed under solution_paths
       (create or overwrite them with the write_file tool); leave all other
       files untouched. Keep the declared module interfaces and naming so the
       files drop into the existing project.
+
+
+    sandbox:
+      enabled: true
+      disabled_reason: null
+      network: none
+      gpu: none
+      read_only_assets: []
+
 
   imo_proof:
     score_key: points_percentage
@@ -116,6 +153,12 @@ domains:
     task_brief: >-
       Write a rigorous proof for the given math problem. Your final answer is
       the proof itself.
+    sandbox:
+      enabled: true
+      disabled_reason: null
+      network: none
+      gpu: none
+      read_only_assets: [domains/imo]
 
   imo_proof_grading:
     score_key: overall_accuracy
@@ -132,6 +175,12 @@ domains:
       allowed_labels: [incorrect, partial, almost, correct]
       case_insensitive: true
       strip: true
+    sandbox:
+      enabled: false
+      disabled_reason: GAN does not provide the required proofs_dname input
+      network: none
+      gpu: none
+      read_only_assets: [domains/imo]
 
 # family prefixes (longest match wins)
 families:
@@ -141,11 +190,31 @@ families:
     ensembled: false
     stagedeval_samples: 1
     stagedeval_frac: 0.1            # default for babyai; minihack overrides below
+    sandbox:
+      enabled: true
+      disabled_reason: null
+      network: none
+      gpu: none
+      read_only_assets: []
   balrog_minihack:
     stagedeval_frac: 0.2
+    # resolve_domain selects only the longest family prefix, so repeat the
+    # balrog sandbox contract for this more-specific family.
+    sandbox:
+      enabled: true
+      disabled_reason: null
+      network: none
+      gpu: none
+      read_only_assets: []
   genesis:
     score_key: average_fitness
     splits: [train]
     ensembled: false
     stagedeval_samples: 3
     stagedeval_frac: 0.5
+    sandbox:
+      enabled: false
+      disabled_reason: WSL CUDA device exposure is not configured or verified
+      network: none
+      gpu: wsl_cuda
+      read_only_assets: []

@@ -61,23 +61,6 @@ def _validate_run_tree(run_dir: str, owner_uid: int) -> None:
                 raise RuntimeError(f"task run tree contains a hard-linked file: {path}")
 
 
-def _restore_directory_ownership(run_dir: str, uid: int, gid: int) -> None:
-    """Let the unprivileged framework score and remove the completed run copy."""
-    for root, dirs, _files in os.walk(run_dir, topdown=False, followlinks=False):
-        for name in dirs:
-            path = os.path.join(root, name)
-            try:
-                if stat.S_ISDIR(os.lstat(path).st_mode):
-                    os.chown(path, uid, gid, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-        try:
-            if stat.S_ISDIR(os.lstat(root).st_mode):
-                os.chown(root, uid, gid, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-
-
 class _TaskBrokerState:
     def __init__(self, config: Dict[str, Any]) -> None:
         self.config = config
@@ -147,6 +130,7 @@ class _TaskBrokerState:
             "GAN_TASK_TOOLS_DIR": "/workspace/.gan_runtime/tools",
             "GAN_TOOLS_LOAD_REPORT": ".gan_runtime/tools_load_report.json",
             "GAN_TASK_KNOWLEDGE_DIR": "/workspace/.gan_runtime/knowledge",
+            "GAN_QUESTION_TIMEOUT_S": str(int(self.config["question_timeout_s"])),
         })
         task_brief = str(self.config.get("task_brief") or "")
         if task_brief:
@@ -157,31 +141,28 @@ class _TaskBrokerState:
         if parent_scored and not os.path.isfile(questions_path):
             raise RuntimeError(f"task questions file is missing: {questions_path}")
 
-        try:
-            return tx._run_harness_and_report_local(
-                str(self.config["python"]),
-                run_dir,
-                str(self.config["domain"]),
-                f"gan_{scope_id}",
-                str(self.config["subset"]),
-                int(self.config["num_samples"]),
-                model,
-                env,
-                int(self.config["timeout"]),
-                questions_path=questions_path if parent_scored else None,
-                dataset_root=None if parent_scored else str(self.config["repo_root"]),
-                proxy_socket=str(self.config["proxy_socket"]),
-                proxy_token=proxy_token,
-                log_path=os.path.join(self.config["output_dir"], "logs", "task_runner.log"),
-                expected_owner_uid=int(self.config["owner_uid"]),
-            )
-        finally:
-            if os.path.isdir(run_dir):
-                _restore_directory_ownership(
-                    run_dir,
-                    int(self.config["owner_uid"]),
-                    int(self.config["owner_gid"]),
-                )
+        return tx._run_harness_and_report_local(
+            str(self.config["python"]),
+            run_dir,
+            str(self.config["domain"]),
+            f"gan_{scope_id}",
+            str(self.config["subset"]),
+            int(self.config["num_samples"]),
+            model,
+            env,
+            int(self.config["timeout"]),
+            questions_path=questions_path if parent_scored else None,
+            dataset_root=None if parent_scored else str(self.config["repo_root"]),
+            proxy_socket=str(self.config["proxy_socket"]),
+            proxy_token=proxy_token,
+            expected_owner_uid=int(self.config["owner_uid"]),
+            expected_owner_gid=int(self.config["owner_gid"]),
+            setpriv_path=str(self.config["setpriv"]),
+            setfacl_path=str(self.config["setfacl"]),
+            bwrap_path=str(self.config["bwrap"]),
+            python_prefix=str(self.config["python_prefix"]),
+            sandbox_profile=dict(self.config["sandbox_profile"]),
+        )
 
 
 class _TaskRequestHandler(socketserver.StreamRequestHandler):

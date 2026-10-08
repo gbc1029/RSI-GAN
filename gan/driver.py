@@ -16,6 +16,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -197,6 +198,25 @@ def _drop_driver_privileges(uid: int, gid: int, username: str) -> None:
     os.environ.update({"HOME": home, "USER": username, "LOGNAME": username})
 
 
+def _trusted_root_tool(name: str) -> str:
+    """Resolve a root-owned, non-writable privilege-boundary executable."""
+    candidate = shutil.which(name)
+    if not candidate:
+        raise RuntimeError(f"secure TaskAgent launch requires {name}")
+    path = os.path.realpath(candidate)
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise RuntimeError(f"cannot stat trusted executable {path}: {exc}") from exc
+    if (not os.path.isabs(path) or not stat.S_ISREG(info.st_mode) or
+            info.st_uid != 0 or info.st_mode & 0o022 or
+            not os.access(path, os.X_OK)):
+        raise RuntimeError(
+            f"secure TaskAgent launch rejects untrusted {name} executable: {path}"
+        )
+    return path
+
+
 def _start_task_broker(socket_path: str, config: Dict[str, Any]) -> _TaskBrokerController:
     if "fork" not in multiprocessing.get_all_start_methods():
         raise RuntimeError("secure TaskAgent launch requires POSIX fork support")
@@ -269,6 +289,14 @@ def run_gan_driver(
     unregistered = domain not in registered and not any(
         domain.startswith(family) for family in families
     )
+    if unregistered:
+        raise ValueError(
+            f"domain {domain!r} has no registered sandbox profile; refusing secure launch"
+        )
+    domain_config = resolve_domain(reg, domain)
+    sandbox_profile = task_execution.validate_domain_sandbox_profile(
+        domain, domain_config.get("sandbox"), repo_root,
+    )
 
     owner_uid, owner_gid, owner_username = _sudo_invoking_identity()
     sandbox_username = os.environ.get("GAN_TASK_SANDBOX_USER", "").strip()
@@ -281,6 +309,10 @@ def run_gan_driver(
         raise RuntimeError(f"sandbox user {sandbox_username!r} does not exist") from exc
     if int(sandbox_account.pw_uid) == 0:
         raise RuntimeError("TaskAgent sandbox user must not be root")
+
+    setpriv_path = _trusted_root_tool("setpriv")
+    setfacl_path = _trusted_root_tool("setfacl")
+    bwrap_path = _trusted_root_tool("bwrap")
 
     python_executable = os.path.realpath(sys.executable)
     python_prefix = os.path.realpath(sys.prefix)
@@ -315,6 +347,8 @@ def run_gan_driver(
         if key in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
                    "PYTHONDONTWRITEBYTECODE"} or key.startswith("LC_")
     }
+    question_timeout_s = int(domain_config.get("question_timeout_s") or 300)
+    harness_timeout = int(num_samples) * question_timeout_s + 900
     broker_config = {
         "output_dir": output_dir,
         "repo_root": repo_root,
@@ -324,11 +358,16 @@ def run_gan_driver(
         "model": models["task"],
         "python": python_executable,
         "python_prefix": python_prefix,
-        "timeout": 1800,
-        "task_brief": (resolve_domain(reg, domain).get("task_brief") or ""),
+        "question_timeout_s": question_timeout_s,
+        "timeout": harness_timeout,
+        "task_brief": (domain_config.get("task_brief") or ""),
         "parent_scored": task_execution.uses_parent_scoring(domain),
+        "sandbox_profile": sandbox_profile,
         "owner_uid": owner_uid,
         "owner_gid": owner_gid,
+        "setpriv": setpriv_path,
+        "setfacl": setfacl_path,
+        "bwrap": bwrap_path,
         "sandbox_username": sandbox_username,
         "proxy_socket": proxy_socket,
         "proxy_control_token": proxy_control_token,
@@ -353,11 +392,6 @@ def run_gan_driver(
                 f"the tree/UCB. Use --resume to continue at outer {newest['index'] + 1}, "
                 f"or --force to re-run from outer 1 (legacy duplicate-prone behaviour, "
                 f"explicit escape hatch).")
-
-        if unregistered:
-            _log_event(output_dir, {"type": "domain_unregistered", "domain": domain,
-                                    "hint": "not in domains.yaml domains/families; "
-                                            "task_brief/output_contract fall back to default"})
 
         code_root = ensure_code_root(repo_root, output_dir)
         start = (int(newest["index"]) + 1) if (resume and newest) else 1
