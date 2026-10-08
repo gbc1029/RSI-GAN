@@ -31,7 +31,7 @@ def get_eval_script(commands):
     return "\n".join(["#!/bin/bash", "set -uxo pipefail"] + commands) + "\n"
 
 def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_dir, model=None,
-                  external_patch=None):
+                  external_patch=None, eval_only=False):
     """
     Process a single dataset entry. This function encapsulates the main processing logic
     for each entry to make it suitable for parallel execution.
@@ -71,21 +71,27 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
         # for evaluation only. A failed apply logs and proceeds unpatched
         # (the eval then records unresolved; the error stays in this log).
         model_patch = ''
-        if external_patch is not None:
-            model_patch = external_patch
-            if model_patch.strip():
-                safe_log("Applying external (GAN) patch to /testbed")
-                with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _pf:
-                    _pf.write(model_patch)
-                    _pf_path = _pf.name
-                try:
-                    copy_to_container(container, _pf_path, '/testbed/parent_external.patch')
-                    _res = container.exec_run(
-                        "git -C /testbed apply --whitespace=nowarn /testbed/parent_external.patch",
-                        workdir='/')
-                    log_container_output(_res, raise_error=False)
-                finally:
-                    os.unlink(_pf_path)
+        if eval_only:
+            # The parent supplies the patch; a MISSING patch (blank prediction,
+            # dropped by run_polyglot_eval) evaluates the UNMODIFIED exercise
+            # as an empty patch. It must NOT fall into in-container agent
+            # staging below: root_dir is unset on this path, so staging would
+            # crash with FileNotFoundError and lose the instance entirely.
+            if external_patch is not None:
+                model_patch = external_patch
+                if model_patch.strip():
+                    safe_log("Applying external (GAN) patch to /testbed")
+                    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as _pf:
+                        _pf.write(model_patch)
+                        _pf_path = _pf.name
+                    try:
+                        copy_to_container(container, _pf_path, '/testbed/parent_external.patch')
+                        _res = container.exec_run(
+                            "git -C /testbed apply --whitespace=nowarn /testbed/parent_external.patch",
+                            workdir='/')
+                        log_container_output(_res, raise_error=False)
+                    finally:
+                        os.unlink(_pf_path)
         else:
             # Copy the necessary files and requirements to the container
             root_dir = root_dir if root_dir is not None else "./"
@@ -357,7 +363,8 @@ def harness(
                 executor.submit(process_entry, entry, out_dname, model_name_or_path_inst,
                                model_patch_paths, root_dir, model,
                                external_patch=(patches or {}).get(entry['instance_id'])
-                               if eval_only else None): entry
+                               if eval_only else None,
+                               eval_only=eval_only): entry
                 for entry in entries
             }
             

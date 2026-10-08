@@ -504,6 +504,7 @@ if __name__ == "__main__":
         choices=[
             "search_arena",
             "paper_review",
+            "polyglot",
             "balrog_babyai",
             "balrog_babaisai",
             "balrog_minihack",
@@ -576,6 +577,28 @@ if __name__ == "__main__":
             resume_from=args.resume_from,
             subset=args.subset,
             proofs_dname=args.proofs_dname,
+            model=args.model,
+            dataset_root=args.dataset_root,
+            questions_path=args.questions_path,
+            proxy_socket=args.proxy_socket,
+            proxy_token=args.proxy_token,
+        )
+
+    # Polyglot (Arch 2): questions-only CSV + sandboxed TaskAgent + parent-side
+    # docker eval. Same questions contract as the preference domains above --
+    # without this dispatch branch the CLI fell through every elif and exited 0
+    # without producing anything.
+    elif domain == "polyglot":
+        output_folder = harness(
+            agent_path=args.agent_path,
+            output_dir=args.output_dir,
+            run_id=args.run_id,
+            domain=args.domain,
+            num_samples=args.num_samples,
+            save_interval=args.save_interval,
+            num_workers=args.num_workers,
+            resume_from=args.resume_from,
+            subset=args.subset,
             model=args.model,
             dataset_root=args.dataset_root,
             questions_path=args.questions_path,
