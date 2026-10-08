@@ -15,7 +15,6 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
-from dotenv import load_dotenv
 from hydra import compose, initialize_config_dir
 from utils.common import summarize_error
 

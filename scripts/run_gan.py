@@ -65,18 +65,48 @@ def main():
         p.error("--resume and --force are mutually exclusive")
 
     if args.in_process:
+        # The in-process debug mode shares the driver's LLM supply model:
+        # credentials stay inside a local ParentLLMProxy and the task chain
+        # receives only a scoped token (GAN_LLM_PROXY_UNIX + control token).
+        # Without this wiring the task harness would have NO LLM endpoint at
+        # all (the task child env allowlist strips real credentials), so every
+        # question would fail silently. In-process still runs WITHOUT the
+        # outer sandbox/broker by design -- it is the developer-facing loop.
+        import shutil as _shutil
+        import tempfile as _tempfile
+
         from gan.build import build_gan_loop
-        loop = build_gan_loop(
-            repo_root=args.repo_root,
-            output_dir=args.output_dir,
-            domains=domains,
-            subset=args.subset,
-            num_samples=args.num_samples,
-            cfg_overrides=overrides or None,
-            preflight=args.preflight,
-            code_repo=False,
-        )
-        tree = loop.run()
+        from gan.framework import models as _models
+        from gan.framework.llm_proxy import ParentLLMProxy
+
+        models = {
+            "task": _models.resolve("gan.task"),
+            "planner": _models.resolve("gan.planner"),
+            "evaluator": _models.resolve("gan.evaluator"),
+        }
+        proxy_dir = _tempfile.mkdtemp(prefix="rsi-gan-inproc-proxy-")
+        proxy_socket = os.path.join(proxy_dir, "p.sock")
+        proxy = ParentLLMProxy(args.output_dir, proxy_socket, models=models)
+        proxy.start()
+        try:
+            os.environ["GAN_LLM_PROXY_UNIX"] = proxy_socket
+            os.environ["GAN_PROXY_CONTROL_TOKEN"] = proxy.issue_framework_scope(0)
+            loop = build_gan_loop(
+                repo_root=args.repo_root,
+                output_dir=args.output_dir,
+                domains=domains,
+                subset=args.subset,
+                num_samples=args.num_samples,
+                cfg_overrides=overrides or None,
+                preflight=args.preflight,
+                code_repo=False,
+            )
+            tree = loop.run()
+        finally:
+            proxy.close()
+            _shutil.rmtree(proxy_dir, ignore_errors=True)
+            os.environ.pop("GAN_LLM_PROXY_UNIX", None)
+            os.environ.pop("GAN_PROXY_CONTROL_TOKEN", None)
         print(f"GAN loop done (in-process). task tree size={len(tree)}; "
               f"output_dir={os.path.abspath(args.output_dir)}")
     else:
