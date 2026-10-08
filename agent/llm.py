@@ -90,7 +90,7 @@ def _completion_kwargs(model, messages, temperature, max_tokens):
 @backoff.on_exception(
     backoff.expo,
     _BACKOFF_EXCEPTIONS,
-    max_time=600,
+    max_time=120,
     max_value=60,
 )
 def get_response_from_llm(

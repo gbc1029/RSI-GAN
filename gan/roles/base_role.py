@@ -295,6 +295,11 @@ class Role(AgentSystem):
         chat_kwargs = {}
         if tool_repeat_limit is not None:
             chat_kwargs["tool_repeat_limit"] = tool_repeat_limit
+        token_name = f"GAN_PROXY_{self.role.upper()}_TOKEN"
+        proxy_token = os.environ.get(token_name)
+        prev_api_key = os.environ.get("OPENAI_API_KEY")
+        if proxy_token:
+            os.environ["OPENAI_API_KEY"] = proxy_token
         try:
             hist, info = chat_with_agent(
                 full_msg,
@@ -314,6 +319,10 @@ class Role(AgentSystem):
                 **chat_kwargs,
             )
         finally:
+            if prev_api_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = prev_api_key
             if prev_sink is None:
                 os.environ.pop("GAN_TOOLS_LOAD_REPORT", None)
             else:

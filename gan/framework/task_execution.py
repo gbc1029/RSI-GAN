@@ -22,6 +22,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -49,6 +50,91 @@ _HARNESS_FILES = [
 ]
 _PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
+
+_TASK_ENV_NAMES = {
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
+    "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
+    "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+}
+_TASK_PARENT_ENV_NAMES = _TASK_ENV_NAMES | {
+    "GAN_LLM_PROXY_UNIX", "GAN_TASK_BROKER_UNIX", "GAN_TASK_BROKER_TOKEN",
+}
+
+def _task_safe_env(base_env: Dict[str, str]) -> Dict[str, str]:
+    """Keep only non-secret runtime configuration for the task child."""
+    return {key: value for key, value in base_env.items()
+            if key in _TASK_ENV_NAMES or key.startswith("LC_")}
+
+def _task_parent_env(base_env: Dict[str, str]) -> Dict[str, str]:
+    """Keep framework-only proxy metadata for the trusted harness parent."""
+    return {key: value for key, value in base_env.items()
+            if key in _TASK_PARENT_ENV_NAMES or key.startswith("LC_")}
+
+
+
+# Keep this probe deliberately small. It runs under the exact credentials and
+# interpreter used for the questions-only harness, so an inaccessible venv or
+# conda prefix is reported before Python emits an opaque init_fs_encoding error.
+_SANDBOX_RUNTIME_PREFLIGHT = r"""
+import json
+import os
+import sys
+
+expected_euid = int(sys.argv[1])
+expected_egid = int(sys.argv[2])
+errors = []
+if os.geteuid() != expected_euid:
+    errors.append("euid=%s (expected %s)" % (os.geteuid(), expected_euid))
+if os.getegid() != expected_egid:
+    errors.append("egid=%s (expected %s)" % (os.getegid(), expected_egid))
+
+no_new_privs = None
+cap_eff = None
+try:
+    with open("/proc/self/status", encoding="ascii") as status_file:
+        for line in status_file:
+            if line.startswith("NoNewPrivs:"):
+                no_new_privs = line.split(":", 1)[1].strip()
+            elif line.startswith("CapEff:"):
+                cap_eff = line.split(":", 1)[1].strip()
+except OSError as exc:
+    errors.append("cannot read /proc/self/status: %s" % exc)
+if no_new_privs != "1":
+    errors.append("NoNewPrivs=%s (expected 1)" % no_new_privs)
+try:
+    effective_capabilities = int(cap_eff or "-1", 16)
+except ValueError:
+    effective_capabilities = -1
+if effective_capabilities != 0:
+    errors.append("CapEff=%s (expected 0)" % cap_eff)
+
+try:
+    import encodings  # noqa: F401
+except Exception as exc:
+    errors.append("cannot import encodings: %s" % exc)
+
+if not os.path.isabs(sys.executable):
+    errors.append("sys.executable is not absolute: %s" % sys.executable)
+elif not os.path.isfile(sys.executable) or not os.access(sys.executable, os.X_OK):
+    errors.append("sys.executable is not executable: %s" % sys.executable)
+
+if not sys.prefix or not os.path.isdir(sys.prefix):
+    errors.append("sys.prefix is not a directory: %s" % sys.prefix)
+elif not os.access(sys.prefix, os.R_OK | os.X_OK):
+    errors.append("sys.prefix is not accessible: %s" % sys.prefix)
+
+print(json.dumps({
+    "euid": os.geteuid(),
+    "egid": os.getegid(),
+    "no_new_privs": no_new_privs,
+    "cap_eff": cap_eff,
+    "executable": sys.executable,
+    "prefix": sys.prefix,
+    "errors": errors,
+}, sort_keys=True))
+raise SystemExit(1 if errors else 0)
+"""
 
 
 def heal_design_keys(config: Dict[str, Any], role: str,
@@ -253,9 +339,6 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
         src = os.path.join(source_root, "domains", dom)
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(run_dir, "domains", dom), ignore=_DOMAIN_IGNORE)
-    envf = os.path.join(source_root, ".env")
-    if os.path.isfile(envf):
-        shutil.copy2(envf, os.path.join(run_dir, ".env"))
 
     applied = bool(apply_patch(run_dir, patch_str)) if (patch_str or "").strip() else False
     return run_dir, applied
@@ -380,7 +463,8 @@ def prepare_questions(
     return questions_path, ground_truth_by_id
 
 
-def _sandbox_identity(run_dir: str, run_id: str) -> Tuple[str, int, int]:
+def _sandbox_identity(run_dir: str, run_id: str,
+                      expected_owner_uid: Optional[int] = None) -> Tuple[str, int, int]:
     """Prepare a dedicated host uid and return (setpriv, uid, gid)."""
     if os.name != "posix" or not hasattr(os, "chown"):
         raise RuntimeError("the sandbox identity path requires a POSIX host with setpriv and chown")
@@ -406,17 +490,112 @@ def _sandbox_identity(run_dir: str, run_id: str) -> Tuple[str, int, int]:
         )
     setpriv = shutil.which("setpriv")
     if not setpriv:
-        raise RuntimeError("the sandbox identity path requires the util-linux setpriv executable")
+        raise RuntimeError("G6b requires the util-linux setpriv executable")
+    if expected_owner_uid is not None:
+        run_stat = os.lstat(run_dir)
+        if run_stat.st_uid != int(expected_owner_uid) or os.path.islink(run_dir):
+            raise RuntimeError("G6b task run directory has an unexpected owner or type")
 
     output_dir = os.path.join(run_dir, "outputs", run_id)
     os.makedirs(output_dir, exist_ok=True)
     for root, dirs, files in os.walk(run_dir, followlinks=False):
-        os.chown(root, uid, gid)
+        os.chown(root, uid, gid, follow_symlinks=False)
         for name in dirs + files:
             path = os.path.join(root, name)
             if not os.path.islink(path):
-                os.chown(path, uid, gid)
+                os.chown(path, uid, gid, follow_symlinks=False)
     return setpriv, uid, gid
+
+
+def _python_prefix_hint(python_executable: str) -> str:
+    try:
+        executable = os.path.abspath(python_executable)
+        bin_dir = os.path.dirname(executable)
+        if os.path.basename(bin_dir) == "bin":
+            return os.path.dirname(bin_dir)
+    except OSError:
+        pass
+    return str(getattr(sys, "prefix", "<unknown>"))
+
+
+def _sandbox_runtime_preflight(
+    setpriv: str,
+    uid: int,
+    gid: int,
+    username: str,
+    python_executable: str,
+    run_dir: str,
+    env: Dict[str, str],
+    timeout: int,
+) -> None:
+    """Fail early if the sandbox uid cannot start the selected Python."""
+    prefix_hint = _python_prefix_hint(python_executable)
+    probe_cmd = [
+        setpriv,
+        "--reuid", str(uid),
+        "--regid", str(gid),
+        "--clear-groups",
+        "--no-new-privs",
+        "--",
+        python_executable,
+        "-c", _SANDBOX_RUNTIME_PREFLIGHT,
+        str(uid),
+        str(gid),
+    ]
+    descriptor = (
+        f"sandbox username={username!r}, uid={uid}, gid={gid}, "
+        f"Python executable={python_executable!r}, Python prefix={prefix_hint!r}"
+    )
+    try:
+        probe = subprocess.run(
+            probe_cmd,
+            cwd=run_dir,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(1, min(int(timeout), 30)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"G6b sandbox runtime preflight failed ({descriptor}): timed out"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"G6b sandbox runtime preflight failed ({descriptor}): "
+            f"could not launch probe: {exc}"
+        ) from exc
+
+    stdout = (probe.stdout or "").strip()
+    stderr = (probe.stderr or "").strip()
+    payload: Dict[str, Any] = {}
+    for line in reversed(stdout.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(candidate, dict):
+            payload = candidate
+            break
+
+    prefix = str(payload.get("prefix") or prefix_hint)
+    probe_errors = payload.get("errors")
+    if isinstance(probe_errors, list):
+        reason = "; ".join(str(item) for item in probe_errors if str(item))
+    else:
+        reason = ""
+    if probe.returncode != 0:
+        reason = reason or stderr or stdout or f"probe exited with rc={probe.returncode}"
+    elif not payload:
+        reason = stderr or stdout or "probe returned no diagnostic payload"
+    if probe.returncode != 0 or not payload or reason:
+        raise RuntimeError(
+            f"G6b sandbox runtime preflight failed ("
+            f"sandbox username={username!r}, uid={uid}, gid={gid}, "
+            f"Python executable={python_executable!r}, Python prefix={prefix!r}"
+            f"): {reason[-2000:]}"
+        )
 
 
 def run_harness_and_report(
@@ -431,9 +610,45 @@ def run_harness_and_report(
     timeout: int,
     questions_path: Optional[str] = None,
     dataset_root: Optional[str] = None,
+    scope_id: Optional[str] = None,
     log_path: Optional[str] = None,
 ) -> Tuple[int, str]:
     """Run the frozen harness; parent-side reporting happens separately."""
+    broker_socket = env.get("GAN_TASK_BROKER_UNIX")
+    if broker_socket:
+        broker_token = env.get("GAN_TASK_BROKER_TOKEN")
+        if not broker_token or not scope_id:
+            raise RuntimeError("task broker requires a launch capability and generation id")
+        from gan.framework.task_broker import request_task_run
+        return request_task_run(
+            broker_socket, broker_token, str(scope_id), int(timeout),
+        )
+    return _run_harness_and_report_local(
+        python, run_dir, domain, run_id, subset, num_samples, model, env, timeout,
+        questions_path=questions_path, dataset_root=dataset_root,
+        scope_id=scope_id, log_path=log_path,
+    )
+
+
+def _run_harness_and_report_local(
+    python: str,
+    run_dir: str,
+    domain: str,
+    run_id: str,
+    subset: str,
+    num_samples: int,
+    model: str,
+    env: Dict[str, str],
+    timeout: int,
+    questions_path: Optional[str] = None,
+    dataset_root: Optional[str] = None,
+    scope_id: Optional[str] = None,
+    log_path: Optional[str] = None,
+    proxy_socket: Optional[str] = None,
+    proxy_token: Optional[str] = None,
+    expected_owner_uid: Optional[int] = None,
+) -> Tuple[int, str]:
+    """Run a fixed harness command; the privileged broker is its only secure caller."""
     harness_cmd = [
         python, "-m", "domains.harness",
         "--domain", domain,
@@ -442,8 +657,20 @@ def run_harness_and_report(
         "--subset", subset,
         "--num_samples", str(num_samples),
     ]
+    proxy_socket = proxy_socket or env.get("GAN_LLM_PROXY_UNIX")
+    if proxy_socket and proxy_token is None:
+        if not scope_id:
+            raise RuntimeError("LLM proxy task scope requires a generation id")
+        control_token = env.get("GAN_PROXY_CONTROL_TOKEN")
+        if not control_token:
+            raise RuntimeError("LLM proxy task scope requires framework control capability")
+        from gan.framework.llm_proxy import request_task_token
+        proxy_token = request_task_token(
+            proxy_socket, control_token, str(scope_id), model)
     if questions_path:
-        setpriv, uid, gid = _sandbox_identity(run_dir, run_id)
+        setpriv, uid, gid = _sandbox_identity(
+            run_dir, run_id, expected_owner_uid=expected_owner_uid,
+        )
         python_executable = python if os.path.isabs(python) else shutil.which(python)
         if not python_executable:
             raise RuntimeError(f"cannot resolve Python executable: {python}")
@@ -466,8 +693,18 @@ def run_harness_and_report(
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
         harness_cmd.extend(["--dataset_root", os.path.abspath(dataset_root)])
-    child_env = dict(env)
-    child_env.pop(_SANDBOX_USER_ENV, None)
+    if proxy_token:
+        harness_cmd.extend([
+            "--proxy_socket", os.path.abspath(proxy_socket),
+            "--proxy_token", proxy_token,
+        ])
+    child_env = _task_safe_env(env)
+    if questions_path:
+        username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
+        _sandbox_runtime_preflight(
+            setpriv, uid, gid, username, python_executable,
+            run_dir, child_env, timeout,
+        )
     proc = subprocess.run(
         harness_cmd, cwd=run_dir, env=child_env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
