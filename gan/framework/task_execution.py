@@ -623,8 +623,15 @@ def run_harness_and_report(
     dataset_root: Optional[str] = None,
     scope_id: Optional[str] = None,
     log_path: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Tuple[int, str]:
-    """Run the frozen harness; parent-side reporting happens separately."""
+    """Run the frozen harness; parent-side reporting happens separately.
+
+    ``reasoning_effort`` rides as a CLI argument (like ``--model``), never the
+    env. In broker mode the caller's value is ignored ON PURPOSE: the broker's
+    command was fixed at root-side registration from the same models.yaml
+    entry, so both paths derive one consistent value by construction.
+    """
     broker_socket = env.get("GAN_TASK_BROKER_UNIX")
     if broker_socket:
         broker_token = env.get("GAN_TASK_BROKER_TOKEN")
@@ -638,6 +645,7 @@ def run_harness_and_report(
         python, run_dir, domain, run_id, subset, num_samples, model, env, timeout,
         questions_path=questions_path, dataset_root=dataset_root,
         scope_id=scope_id, log_path=log_path,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -658,6 +666,7 @@ def _run_harness_and_report_local(
     proxy_socket: Optional[str] = None,
     proxy_token: Optional[str] = None,
     expected_owner_uid: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Tuple[int, str]:
     """Run a fixed harness command; the privileged broker is its only secure caller."""
     harness_cmd = [
@@ -668,6 +677,9 @@ def _run_harness_and_report_local(
         "--subset", subset,
         "--num_samples", str(num_samples),
     ]
+    if reasoning_effort:
+        # Explicit CLI transport (mirrors --model); never an env variable.
+        harness_cmd.extend(["--reasoning_effort", str(reasoning_effort)])
     proxy_socket = proxy_socket or env.get("GAN_LLM_PROXY_UNIX")
     if proxy_socket and proxy_token is None:
         if not scope_id:
@@ -700,6 +712,8 @@ def _run_harness_and_report_local(
             "--subset", subset,
             "--num_samples", str(num_samples),
         ]
+        if reasoning_effort:
+            harness_cmd.extend(["--reasoning_effort", str(reasoning_effort)])
         harness_cmd.extend(["--questions_path", os.path.abspath(questions_path)])
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.

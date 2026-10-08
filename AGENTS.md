@@ -246,14 +246,28 @@ batch-8 isolation), one subprocess each.
   travels via explicitly SEEDED contextvars (`contextvars.copy_context()`) — a bare
   executor thread would break every context-dependent tool.
 - **Model config**: the single source is `gan/framework/models.yaml`, read only by
-  `gan/framework/models.py` (`resolve/resolve_section/describe`) — a **pure lookup**
-  with NO env, NO fallback and NO precedence chain. Sections: `gan.{task,planner,evaluator}`,
-  `dgmh.{meta,task}`, `domains.<role>` (non-task domain roles only, e.g. the polyglot
-  aider CLI). The **domain task agent shares the driver's task model** and receives it
-  at runtime via an explicit `domains.harness --model ...` argument (never env). The
-  effective model is recorded at runtime (`events.jsonl: model_config` for GAN;
-  `[model_config]` log line for DGM-H; `Node.meta["model"]` per generation). Do not
-  read `models.yaml` anywhere else.
+  `gan/framework/models.py` (`resolve/resolve_entry/resolve_section/describe`) — a
+  **pure lookup** with NO env, NO fallback and NO precedence chain. Sections:
+  `gan.{task,planner,evaluator}`, `dgmh.{meta,task}`, `domains.<role>` (non-task
+  domain roles only, e.g. the polyglot aider CLI). An entry is either a plain
+  model string or a mapping `{model: ..., reasoning_effort: ...}` — `resolve()`
+  always returns the model STRING (all existing consumers unaffected);
+  `resolve_entry()` returns the normalized entry and validates it at startup
+  (unknown mapping keys / unknown `reasoning_effort` values fail before any run).
+  `reasoning_effort` is the gateway's thinking-intensity knob (contract:
+  `low|high|max`, NOT the OpenAI enum; defined as `agent.llm.REASONING_EFFORTS`).
+  It travels EXPLICITLY as a function/CLI argument — never an environment
+  variable: roles get it threaded `build factories -> Role -> chat_with_agent ->
+  get_response_from_llm`; the task child gets it `DomainTaskRunner ->
+  run_harness_and_report -> domains.harness --reasoning_effort -> stdin payload ->
+  TaskAgent` (broker mode: fixed in the root-side broker config from the same
+  models.yaml entry). The **domain task agent shares the driver's task model**
+  and receives it at runtime via an explicit `domains.harness --model ...`
+  argument (never env). The effective model config is recorded at runtime
+  (`events.jsonl: model_config` for GAN, via `describe()` incl. effort;
+  `[model_config]` log line for DGM-H; `Node.meta["model"]` per generation; the
+  proxy audit adds the caller's `reasoning_effort` per call). Do not read
+  `models.yaml` anywhere else.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable. Task
   trajectory visibility is NOT configured here: the loop passes an explicit
   `AccessContext.trajectory_genids` set per session (v4.20) — planner = direct

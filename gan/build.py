@@ -121,9 +121,14 @@ def build_gan_loop(
     repo_root = os.path.abspath(repo_root)
 
     # Single source: gan/framework/models.yaml (no env, no fallback, no overrides).
-    t_model = model_registry.resolve("gan.task")
-    p_model = model_registry.resolve("gan.planner")
-    e_model = model_registry.resolve("gan.evaluator")
+    # resolve_entry() validates the call parameters at STARTUP (unknown
+    # reasoning_effort values fail here, not as a mid-run gateway 400).
+    t_entry = model_registry.resolve_entry("gan.task")
+    p_entry = model_registry.resolve_entry("gan.planner")
+    e_entry = model_registry.resolve_entry("gan.evaluator")
+    t_model, t_effort = t_entry["model"], t_entry.get("reasoning_effort")
+    p_model, p_effort = p_entry["model"], p_entry.get("reasoning_effort")
+    e_model, e_effort = e_entry["model"], e_entry.get("reasoning_effort")
 
     os.makedirs(output_dir, exist_ok=True)
     _seed_self_designs(output_dir)
@@ -136,11 +141,13 @@ def build_gan_loop(
     # (session content and stop records share one file; see loop._refresh_roles).
     def _planner_factory(outer: int, attempt: str):
         return Planner(p_model, output_dir, instance=f"outer_{outer}",
-                       code_root=code_root, attempt_id=attempt)
+                       code_root=code_root, attempt_id=attempt,
+                       reasoning_effort=p_effort)
 
     def _evaluator_factory(outer: int, attempt: str):
         return Evaluator(e_model, output_dir, instance=f"outer_{outer}",
-                         code_root=code_root, attempt_id=attempt)
+                         code_root=code_root, attempt_id=attempt,
+                         reasoning_effort=e_effort)
 
     runner = DomainTaskRunner(
         repo_root=repo_root,
@@ -149,6 +156,11 @@ def build_gan_loop(
         subset=subset,
         num_samples=num_samples,
         default_model=t_model,
+        # Task-child transport: the effort rides the task env (single-purpose
+        # process; mirrors GAN_LLM_TIMEOUT_S). Explicit allowlists in
+        # gan/framework/task_execution.py, domains/harness.py and
+        # domains/task_worker.py carry it into the sandbox.
+        reasoning_effort=t_effort,
         code_root=code_root,
     )
     # Grants/diffs are against the per-run code baseline when code_repo is on;

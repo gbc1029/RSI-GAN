@@ -32,6 +32,15 @@ def _load_design():
 
 
 class TaskAgent(AgentSystem):
+    def __init__(self, model, chat_history_file='./outputs/trajectory.jsonl',
+                 reasoning_effort=None):
+        super().__init__(model, chat_history_file=chat_history_file)
+        # Thinking-intensity knob for this agent's every LLM call (valid values:
+        # agent.llm.REASONING_EFFORTS, gateway contract low|high|max). Threaded
+        # EXPLICITLY from the harness payload / CLI -- no env transport. None
+        # keeps the gateway default.
+        self.reasoning_effort = reasoning_effort
+
     def forward(self, inputs):
         """
         A design-driven agent that solves a given task.
@@ -77,6 +86,7 @@ Respond in JSON format with the following schema (wrap the object in <json>...</
             tools_available=(tools if tools else []),
             tools_dir=(tools_dir if tools else None),
             trajectory_file=getattr(self, "trajectory_file", None),
+            reasoning_effort=self.reasoning_effort,
             # C1: task child lives under the harness QUESTION_TIMEOUT (300s) --
             # a wedged tool must fail at the call level well before the whole
             # question subprocess is killed (S2 fixed the outer timeout; this

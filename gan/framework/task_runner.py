@@ -75,6 +75,7 @@ class DomainTaskRunner:
         python: Optional[str] = None,
         timeout: int = 1800,
         code_root: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         self.repo_root = os.path.abspath(repo_root)
         self.output_dir = os.path.abspath(output_dir)
@@ -83,6 +84,10 @@ class DomainTaskRunner:
         self.subset = subset
         self.num_samples = num_samples
         self.default_model = default_model
+        # Thinking-intensity knob for the task child's every LLM call; rides
+        # the task env (GAN_LLM_REASONING_EFFORT) like GAN_LLM_TIMEOUT_S.
+        # Validated upstream by models.resolve_entry(); None -> gateway default.
+        self.reasoning_effort = reasoning_effort
         self.python = python or sys.executable
         self.timeout = timeout
 
@@ -224,6 +229,9 @@ class DomainTaskRunner:
         question_timeout_s = int(self.domain_cfg.get("question_timeout_s") or 300)
         env["GAN_QUESTION_TIMEOUT_S"] = str(question_timeout_s)
         harness_timeout = self.num_samples * question_timeout_s + 900
+        # NOTE: the thinking-intensity knob is NOT an env variable -- it is
+        # threaded as reasoning_effort= into each run_harness_and_report call
+        # below and travels --reasoning_effort -> payload -> TaskAgent.
 
         # Surface the per-inner task toolset assembly report (written by
         # assemble_task_env into the runtime dir). Recorded as node meta (so the
@@ -265,6 +273,7 @@ class DomainTaskRunner:
                 self.num_samples, model, env, harness_timeout,
                 questions_path=questions_path, scope_id=str(genid),
                 log_path=self.log_path,
+                reasoning_effort=self.reasoning_effort,
             )
             self._event("task_harness_done", genid=str(genid), rc=rc,
                         duration_s=round(time.time() - _t_harness, 1),
@@ -299,6 +308,7 @@ class DomainTaskRunner:
                 self.python, run_dir, self.domain, run_id, self.subset,
                 self.num_samples, model, env, harness_timeout,
                 questions_path=questions_path, scope_id=str(genid), log_path=self.log_path,
+                reasoning_effort=self.reasoning_effort,
             )
             self._event("task_harness_done", genid=str(genid), rc=rc,
                         duration_s=round(time.time() - _t_harness, 1),
@@ -329,6 +339,7 @@ class DomainTaskRunner:
                 self.python, run_dir, self.domain, run_id, self.subset,
                 self.num_samples, model, env, self.timeout,
                 dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
+                reasoning_effort=self.reasoning_effort,
             )
             try:
                 report = tx.run_existing_domain_report(self.domain, output_path, model)

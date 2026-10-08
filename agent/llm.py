@@ -24,6 +24,16 @@ MAX_TOKENS = 32768
 # doomed retries).
 LLM_TIMEOUT_S = float(os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
 
+# Thinking-intensity knob for reasoning models, forwarded to the gateway as the
+# OpenAI-compatible ``reasoning_effort`` body field (verified: litellm forwards
+# it verbatim under drop_params=True; the GAN proxy forwards the body verbatim;
+# the gateway accepts low | high | max). Values are the GATEWAY contract, not
+# the OpenAI enum -- unknown values fail loudly here instead of mid-run.
+# Transport is EXPLICIT ONLY (function argument threaded from
+# gan/framework/models.yaml through the roles / the task harness payload);
+# there is deliberately no environment fallback.
+REASONING_EFFORTS = ("low", "high", "max")
+
 # Usage/cost hooks: registered callbacks receive (model, usage_dict) after every
 # successful LLM call. The GAN reward layer uses this to attach token cost.
 USAGE_HOOKS: list = []
@@ -81,7 +91,18 @@ else:
 litellm.drop_params = True
 
 
-def _completion_kwargs(model, messages, temperature, max_tokens):
+def _reasoning_effort(explicit):
+    """Validate the explicit knob; None keeps the gateway default."""
+    if explicit is None:
+        return None
+    effort = str(explicit).strip().lower()
+    if effort not in REASONING_EFFORTS:
+        raise ValueError(
+            f"reasoning_effort {effort!r} not in {list(REASONING_EFFORTS)}")
+    return effort
+
+
+def _completion_kwargs(model, messages, temperature, max_tokens, reasoning_effort=None):
     """Model-specific completion kwargs (GPT-5 / Claude-Haiku quirks)."""
     kw = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_S}
     # GPT-5 and GPT-5-mini only support default temperature (1); GPT-5.2 does.
@@ -94,6 +115,9 @@ def _completion_kwargs(model, messages, temperature, max_tokens):
         kw["max_tokens"] = min(max_tokens, 4096)
     else:
         kw["max_tokens"] = max_tokens
+    effort = _reasoning_effort(reasoning_effort)
+    if effort is not None:
+        kw["reasoning_effort"] = effort
     return kw
 
 
@@ -109,6 +133,7 @@ def get_response_from_llm(
     temperature: float = 0.0,
     max_tokens: int = MAX_TOKENS,
     msg_history=None,
+    reasoning_effort: str | None = None,
 ) -> Tuple[str, list, dict]:
     if msg_history is None:
         msg_history = []
@@ -122,7 +147,8 @@ def get_response_from_llm(
     new_msg_history = msg_history + [{"role": "user", "content": msg}]
 
     response = litellm.completion(
-        **_completion_kwargs(model, new_msg_history, temperature, max_tokens)
+        **_completion_kwargs(model, new_msg_history, temperature, max_tokens,
+                             reasoning_effort=reasoning_effort)
     )
     _run_usage_hooks(model, response)
     _choice = response['choices'][0]

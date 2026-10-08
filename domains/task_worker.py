@@ -18,6 +18,9 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
+    # does NOT ride the env: it arrives inside the stdin payload.
+    "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
 }
 
 
@@ -189,6 +192,9 @@ def _run_agent_child(result_fd: int) -> None:
     agent = TaskAgent(
         model=payload["model"],
         chat_history_file=payload["trajectory_path"],
+        # Thinking-intensity knob rides the stdin payload (explicit transport,
+        # no env); agent/llm.py validates the value.
+        reasoning_effort=payload.get("reasoning_effort"),
     )
     inputs = payload["inputs"]
     if inputs.get("domain") == "polyglot":

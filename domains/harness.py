@@ -31,6 +31,10 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # timeout plumbing (consumers: QUESTION_TIMEOUT above, agent/llm.py
+    # per-call client budget). The thinking-intensity knob does NOT ride the
+    # env: it is threaded explicitly (CLI --reasoning_effort -> payload).
+    "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
 }
 
 def _task_child_env(base_env):
@@ -190,7 +194,8 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
     return command
 
 
-def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None):
+def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
+                         reasoning_effort=None):
     run_root = os.path.realpath(os.getcwd())
     trajectory_path = os.path.realpath(trajectory_path)
     os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
@@ -209,6 +214,9 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
         "trajectory_path": "/workspace/trajectory.jsonl",
         "proxy_socket": "/workspace/.llm.sock" if proxy_socket else None,
         "proxy_token": proxy_token,
+        # Thinking-intensity knob rides the stdin PAYLOAD (explicit CLI arg ->
+        # payload -> TaskAgent), never the environment.
+        "reasoning_effort": reasoning_effort,
     }
     child_env = _task_child_env(os.environ)
 
@@ -248,18 +256,21 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
 
 def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
               question_id_col, sandbox_task_agent=False, agent_path="./task_agent.py",
-              proxy_socket=None, proxy_token=None):
+              proxy_socket=None, proxy_token=None, reasoning_effort=None):
     question_id = row[question_id_col]
     chat_history_path = os.path.join(evals_folder, f"chat_history_{question_id}.jsonl")
     inputs = format_input_dict(row)
     _t0 = time.time()
     if sandbox_task_agent:
-        prediction = _run_sandboxed_agent(model, inputs, agent_path, chat_history_path, proxy_socket, proxy_token)
+        prediction = _run_sandboxed_agent(model, inputs, agent_path, chat_history_path,
+                                          proxy_socket, proxy_token,
+                                          reasoning_effort=reasoning_effort)
         print(f"[timing] question {question_id}: {time.time() - _t0:.1f}s "
               f"(budget {QUESTION_TIMEOUT}s, {'blank' if not str(prediction).strip() else 'prediction produced'})",
               flush=True)
         return prediction
-    agent = TaskAgent(model=model, chat_history_file=chat_history_path)
+    agent = TaskAgent(model=model, chat_history_file=chat_history_path,
+                      reasoning_effort=reasoning_effort)
     prediction, _ = agent.forward(inputs)
     print(f"[timing] question {question_id}: {time.time() - _t0:.1f}s (in-process)", flush=True)
     return prediction
@@ -336,6 +347,7 @@ def harness(
     questions_path=None,
     proxy_socket=None,
     proxy_token=None,
+    reasoning_effort=None,
 ):
     # Dynamically import functions based on the domain
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
@@ -429,6 +441,7 @@ def harness(
                         format_input_dict, question_id_col,
                         sandbox_task_agent, agent_path,
                         proxy_socket, proxy_token,
+                        reasoning_effort=reasoning_effort,
                     ),
                 )
             )
@@ -563,7 +576,20 @@ if __name__ == "__main__":
     )
     parser.add_argument("--proxy_socket", type=str, default=None)
     parser.add_argument("--proxy_token", type=str, default=None)
+    parser.add_argument(
+        "--reasoning_effort", type=str, default=None,
+        help="Thinking-intensity knob for reasoning models, forwarded as the "
+             "reasoning_effort body field (gateway contract: low|high|max). "
+             "Validated against agent.llm.REASONING_EFFORTS; default = gateway "
+             "default. Resolved from gan/framework/models.yaml by the GAN driver.",
+    )
     args = parser.parse_args()
+    if args.reasoning_effort is not None:
+        # Contract lives in the LLM chokepoint (agent/llm.py); imported lazily
+        # so harness startup stays free of the litellm import cost otherwise.
+        from agent.llm import REASONING_EFFORTS
+        if str(args.reasoning_effort).strip().lower() not in REASONING_EFFORTS:
+            parser.error(f"--reasoning_effort must be one of {list(REASONING_EFFORTS)}")
 
     domain = args.domain
    # Make proofs_dname required for imo_proof_grading
@@ -588,6 +614,7 @@ if __name__ == "__main__":
             questions_path=args.questions_path,
             proxy_socket=args.proxy_socket,
             proxy_token=args.proxy_token,
+            reasoning_effort=args.reasoning_effort,
         )
 
     # Polyglot (Arch 2): questions-only CSV + sandboxed TaskAgent + parent-side
@@ -610,6 +637,7 @@ if __name__ == "__main__":
             questions_path=args.questions_path,
             proxy_socket=args.proxy_socket,
             proxy_token=args.proxy_token,
+            reasoning_effort=args.reasoning_effort,
         )
 
     # Balrog game domains

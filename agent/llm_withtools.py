@@ -5,6 +5,7 @@ import io
 import re
 import sys
 import json
+from functools import partial
 
 from agent.llm import get_response_from_llm
 from agent.tools import load_tools
@@ -350,8 +351,15 @@ def chat_with_agent(
                           # input + identical output cannot produce new information.
                           # Each tool's FIRST call is always exempt (a seat's mandatory
                           # eval-points therefore always complete). 0 disables.
+    reasoning_effort=None,  # Thinking-intensity knob forwarded to EVERY LLM call
+                          # of the session (agent/llm.py contract: low|high|max;
+                          # None -> GAN_LLM_REASONING_EFFORT env -> gateway default).
 ):
-    get_response_fn = get_response_from_llm
+    # One binding covers all call turns below (initial, budget-exhausted,
+    # malformed-feedback, repeat-break, tool-result): the knob is per-SESSION
+    # config, identical on every turn.
+    get_response_fn = partial(get_response_from_llm,
+                              reasoning_effort=reasoning_effort)
     # Construct message
     if msg_history is None:
         msg_history = []

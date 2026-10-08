@@ -174,6 +174,9 @@ class _TaskBrokerState:
                 proxy_token=proxy_token,
                 log_path=os.path.join(self.config["output_dir"], "logs", "task_runner.log"),
                 expected_owner_uid=int(self.config["owner_uid"]),
+                # Fixed at root-side registration (same models.yaml entry as
+                # ``model``): the outer worker cannot influence it.
+                reasoning_effort=self.config.get("reasoning_effort"),
             )
         finally:
             if os.path.isdir(run_dir):

@@ -143,8 +143,14 @@ class Role(AgentSystem):
         instance: Optional[str] = None,
         code_root: Optional[str] = None,
         attempt_id: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         self.role = role
+        # Thinking-intensity knob for this role's every LLM call (resolved from
+        # gan/framework/models.yaml by the loop factory). Explicitly threaded --
+        # planner/evaluator share one worker process, so env cannot separate
+        # them. None -> GAN_LLM_REASONING_EFFORT env -> gateway default.
+        self.reasoning_effort = reasoning_effort
         self.output_dir = os.path.abspath(output_dir)
         self.code_root = code_root
         # Per-generation instance key (e.g. "outer_3"). A role instance is
@@ -315,6 +321,7 @@ class Role(AgentSystem):
                 tools_dir=self.tools_dir,
                 max_tool_calls=max_tool_calls,
                 trajectory_file=path,
+                reasoning_effort=self.reasoning_effort,
                 # Per-CALL budget. Resolution order: explicit arg -> the
                 # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
                 # -> the dispatch default (agent.llm_withtools, 600).

@@ -271,6 +271,10 @@ class ParentLLMProxy:
                          "prompt_tokens": usage.get("prompt_tokens"),
                          "completion_tokens": usage.get("completion_tokens"),
                          "total_tokens": usage.get("total_tokens"),
+                         # Thinking-intensity knob as requested by the caller
+                         # (absent when the client sent none); observability
+                         # only -- it is not part of the model policy check.
+                         "reasoning_effort": body.get("reasoning_effort"),
                          "latency_ms": round((time.monotonic() - started) * 1000, 2)})
 
 

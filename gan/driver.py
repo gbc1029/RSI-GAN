@@ -322,6 +322,9 @@ def run_gan_driver(
         "subset": subset,
         "num_samples": int(num_samples),
         "model": models["task"],
+        # Same models.yaml entry as ``model``; resolve_entry() validated it at
+        # startup. Rides the broker config (like the model), never the env.
+        "reasoning_effort": model_registry.resolve_entry("gan.task").get("reasoning_effort"),
         "python": python_executable,
         "python_prefix": python_prefix,
         "timeout": 1800,

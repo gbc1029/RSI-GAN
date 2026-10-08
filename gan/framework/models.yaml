@@ -4,13 +4,27 @@
 # A model is selected by its ROLE KEY only, and the resolved value is passed
 # explicitly at runtime (e.g. domains/harness `--model`).
 #
+# Entries are either a plain model string or a mapping with a REQUIRED `model`
+# key plus optional call parameters (`reasoning_effort`; gateway contract:
+# low | high | max). `resolve()` always returns the model string; `resolve_entry()`
+# returns the full normalized entry with validation.
+#
 # Part 1 - GAN roles
 # Part 2 - DGM-H roles
 # Part 3 - domain-specific (non-task) roles
 gan:
-  task: openai/glm-5.3-flash
-  planner: openai/glm-5.3-flash
-  evaluator: openai/glm-5.3-flash
+  # task arm is latency-bound (per-question wall budget); low keeps long calls
+  # away from the wall. planner/evaluator are bound by the per-call client
+  # budget instead, so they take the higher-effort thinking mode.
+  task:
+    model: openai/glm-5.3-flash
+    reasoning_effort: low
+  planner:
+    model: openai/glm-5.3-flash
+    reasoning_effort: high
+  evaluator:
+    model: openai/glm-5.3-flash
+    reasoning_effort: high
 
 dgmh:
   meta: openai/claude-sonnet-4-5-20250929
