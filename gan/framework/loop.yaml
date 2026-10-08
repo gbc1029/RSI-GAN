@@ -13,11 +13,11 @@ loop:
   stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
   stagnation_epsilon: 0.005     # delta score threshold
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
-  self_improve_max_tool_calls: 30  # tool-call budget for role self-improvement
-  plan_max_tool_calls: 40          # tool-call budget for the PLAN seat (planner only;
+  self_improve_max_tool_calls: 5  # tool-call budget for role self-improvement
+  plan_max_tool_calls: 6          # tool-call budget for the PLAN seat (planner only;
                                    # the evaluate seat has its own key below -- it must
                                    # at minimum complete its mandatory eval-points)
-  evaluate_max_tool_calls: 20     # tool-call budget for the EVALUATE seat (blind phase;
+  evaluate_max_tool_calls: 8      # tool-call budget for the EVALUATE seat (blind phase;
                                    # the reveal phase gets a third of it, min 6). Must
                                    # cover: eval-points sweep + record/report/judge_fix.
   tool_repeat_limit: 3             # anti-thrash: >= this many CONSECUTIVE identical
