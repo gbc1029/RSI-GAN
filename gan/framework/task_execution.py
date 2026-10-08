@@ -42,6 +42,12 @@ _DOMAIN_IGNORE = shutil.ignore_patterns(
 # Allowlist of what a task run actually needs (never copy the whole repo).
 _RUNTIME_FILES = ["task_agent.py"]
 _RUNTIME_DIRS = ["agent", "utils"]
+# Polyglot (Arch 2): the FROZEN framework layer must be importable by task
+# toolset components inside the per-question bwrap sandbox (the write_file
+# component delegates to gan.framework.sandbox_write). Copied whole-directory
+# -- the same trust tier as agent/ and utils/ -- minus yamls: the child needs
+# none, and this keeps domain score keys out of the sandbox entirely.
+_SANDBOX_FRAMEWORK_IGNORE = shutil.ignore_patterns("*.yaml", "__pycache__", "*.pyc")
 _HARNESS_FILES = [
     "domains/__init__.py",
     "domains/harness.py",
@@ -339,6 +345,14 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
         src = os.path.join(source_root, "domains", dom)
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(run_dir, "domains", dom), ignore=_DOMAIN_IGNORE)
+    if domain == "polyglot":
+        gan_init = os.path.join(source_root, "gan", "__init__.py")
+        fw_src = os.path.join(source_root, "gan", "framework")
+        if os.path.isfile(gan_init) and os.path.isdir(fw_src):
+            os.makedirs(os.path.join(run_dir, "gan"), exist_ok=True)
+            shutil.copy2(gan_init, os.path.join(run_dir, "gan", "__init__.py"))
+            shutil.copytree(fw_src, os.path.join(run_dir, "gan", "framework"),
+                            ignore=_SANDBOX_FRAMEWORK_IGNORE)
 
     applied = bool(apply_patch(run_dir, patch_str)) if (patch_str or "").strip() else False
     return run_dir, applied

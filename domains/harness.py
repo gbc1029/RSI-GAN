@@ -166,6 +166,14 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
             "--ro-bind", runtime_dir,
             "/workspace/.gan_runtime",
         ])
+    # Arch 2 (polyglot): the FROZEN framework layer must be importable by task
+    # toolset components (the write_file component delegates to
+    # gan.framework.sandbox_write). Bound whole-directory read-only -- the same
+    # trust tier as agent/ and utils/ and the same wholesale-bind pattern.
+    # Legacy direct-harness runs have no gan/ tree, so conditional, not fatal.
+    gan_dir = os.path.join(run_root, "gan")
+    if os.path.isdir(gan_dir):
+        command.extend(["--ro-bind", gan_dir, "/workspace/gan"])
     command.extend([
         # Expose only this question's trajectory file, never outputs/ or other
         # questions' trajectories, which may themselves contain benchmark data.
