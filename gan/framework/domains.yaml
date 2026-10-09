@@ -60,6 +60,18 @@ domains:
 
   search_arena:
     score_key: overall_accuracy
+    # Same interface contract as paper_review: the task plus the required
+    # answer form. The scorer matches the prediction string exactly against
+    # the dataset label, so the brief MUST carry the label vocabulary
+    # (model_a / model_b): without it the agent answers in prose and every
+    # prediction scores 0 regardless of quality (observed: 71% correct by
+    # lenient extraction, scored 0/24 as free text).
+    task_brief: >-
+      This is a side-by-side comparison from a chatbot arena: you are given
+      one user conversation and two anonymous candidate responses, presented
+      as messages_a and messages_b. Judge which response is better for the
+      user and say why briefly. Your final answer must be exactly one
+      identifier: model_a or model_b.
     splits: [train, val]
     ensembled: true
     eval_subset: _filtered_100_train
