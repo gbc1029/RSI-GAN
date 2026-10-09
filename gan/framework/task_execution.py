@@ -66,6 +66,8 @@ _TASK_ENV_NAMES = {
     # timeout plumbing (consumers: domains/harness.py QUESTION_TIMEOUT,
     # agent/llm.py per-call client budget)
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
+    # litellm offline cost map (no github egress; set by run_gan.py)
+    "LITELLM_LOCAL_MODEL_COST_MAP",
 }
 _TASK_PARENT_ENV_NAMES = _TASK_ENV_NAMES | {
     "GAN_LLM_PROXY_UNIX", "GAN_TASK_BROKER_UNIX", "GAN_TASK_BROKER_TOKEN",

@@ -39,6 +39,8 @@ def _outer_env(base: Dict[str, str], *, proxy_socket: str,
         "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
         "PYTHONPATH", "PYTHONDONTWRITEBYTECODE",
         "CUDA_VISIBLE_DEVICES",
+        # litellm offline cost map (no github egress); set by run_gan.py
+        "LITELLM_LOCAL_MODEL_COST_MAP",
     }
     env = {k: v for k, v in base.items()
            if k in allowed or k.startswith("LC_")}

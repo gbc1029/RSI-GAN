@@ -75,6 +75,16 @@ COPY ./setup_env.sh /root/
 RUN chmod +x /root/setup_env.sh
 RUN /bin/bash -c "source ~/.bashrc && /root/setup_env.sh"
 
+# Bake the agent runtime requirements into the environment image ONCE.
+# Without this every task container re-downloaded requirements.txt at run
+# time (~85s per task, network-bound); the env image is shared by all tasks,
+# so the install amortizes to zero per task. Consumed by
+# harness.process_entry via the label below (old env images without the
+# label keep the runtime install path).
+COPY ./requirements.txt /hyperagents_meta/requirements.txt
+RUN python -m pip install --no-cache-dir -r /hyperagents_meta/requirements.txt
+LABEL {req_bake_label}="1"
+
 WORKDIR /testbed/
 
 # Automatically activate the testbed environment
@@ -99,8 +109,14 @@ def get_dockerfile_base(platform, arch):
     return _DOCKERFILE_BASE.format(conda_arch=conda_arch)
 
 
+# Label marking an env image whose agent requirements are baked in. Runtime
+# task containers created from a labeled image skip the per-task pip install.
+REQ_BAKE_LABEL = "com.hyperagents.polyglot.req_baked"
+
+
 def get_dockerfile_env(platform, arch):
-    return _DOCKERFILE_ENV.format(platform=platform, arch=arch)
+    return _DOCKERFILE_ENV.format(platform=platform, arch=arch,
+                                  req_bake_label=REQ_BAKE_LABEL)
 
 
 def get_dockerfile_instance(platform, env_image_name):

@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+from pathlib import Path
 
 from dataclasses import dataclass
 from typing import Any, Union, cast
@@ -119,13 +120,21 @@ class TestSpec:
     @property
     def env_image_key(self):
         """
-        The key for the environment image is based on the hash of the environment script list.
-        If the environment script list changes, the image will be rebuilt automatically.
+        The key for the environment image is based on the hash of the environment script list
+        PLUS the agent requirements.txt baked into the image (content-addressed:
+        either input changing triggers exactly one rebuild; stale env images
+        remain valid for older code because the old tag is still derivable
+        from the same inputs).
 
         Note that old images are not automatically deleted, so consider cleaning up old images periodically.
         """
         hash_object = hashlib.sha256()
         hash_object.update(str(self.env_script_list).encode("utf-8"))
+        try:
+            req_path = Path(__file__).resolve().parents[2] / "requirements.txt"
+            hash_object.update(b"|req:" + req_path.read_bytes())
+        except OSError:
+            hash_object.update(b"|req:<missing>")
         hash_value = hash_object.hexdigest()
         val = hash_value[:22]  # 22 characters is still very likely to be unique
         return f"pb.env.{self.arch}.{val}:latest"

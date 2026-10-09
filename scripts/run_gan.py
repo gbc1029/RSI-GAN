@@ -43,6 +43,11 @@ def main():
                    help="Run all outers in one process WITHOUT the per-run code repo (legacy).")
     args = p.parse_args()
 
+    # litellm offline cost map: the deployment has no github egress, so the
+    # remote fetch burns ~10s of retries in every process before falling back
+    # to the bundled copy. Opt-out by exporting it explicitly.
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
     # --domains: the single domain entry. Multi-value / empty are rejected here,
     # BEFORE any task execution. (Multi-domain evaluation is not implemented yet;
     # this parse shape is kept so the future extension is additive.)

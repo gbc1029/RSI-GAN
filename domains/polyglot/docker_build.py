@@ -300,6 +300,11 @@ def build_env_images(
 
     # Build the environment images
     successful, failed = list(), list()
+    # Stage the agent requirements into every env build context: the env
+    # dockerfile bakes them once per image (see _DOCKERFILE_ENV) so task
+    # containers no longer pip-install at run time. Missing file -> the build
+    # fails loudly (the COPY would fail anyway); better here than mid-build.
+    repo_requirements = (Path(__file__).resolve().parents[2] / "requirements.txt").read_text()
     with tqdm(
         total=len(configs_to_build), smoothing=0, desc="Building environment images"
     ) as pbar:
@@ -309,7 +314,8 @@ def build_env_images(
                 executor.submit(
                     build_image,
                     image_name,
-                    {"setup_env.sh": config["setup_script"]},
+                    {"setup_env.sh": config["setup_script"],
+                     "requirements.txt": repo_requirements},
                     config["dockerfile"],
                     config["platform"],
                     client,

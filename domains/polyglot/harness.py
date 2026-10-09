@@ -11,6 +11,7 @@ import docker
 from datasets import load_dataset
 
 from utils.constants import REPO_NAME
+from domains.polyglot.dockerfiles import REQ_BAKE_LABEL
 from utils.common import load_json_file
 from domains.polyglot.testrepo_prompt import get_test_description
 from domains.polyglot.test_spec import make_test_spec
@@ -127,10 +128,16 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
                     exec_result = container.exec_run(f"rm /{REPO_NAME}/parent_patch.txt", workdir='/')
                     log_container_output(exec_result)
 
-            # Install this repo requirements
-            safe_log("Installing more requirements")
-            exec_result = container.exec_run(f"python -m pip install -r /{REPO_NAME}/requirements.txt", workdir='/')
-            log_container_output(exec_result)
+            # Install this repo requirements — SKIPPED when the env image
+            # already baked them (REQ_BAKE_LABEL; ~85s/task saved). Old env
+            # images without the label keep the runtime install path.
+            _img_labels = getattr(getattr(container, "image", None), "labels", None) or {}
+            if str(_img_labels.get(REQ_BAKE_LABEL, "")) == "1":
+                safe_log("Requirements already baked into the env image; skipping runtime install")
+            else:
+                safe_log("Installing more requirements")
+                exec_result = container.exec_run(f"python -m pip install -r /{REPO_NAME}/requirements.txt", workdir='/')
+                log_container_output(exec_result)
 
             # Run the agent
             env_vars = {
@@ -140,6 +147,10 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
                 # deployment assumed api.openai.com, where the key alone suffices).
                 "OPENAI_API_BASE": os.getenv('OPENAI_API_BASE', ''),
                 "METAGEN_ACCESS_TOKEN": os.getenv('METAGEN_ACCESS_TOKEN'),
+                # Offline cost map: the container has no github access, and
+                # litellm otherwise burns ~10s on 3 failed fetch retries per
+                # agent process before falling back to its local copy.
+                "LITELLM_LOCAL_MODEL_COST_MAP": "True",
             }
             safe_log("Running the agent")
             cmd = [
