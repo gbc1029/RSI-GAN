@@ -125,7 +125,14 @@ batch-8 isolation), one subprocess each.
   outer's plan/evaluate/self_improve, and cleared at each outer start.
 - **Scheduling is single-chain**: no accept/reject and no parent selection for
   planner/evaluator. Each outer saves a checkpoint; the next outer starts from the
-  previous checkpoint's design. `outer_improved` is logged, not enforced.
+  previous checkpoint's design. `outer_improved` is logged, not enforced. The two
+  role SELF-IMPROVE sessions inside one outer run in PARALLEL threads (their write
+  surfaces are seat-disjoint by `frozen.SEAT_WRITE`); only the fast patch
+  apply+commit serializes on `code_repo._TREE_LOCK`, and commits stage only the
+  patch's own files (attribution-clean). Role sessions carry their proxy
+  credential as an explicit `api_key` argument and the toolset load-report sink as
+  an explicit parameter — never process-global `os.environ` swaps;
+  `AccessBroker.last_result` is thread-local.
 - **Output layout** (`gan/framework/paths.py`, the single source): `ckpt/`
   (recovery + `code/` per-run git tree + `code.json` manifest + `design/`), `logs/`
   (`events.jsonl`, `*_tree.jsonl`, `*.log`),

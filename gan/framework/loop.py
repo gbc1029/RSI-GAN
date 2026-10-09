@@ -39,6 +39,7 @@ import json
 import os
 import shutil
 import statistics
+import threading
 import time
 import uuid
 from copy import deepcopy
@@ -1220,32 +1221,62 @@ class GanLoop:
                 p = getattr(last, "parent_genid", None) if last is not None else None
                 if p is not None and str(p) != "initial" and p not in si_refs:
                     si_refs.append(p)
-            try:
-                res = self.evaluator.self_improve(recent={**recent_eval, "receipt": self._self_receipts.get("evaluator")},
-                                                  broker=self.broker,
-                                                  max_tool_calls=self.self_improve_max_tool_calls,
-                                                  tool_repeat_limit=self.tool_repeat_limit,
-                                                  trajectory_genids=si_refs,
-                                                  patch_retry_k=self.patch_retry_k)
-                self._apply_self_patch("evaluator", outer, res)
-                self._make_self_receipt("evaluator", outer, res)
-            except code_repo.RepoIntegrityError:
-                raise  # undefined code tree: never degrade to self_improve_error
-            except Exception as e:
-                self.log_event({"type": "self_improve_error", "role": "evaluator", "error": str(e)})
-            try:
-                res = self.planner.self_improve(recent={**recent_plan, "receipt": self._self_receipts.get("planner")},
-                                                broker=self.broker,
-                                                max_tool_calls=self.self_improve_max_tool_calls,
-                                                tool_repeat_limit=self.tool_repeat_limit,
-                                                trajectory_genids=si_refs,
-                                                patch_retry_k=self.patch_retry_k)
-                self._apply_self_patch("planner", outer, res)
-                self._make_self_receipt("planner", outer, res)
-            except code_repo.RepoIntegrityError:
-                raise  # undefined code tree: never degrade to self_improve_error
-            except Exception as e:
-                self.log_event({"type": "self_improve_error", "role": "planner", "error": str(e)})
+            # The two self-improve sessions are INDEPENDENT (each role reads its
+            # own trajectory/design and writes only its own seat surface --
+            # frozen.SEAT_WRITE guarantees the path sets are disjoint) and run
+            # in PARALLEL threads; the expensive part is the LLM session, while
+            # the fast apply+commit step serializes on code_repo._TREE_LOCK.
+            # RepoIntegrityError still aborts the run; any other error degrades
+            # to self_improve_error exactly as before.
+            session_results: Dict[str, Any] = {}
+            session_errors: Dict[str, Exception] = {}
+
+            def _self_session(role: str, recent_payload: Dict[str, Any],
+                              role_obj: Any, prev_receipt: Any) -> None:
+                try:
+                    session_results[role] = role_obj.self_improve(
+                        recent={**recent_payload, "receipt": prev_receipt},
+                        broker=self.broker,
+                        max_tool_calls=self.self_improve_max_tool_calls,
+                        tool_repeat_limit=self.tool_repeat_limit,
+                        trajectory_genids=si_refs,
+                        patch_retry_k=self.patch_retry_k)
+                except Exception as e:  # noqa: BLE001 -- classified after join
+                    session_errors[role] = e
+
+            workers = [
+                threading.Thread(target=_self_session,
+                                 args=("evaluator", recent_eval, self.evaluator,
+                                       self._self_receipts.get("evaluator")),
+                                 name="self-improve-evaluator"),
+                threading.Thread(target=_self_session,
+                                 args=("planner", recent_plan, self.planner,
+                                       self._self_receipts.get("planner")),
+                                 name="self-improve-planner"),
+            ]
+            for t in workers:
+                t.start()
+            for t in workers:
+                t.join()
+            # RepoIntegrityError from either session: undefined code tree -- the
+            # whole run must abort rather than continue on an unqualified tree.
+            for role in ("evaluator", "planner"):
+                err = session_errors.get(role)
+                if isinstance(err, code_repo.RepoIntegrityError):
+                    raise err
+            for role in ("evaluator", "planner"):
+                err = session_errors.get(role)
+                if err is not None:
+                    self.log_event({"type": "self_improve_error", "role": role,
+                                    "error": str(err)})
+            # Apply in the historical fixed order (evaluator first) so event
+            # ordering and receipts keep their pre-parallel semantics. The
+            # applies themselves serialize on the code_repo tree lock.
+            for role in ("evaluator", "planner"):
+                res = session_results.get(role)
+                if res is not None:
+                    self._apply_self_patch(role, outer, res)
+                    self._make_self_receipt(role, outer, res)
 
             # Acceptance: none. Single chain — the self-improved design is kept and
             # becomes the active design for the next outer's fresh instances.

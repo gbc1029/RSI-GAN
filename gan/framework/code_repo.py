@@ -15,9 +15,19 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from gan.framework import frozen
+
+# Tree-level mutation lock. Parallel role self-improvement sessions commit to
+# the SAME git tree; the git layer is tree-global regardless of how disjoint
+# the patch CONTENT is (``add -A``/``commit`` share one index; the registry
+# before/after snapshots read the whole tree; the stale index.lock cleanup
+# would delete a concurrent writer's LIVE lock). The expensive LLM sessions
+# stay parallel -- only this fast validate/apply/commit section serializes
+# (measured: ~0.1-2s per patch). RLock: entry points may nest.
+_TREE_LOCK = threading.RLock()
 
 # What is copied into the per-run code tree. Only what the worker/roles/task
 # actually need at runtime (no README / requirements / scripts: never edited,
@@ -49,7 +59,9 @@ def _git(code_root: str, *args: str, check: bool = True) -> subprocess.Completed
     return r
 
 
-def _git_commit(code_root: str, message: str) -> str:
+def _git_commit(code_root: str, message: str, paths: Optional[List[str]] = None) -> str:
+    # Callers hold _TREE_LOCK: the index.lock cleanup below only fires when no
+    # in-process writer can own the lock (a leftover from a crashed run).
     lock = os.path.join(code_root, ".git", "index.lock")
     if os.path.exists(lock):
         try:
@@ -59,7 +71,12 @@ def _git_commit(code_root: str, message: str) -> str:
     last = None
     for _ in range(2):
         try:
-            _git(code_root, "add", "-A")
+            if paths:
+                # Stage ONLY the patch's own files: commits stay
+                # attribution-clean even if something else is dirty in the tree.
+                _git(code_root, "add", "--", *paths)
+            else:
+                _git(code_root, "add", "-A")
             last = None
             break
         except RuntimeError as e:
@@ -130,8 +147,8 @@ def current_commit(code_root: str) -> str:
         ) from e
 
 
-def commit(code_root: str, message: str) -> str:
-    return _git_commit(code_root, message)
+def commit(code_root: str, message: str, paths: Optional[List[str]] = None) -> str:
+    return _git_commit(code_root, message, paths=paths)
 
 
 def checkout(code_root: str, sha: Optional[str]) -> None:
@@ -526,34 +543,35 @@ def check_patch(code_root: str, patch: str, strict_unparseable: bool = True,
     """
     if not (patch or "").strip():
         return True, ""
-    files = changed_files(patch)
-    if role is not None:
-        for f in files:
-            if not frozen.is_allowed(role, f, "modify", seat=seat):
-                return False, f"patch touches non-editable path for {role}: {f}"
-    prev = current_commit(code_root)
-    before = registry_report(code_root)
-    before_schema = schema_ext_report(code_root)
-    ok, apply_err = apply_patch_detail(code_root, patch)
-    if not ok:
+    with _TREE_LOCK:
+        files = changed_files(patch)
+        if role is not None:
+            for f in files:
+                if not frozen.is_allowed(role, f, "modify", seat=seat):
+                    return False, f"patch touches non-editable path for {role}: {f}"
+        prev = current_commit(code_root)
+        before = registry_report(code_root)
+        before_schema = schema_ext_report(code_root)
+        ok, apply_err = apply_patch_detail(code_root, patch)
+        if not ok:
+            _hard_rollback(code_root, prev)
+            return False, f"patch failed to apply: {apply_err}"
+        ok, err = validate_python(code_root, files)
+        if not ok:
+            _hard_rollback(code_root, prev)
+            return False, f"compile failed: {err}"
+        from gan.framework.ast_checker import validate_files as validate_ast_policy
+        policy_issues = validate_ast_policy(code_root, files)
+        if policy_issues:
+            _hard_rollback(code_root, prev)
+            return False, "unsafe capability in agent source: " + "; ".join(policy_issues[:8])
+        reason = ""
+        if _needs_registry_check(files):
+            reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
+            if not reason:
+                reason = _schema_ext_worsened(before_schema, schema_ext_report(code_root))
         _hard_rollback(code_root, prev)
-        return False, f"patch failed to apply: {apply_err}"
-    ok, err = validate_python(code_root, files)
-    if not ok:
-        _hard_rollback(code_root, prev)
-        return False, f"compile failed: {err}"
-    from gan.framework.ast_checker import validate_files as validate_ast_policy
-    policy_issues = validate_ast_policy(code_root, files)
-    if policy_issues:
-        _hard_rollback(code_root, prev)
-        return False, "unsafe capability in agent source: " + "; ".join(policy_issues[:8])
-    reason = ""
-    if _needs_registry_check(files):
-        reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
-        if not reason:
-            reason = _schema_ext_worsened(before_schema, schema_ext_report(code_root))
-    _hard_rollback(code_root, prev)
-    return (reason == ""), reason
+        return (reason == ""), reason
 
 
 def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
@@ -568,30 +586,31 @@ def apply_code_patch(code_root: str, role: str, patch: str, commit_msg: str,
     for f in files:
         if not frozen.is_allowed(role, f, "modify", seat=seat):
             raise PatchRejected(f"patch touches non-editable path for {role}: {f}")
-    prev = current_commit(code_root)
-    before = registry_report(code_root)
-    before_schema = schema_ext_report(code_root)
-    ok, apply_err = apply_patch_detail(code_root, patch)
-    if not ok:
-        _hard_rollback(code_root, prev)
-        raise PatchRejected(f"patch failed to apply: {apply_err}")
-    ok, err = validate_python(code_root, files)
-    if not ok:
-        _hard_rollback(code_root, prev)
-        raise PatchRejected(f"compile failed: {err}")
-    from gan.framework.ast_checker import validate_files as validate_ast_policy
-    policy_issues = validate_ast_policy(code_root, files)
-    if policy_issues:
-        _hard_rollback(code_root, prev)
-        raise PatchRejected("unsafe capability in agent source: " + "; ".join(policy_issues[:8]))
-    if _needs_registry_check(files):
-        reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
-        if not reason:
-            reason = _schema_ext_worsened(before_schema, schema_ext_report(code_root))
-        if reason:
+    with _TREE_LOCK:
+        prev = current_commit(code_root)
+        before = registry_report(code_root)
+        before_schema = schema_ext_report(code_root)
+        ok, apply_err = apply_patch_detail(code_root, patch)
+        if not ok:
             _hard_rollback(code_root, prev)
-            raise PatchRejected(reason)
-    return commit(code_root, commit_msg)
+            raise PatchRejected(f"patch failed to apply: {apply_err}")
+        ok, err = validate_python(code_root, files)
+        if not ok:
+            _hard_rollback(code_root, prev)
+            raise PatchRejected(f"compile failed: {err}")
+        from gan.framework.ast_checker import validate_files as validate_ast_policy
+        policy_issues = validate_ast_policy(code_root, files)
+        if policy_issues:
+            _hard_rollback(code_root, prev)
+            raise PatchRejected("unsafe capability in agent source: " + "; ".join(policy_issues[:8]))
+        if _needs_registry_check(files):
+            reason = _registry_worsened(before, registry_report(code_root), strict=strict_unparseable)
+            if not reason:
+                reason = _schema_ext_worsened(before_schema, schema_ext_report(code_root))
+            if reason:
+                _hard_rollback(code_root, prev)
+                raise PatchRejected(reason)
+        return commit(code_root, commit_msg, paths=files)
 
 
 def apply_self_patch(code_root: str, role: str, patch: str, *, seat: str) -> str:
@@ -611,20 +630,21 @@ def apply_task_patch(code_root: str, role: str, patch: str, genid: Any,
 
     Returns ``{"code_commit", "base_commit", "applied", "ref_ok", "ref_mode"}``.
     """
-    base_commit = checkout_base(code_root, base)
-    applied = False
-    if (patch or "").strip():
-        try:
-            sha = apply_code_patch(code_root, role, patch,
-                                   f"task gen {genid} parent {parent_genid}",
-                                   seat=seat)
-            applied = True
-        except PatchRejected:
-            _hard_rollback(code_root, base_commit)
-            sha = base_commit  # node's code state == parent's code (no lineage gap)
-    else:
-        sha = current_commit(code_root)
-    ref_ok, ref_mode = ensure_branch(code_root, task_ref_name(genid), sha)
+    with _TREE_LOCK:
+        base_commit = checkout_base(code_root, base)
+        applied = False
+        if (patch or "").strip():
+            try:
+                sha = apply_code_patch(code_root, role, patch,
+                                       f"task gen {genid} parent {parent_genid}",
+                                       seat=seat)
+                applied = True
+            except PatchRejected:
+                _hard_rollback(code_root, base_commit)
+                sha = base_commit  # node's code state == parent's code (no lineage gap)
+        else:
+            sha = current_commit(code_root)
+        ref_ok, ref_mode = ensure_branch(code_root, task_ref_name(genid), sha)
     return {"code_commit": sha, "base_commit": base_commit, "applied": applied,
             "ref_ok": ref_ok, "ref_mode": ref_mode}
 

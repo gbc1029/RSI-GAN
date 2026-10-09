@@ -106,9 +106,15 @@ def _reasoning_effort(explicit):
     return effort
 
 
-def _completion_kwargs(model, messages, temperature, max_tokens, reasoning_effort=None):
+def _completion_kwargs(model, messages, temperature, max_tokens,
+                       reasoning_effort=None, api_key=None):
     """Model-specific completion kwargs (GPT-5 / Claude-Haiku quirks)."""
     kw = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_S}
+    # Explicit per-caller credential (GAN roles under the shared proxy: each
+    # role carries its own scoped token; threads must NEVER rely on the
+    # process-global OPENAI_API_KEY, which a concurrent session could swap).
+    if api_key:
+        kw["api_key"] = api_key
     # GPT-5 and GPT-5-mini only support default temperature (1); GPT-5.2 does.
     if model not in ["openai/gpt-5", "openai/gpt-5-mini"]:
         kw["temperature"] = temperature
@@ -138,6 +144,7 @@ def get_response_from_llm(
     max_tokens: int = MAX_TOKENS,
     msg_history=None,
     reasoning_effort: str | None = None,
+    api_key: str | None = None,
 ) -> Tuple[str, list, dict]:
     if msg_history is None:
         msg_history = []
@@ -152,7 +159,7 @@ def get_response_from_llm(
 
     response = litellm.completion(
         **_completion_kwargs(model, new_msg_history, temperature, max_tokens,
-                             reasoning_effort=reasoning_effort)
+                             reasoning_effort=reasoning_effort, api_key=api_key)
     )
     _run_usage_hooks(model, response)
     _choice = response['choices'][0]

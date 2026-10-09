@@ -353,13 +353,19 @@ def chat_with_agent(
                           # eval-points therefore always complete). 0 disables.
     reasoning_effort=None,  # Thinking-intensity knob forwarded to EVERY LLM call
                           # of the session (agent/llm.py contract: low|high|max;
-                          # None -> GAN_LLM_REASONING_EFFORT env -> gateway default).
+                          # None -> gateway default).
+    api_key=None,  # Explicit per-session credential (GAN role proxy token).
+                          # Threaded instead of the process-global OPENAI_API_KEY
+                          # so concurrent role sessions cannot swap each other's
+                          # credentials; None -> ambient env (legacy callers).
+    load_report_path=None,  # Explicit sink for the toolset LOAD outcome; None
+                          # -> $GAN_TOOLS_LOAD_REPORT env fallback (legacy).
 ):
     # One binding covers all call turns below (initial, budget-exhausted,
     # malformed-feedback, repeat-break, tool-result): the knob is per-SESSION
     # config, identical on every turn.
     get_response_fn = partial(get_response_from_llm,
-                              reasoning_effort=reasoning_effort)
+                              reasoning_effort=reasoning_effort, api_key=api_key)
     # Construct message
     if msg_history is None:
         msg_history = []
@@ -369,7 +375,8 @@ def chat_with_agent(
 
     try:
         # Load all tools
-        all_tools = load_tools(logging=logging, names=tools_available, tools_dir=tools_dir)
+        all_tools = load_tools(logging=logging, names=tools_available,
+                               tools_dir=tools_dir, report_path=load_report_path)
         tools_dict = {tool['info']['name']: tool for tool in all_tools}
         system_msg = f"{get_tooluse_prompt([tool['info'] for tool in all_tools])}\n\n"
 

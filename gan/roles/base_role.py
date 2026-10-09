@@ -298,47 +298,39 @@ class Role(AgentSystem):
         # report only proves what was copied; this catches the files that never
         # imported (or lost their tool API) and folds them into `assembly_report`
         # so the role's next session sees the real capability set.
+        # CONCURRENCY: both the credential and the report sink travel as EXPLICIT
+        # arguments -- Role sessions may now run in parallel threads, and any
+        # process-global os.environ swap would let one session steal the other's
+        # proxy token or redirect its load report (observed failure class).
         load_report_path = os.path.join(
             paths.logs_dir(self.output_dir),
             f"tools_load_{self.role}_{self.instance or 'default'}.json")
-        prev_sink = os.environ.get("GAN_TOOLS_LOAD_REPORT")
-        os.environ["GAN_TOOLS_LOAD_REPORT"] = load_report_path
+        # Scoped proxy credential for THIS role (framework-injected via env at
+        # worker start; read-only here). Sent per call as an explicit api_key.
+        proxy_token = os.environ.get(f"GAN_PROXY_{self.role.upper()}_TOKEN")
         chat_kwargs = {}
         if tool_repeat_limit is not None:
             chat_kwargs["tool_repeat_limit"] = tool_repeat_limit
-        token_name = f"GAN_PROXY_{self.role.upper()}_TOKEN"
-        proxy_token = os.environ.get(token_name)
-        prev_api_key = os.environ.get("OPENAI_API_KEY")
-        if proxy_token:
-            os.environ["OPENAI_API_KEY"] = proxy_token
-        try:
-            hist, info = chat_with_agent(
-                full_msg,
-                model=self.model,
-                msg_history=msg_history or [],
-                logging=self.log,
-                tools_available=tools_available,
-                tools_dir=self.tools_dir,
-                max_tool_calls=max_tool_calls,
-                trajectory_file=path,
-                reasoning_effort=self.reasoning_effort,
-                # Per-CALL budget. Resolution order: explicit arg -> the
-                # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
-                # -> the dispatch default (agent.llm_withtools, 600).
-                tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
-                                else getattr(self, "tool_timeout_s", None)),
-                return_info=True,
-                **chat_kwargs,
-            )
-        finally:
-            if prev_api_key is None:
-                os.environ.pop("OPENAI_API_KEY", None)
-            else:
-                os.environ["OPENAI_API_KEY"] = prev_api_key
-            if prev_sink is None:
-                os.environ.pop("GAN_TOOLS_LOAD_REPORT", None)
-            else:
-                os.environ["GAN_TOOLS_LOAD_REPORT"] = prev_sink
+        hist, info = chat_with_agent(
+            full_msg,
+            model=self.model,
+            msg_history=msg_history or [],
+            logging=self.log,
+            tools_available=tools_available,
+            tools_dir=self.tools_dir,
+            max_tool_calls=max_tool_calls,
+            trajectory_file=path,
+            reasoning_effort=self.reasoning_effort,
+            api_key=proxy_token,
+            load_report_path=load_report_path,
+            # Per-CALL budget. Resolution order: explicit arg -> the
+            # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
+            # -> the dispatch default (agent.llm_withtools, 600).
+            tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
+                            else getattr(self, "tool_timeout_s", None)),
+            return_info=True,
+            **chat_kwargs,
+        )
         self._merge_load_report(load_report_path)
         # expose the last run's outcome (truncated/tool_calls) to callers
         self.last_run_info = info

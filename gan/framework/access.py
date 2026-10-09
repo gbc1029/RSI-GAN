@@ -21,6 +21,7 @@ import glob
 import json
 import os
 import shutil
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -60,7 +61,18 @@ class AccessBroker:
         # The result of the LAST grant call, empty before any grant. Readers
         # must not depend on grant() having run first: the attribute is part of
         # the documented audit surface (see the ``grant`` docstring).
-        self.last_result: Dict[str, Any] = {}
+        # THREAD-LOCAL on purpose: parallel role self-improvement sessions grant
+        # through the SAME broker object, and a shared slot would let one
+        # session read the other's skipped/denied audit (observed failure class).
+        self._last_result_tls = threading.local()
+
+    @property
+    def last_result(self) -> Dict[str, Any]:
+        return getattr(self._last_result_tls, "value", None) or {}
+
+    @last_result.setter
+    def last_result(self, value: Dict[str, Any]) -> None:
+        self._last_result_tls.value = value
 
     # -- workspace ---------------------------------------------------------
     def workspace(self, role: str, node_id: Any) -> str:
