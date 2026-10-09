@@ -251,7 +251,11 @@ batch-8 isolation), one subprocess each.
   abandoned — a wedged thread must never swallow main-thread output) and merged
   into the tool result as `-- tool stdout (captured) --` + audit events. Tool STATE
   travels via explicitly SEEDED contextvars (`contextvars.copy_context()`) — a bare
-  executor thread would break every context-dependent tool.
+  executor thread would break every context-dependent tool. A FIRST-TURN response
+  that announces intent in prose but emits NO tool-call block gets exactly one
+  bounded feedback turn (first-turn no-op guard; reasoning models occasionally
+  narrate "I'll start by..." and stop — 3/10 role self-improve sessions); sessions
+  without a toolset and later prose endings are unaffected.
 - **Model config**: the single source is `gan/framework/models.yaml`, read only by
   `gan/framework/models.py` (`resolve/resolve_entry/resolve_section/describe`) — a
   **pure lookup** with NO env, NO fallback and NO precedence chain. Sections:

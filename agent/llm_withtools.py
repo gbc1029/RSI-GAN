@@ -391,6 +391,30 @@ def chat_with_agent(
 
         # Tool use
         tool_uses, malformed = check_for_tool_uses(response)
+        # First-turn no-op guard: a reasoning model sometimes ANNOUNCES its
+        # plan in prose and stops without emitting any tool-call block
+        # (observed 3/10 role self-improve sessions: "I'll start by reading
+        # ..."), which the loop can only treat as a final answer -- the session
+        # ends having done nothing, silently. With a toolset available, give
+        # exactly ONE bounded feedback turn asking for a real call or an
+        # explicit final answer (same pattern as the malformed-JSON feedback
+        # below). Later prose responses are legitimate session endings and are
+        # NOT retried; sessions without a toolset are unaffected.
+        if all_tools and not tool_uses and "<json>" not in response and not malformed:
+            _emit(logging, trajectory_file, "tool_output", tool="<no_tool_call>",
+                  output="first response announced intent but emitted no tool call; "
+                         "one feedback turn issued")
+            response, new_msg_history, info = get_response_fn(
+                msg=(system_msg + "\n\n# No tool call emitted\n"
+                     "Your previous message described an intention but contained NO "
+                     "tool call, so nothing happened. Either emit the tool call now "
+                     "as a <json> block with tool_name and tool_input, or, if you are "
+                     "done, reply with your final answer (which ends the session)."),
+                model=model,
+                msg_history=new_msg_history,
+            )
+            _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
+            tool_uses, malformed = check_for_tool_uses(response)
         retry_tool_use = should_retry_tool_use(response, tool_uses)
         malformed_feedback = 0
         _last_fp = None
