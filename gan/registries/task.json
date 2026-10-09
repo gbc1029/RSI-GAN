@@ -11,7 +11,7 @@
       "name": "editor",
       "kind": "skill",
       "module": "task/skills/editor.py",
-      "description": "View/create/edit files (re-export of agent/tools/edit).",
+      "description": "View/create/edit files (re-export of agent/tools/editor).",
       "params_schema": {}
     },
     {

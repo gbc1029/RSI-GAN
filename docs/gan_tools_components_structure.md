@@ -54,7 +54,7 @@
 | 8 | `work/common/read_file.py` | `read_file` | 读 workspace `src` | `path` | Access | ❌ | always-on | p,e |
 | 9 | `work/common/list_dir.py` | `list_dir` | 列 `src` 目录 | — | Access | ❌ | always-on | p,e |
 | 10 | `work/common/grep.py` | `grep` | 在 `src` 内正则搜索 | `pattern` | Access | ❌ | always-on | p,e |
-| 11 | `work/common/edit_source.py` | `edit_source` | 受限编辑器（代理 `agent.tools.edit`） | `command,path` | Access | ❌ | always-on | p,e |
+| 11 | `work/common/edit_source.py` | `edit_source` | 受限编辑器（代理 `agent.tools.editor`） | `command,path` | Access | ❌ | always-on | p,e |
 | 12 | `work/common/list_editable.py` | `list_editable` | 展开 allowlist 为具体文件 | — | Access | ❌ | always-on | p,e |
 | 13 | `work/common/read_trajectory.py` | `read_trajectory` | 读某 task 代的脱敏轨迹 | — | Access | ❌ | always-on | p,e |
 | 14 | `work/common/read_session_trajectory.py` | `read_session_trajectory` | 读自己本 outer 会话 | — | Access | ❌ | always-on | p,e |
@@ -65,7 +65,7 @@
 
 ※ planner 拿到但**不可用**：planner schema 无 slot（`schema.py:21-24`），两算子必然返回 `slot not in schema`（`select_component.py:39-40`）。
 
-**命名一致性**：`gan/tools/**` 内 **18/18 的 stem == `tool_info().name`** ✅。唯一不一致在外部源 `agent/tools/edit.py`（stem `edit` vs name `editor`），GAN 侧通过把它重导出为 `editor.py` 规避。
+**命名一致性**：`gan/tools/**` 内 **18/18 的 stem == `tool_info().name`** ✅。外部源原唯一不一致 `agent/tools/edit.py`（stem `edit` vs name `editor`）——**已于 2026-10-09 修复**：基座文件改名为 `agent/tools/editor.py`（保持对外名 `editor` 不变），task 组件 shim 改从 `agent.tools.editor` 导入，注册表描述同步；GAN 侧不再需要靠重导出规避。
 
 **三个 `__init__.py`、`assembly.py`、`gan/tools/__init__.py` 均不会被装配**（`always_on_dirs` 只返回子目录，`assembly.py:41-47`；顶层从不作为源）。**"装配器被自己装配"的担忧排除。**
 
@@ -101,7 +101,7 @@
 | 18 个 `gan/tools` 工具 | ✅ | —（不注册） | ✅ | 一致 |
 | `shared/skills/{bash,editor}` | ✅ | ✅ | ✅ | 一致 |
 | 4 个 eval_points | ✅ | ❌（少 `eval_` 前缀） | — | **不一致** |
-| `agent/tools/edit.py` | ✅ | — | ❌（`edit` vs `editor`） | **不一致** |
+| `agent/tools/editor.py`（原 `edit.py`，2026-10-09 改名） | ✅ | — | ✅ | 一致 |
 
 ---
 
@@ -206,7 +206,7 @@
 | # | 动作 | 落点 |
 |---|---|---|
 | T0-1 | **强制 `name == stem`**，并把 4 个 eval_point 的注册名改为与 stem 一致（或反之改文件名），使 config/工具/schema 三处同名 | `evaluator.json:3-14`；`eval_*.py:7` |
-| T0-2 | 修 `agent/tools/edit.py` 的 `editor` vs `edit`（或显式记录该例外） | `agent/tools/edit.py:6` |
+| T0-2 | ~~修 `agent/tools/edit.py` 的 `editor` vs `edit`~~ **已完成（2026-10-09）**：文件改名 `agent/tools/editor.py`，对外名保持 `editor` | `agent/tools/editor.py:6` |
 | T0-3 | 删 `planner.py:125-126` 的 `code_edit` 死分支 | `gan/roles/planner.py:125-126` |
 | T0-4 | 文档校正：`docs/3:23,42`、`docs/4` 移除 `memory` 槽与 `components/shared/memory/` | 文档 |
 | T0-5 | `unregister_component` 补 `ctx.record`（结构化字段），与 `register_component` 对称 | `unregister_component.py:66` |

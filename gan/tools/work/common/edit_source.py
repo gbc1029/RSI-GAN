@@ -12,7 +12,7 @@ workspace. Only the base ``editor`` capabilities are exposed, path-checked here.
 """
 import os
 
-from agent.tools import edit as _edit
+from agent.tools import editor as _edit
 from gan.framework.context import get_access_context, get_design_context
 from gan.framework.write_auth import authorize_write, resolve_workspace_path
 
