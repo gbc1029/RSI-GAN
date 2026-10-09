@@ -26,6 +26,12 @@ def main() -> None:
     p.add_argument("--subset", default="_filtered_100_train")
     p.add_argument("--num_samples", type=int, default=2)
     p.add_argument("--inner", type=int, default=None)
+    p.add_argument("--sample-seed-base", dest="sample_seed_base", type=int, default=None,
+                   help="Run-persistent question-sampling base seed (driver-owned; "
+                        "absent = legacy prefix slice).")
+    p.add_argument("--anchor-ids", dest="anchor_ids", default="",
+                   help="Comma-separated anchor question ids evaluated every "
+                        "generation (paired core); empty = none.")
     args = p.parse_args()
 
     # Entry validation before building/running anything: empty and multi-value
@@ -51,6 +57,8 @@ def main() -> None:
         num_samples=args.num_samples,
         cfg_overrides=cfg_overrides,
         code_repo=True,
+        sample_seed_base=args.sample_seed_base,
+        anchor_ids=[a for a in (args.anchor_ids or "").split(",") if a.strip()],
     )
     loop.resume = True  # load trees/state produced by previous outers
     loop.resume_boundary = args.resume_boundary

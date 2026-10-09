@@ -16,10 +16,12 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -439,14 +441,141 @@ def uses_parent_scoring(domain: str) -> bool:
     return domain in _PARENT_SCORED_DOMAINS
 
 
+def derive_sample_seed(base_seed: int, genid: str) -> int:
+    """Per-generation seed derived deterministically from the run base seed.
+
+    Pure function of ``(base_seed, genid)``: resume re-derives identical seeds
+    without extra state, and different generations never share a draw.
+    """
+    digest = hashlib.sha256(f"{int(base_seed)}:{str(genid)}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def load_dataset_ids(dataset_root: str, domain: str, subset: str) -> List[str]:
+    """Pool of question ids for the domain/subset (parent side only)."""
+    utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
+    domain_folder = domain.split("_")[0] if "imo_" in domain else domain
+    utils_module = importlib.import_module(f"domains.{domain_folder}.{utils_prefix}utils")
+    question_id_col = utils_module.QUESTION_ID
+    if "imo_" in domain:
+        rel = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
+    else:
+        rel = f"domains/{domain}/dataset{subset}.csv"
+    dataset = pd.read_csv(os.path.join(os.path.abspath(dataset_root), rel), dtype=str)
+    return [str(v) for v in dataset[question_id_col].tolist()]
+
+
+def select_samples(
+    dataset: pd.DataFrame,
+    question_id_col: str,
+    num_samples: int,
+    sample_seed: Optional[int] = None,
+    anchor_ids: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Question selection with two modes (replaces the fixed prefix slice).
+
+    - ``sample_seed is None``: legacy behaviour -- the first ``num_samples``
+      rows of the file (deterministic prefix; kept as the explicit A/B base).
+    - ``sample_seed is not None``: anchor rows first (``anchor_ids`` present in
+      the pool, dataset order, deduplicated), then the remainder drawn without
+      replacement from the rest of the pool with ``random.Random(sample_seed)``.
+      Selection is deterministic for a given (seed, pool) and recorded via the
+      returned info dict. ``num_samples <= 0`` returns the full dataset.
+
+    Returns ``(selected_dataset, info)`` where info carries the audit fields
+    (mode / seed / anchor ids actually present / sampled ids in file order).
+    """
+    if num_samples is None or num_samples <= 0:
+        return dataset, {"mode": "all", "sample_seed": None,
+                         "anchor_ids": [], "sampled_ids": []}
+    if sample_seed is None:
+        selected = dataset.iloc[:num_samples]
+        return selected, {"mode": "legacy_prefix", "sample_seed": None,
+                          "anchor_ids": [],
+                          "sampled_ids": [str(v) for v in selected[question_id_col].tolist()]}
+    ids = [str(v) for v in dataset[question_id_col].tolist()]
+    anchor_req = [str(a) for a in (anchor_ids or [])]
+    anchor_set: Dict[str, int] = {}
+    for pos, qid in enumerate(ids):
+        if qid in anchor_req and qid not in anchor_set:
+            anchor_set[qid] = pos
+    anchor_positions = sorted(anchor_set.values())
+    # Anchor core must never consume the whole budget: cap at half.
+    anchor_positions = anchor_positions[: max(0, num_samples // 2)]
+    n_anchor = len(anchor_positions)
+    pool_positions = [p for p in range(len(ids)) if p not in set(anchor_positions)]
+    n_rest = min(num_samples - n_anchor, len(pool_positions))
+    rng = random.Random(int(sample_seed))
+    drawn = sorted(rng.sample(pool_positions, n_rest)) if n_rest > 0 else []
+    positions = sorted(anchor_positions + drawn)
+    selected = dataset.iloc[positions]
+    return selected, {
+        "mode": "seeded",
+        "sample_seed": int(sample_seed),
+        "anchor_ids": [ids[p] for p in anchor_positions],
+        "sampled_ids": [str(v) for v in selected[question_id_col].tolist()],
+    }
+
+
+def ensure_sampling_seed(
+    output_dir: str,
+    domain: str,
+    subset: str,
+    dataset_root: str,
+    num_samples: int,
+    anchor_k: int = 2,
+    base_seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create (or reload) the run-persistent sampling seed + anchor core.
+
+    Idempotent: the seed file lives at ``<output_dir>/ckpt/sample_seed.json``
+    and survives resume -- a re-run with the same output_dir reuses the exact
+    base seed and anchor ids (comparability with already-scored generations).
+    """
+    seed_path = os.path.join(output_dir, "ckpt", "sample_seed.json")
+    if os.path.isfile(seed_path):
+        with open(seed_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if base_seed is None:
+        base_seed = int.from_bytes(os.urandom(8), "big")
+    anchor_ids: List[str] = []
+    try:
+        pool = load_dataset_ids(dataset_root, domain, subset)
+        k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
+        if pool and k > 0:
+            rng = random.Random(f"{int(base_seed)}:anchor")
+            anchor_ids = sorted(rng.sample(pool, min(k, len(pool))))
+    except Exception as exc:  # noqa: BLE001 -- anchor drawing must never kill a run
+        anchor_ids = []
+        _log_soft_sample_note(f"anchor drawing failed ({exc}); continuing without anchors")
+    info = {"base_seed": int(base_seed), "anchor_ids": anchor_ids,
+            "domain": domain, "subset": subset}
+    os.makedirs(os.path.dirname(seed_path), exist_ok=True)
+    tmp = seed_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+    os.replace(tmp, seed_path)
+    return info
+
+
+def _log_soft_sample_note(message: str) -> None:
+    print(f"[sample] {message}")
+
+
 def prepare_questions(
     dataset_root: str,
     run_dir: str,
     domain: str,
     subset: str,
     num_samples: int,
-) -> Tuple[str, Dict[str, Any]]:
-    """Write questions-only input and retain ground truth in parent memory."""
+    sample_seed: Optional[int] = None,
+    anchor_ids: Optional[List[str]] = None,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Write questions-only input and retain ground truth in parent memory.
+
+    Returns ``(questions_path, ground_truth_by_id, sample_info)``; ``sample_info``
+    is the audit record from :func:`select_samples` (mode/seed/ids).
+    """
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
     domain_folder = domain.split("_")[0] if "imo_" in domain else domain
     utils_module = importlib.import_module(
@@ -460,8 +589,10 @@ def prepare_questions(
     else:
         rel = f"domains/{domain}/dataset{subset}.csv"
     dataset = pd.read_csv(os.path.join(os.path.abspath(dataset_root), rel), dtype=str)
-    if num_samples > 0:
-        dataset = dataset[:num_samples]
+    dataset, sample_info = select_samples(
+        dataset, question_id_col, num_samples,
+        sample_seed=sample_seed, anchor_ids=anchor_ids,
+    )
 
     ground_truth_by_id = dict(
         zip(dataset[question_id_col].tolist(), dataset[ground_truth_key].tolist())
@@ -471,7 +602,7 @@ def prepare_questions(
     os.makedirs(input_dir, exist_ok=True)
     questions_path = os.path.join(input_dir, "questions.csv")
     questions.to_csv(questions_path, index=False)
-    return questions_path, ground_truth_by_id
+    return questions_path, ground_truth_by_id, sample_info
 
 
 def _sandbox_identity(run_dir: str, run_id: str,
@@ -667,8 +798,17 @@ def _run_harness_and_report_local(
     proxy_token: Optional[str] = None,
     expected_owner_uid: Optional[int] = None,
     reasoning_effort: Optional[str] = None,
+    sample_seed: Optional[int] = None,
+    anchor_ids: Optional[List[str]] = None,
 ) -> Tuple[int, str]:
-    """Run a fixed harness command; the privileged broker is its only secure caller."""
+    """Run a fixed harness command; the privileged broker is its only secure caller.
+
+    ``sample_seed``/``anchor_ids`` apply ONLY to the ``dataset_root`` branch
+    (domains that score in the harness): the questions read there are sliced by
+    the harness itself. In the ``questions_path`` branch the parent already
+    applied the selection in :func:`prepare_questions`, so no seed is forwarded
+    (a second draw here would re-sample the already-sampled questions).
+    """
     harness_cmd = [
         python, "-m", "domains.harness",
         "--domain", domain,
@@ -718,6 +858,10 @@ def _run_harness_and_report_local(
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
         harness_cmd.extend(["--dataset_root", os.path.abspath(dataset_root)])
+        if sample_seed is not None:
+            harness_cmd.extend(["--sample_seed", str(int(sample_seed))])
+            if anchor_ids:
+                harness_cmd.extend(["--anchor_ids", ",".join(str(a) for a in anchor_ids)])
     if proxy_token:
         harness_cmd.extend([
             "--proxy_socket", os.path.abspath(proxy_socket),

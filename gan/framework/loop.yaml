@@ -93,3 +93,17 @@ cost:
 # feedback 信息流契约（谁可见什么）记录于 AGENTS.md / docs/6_v5改动.md，
 # 断言将随三档 F1 以 smoke 形式锚定，此处不设键。
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 抽题方案（消费者：gan/driver.py + gan/framework/task_execution.py）
+# mode:
+#   seeded        -- 每代用 (base_seed, genid) 派生的种子无放回抽题；anchor_k 题
+#                    组成每代固定的配对锚核（driver 启动时一次抽取，入
+#                    ckpt/sample_seed.json，resume 复用）。seed 缺省=旧行为。
+#   legacy_prefix -- 固定取前 num_samples 行（历史前缀切片，A/B 基线）。
+# 注：num_samples<=0（全量）时两种 mode 等价；anchor_k 被钳制在
+# num_samples//2 以内，锚核永不吞掉全部预算。
+# ---------------------------------------------------------------------------
+sampling:
+  mode: seeded
+  anchor_k: 2

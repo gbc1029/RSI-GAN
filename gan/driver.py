@@ -339,6 +339,10 @@ def run_gan_driver(
         "timeout": 1800,
         "task_brief": (domain_cfg.get("task_brief") or ""),
         "parent_scored": task_execution.uses_parent_scoring(domain),
+        # Question-sampling scheme (loop.yaml sampling.*). The broker reads the
+        # run-persistent seed file at launch time (per generation) so a resume
+        # reuses the same base seed without restart-order constraints.
+        "sampling_mode": str((cfg.get("sampling") or {}).get("mode", "seeded")),
         "owner_uid": owner_uid,
         "owner_gid": owner_gid,
         "sandbox_username": sandbox_username,
@@ -372,6 +376,28 @@ def run_gan_driver(
                                             "task_brief/output_contract fall back to default"})
 
         code_root = ensure_code_root(repo_root, output_dir)
+
+        # Question-sampling scheme (loop.yaml sampling.*). Created post-drop so
+        # the seed file is owned by the run owner; idempotent across resume.
+        sampling_cfg = cfg.get("sampling") or {}
+        sampling_mode = str(sampling_cfg.get("mode", "seeded"))
+        sample_seed_base: Optional[int] = None
+        anchor_ids: list = []
+        if sampling_mode == "seeded":
+            seed_info = task_execution.ensure_sampling_seed(
+                output_dir, domain, subset, repo_root, int(num_samples),
+                anchor_k=int(sampling_cfg.get("anchor_k", 2)),
+            )
+            sample_seed_base = int(seed_info["base_seed"])
+            anchor_ids = list(seed_info.get("anchor_ids") or [])
+            _log_event(output_dir, {"type": "sampling_seed_ready",
+                                    "mode": "seeded",
+                                    "base_seed": sample_seed_base,
+                                    "anchor_ids": anchor_ids})
+        else:
+            _log_event(output_dir, {"type": "sampling_seed_ready",
+                                    "mode": sampling_mode})
+
         start = (int(newest["index"]) + 1) if (resume and newest) else 1
         _driver_t0 = time.time()
         _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
@@ -429,6 +455,10 @@ def run_gan_driver(
                 "--outer", str(outer), "--domains", domain,
                 "--subset", subset, "--num_samples", str(num_samples),
             ]
+            if sample_seed_base is not None:
+                cmd.extend(["--sample-seed-base", str(sample_seed_base)])
+                if anchor_ids:
+                    cmd.extend(["--anchor-ids", ",".join(anchor_ids)])
             if inner is not None:
                 cmd.extend(["--inner", str(inner)])
             if resume:

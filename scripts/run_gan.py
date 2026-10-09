@@ -91,6 +91,21 @@ def main():
         try:
             os.environ["GAN_LLM_PROXY_UNIX"] = proxy_socket
             os.environ["GAN_PROXY_CONTROL_TOKEN"] = proxy.issue_framework_scope(0)
+            # Sampling scheme parity with driver mode (loop.yaml sampling.*):
+            # same run-persistent seed file, so an in-process debug run of the
+            # same output_dir stays comparable with a driver run.
+            from gan.framework import task_execution as _tx
+            from gan.framework.loader import load_gan_loop_config as _load_cfg
+            _sampling = (_load_cfg().get("sampling") or {})
+            _seed_base, _anchor = None, None
+            if str(_sampling.get("mode", "seeded")) == "seeded":
+                _info = _tx.ensure_sampling_seed(
+                    os.path.abspath(args.output_dir), domains[0], args.subset,
+                    os.path.abspath(args.repo_root), args.num_samples,
+                    anchor_k=int(_sampling.get("anchor_k", 2)),
+                )
+                _seed_base = int(_info["base_seed"])
+                _anchor = list(_info.get("anchor_ids") or [])
             loop = build_gan_loop(
                 repo_root=args.repo_root,
                 output_dir=args.output_dir,
@@ -100,6 +115,8 @@ def main():
                 cfg_overrides=overrides or None,
                 preflight=args.preflight,
                 code_repo=False,
+                sample_seed_base=_seed_base,
+                anchor_ids=_anchor,
             )
             tree = loop.run()
         finally:

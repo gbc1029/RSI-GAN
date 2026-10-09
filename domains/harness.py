@@ -331,6 +331,50 @@ def _dump_failure_log(evals_folder, qid, e):
         pass
 
 
+def _select_samples(dataset, question_id_col, num_samples,
+                    sample_seed=None, anchor_ids=None):
+    """Question selection with two modes (replaces the fixed prefix slice).
+
+    - ``sample_seed is None``: legacy behaviour -- the first ``num_samples``
+      rows of the file (deterministic prefix; kept as the explicit A/B base).
+    - ``sample_seed is not None``: anchor rows first (present in the pool,
+      dataset order, deduplicated, capped at half the budget), then the rest
+      drawn without replacement from the remaining pool with
+      ``random.Random(sample_seed)``. Deterministic for a given (seed, pool).
+
+    Returns ``(selected_dataset, info)`` with audit fields in ``info``.
+    """
+    import random as _random
+    if num_samples is None or num_samples <= 0:
+        return dataset, {"mode": "all", "sample_seed": None,
+                         "anchor_ids": [], "sampled_ids": []}
+    if sample_seed is None:
+        selected = dataset.iloc[:num_samples]
+        return selected, {"mode": "legacy_prefix", "sample_seed": None,
+                          "anchor_ids": [],
+                          "sampled_ids": [str(v) for v in selected[question_id_col].tolist()]}
+    ids = [str(v) for v in dataset[question_id_col].tolist()]
+    anchor_req = [str(a) for a in (anchor_ids or [])]
+    anchor_set = {}
+    for pos, qid in enumerate(ids):
+        if qid in anchor_req and qid not in anchor_set:
+            anchor_set[qid] = pos
+    anchor_positions = sorted(anchor_set.values())[: max(0, num_samples // 2)]
+    n_anchor = len(anchor_positions)
+    pool_positions = [p for p in range(len(ids)) if p not in set(anchor_positions)]
+    n_rest = min(num_samples - n_anchor, len(pool_positions))
+    rng = _random.Random(int(sample_seed))
+    drawn = sorted(rng.sample(pool_positions, n_rest)) if n_rest > 0 else []
+    positions = sorted(anchor_positions + drawn)
+    selected = dataset.iloc[positions]
+    return selected, {
+        "mode": "seeded",
+        "sample_seed": int(sample_seed),
+        "anchor_ids": [ids[p] for p in anchor_positions],
+        "sampled_ids": [str(v) for v in selected[question_id_col].tolist()],
+    }
+
+
 def harness(
     agent_path="./task_agent.py",
     output_dir="./outputs",
@@ -348,6 +392,8 @@ def harness(
     proxy_socket=None,
     proxy_token=None,
     reasoning_effort=None,
+    sample_seed=None,
+    anchor_ids=None,
 ):
     # Dynamically import functions based on the domain
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
@@ -413,7 +459,14 @@ def harness(
             domain=domain, subset=subset, dataset_root=dataset_root,
         )
     if num_samples > 0:
-        dataset = dataset[:num_samples]
+        dataset, _sample_info = _select_samples(
+            dataset, question_id_col, num_samples,
+            sample_seed=sample_seed, anchor_ids=anchor_ids,
+        )
+        if _sample_info.get("mode") == "seeded":
+            print(f"[sample] mode=seeded seed={_sample_info['sample_seed']} "
+                  f"anchor={_sample_info['anchor_ids']} "
+                  f"ids={_sample_info['sampled_ids']}")
 
     # Add a prediction column
     if existing_df is not None:
@@ -560,6 +613,16 @@ if __name__ == "__main__":
         "--subset", type=str, default="", help="Subset of the dataset to evaluate"
     )
     parser.add_argument(
+        "--sample_seed", type=int, default=None,
+        help="Seed for per-call question sampling (anchor core + seeded draw). "
+             "Absent = legacy fixed prefix slice.",
+    )
+    parser.add_argument(
+        "--anchor_ids", type=str, default="",
+        help="Comma-separated question ids always included in the sample "
+             "(paired core across runs); capped at half the sample budget.",
+    )
+    parser.add_argument(
         "--proofs_dname", type=str, default="", help="Path to the directory containing proofs to grade (for imo_proof_grading)"
     )
     parser.add_argument(
@@ -617,6 +680,9 @@ if __name__ == "__main__":
             proxy_socket=args.proxy_socket,
             proxy_token=args.proxy_token,
             reasoning_effort=args.reasoning_effort,
+            sample_seed=args.sample_seed,
+            anchor_ids=([a for a in (args.anchor_ids or "").split(",") if a.strip()]
+                        or None),
         )
 
     # Polyglot (Arch 2): questions-only CSV + sandboxed TaskAgent + parent-side

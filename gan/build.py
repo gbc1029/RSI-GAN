@@ -104,6 +104,8 @@ def build_gan_loop(
     cfg_overrides: Optional[dict] = None,
     preflight: bool = False,
     code_repo: bool = True,
+    sample_seed_base: Optional[int] = None,
+    anchor_ids: Optional[list] = None,
 ) -> GanLoop:
     cfg = load_gan_loop_config(cfg_overrides)
     # Domain shape checks: `domains` is required input with NO default (the only
@@ -162,6 +164,8 @@ def build_gan_loop(
         # domains/task_worker.py carry it into the sandbox.
         reasoning_effort=t_effort,
         code_root=code_root,
+        sample_seed_base=sample_seed_base,
+        anchor_ids=anchor_ids,
     )
     # Grants/diffs are against the per-run code baseline when code_repo is on;
     # only the parent harness receives repo_root for loading benchmark labels.

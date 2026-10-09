@@ -165,6 +165,23 @@ class _TaskBrokerState:
             raise RuntimeError(f"task questions file is missing: {questions_path}")
 
         try:
+            # Harness-side sampling (only for domains that score in the harness
+            # and read the dataset themselves): derive this generation's seed
+            # from the run-persistent seed file written by the driver.
+            sample_seed = None
+            anchor_ids = None
+            if (not parent_scored
+                    and str(self.config.get("sampling_mode", "")) == "seeded"):
+                seed_path = os.path.join(str(self.config["output_dir"]),
+                                         "ckpt", "sample_seed.json")
+                try:
+                    with open(seed_path, "r", encoding="utf-8") as f:
+                        seed_info = json.load(f)
+                    sample_seed = tx.derive_sample_seed(
+                        int(seed_info["base_seed"]), scope_id)
+                    anchor_ids = list(seed_info.get("anchor_ids") or [])
+                except (OSError, ValueError, KeyError):
+                    sample_seed = None  # fall back to the legacy prefix slice
             return tx._run_harness_and_report_local(
                 str(self.config["python"]),
                 run_dir,
@@ -184,6 +201,8 @@ class _TaskBrokerState:
                 # Fixed at root-side registration (same models.yaml entry as
                 # ``model``): the outer worker cannot influence it.
                 reasoning_effort=self.config.get("reasoning_effort"),
+                sample_seed=sample_seed,
+                anchor_ids=anchor_ids,
             )
         finally:
             if os.path.isdir(run_dir):

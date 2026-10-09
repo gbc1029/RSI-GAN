@@ -76,6 +76,8 @@ class DomainTaskRunner:
         timeout: int = 1800,
         code_root: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        sample_seed_base: Optional[int] = None,
+        anchor_ids: Optional[list] = None,
     ):
         self.repo_root = os.path.abspath(repo_root)
         self.output_dir = os.path.abspath(output_dir)
@@ -84,6 +86,11 @@ class DomainTaskRunner:
         self.subset = subset
         self.num_samples = num_samples
         self.default_model = default_model
+        # Sampling scheme (framework-owned): per-generation seed derived from
+        # the run-persistent base seed; anchor_ids form the fixed paired core.
+        # None base seed -> legacy prefix slice (explicit A/B baseline).
+        self.sample_seed_base = sample_seed_base
+        self.anchor_ids = list(anchor_ids or [])
         # Thinking-intensity knob for the task child's every LLM call; rides
         # the task env (GAN_LLM_REASONING_EFFORT) like GAN_LLM_TIMEOUT_S.
         # Validated upstream by models.resolve_entry(); None -> gateway default.
@@ -299,8 +306,13 @@ class DomainTaskRunner:
                               event_path=paths.events_path(self.output_dir),
                               event_type="polyglot_eval_failed", genid=str(genid))
         elif tx.uses_parent_scoring(self.domain):
-            questions_path, ground_truth_by_id = tx.prepare_questions(
+            per_gen_seed = (
+                tx.derive_sample_seed(self.sample_seed_base, str(genid))
+                if self.sample_seed_base is not None else None
+            )
+            questions_path, ground_truth_by_id, sample_info = tx.prepare_questions(
                 self.repo_root, run_dir, self.domain, self.subset, self.num_samples,
+                sample_seed=per_gen_seed, anchor_ids=self.anchor_ids,
             )
             # The child sees questions only; scoring remains in this parent.
             _t_harness = time.time()
@@ -313,7 +325,11 @@ class DomainTaskRunner:
             self._event("task_harness_done", genid=str(genid), rc=rc,
                         duration_s=round(time.time() - _t_harness, 1),
                         question_timeout_s=question_timeout_s,
-                        harness_timeout_s=harness_timeout)
+                        harness_timeout_s=harness_timeout,
+                        sample_mode=sample_info.get("mode"),
+                        sample_seed=sample_info.get("sample_seed"),
+                        sampled_ids=sample_info.get("sampled_ids"),
+                        anchor_ids=sample_info.get("anchor_ids"))
             predictions_path = os.path.join(output_path, "predictions.csv")
             report = None
             if os.path.exists(predictions_path):
