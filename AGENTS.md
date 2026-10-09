@@ -82,6 +82,42 @@ scripts/local/run_tool_regression.py` before and after touching `gan/tools/`,
 design operators — three suites (deep gate S1–S4 / batch-6 unification /
 batch-8 isolation), one subprocess each.
 
+## Offline run analysis (scripts/local/, gitignored)
+
+Two local analyzers read finished GAN run dirs (`scores.jsonl`,
+`runs/<genid>/`, `logs/events.jsonl`, `ckpt/`) — **offline only** (no network,
+no LLM calls), run with `venv_nat/bin/python`, and write artifacts into
+`<run_dir>/score_analysis/`. The base `analysis/*.py` scripts consume the DGM-H
+`archive.jsonl` + `gen_<id>/metadata.json` layout and do NOT fit GAN run dirs
+directly; the sanctioned bridge is to reuse their computation/rendering cores
+with a GAN-native data layer.
+
+- **`gan_scores_extract.py` — score extraction + analysis** (per run:
+  `scores_extract.csv` / `REPORT.md` / `significance.txt` / `progress.png`).
+  Reuses `analysis/analysis_utils.py` (`save_significance_tests`,
+  `compute_bootstrap_ci`) verbatim. Conventions: **strict** = the harness's
+  exact lowercase string match against the dataset `winner`
+  (`report.json.total` excludes invalid samples when `coverage<1` — crosscheck
+  counts, not denominators); **lenient** = offline verdict re-parse from the
+  raw prediction text with a per-row parse-method audit trail
+  (dict_verdict/verdict_line/response_better/bare/model_exact/…); ground truth
+  is auto-disambiguated by matching every observed `question_id` against the
+  `domains/<domain>/dataset*.csv` files. Per-generation AND per-question tables
+  (systematic-error localization), evaluator `predicted_score` calibration, and
+  the significance file only include runs with n≥2 samples (n=1 runs are noise).
+- **`gan_lineage_graph.py` — genealogy graphs + offline lineage audit** (per
+  run: `lineage_inner_{lenient,strict}.png`, `lineage_outer_{lenient,strict}.png`,
+  `lineage_audit.md`). Imports `analysis/visualize_archive.py:visualize_graph`
+  UNCHANGED (colormap, valid_parent red/green borders, best-node diamond,
+  dot layout); the data layer replays `events.jsonl` (`code_lineage` /
+  `code_branch` / `inner_done` / `stagnation_break`). Border metadata reaches
+  the renderer through a shim dir (`gen_<node>/metadata.json`); node ids encode
+  代际 + marks (`g4·o3i1·nopatch·stag`). Git audit is read-only via
+  `git -c safe.directory=<code_root>`: a generation with `applied:false`
+  aliases its parent's commit (lineage expressed by ref equality, no new git
+  parentage — reported as ALIAS, not MISMATCH); all refs resolving to one
+  commit is reported as a degenerate tree, not an error.
+
 ## Conventions
 
 - **Shallow vs deep**: each agent's *shallow design* is a single config JSON in
