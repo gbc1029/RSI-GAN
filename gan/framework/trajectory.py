@@ -133,11 +133,14 @@ def _session_file(output_dir: str, genid: Any, role: str) -> str:
 def _expose_reasoning() -> bool:
     """Decision-surface gate for reasoning text (loop.yaml, default OFF).
 
-    The reasoning text IS recorded in the raw trajectory (audit surface), but
-    `read`/`read_session` (the tools roles actually read through) omit it unless
-    this key is explicitly enabled -- the task model's chain-of-thought is the
-    strongest persuasion surface and may speculate about benchmark mechanics,
-    so the default mirrors the B29 artifact-vs-rationale rule."""
+    SCOPE (see ``read``/``read_session``): the flag governs the TASK
+    trajectory surface ONLY (``read_trajectory`` -> ``read(role="task")``).
+    Role sessions (``read_session_trajectory``) NEVER expose reasoning
+    regardless of this flag — planner/evaluator may see the task agent's CoT,
+    never their own or each other's. The reasoning text IS recorded in the raw
+    trajectory (audit surface, already line-redacted); the default mirrors the
+    B29 artifact-vs-rationale rule (the task model's chain-of-thought is the
+    strongest persuasion surface and may speculate about benchmark mechanics)."""
     try:
         from gan.framework.loader import load_gan_loop_config
         return bool(load_gan_loop_config().get("loop.trajectory_expose_reasoning", False))
@@ -145,7 +148,13 @@ def _expose_reasoning() -> bool:
         return False
 
 
-def _render(text: str, max_chars: int) -> str:
+def _render(text: str, max_chars: int, expose_reasoning: Optional[bool] = None) -> str:
+    """Render a JSONL trajectory blob for a decision surface.
+
+    ``expose_reasoning=None`` keeps the legacy behavior (consult
+    ``_expose_reasoning()`` per record); an explicit True/False pins the gate
+    for this render — the scoping mechanism that keeps ROLE sessions
+    reasoning-blind while the TASK surface follows the loop.yaml flag."""
     parts: List[str] = []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -174,7 +183,8 @@ def _render(text: str, max_chars: int) -> str:
                     out += f" [{', '.join(meta)}]"
                 rsn = rec.get("reasoning")
                 if rsn:
-                    if _expose_reasoning():
+                    expose = _expose_reasoning() if expose_reasoning is None else expose_reasoning
+                    if expose:
                         out += f"\n[reasoning]\n{rsn}"
                     else:
                         out += f" [reasoning omitted: {len(rsn)} chars]"
@@ -182,12 +192,24 @@ def _render(text: str, max_chars: int) -> str:
     return "\n".join(parts)[:max_chars]
 
 
-def read(output_dir: str, genid: Any, max_chars: int = 6000, role: str = "task") -> str:
-    """Return a redacted, truncated rendering of a generation's trajectory."""
+def read(output_dir: str, genid: Any, max_chars: int = 6000, role: str = "task",
+         expose_reasoning: Optional[bool] = None) -> str:
+    """Return a redacted, truncated rendering of a generation's trajectory.
+
+    Reasoning-exposure SCOPE rule, enforced here:
+    - role="task" (the only surface the `read_trajectory` tool serves):
+      follows ``loop.trajectory_expose_reasoning`` unless ``expose_reasoning``
+      pins it explicitly;
+    - any non-task role: agent-session content — NEVER exposed, regardless of
+      the flag (session reads must go through ``read_session``, which pins it).
+    """
     path = _session_file(output_dir, genid, role)
     if not path or not os.path.isfile(path):
         return ""
-    return _render(trajectory_log.read_all(path), max_chars)
+    if expose_reasoning is None:
+        expose_reasoning = _expose_reasoning() if role == "task" else False
+    return _render(trajectory_log.read_all(path), max_chars,
+                   expose_reasoning=expose_reasoning)
 
 
 def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: int = 6000) -> str:
@@ -202,7 +224,10 @@ def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: 
 
 def _read_gen_session(output_dir: str, outer: Any, genid: Any, role: str,
                       max_chars: int) -> str:
-    """Per-generation session read (genid-keyed files; attempt id irrelevant)."""
+    """Per-generation session read (genid-keyed files; attempt id irrelevant).
+
+    Reasoning is PINNED OFF for role sessions regardless of the loop.yaml
+    flag: planner/evaluator never read their own (or each other's) CoT."""
     path = paths.session_traj_file(output_dir, outer, genid, role)
     if not os.path.isfile(path):
         quarantined = sorted(glob.glob(path + ".unredacted-*"))
@@ -210,8 +235,12 @@ def _read_gen_session(output_dir: str, outer: Any, genid: Any, role: str,
             return ("[unavailable] this session trajectory could not be redacted and was "
                     "quarantined; the audit trail is in events.jsonl "
                     "(session_redaction_failed).")
-        return read(output_dir, genid, max_chars, role)
-    return _render(trajectory_log.read_all(path), max_chars)
+        # legacy fallback: a missing gen-session file falls back to the
+        # generational archive. That may be a ROLE session file (role != task),
+        # so the reasoning gate stays pinned off here too — only the
+        # `read_trajectory` tool path (role="task") consults the flag.
+        return read(output_dir, genid, max_chars, role, expose_reasoning=False)
+    return _render(trajectory_log.read_all(path), max_chars, expose_reasoning=False)
 
 
 def _outer_session_files(output_dir: str, outer: Any, role: str) -> List[str]:
@@ -235,7 +264,8 @@ def _outer_session_files(output_dir: str, outer: Any, role: str) -> List[str]:
 def _read_outer_sessions(output_dir: str, outer: Any, role: str,
                          max_chars: int) -> str:
     """Render a role's OUTER-level sessions: canonical + attempt files, newest
-    first. Quarantined-only attempts are reported explicitly (fail-closed)."""
+    first. Quarantined-only attempts are reported explicitly (fail-closed).
+    Reasoning PINNED OFF: role sessions never expose CoT (see read_session)."""
     files = _outer_session_files(output_dir, outer, role)
     d = paths.outer_traj_dir(output_dir, outer)
     quarantined = sorted(glob.glob(os.path.join(d, f"{role}*.jsonl.unredacted-*")))
@@ -249,7 +279,8 @@ def _read_outer_sessions(output_dir: str, outer: Any, role: str,
     if quarantined:
         parts.append("[unavailable] %d attempt file(s) could not be redacted and were "
                      "quarantined (session_redaction_failed)." % len(quarantined))
-    return _render("\n".join(t for t in parts if t.strip()), max_chars)
+    return _render("\n".join(t for t in parts if t.strip()), max_chars,
+                   expose_reasoning=False)
 
 
 def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str, Any]]:

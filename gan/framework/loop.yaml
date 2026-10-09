@@ -41,13 +41,21 @@ loop:
                                    # QUESTION_TIMEOUT via GAN_QUESTION_TIMEOUT_S; consumers:
                                    # task_runner env + harness-total scaling). domains.yaml
                                    # overrides per domain.
-  trajectory_expose_reasoning: false  # consumer: trajectory._render (read_trajectory /
-                                   # read_session_trajectory). The model's reasoning text is
-                                   # RECORDED in trajectories either way; this gate decides
-                                   # whether the decision surface (roles reading trajectories)
-                                   # sees it. Default off: raw chain-of-thought is the strongest
-                                   # persuasion surface and may speculate about benchmark
-                                   # mechanics (B29 artifact-vs-rationale, same spirit).
+  trajectory_expose_reasoning: true
+                                   # trajectories ONLY (read_trajectory, role="task");
+                                   # role sessions (read_session_trajectory, incl. its
+                                   # legacy per-gen fallback) NEVER expose reasoning
+                                   # regardless of this flag. The task agent's (already
+                                   # line-redacted) reasoning text is rendered into the
+                                   # read() output when true; false restores
+                                   # "[reasoning omitted: N chars]". Default on since the
+                                   # short-answer domains (search_arena): a one-word
+                                   # verdict carries too little signal for the
+                                   # planner/evaluator to reason about WHAT failed.
+                                   # Persuasion note (B29 spirit): raw CoT may speculate
+                                   # about benchmark mechanics — the evaluator's
+                                   # reward_hacking / rule_violation checkpoints are the
+                                   # backstop.
 
 # ---------------------------------------------------------------------------
 # task 树/DAG 约束与父代选择

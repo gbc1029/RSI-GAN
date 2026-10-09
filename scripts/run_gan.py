@@ -9,11 +9,52 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+
+def _run_offline_analysis(output_dir: str, skip: bool = False) -> int:
+    """Post-run offline data analysis into <output_dir>/score_analysis/.
+
+    Runs the local (gitignored) analyzers on whatever artifacts landed:
+    score extraction (scores_extract.csv / REPORT.md / significance.txt /
+    progress.png) + lineage graphs (lineage_{inner,outer}_{lenient,strict}.png
+    + lineage_audit.md). NO network, NO LLM calls.
+
+    Deliberately runs EVEN when the loop failed or was interrupted: the
+    artifacts are the point (driver-mode lesson: judge a round by its events
+    and artifacts, not by the exit code alone). A missing analyzer script
+    degrades to a printed note, never masks the loop's own result.
+    Returns the FIRST non-zero analyzer rc (0 when all ok), after running both.
+    """
+    if skip:
+        return 0
+    import shutil
+    analyzers = [
+        os.path.join(REPO_ROOT, "scripts", "local", "gan_scores_extract.py"),
+        os.path.join(REPO_ROOT, "scripts", "local", "gan_lineage_graph.py"),
+    ]
+    if not os.path.isdir(os.path.join(REPO_ROOT, "scripts", "local")):
+        return 0  # upstream checkout without the local tools: nothing to run
+    py = sys.executable or shutil.which("python3")
+    rc_first = 0
+    for path in analyzers:
+        if not os.path.isfile(path):
+            print(f"[analysis] missing {os.path.basename(path)}; skipped")
+            continue
+        proc = subprocess.run([py, path, output_dir],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.STDOUT)
+        status = "ok" if proc.returncode == 0 else f"rc={proc.returncode}"
+        print(f"[analysis] {os.path.basename(path)}: {status} "
+              f"-> {os.path.join(output_dir, 'score_analysis')}")
+        if proc.returncode != 0 and rc_first == 0:
+            rc_first = proc.returncode
+    return rc_first
 
 
 def main():
@@ -41,7 +82,20 @@ def main():
                    help="Probe configured models once before running (fail-fast).")
     p.add_argument("--in-process", action="store_true",
                    help="Run all outers in one process WITHOUT the per-run code repo (legacy).")
+    p.add_argument("--skip-analysis", action="store_true",
+                   help="Skip the offline post-run analysis (scripts/local/gan_*.py -> "
+                        "<output_dir>/score_analysis/). Default: run it after the loop "
+                        "exits, even on a failed run (judge a round by its artifacts).")
     args = p.parse_args()
+
+    # Post-run analysis always targets THIS run's output_dir. The loop itself
+    # may fail (raise) — analysis still runs first via the wrapper below.
+    from gan.framework import paths as _paths  # noqa: F401  (early sanity)
+    out_abs = os.path.abspath(args.output_dir)
+
+    def _finish(loop_rc: int) -> int:
+        ana_rc = _run_offline_analysis(out_abs, skip=args.skip_analysis)
+        return loop_rc if loop_rc != 0 else ana_rc
 
     # litellm offline cost map: the deployment has no github egress, so the
     # remote fetch burns ~10s of retries in every process before falling back
@@ -123,30 +177,50 @@ def main():
                 sample_seed_base=_seed_base,
                 anchor_ids=_anchor,
             )
-            tree = loop.run()
+            _tree = loop.run()
+        except BaseException as _exc:  # noqa: BLE001 — artifacts outlive the error
+            _exc_repr = repr(_exc)
+            _tree = None
+        else:
+            _exc_repr = None
         finally:
             proxy.close()
             _shutil.rmtree(proxy_dir, ignore_errors=True)
             os.environ.pop("GAN_LLM_PROXY_UNIX", None)
             os.environ.pop("GAN_PROXY_CONTROL_TOKEN", None)
-        print(f"GAN loop done (in-process). task tree size={len(tree)}; "
+            # judge the run by its artifacts: analyze even when it raised
+            _finish(1 if _exc_repr else 0)
+        if _exc_repr is not None:
+            print(f"GAN loop (in-process) exited with {_exc_repr}; analysis above",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        print(f"GAN loop done (in-process). task tree size={len(_tree)}; "
               f"output_dir={os.path.abspath(args.output_dir)}")
     else:
         from gan.driver import run_gan_driver
-        code_root = run_gan_driver(
-            repo_root=args.repo_root,
-            output_dir=args.output_dir,
-            domains=domains,
-            subset=args.subset,
-            num_samples=args.num_samples,
-            inner=args.inner,
-            cfg_overrides=overrides or None,
-            preflight=args.preflight,
-            resume=args.resume,
-            force=args.force,
-        )
-        print(f"GAN driver done. code_root={code_root}; "
-              f"output_dir={os.path.abspath(args.output_dir)}")
+        _exc_repr = None
+        try:
+            code_root = run_gan_driver(
+                repo_root=args.repo_root,
+                output_dir=args.output_dir,
+                domains=domains,
+                subset=args.subset,
+                num_samples=args.num_samples,
+                inner=args.inner,
+                cfg_overrides=overrides or None,
+                preflight=args.preflight,
+                resume=args.resume,
+                force=args.force,
+            )
+            print(f"GAN driver done. code_root={code_root}; "
+                  f"output_dir={os.path.abspath(args.output_dir)}")
+        except BaseException as _exc:  # noqa: BLE001 — artifacts outlive the error
+            _exc_repr = repr(_exc)
+            print(f"GAN driver exited with {_exc_repr}; analyzing landed artifacts",
+                  file=sys.stderr)
+        _finish(1 if _exc_repr else 0)
+        if _exc_repr is not None:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
