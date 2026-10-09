@@ -30,6 +30,63 @@ def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
     trajectory_log.append(paths.events_path(output_dir), event)
 
 
+def _load_events(output_dir: str) -> List[Dict[str, Any]]:
+    from utils import trajectory_log
+    ev_path = paths.events_path(output_dir)
+    if not os.path.exists(ev_path):
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in trajectory_log.read_all(ev_path).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _cost_role_of(e: Dict[str, Any]) -> str:
+    # genid-scoped calls are the task child's; outer-scoped carry role directly.
+    return "task" if e.get("scope_type") == "genid" else str(e.get("role") or "unknown")
+
+
+def _cost_rollup(output_dir: str, *, label: str, since_ts: float = 0.0) -> float:
+    """Log a per-outer llm-cost rollup event (root-side, from the proxy audit).
+
+    ``delta`` covers calls since the previous rollup; ``cumulative`` covers the
+    whole run. The per-call records stay in events.jsonl (single source); this
+    is a monitoring convenience, never an authority.
+    Returns the newest call timestamp seen (the next rollup's ``since_ts``)."""
+    calls = [e for e in _load_events(output_dir) if e.get("type") == "llm_call"]
+
+    def agg(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for role in ("planner", "evaluator", "task", "unknown"):
+            sel = [e for e in items if _cost_role_of(e) == role]
+            if not sel:
+                continue
+            out[role] = {
+                "calls": len(sel),
+                "prompt_tokens": int(sum(e.get("prompt_tokens") or 0 for e in sel)),
+                "completion_tokens": int(sum(e.get("completion_tokens") or 0 for e in sel)),
+                "total_tokens": int(sum(e.get("total_tokens") or 0 for e in sel)),
+                "latency_s": round(sum(e.get("latency_ms") or 0 for e in sel) / 1000.0, 1),
+                "failures": sum(1 for e in sel if e.get("status") != 200),
+            }
+        return out
+
+    delta_calls = [e for e in calls if (e.get("timestamp") or 0) > since_ts]
+    _log_event(output_dir, {
+        "type": "cost_rollup", "scope": label,
+        "delta": agg(delta_calls),
+        "cumulative": agg(calls),
+        "delta_calls": len(delta_calls), "cumulative_calls": len(calls),
+    })
+    return max((e.get("timestamp") or 0.0 for e in calls), default=since_ts)
+
+
 def _outer_env(base: Dict[str, str], *, proxy_socket: str,
                planner_token: str, evaluator_token: str,
                task_broker_socket: str, task_broker_token: str,
@@ -443,6 +500,7 @@ def run_gan_driver(
         os.chmod(env_mask_file, 0o400)
         proxy.start()
         proxy_started = True
+        cost_since = 0.0  # llm_call timestamp watermark for per-outer deltas
         for outer in range(start, G + 1):
             tokens = {
                 "planner": proxy.issue_scope(
@@ -484,10 +542,15 @@ def run_gan_driver(
             if proc.returncode != 0:
                 _log_event(output_dir, {"type": "outer_worker_failed", "outer": outer,
                                         "rc": proc.returncode})
+                _cost_rollup(output_dir, label=f"outer_{outer}_failed",
+                             since_ts=cost_since)
                 raise RuntimeError(f"outer worker failed at outer {outer} (rc={proc.returncode})")
             # Role self-edits are applied+committed by the worker itself.
+            cost_since = _cost_rollup(output_dir, label=f"outer_{outer}",
+                                      since_ts=cost_since)
         _log_event(output_dir, {"type": "driver_done", "code_root": code_root,
                                 "duration_s": round(time.time() - _driver_t0, 1)})
+        _cost_rollup(output_dir, label="run", since_ts=0.0)  # full-run cumulative
         return code_root
     finally:
         if proxy_started:

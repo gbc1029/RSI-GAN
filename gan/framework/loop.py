@@ -105,6 +105,42 @@ from utils.soft_fail import soft_fail
 _MEASURED = ("ok", "partial")
 
 
+def _llm_cost_for_gen(output_dir: str, genid: Any) -> Optional[tuple]:
+    """Task-child cost for one generation, from the proxy audit (single source).
+
+    Returns ``(cost_tokens, cost_wallclock_s)`` for the generation's task
+    child — llm tokens (prompt+completion) summed over the child's proxy
+    calls, wall clock from the harness duration (falls back to summed call
+    latency). ``None`` when the generation produced no llm calls (offline
+    smoke / planner-failed generations): an unrecorded cost must stay None,
+    not a fake 0 — ``cost_penalty`` and packet.json treat None as absent.
+    """
+    from utils import trajectory_log
+    ev_path = paths.events_path(output_dir)
+    if not os.path.exists(ev_path):
+        return None
+    calls, harness_s = [], None
+    for line in trajectory_log.read_all(ev_path).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("type") == "llm_call" and e.get("scope_type") == "genid" \
+                and str(e.get("scope_id")) == str(genid):
+            calls.append(e)
+        elif e.get("type") == "task_harness_done" and str(e.get("genid")) == str(genid):
+            harness_s = e.get("duration_s")
+    if not calls:
+        return None
+    tokens = float(sum(e.get("total_tokens") or 0 for e in calls))
+    wall = float(harness_s) if harness_s is not None else \
+        round(sum(e.get("latency_ms") or 0 for e in calls) / 1000.0, 3)
+    return tokens, wall
+
+
 class GanLoop:
     def __init__(
         self,
@@ -322,6 +358,12 @@ class GanLoop:
 
     def _finalize_child(self, child: Node, parent: Optional[Node]) -> None:
         """Decide score/validity: measured / partial / imputed / invalid."""
+        # Task-child cost (tokens + wall clock) from the proxy audit; recorded
+        # on every settled child so packet.json / UCB cost_penalty see real
+        # numbers instead of a permanent None.
+        cost = _llm_cost_for_gen(self.output_dir, child.genid)
+        if cost is not None:
+            child.value.cost_tokens, child.value.cost_wallclock_s = cost
         status = getattr(child.value, "score_status", "ok") or "ok"
         child.meta.setdefault("report_summary", {})
         if child.value.score is not None and status in _MEASURED:

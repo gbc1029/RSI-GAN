@@ -22,8 +22,10 @@ def _run_offline_analysis(output_dir: str, skip: bool = False) -> int:
 
     Runs the local (gitignored) analyzers on whatever artifacts landed:
     score extraction (scores_extract.csv / REPORT.md / significance.txt /
-    progress.png) + lineage graphs (lineage_{inner,outer}_{lenient,strict}.png
-    + lineage_audit.md). NO network, NO LLM calls.
+    progress.png), lineage graphs (lineage_{inner,outer}_{lenient,strict}.png
+    + lineage_audit.md), and the cost report (cost_report.md /
+    cost_breakdown.csv; token-only unless --prices/$GAN_PRICE_TABLE).
+    NO network, NO LLM calls.
 
     Deliberately runs EVEN when the loop failed or was interrupted: the
     artifacts are the point (driver-mode lesson: judge a round by its events
@@ -37,6 +39,7 @@ def _run_offline_analysis(output_dir: str, skip: bool = False) -> int:
     analyzers = [
         os.path.join(REPO_ROOT, "scripts", "local", "gan_scores_extract.py"),
         os.path.join(REPO_ROOT, "scripts", "local", "gan_lineage_graph.py"),
+        os.path.join(REPO_ROOT, "scripts", "local", "gan_cost_report.py"),
     ]
     if not os.path.isdir(os.path.join(REPO_ROOT, "scripts", "local")):
         return 0  # upstream checkout without the local tools: nothing to run
