@@ -24,6 +24,7 @@ class Evaluator(Role):
         parent_feedback: Optional[Dict[str, Any]],
         blind_enabled: bool = True,
         task_brief: Optional[str] = None,
+        cost_statement: str = "",
     ) -> str:
         parts = [
             "Evaluate the task agent this round.",
@@ -63,6 +64,11 @@ class Evaluator(Role):
                 "extend a declared key's value enum (key/value).\n"
                 f"```json\n{json.dumps(parent_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
             )
+        if cost_statement:
+            # Framework-measured cost facts (docs/10 §2.3): THIS round's task
+            # cost as a PROCESS fact (no scores — blind discipline holds) plus
+            # your own last session. Injected verbatim, aggregate-only.
+            parts.append(f"\n{cost_statement}")
         return "\n".join(parts)
 
     def _reveal_instruction(self, benchmark_score: float, penalties_hint: Optional[Dict[str, Any]] = None) -> str:
@@ -92,6 +98,7 @@ class Evaluator(Role):
         trajectory_genids: Optional[List[Any]] = None,
         max_tool_calls: Optional[int] = None,
         tool_repeat_limit: Optional[int] = None,
+        cost_statement: str = "",
     ) -> EvalContext:
         """Two-phase evaluation: blind first, then reveal benchmark (if provided).
 
@@ -112,7 +119,8 @@ class Evaluator(Role):
         blind_cap = max_tool_calls if max_tool_calls is not None else 30
         reveal_cap = max(6, blind_cap // 3)
         try:
-            hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief),
+            hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief,
+                                                    cost_statement=cost_statement),
                             max_tool_calls=blind_cap,
                             tool_repeat_limit=tool_repeat_limit,
                             trajectory_file=self.session_trajectory(node_id))
@@ -157,6 +165,7 @@ class Evaluator(Role):
             sessions = outer_session_index(self.output_dir, self.outer, "evaluator")
             sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
             rr = render_receipt((recent or {}).get("receipt"))
+            cost_stmt = str((recent or {}).get("cost_statement") or "")
             instruction = (
                 "Improve YOURSELF (the evaluator's own design) using only design operators "
                 "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
@@ -170,6 +179,7 @@ class Evaluator(Role):
                 "Do not repeat the same tool call; when done, stop.\n"
                 f"\n## Your session trajectories this outer (use read_session_trajectory)\n{sess_line}\n"
                 + (("\n" + rr + "\n") if rr else "")
+                + ((f"\n{cost_stmt}\n") if cost_stmt else "")
                 + f"\n## Feedback digests\n{digest_text}"
             )
             hist = self.run(instruction, max_tool_calls=max_tool_calls,

@@ -35,6 +35,7 @@ class Planner(Role):
         receipt: Optional[Dict[str, Any]] = None,
         parent_predicted_score: Optional[float] = None,
         parent_benchmark_score: Optional[float] = None,
+        cost_statement: str = "",
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -83,6 +84,12 @@ class Planner(Role):
                 "\n## Selected parent calibration\n"
                 f"```json\n{json.dumps({'predicted_score': parent_predicted_score, 'benchmark_score': parent_benchmark_score}, ensure_ascii=False)}\n```"
             )
+        if cost_statement:
+            # Framework-measured cost facts (docs/10 §2.3): injected verbatim,
+            # aggregate-only and length-capped at the source. Numbers, not
+            # assertions — the statement carries no instruction to change
+            # behavior beyond what the loop's selection already rewards.
+            parts.append(f"\n{cost_statement}")
         return "\n".join(parts)
 
     # -- API ---------------------------------------------------------------
@@ -103,6 +110,7 @@ class Planner(Role):
         patch_retry_k: int = 2,
         max_tool_calls: int = 40,
         tool_repeat_limit: Optional[int] = None,
+        cost_statement: str = "",
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
@@ -125,7 +133,8 @@ class Planner(Role):
             hist = self.run(
                 self._plan_instruction(parent_summary or {}, parent_feedback, evaluator_issues,
                                        parents, task_brief, receipt,
-                                       parent_predicted_score, parent_benchmark_score),
+                                       parent_predicted_score, parent_benchmark_score,
+                                       cost_statement=cost_statement),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
 
@@ -207,6 +216,7 @@ class Planner(Role):
             sessions = outer_session_index(self.output_dir, self.outer, "planner")
             sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
             rr = render_receipt((recent or {}).get("receipt"))
+            cost_stmt = str((recent or {}).get("cost_statement") or "")
             instruction = (
                 "Improve YOURSELF (the planner's own design) using only design operators "
                 "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
@@ -219,7 +229,8 @@ class Planner(Role):
                 "Do not repeat the same tool call; when done, stop.\n"
                 f"\n## Your session trajectories this outer (use read_session_trajectory)\n{sess_line}\n"
                 + (("\n" + rr + "\n") if rr else "")
-                + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k != 'receipt'}, ensure_ascii=False)[:2000]}"
+                + ((f"\n{cost_stmt}\n") if cost_stmt else "")
+                + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k not in ('receipt', 'cost_statement')}, ensure_ascii=False)[:2000]}"
             )
             hist = self.run(instruction, max_tool_calls=max_tool_calls,
                             tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)

@@ -61,6 +61,36 @@ def _run_usage_hooks(model, response):
             pass
 
 
+def _usage_dict(response) -> dict:
+    """Whitelisted per-call usage counters for the session trajectory.
+
+    Cost-attribution source (gan/framework/cost_ledger.py sums these over a
+    session's ``output`` rows; the proxy audit is the independent
+    reconciliation source). Unavailable counters stay ``None`` -- an
+    unrecorded cost must never be recorded as 0.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return {}
+    if hasattr(usage, "model_dump"):
+        try:
+            usage = usage.model_dump()
+        except Exception:
+            usage = None
+    if not isinstance(usage, dict):
+        return {}
+
+    def _get(key):
+        val = usage.get(key)
+        return val if isinstance(val, (int, float)) else None
+
+    return {"prompt_tokens": _get("prompt_tokens"),
+            "completion_tokens": _get("completion_tokens"),
+            "total_tokens": _get("total_tokens")}
+
+
 # Retry on TRANSIENT provider failures only (rate limit / timeout / conn drops).
 # NOTE: there is NO fallback model — a model is chosen solely from
 # gan/framework/models.yaml and passed in explicitly by the caller.
@@ -191,4 +221,5 @@ def get_response_from_llm(
     ]
 
     return response_text, new_msg_history, {"reasoning": reasoning, "finish_reason": finish_reason,
-                                            "reasoning_tokens": reasoning_tokens}
+                                            "reasoning_tokens": reasoning_tokens,
+                                            "usage": _usage_dict(response)}

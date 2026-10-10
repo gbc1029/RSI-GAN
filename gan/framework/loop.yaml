@@ -1,8 +1,9 @@
 # GAN-style three-role self-evolution framework - loop / reward / gating config
 # NOTE: every key below MUST have a code consumer (cfg.get(...)); design-only
 # statements live in AGENTS.md / docs, not here (see docs/6_v5改动.md R2).
-# Exception (A16): the ``cost.*`` section is RESERVED -- it has no consumer yet
-# and must not be removed on that ground; wiring it up is backlog item B21.
+# Exception retired (docs/10 §9): the ``cost.*`` section now HAS consumers
+# (record_usage -> runtime ledger + statements; token_budget_per_gen ->
+# statement reference line); clamping consumption remains stage C.
 
 # ---------------------------------------------------------------------------
 # 双循环调度
@@ -90,7 +91,11 @@ source_access:
   max_bytes_per_grant: 52428800 # 50 MiB
 
 # ---------------------------------------------------------------------------
-# 成本（键保留，实现归 G3：usage hook 注册 + 任务子进程成本导出/聚合）
+# 成本（A/B 阶段已接线，docs/10 §9；钳制消费点归 C 阶段）
+#   record_usage          -> 消费点：GanLoop._record_session_cost/_write_gen_cost/
+#                            对账单注入（false 只停运行时落账，离线聚合器不受影响）
+#   token_budget_per_gen  -> 消费点：成本对账单的参考线（B1）；
+#                            消费点钳制（C）待接线，键保留
 # ---------------------------------------------------------------------------
 cost:
   token_budget_per_gen: 200000

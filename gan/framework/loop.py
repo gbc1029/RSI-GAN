@@ -47,6 +47,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from gan.design import initial_config
 from gan.framework import checkpoint as ckpt
+from gan.framework import cost_ledger
 from gan.framework import paths, scores, trajectory
 from gan.framework.loader import load_registry, resolve_domain
 from gan.framework.reward.evaluator_reward import build_feedback_digest
@@ -88,6 +89,9 @@ def _receipt_for_evaluator(receipt):
     if not isinstance(receipt, dict):
         return {}
     cp = receipt.get("code_patch") or {}
+    # Cost projection: TASK-ONLY (docs/10 §4). The planner's plan-session
+    # cost is the planner's own business; the evaluator never sees it here
+    # (its own costs arrive via its cost statement / self-improve payload).
     return {
         # The lagged facts below describe the PARENT round -- label them with
         # the receipt's own genid so the evaluator cannot misread them as
@@ -95,6 +99,7 @@ def _receipt_for_evaluator(receipt):
         # context, not a current-round event.
         "round": receipt.get("genid"),
         "budget": receipt.get("budget") or {},
+        "cost": {"task": (receipt.get("cost") or {}).get("task")},
         "design_stripped": receipt.get("design_stripped") or [],
         "toolset": receipt.get("toolset") or {},
         "code_patch": {"proposed": cp.get("proposed"), "applied": cp.get("applied")},
@@ -103,42 +108,6 @@ def _receipt_for_evaluator(receipt):
 from utils.soft_fail import soft_fail
 
 _MEASURED = ("ok", "partial")
-
-
-def _llm_cost_for_gen(output_dir: str, genid: Any) -> Optional[tuple]:
-    """Task-child cost for one generation, from the proxy audit (single source).
-
-    Returns ``(cost_tokens, cost_wallclock_s)`` for the generation's task
-    child — llm tokens (prompt+completion) summed over the child's proxy
-    calls, wall clock from the harness duration (falls back to summed call
-    latency). ``None`` when the generation produced no llm calls (offline
-    smoke / planner-failed generations): an unrecorded cost must stay None,
-    not a fake 0 — ``cost_penalty`` and packet.json treat None as absent.
-    """
-    from utils import trajectory_log
-    ev_path = paths.events_path(output_dir)
-    if not os.path.exists(ev_path):
-        return None
-    calls, harness_s = [], None
-    for line in trajectory_log.read_all(ev_path).splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if e.get("type") == "llm_call" and e.get("scope_type") == "genid" \
-                and str(e.get("scope_id")) == str(genid):
-            calls.append(e)
-        elif e.get("type") == "task_harness_done" and str(e.get("genid")) == str(genid):
-            harness_s = e.get("duration_s")
-    if not calls:
-        return None
-    tokens = float(sum(e.get("total_tokens") or 0 for e in calls))
-    wall = float(harness_s) if harness_s is not None else \
-        round(sum(e.get("latency_ms") or 0 for e in calls) / 1000.0, 3)
-    return tokens, wall
 
 
 class GanLoop:
@@ -169,6 +138,15 @@ class GanLoop:
         self.planner_factory = planner_factory
         self.evaluator_factory = evaluator_factory
         self.keep_workdirs = bool(cfg.get("loop.keep_workdirs", False))
+        # Cost ledger (phases A/B, docs/10 §9): per-session cost records +
+        # framework-rendered cost statements. ``cost.record_usage`` gates the
+        # RUNTIME emit only -- the ledger still aggregates offline (A3).
+        # ``cost.token_budget_per_gen`` is the statements' reference line here;
+        # its clamp consumer arrives with the reserved-key phase (C).
+        self.record_usage = bool(cfg.get("cost.record_usage", True))
+        self.token_budget_per_gen = cfg.get("cost.token_budget_per_gen")
+        # Session cost records settled by THIS loop (outer summary + audit).
+        self._session_costs: List[Dict[str, Any]] = []
         self.self_improve_max_tool_calls = int(cfg.get("loop.self_improve_max_tool_calls", 30))
         self.plan_max_tool_calls = int(cfg.get("loop.plan_max_tool_calls", 40))
         # The evaluate seat has its OWN budget: it must at minimum complete the
@@ -360,8 +338,8 @@ class GanLoop:
         """Decide score/validity: measured / partial / imputed / invalid."""
         # Task-child cost (tokens + wall clock) from the proxy audit; recorded
         # on every settled child so packet.json / UCB cost_penalty see real
-        # numbers instead of a permanent None.
-        cost = _llm_cost_for_gen(self.output_dir, child.genid)
+        # numbers instead of a permanent None. (Moved to cost_ledger, phase A.)
+        cost = cost_ledger.task_cost_for_gen(self.output_dir, child.genid)
         if cost is not None:
             child.value.cost_tokens, child.value.cost_wallclock_s = cost
         status = getattr(child.value, "score_status", "ok") or "ok"
@@ -384,6 +362,142 @@ class GanLoop:
         child.value.score_status = "imputed"
         child.meta["imputed"] = True
         child.meta["imputed_score"] = imputed
+
+    # -- cost ledger (phases A/B, docs/10 §9) -------------------------------
+    def _record_session_cost(self, role: str, seat: str, outer: Any,
+                             genid: Any = None) -> Optional[Dict[str, Any]]:
+        """Settled-session cost record (A5): append to
+        ``logs/cost_sessions.jsonl`` + a ``cost_session`` event.
+
+        Audit-only: a ledger failure is surfaced via ``soft_fail`` and never
+        fails the generation. genid-keyed seats (plan/evaluate) read the
+        session trajectory directly; the self-improve seat resolves the role's
+        newest outer-level file (canonical or attempt-keyed — the loop binds
+        the attempt-keyed sink, which sorts newest)."""
+        if not self.record_usage:
+            return None
+        try:
+            if genid is not None:
+                rec = cost_ledger.session_cost_from_file(
+                    paths.session_traj_file(self.output_dir, outer, genid, role),
+                    role=role, seat=seat, outer=outer, genid=genid,
+                    output_dir=self.output_dir)
+            else:
+                recs = cost_ledger.self_session_costs(self.output_dir, outer, role)
+                rec = recs[0] if recs else None
+            if rec is None:
+                return None
+            cost_ledger.append_session_cost(self.output_dir, rec)
+            self._session_costs.append(rec)
+            self.log_event({"type": "cost_session",
+                            **{k: rec.get(k) for k in
+                               ("role", "seat", "outer", "genid", "attempt", "records",
+                                "llm_calls", "tool_calls", "tool_outputs", "prompt_tokens",
+                                "completion_tokens", "reasoning_tokens", "total_tokens",
+                                "wallclock_s")}})
+            return rec
+        except Exception as e:  # noqa: BLE001 -- audit-only, never fatal
+            soft_fail(f"cost_session record failed ({role}/{seat}, outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cost_session_record_failed")
+            return None
+
+    def _write_gen_cost(self, genid: Any, outer: Any) -> None:
+        """``runs/<genid>/cost.json`` (A5): the generation's settled sessions —
+        task child from the proxy audit, plan/evaluate from trajectories, plus
+        the task child's trajectory-side cost as the reconciliation sibling.
+        Evidence file only (same bucket as packet.json / patch_receipt.json);
+        a write failure is surfaced, never fatal."""
+        if not self.record_usage:
+            return
+        try:
+            task = cost_ledger.task_cost_for_gen(self.output_dir, genid)
+            sess = cost_ledger.gen_session_costs(self.output_dir, outer, genid)
+            task_traj = cost_ledger.task_trajectory_cost(self.output_dir, outer, genid)
+            payload: Dict[str, Any] = {
+                "genid": str(genid), "outer": outer,
+                "task": ({"cost_tokens": task[0], "cost_wallclock_s": task[1],
+                          "source": "proxy_audit"} if task is not None else None),
+                "task_trajectory": ({"total_tokens": task_traj.get("total_tokens"),
+                                     "wallclock_s": task_traj.get("wallclock_s"),
+                                     "llm_calls": task_traj.get("llm_calls"),
+                                     "tool_calls": task_traj.get("tool_calls"),
+                                     "source": "trajectory"} if task_traj else None),
+                "planner_plan": cost_ledger.compact(sess.get("planner_plan")),
+                "evaluator_evaluate": cost_ledger.compact(sess.get("evaluator_evaluate")),
+            }
+            d = paths.runs_dir(self.output_dir, genid)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "cost.json"), "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:  # noqa: BLE001 -- evidence file, never fatal
+            soft_fail(f"cost.json write failed for genid {genid}: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cost_json_write_failed", genid=str(genid))
+
+    def _cost_statement_plan(self, parent: Any, outer: Any, genid: Any,
+                             history_genids: List[Any]) -> str:
+        """Framework-rendered cost statement for the planner's plan session
+        (B2). Advisory: a render failure degrades to an empty statement and is
+        surfaced, never fatal."""
+        if not self.record_usage:
+            return ""
+        try:
+            parent_cost = (cost_ledger.task_cost_for_gen(self.output_dir, parent.genid)
+                           if str(parent.genid) != "initial" else None)
+            bulk = cost_ledger.task_costs_for_gens(
+                self.output_dir, [g for g in history_genids if g != genid])
+            history = [{"genid": g, "cost_tokens": bulk[str(g)][0]}
+                       for g in history_genids if str(g) in bulk]
+            return cost_ledger.render_plan_statement(
+                parent_genid=parent.genid,
+                parent_task_cost=parent_cost,
+                history_costs=history,
+                own_last=cost_ledger.latest_session_cost(self.output_dir, "planner", "plan"),
+                token_budget=self.token_budget_per_gen)
+        except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+            soft_fail(f"plan cost statement build failed: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cost_statement_build_failed", seat="plan")
+            return ""
+
+    def _cost_statement_eval(self, genid: Any,
+                             task_cost: Optional[tuple] = None) -> str:
+        if not self.record_usage:
+            return ""
+        try:
+            return cost_ledger.render_evaluate_statement(
+                genid=genid, task_cost=task_cost,
+                own_last=cost_ledger.latest_session_cost(
+                    self.output_dir, "evaluator", "evaluate", exclude_genid=genid))
+        except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+            soft_fail(f"evaluate cost statement build failed: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cost_statement_build_failed", seat="evaluate")
+            return ""
+
+    def _cost_statement_self(self, role: str, outer: Any) -> str:
+        if not self.record_usage:
+            return ""
+        try:
+            return cost_ledger.render_self_statement(
+                role=role, outer=outer,
+                own_sessions=cost_ledger.self_session_costs(self.output_dir, outer, role),
+                own_last=cost_ledger.latest_session_cost(self.output_dir, role, "self_improve"))
+        except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+            soft_fail(f"self-improve cost statement build failed ({role}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cost_statement_build_failed", seat="self_improve")
+            return ""
+
+    def _cost_statement_accepted(self, fn: Any, name: str = "cost_statement") -> bool:
+        """Signature probe: older role source (a resumed checkpoint's code
+        tree) may predate the ``cost_statement`` kwarg — the statement is then
+        silently absent for that session (audited, never a TypeError)."""
+        try:
+            return name in inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return False
 
     def _finalize_invalid_node(self, node: Node, reason: str, detail: str,
                                outer: Optional[int], inner: Optional[int]) -> None:
@@ -714,7 +828,8 @@ class GanLoop:
             return []
 
     def _make_receipt(self, genid: Any, plan_result: Dict[str, Any],
-                      parent_cfg: Dict[str, Any], child: Node, outer: Any) -> Dict[str, Any]:
+                      parent_cfg: Dict[str, Any], child: Node, outer: Any,
+                      plan_cost: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         from gan.framework.receipt import build_receipt
         rejected = plan_result.get("patch_rejection") or child.meta.get("task_patch_rejected")
         exhausted = bool(plan_result.get("budget_exhausted"))
@@ -725,6 +840,18 @@ class GanLoop:
             "attempts": plan_result.get("attempts", 0),
             "truncated": truncated,
         }
+        # Cost facts of THIS round (B6): the task child (proxy audit) and the
+        # planner's OWN plan session. The evaluator's session cost is
+        # deliberately NOT here — the receipt feeds the PLANNER's next prompt,
+        # and e's internal costs are outside the planner's view (docs/10 §4).
+        cost: Optional[Dict[str, Any]] = None
+        if self.record_usage:
+            cost = {
+                "task": ({"cost_tokens": child.value.cost_tokens,
+                          "cost_wallclock_s": child.value.cost_wallclock_s}
+                         if child.value.cost_tokens is not None else None),
+                "planner_plan": cost_ledger.compact(plan_cost),
+            }
         refs = [
             paths.session_traj_file(self.output_dir, outer, genid, "planner"),
             paths.session_traj_file(self.output_dir, outer, genid, "task"),
@@ -754,6 +881,9 @@ class GanLoop:
             # The dangling slot names the framework stripped
             # from the design right before persisting it.
             design_stripped=child.meta.get("design_stripped"),
+            # Cost facts of this round (B6): task child + the planner's OWN
+            # plan session (never the evaluator's — see the cost dict above).
+            cost=cost,
         )
         try:
             d = paths.runs_dir(self.output_dir, genid)
@@ -1026,6 +1156,25 @@ class GanLoop:
                 evaluator_issues = (parent_feedback or {}).get("issues")
                 parent_ref = [] if str(parent.genid) == "initial" else [parent.genid]
 
+                # Cost statement for the plan session (B2): framework-rendered
+                # facts only; the role injects the text verbatim. Resume-safe:
+                # an older role source without the kwarg keeps working (the
+                # statement is then absent for that session — audited).
+                cost_stmt_plan = self._cost_statement_plan(
+                    parent, outer, genid, [g for g in outer_genids if g != genid])
+                plan_cost_kwargs: Dict[str, Any] = {}
+                if cost_stmt_plan and self._cost_statement_accepted(self.planner.plan):
+                    plan_cost_kwargs["cost_statement"] = cost_stmt_plan
+                    # Injection fact (B2): what was rendered and how big — the
+                    # offline audit reconciles this against the session's first
+                    # `input` row.
+                    self.log_event({"type": "cost_statement", "seat": "plan",
+                                    "genid": str(genid), "bytes": len(cost_stmt_plan)})
+                elif cost_stmt_plan:
+                    self.log_event({"type": "cost_statement_skipped", "seat": "plan",
+                                    "genid": str(genid),
+                                    "reason": "role signature lacks cost_statement"})
+
                 try:
                     plan_result = self.planner.plan(
                         parent_summary=self._parent_summary(parent),
@@ -1043,6 +1192,7 @@ class GanLoop:
                         patch_retry_k=self.patch_retry_k,
                         max_tool_calls=self.plan_max_tool_calls,
                         tool_repeat_limit=self.tool_repeat_limit,
+                        **plan_cost_kwargs,
                     ) or {}
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to planner_failed
@@ -1050,6 +1200,9 @@ class GanLoop:
                     self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
+                # Settled plan session -> cost ledger (A5). Success-only: a
+                # planner_failed round has no settled session to record.
+                plan_cost_rec = self._record_session_cost("planner", "plan", outer, genid)
 
                 try:
                     child = self.task_runner(plan=plan_result, parent=parent, genid=genid,
@@ -1125,6 +1278,20 @@ class GanLoop:
                              if k in (child.meta or {})}
                 report_view = {k: v for k, v in (child.meta.get("report_summary") or {}).items()
                                if k not in ("overall_accuracy", "random_guess_accuracy")}
+                # Cost statement for the evaluate session (B2): THIS round's
+                # task cost as a process fact (no scores — blind discipline).
+                task_cost_pair = ((child.value.cost_tokens, child.value.cost_wallclock_s)
+                                  if child.value.cost_tokens is not None else None)
+                cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair)
+                eval_cost_kwargs: Dict[str, Any] = {}
+                if cost_stmt_eval and self._cost_statement_accepted(self.evaluator.evaluate):
+                    eval_cost_kwargs["cost_statement"] = cost_stmt_eval
+                    self.log_event({"type": "cost_statement", "seat": "evaluate",
+                                    "genid": str(genid), "bytes": len(cost_stmt_eval)})
+                elif cost_stmt_eval:
+                    self.log_event({"type": "cost_statement_skipped", "seat": "evaluate",
+                                    "genid": str(genid),
+                                    "reason": "role signature lacks cost_statement"})
                 try:
                     ctx = self.evaluator.evaluate(
                         run_summary={
@@ -1147,6 +1314,7 @@ class GanLoop:
                         trajectory_genids=[genid] + parent_ref,
                         max_tool_calls=self.evaluate_max_tool_calls,
                         tool_repeat_limit=self.tool_repeat_limit,
+                        **eval_cost_kwargs,
                     )
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to evaluator_failed
@@ -1162,6 +1330,8 @@ class GanLoop:
                                                 outer, inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
+                # Settled evaluate session -> cost ledger (A5).
+                eval_cost_rec = self._record_session_cost("evaluator", "evaluate", outer, genid)
 
                 packet = self._build_packet(child, ctx)
                 if getattr(ctx, "predicted_score", None) is not None:
@@ -1179,8 +1349,10 @@ class GanLoop:
                 self.task_tree.add_node(child)
                 self._append_score(child)
                 self._write_eval(child, ctx, packet)
+                self._write_gen_cost(genid, outer)
                 child.meta["receipt"] = self._make_receipt(
-                    genid, plan_result, parent_cfg, child, outer)
+                    genid, plan_result, parent_cfg, child, outer,
+                    plan_cost=plan_cost_rec)
                 if child.meta.get("task_patch_files") and self.broker is not None:
                     self._resync_workspace(outer, child.meta["task_patch_files"])
                 if not self.keep_workdirs:
@@ -1218,6 +1390,8 @@ class GanLoop:
                     "valid_parent": child.valid_parent,
                     "no_improve": no_improve, "penalties": packet.penalties,
                     "modify_depth": child.modify_depth,
+                    "cost_tokens": child.value.cost_tokens,
+                    "cost_wallclock_s": child.value.cost_wallclock_s,
                     "duration_s": round(time.time() - _inner_t0, 1),
                 })
 
@@ -1255,6 +1429,21 @@ class GanLoop:
             recent_plan = {"advantages": self._advantages[-I_max:],
                            "task_tree_size": len(self.task_tree),
                            "toolset_report": getattr(self.planner, "assembly_report", None)}
+            # Self-improve cost statements (B2): each role's OWN sessions this
+            # outer (cost × quality alignment material) + the role's compact
+            # ledger records; the OTHER role's costs are deliberately absent.
+            if self.record_usage:
+                for role, payload in (("evaluator", recent_eval), ("planner", recent_plan)):
+                    try:
+                        own = [cost_ledger.compact(r)
+                               for r in cost_ledger.self_session_costs(self.output_dir, outer, role)]
+                        payload["costs"] = {"own_sessions": [r for r in own if r]}
+                        payload["cost_statement"] = self._cost_statement_self(role, outer)
+                    except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+                        soft_fail(f"self cost payload failed ({role}): {e}",
+                                  event_path=paths.events_path(self.output_dir),
+                                  event_type="cost_statement_build_failed",
+                                  seat="self_improve")
             # visible task trajectories for self-improvement: this outer's gens
             # + the direct parent of the last generation (read-only).
             si_refs = list(outer_genids)
@@ -1283,6 +1472,11 @@ class GanLoop:
                         tool_repeat_limit=self.tool_repeat_limit,
                         trajectory_genids=si_refs,
                         patch_retry_k=self.patch_retry_k)
+                    # Settled self-improve session -> cost ledger (A5). Thread
+                    # safety: trajectory_log.append is locked and list.append
+                    # is GIL-atomic; the parallel sessions write DISJOINT
+                    # trajectory files (seat-disjoint by SEAT_WRITE).
+                    self._record_session_cost(role, "self_improve", outer, None)
                 except Exception as e:  # noqa: BLE001 -- classified after join
                     session_errors[role] = e
 
@@ -1328,7 +1522,29 @@ class GanLoop:
 
             self.evaluator_tree.add_node(Node(genid=f"eval_{outer}", meta={"num_digests": len(self._digests)}))
             self.planner_tree.add_node(Node(genid=f"plan_{outer}", meta={"advantages": self._advantages[-I_max:]}))
+            # Cost reconciliation at the outer boundary (A5, advisory): the
+            # proxy audit vs the session-trajectory sums. A mismatch is data
+            # for the ledger's consumers, never a run-killer.
+            if self.record_usage:
+                try:
+                    self.log_event({"type": "cost_reconciliation", "outer": outer,
+                                    "report": cost_ledger.reconcile(self.output_dir)})
+                except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+                    soft_fail(f"cost reconciliation failed (outer {outer}): {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="cost_reconciliation_failed", outer=outer)
+            self_own_costs: Dict[str, Any] = {}
+            if self.record_usage:
+                for role in ("planner", "evaluator"):
+                    own = [c for c in self._session_costs
+                           if c.get("role") == role and c.get("seat") == "self_improve"
+                           and str(c.get("outer")) == str(outer)]
+                    toks = [c.get("total_tokens") for c in own
+                            if isinstance(c.get("total_tokens"), (int, float))]
+                    self_own_costs[role] = {"sessions": len(own),
+                                            "total_tokens": (sum(toks) if toks else None)}
             self.log_event({"type": "outer_done", "outer": outer, "improved": outer_improved,
+                            "self_cost_tokens": self_own_costs,
                             "duration_s": round(time.time() - _outer_t0, 1)})
             self._save_checkpoint("outer", outer, I_max)
 

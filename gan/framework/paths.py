@@ -76,6 +76,16 @@ def events_path(output_dir: str) -> str:
     return os.path.join(logs_dir(output_dir), "events.jsonl")
 
 
+def cost_sessions_path(output_dir: str) -> str:
+    """Append-only per-session cost records (see gan/framework/cost_ledger.py).
+
+    One line per recorded session (role/seat/outer/genid + usage sums). The
+    per-generation evidence card is ``runs/<genid>/cost.json`` (written by the
+    loop); this file is the append-only stream the cost statements read back
+    ("your last <seat> session")."""
+    return os.path.join(logs_dir(output_dir), "cost_sessions.jsonl")
+
+
 def tree_path(output_dir: str, name: str) -> str:
     return os.path.join(logs_dir(output_dir), f"{name}_tree.jsonl")
 

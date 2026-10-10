@@ -325,11 +325,21 @@ def _output_fields(info):
     The reasoning TEXT is recorded (capped) for audit; `finish_reason` and
     `reasoning_tokens` are counters that ride along on every row. Whether any
     decision surface SEES the reasoning text is decided downstream
-    (gan/framework/trajectory.py:_render, default: omitted)."""
+    (gan/framework/trajectory.py:_render, default: omitted).
+    ``usage`` rides for per-session cost attribution: the cost ledger
+    (gan/framework/cost_ledger.py) sums these over a session's output rows,
+    with the proxy audit reconciling at the coarser role/outer scope.
+    Unavailable counters stay ABSENT, never 0."""
     info = info or {}
-    return {"reasoning": _cap_text(info.get("reasoning")),
-            "finish_reason": info.get("finish_reason"),
-            "reasoning_tokens": info.get("reasoning_tokens")}
+    fields = {"reasoning": _cap_text(info.get("reasoning")),
+              "finish_reason": info.get("finish_reason"),
+              "reasoning_tokens": info.get("reasoning_tokens")}
+    usage = info.get("usage")
+    if isinstance(usage, dict):
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            if usage.get(key) is not None:
+                fields[key] = usage[key]
+    return fields
 
 def chat_with_agent(
     msg,

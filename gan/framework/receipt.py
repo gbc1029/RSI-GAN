@@ -177,6 +177,7 @@ def build_receipt(
     commit: Optional[str] = None,
     rejected_reason: Optional[str] = None,
     budget: Optional[Dict[str, Any]] = None,
+    cost: Optional[Dict[str, Any]] = None,
     grants: Optional[List[Dict[str, Any]]] = None,
     trajectory_refs: Optional[List[str]] = None,
     toolset: Optional[Dict[str, Any]] = None,
@@ -209,6 +210,12 @@ def build_receipt(
             "rejected_reason": rejected_reason,
         },
         "budget": budget or {},
+        # Cost facts of the round (framework-measured; see cost_ledger).
+        # ``task`` = the task child's proxy-audit cost; ``planner_plan`` = the
+        # planner's OWN session record. The evaluator's session cost is
+        # deliberately absent (it must not reach the planner — docs/10 §4),
+        # and _receipt_for_evaluator re-projects ``task`` only.
+        "cost": cost or {},
         "grants": _grants_summary(grants),
         "trajectory_refs": trajectory_refs or [],
         "next_hint": _next_hint(rejected_reason),
@@ -249,6 +256,19 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"code patch REJECTED: {cp.get('rejected_reason')}")
     if budget.get("exhausted"):
         parts.append(f"budget exhausted ({budget.get('kind')}, attempts={budget.get('attempts')})")
+    cost = receipt.get("cost") or {}
+    task_cost = cost.get("task") or {}
+    if isinstance(task_cost.get("cost_tokens"), (int, float)):
+        line = (f"cost (this round): task child {int(task_cost['cost_tokens']):,} tokens"
+                + (f", {float(task_cost['cost_wallclock_s']):.1f}s wall"
+                   if isinstance(task_cost.get("cost_wallclock_s"), (int, float)) else ""))
+        parts.append(line)
+    plan_cost = cost.get("planner_plan") or {}
+    if isinstance(plan_cost.get("total_tokens"), (int, float)):
+        line = (f"cost (this round): your plan session {int(plan_cost['total_tokens']):,} tokens"
+                + (f", {int(plan_cost['tool_calls'])} tool calls"
+                   if isinstance(plan_cost.get("tool_calls"), (int, float)) else ""))
+        parts.append(line)
     ts = receipt.get("toolset") or {}
     skipped = ts.get("skipped") or []
     if skipped:
