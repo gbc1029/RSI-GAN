@@ -346,7 +346,7 @@
 | **G5** | 确认 → I-c |
 | **B5** | 确认未实施，且 task 可选面实际来自 `shared.json` → S-a |
 | **选择静默降级** | 确认；补全跨 outer 分支可达性链路（§1.7）→ A-b |
-| **`source_access.deny_deep`** | 与本轮无关，接线方案见 `docs/7` §3.2.1 |
+| **`source_access.deny_deep`** | 与本轮无关，接线方案见 `docs/7` §7 |
 | **N_op / 算子预算** | 确认"暂不做"，靠 `max_toolcall`；**N8 指出 task 侧无独立键** → S-b |
 
 **本轮新增（docs/7 §3 未登记）**：N1（覆盖面）、N2（名称契约）、N3（通道 C/D）、N4（receipt 策略不一致）、N5（config 未进 git）、N6（孤儿检测缺失）、N7（装配期 preflight 缺失）、N8（task 预算键缺失）、N9（prompt 双写）。

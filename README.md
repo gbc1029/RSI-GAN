@@ -12,11 +12,10 @@ A **GAN-inspired three-role self-evolution framework** built on top of
 
 The design and rationale are documented in:
 
-- [`docs/3_GAN深入设计说明.md`](docs/3_GAN深入设计说明.md) — deep design (loops, config/operators, versioning, isolation) with code locations.
-- [`docs/2_GAN_plan.md`](docs/2_GAN_plan.md) — full design + implementation plan.
-- [`docs/4_v1实现和v2改动.md`](docs/4_v1实现和v2改动.md) — implementation record (files, problems, fixes, minimal run).
-- [`docs/5_v3改动.md`](docs/5_v3改动.md) — modification decision record (v3/v4 changes).
-- [`docs/1_DGMH部署记录.md`](docs/1_DGMH部署记录.md) — deployment / environment record.
+- [`docs/整合_框架简述和细节决策记录.md`](docs/整合_框架简述和细节决策记录.md) — current-state framework + per-topic decision record (start here).
+- [`docs/整合_待办记录.md`](docs/整合_待办记录.md) — open-todo ledger.
+- [`docs/整合_已办留档.md`](docs/整合_已办留档.md) — done archive + item→batch closure map.
+- Historical records (archived under [`docs/archive/`](docs/archive/)): deep design `3_GAN深入设计说明.md`, plan `2_GAN_plan.md`, implementation `4_v1实现和v2改动.md`, v3/v4 decision record `5_v3改动.md`, deployment `1_DGMH部署记录.md`.
 - [`AGENTS.md`](AGENTS.md) — contributor/agent guide.
 
 > This repository also contains the original HyperAgents (DGM-H) codebase, which
@@ -43,7 +42,7 @@ gan/                     # the GAN framework (new)
 scripts/run_gan.py       # GAN dual-loop CLI entry (driver mode default; --in-process = legacy)
 scripts/dgmh/            # DGM-H-only entry scripts (generate_loop/meta_agent/run_meta_agent/...)
 scripts/local/           # local-only verification scripts (gitignored)
-docs/                    # design / implementation / deployment docs
+docs/                    # integrated docs (current) + archive/ (historical records)
 agent/ domains/ utils/   # HyperAgents base code (reused)
 task_agent.py            # the (design-driven) task agent
 Dockerfile               # HyperAgents container image

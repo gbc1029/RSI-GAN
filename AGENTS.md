@@ -357,8 +357,9 @@ with a GAN-native data layer.
   import and expose).
   Both deep tools only reach the code tree through the **patch channel**: their
   changes are committed only in sessions that build a patch (`plan` / `self_improve`);
-  an `evaluate` session has no patch builder, so deep registry edits made there are
-  dropped. `register_component` registers source that **already exists** (in
+  an `evaluate` session cannot build a patch, so `modify` intents are refused
+  outright there (batch 26) — nothing is silently dropped. `register_component`
+  registers source that **already exists** (in
   `code_root` or in the workspace) and never creates, restores or deletes source
   files — restoring a deleted component means re-granting it
   (`request_source_access(..., refresh=true)`) and registering it again.
@@ -532,15 +533,19 @@ OpenAI-compatible gateway — each was invisible to the offline smokes:
 
 ## Where things are
 
-- Deep design + code locations: `docs/3_GAN深入设计说明.md`
-- Design/plan: `docs/2_GAN_plan.md`
-- Implementation record: `docs/4_v1实现和v2改动.md`
-- Modification decision record (v3/v4): `docs/5_v3改动.md`
-- v5 change record: `docs/6_v5改动.md`; outstanding-issue ledger: `docs/7_遗留问题与待办.md`;
-  tool-management ledger (todo/done snapshot): `docs/8_工具待办与已办.md`
-  (+ audit trail `docs/工具管理审查.md`, `docs/工具管理复核报告.md`,
-  `docs/工具管理线复核报告_2.md`, session summary `docs/gan_tools_deep_write_fix.md`)
-- Environment/deployment record: `docs/1_DGMH部署记录.md` and `README.md`
+- **Current entry point (integrated)**: `docs/整合_框架简述和细节决策记录.md`
+  (current-state framework + per-topic decision record), `docs/整合_待办记录.md`
+  (open-todo ledger), `docs/整合_已办留档.md` (done archive + item→batch closure map).
+- Historical record docs (archived 2026-10 under `docs/archive/`, content unchanged
+  apart from in-place erratum annotations): `1_DGMH部署记录.md`, `2_GAN_plan.md`,
+  `3_GAN深入设计说明.md`, `4_v1实现和v2改动.md`, `5_v3改动.md`, `6_v5改动.md`,
+  `7_遗留问题与待办.md`, `8_工具待办与已办.md`, plus the tool-line audit trail
+  (`工具管理审查.md`, `工具管理复核报告.md`, `工具管理线复核报告_2.md`,
+  `gan_tools_*.md`, `注释审查报告.md`). Line-number citations to "docs/N L…" in the
+  integrated docs refer to these archived files.
+- Active design docs outside that consolidation: `docs/9_多域评测设计.md`,
+  `docs/10_成本反馈闭环设计.md` (and `docs/cost_tem.md`).
+- Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license
 
