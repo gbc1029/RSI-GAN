@@ -125,6 +125,13 @@ def collect(run_dir: str, run_id: str, output_dir: str, outer: Any, genid: Any) 
 
 
 def _session_file(output_dir: str, genid: Any, role: str) -> str:
+    if role in ("planner", "evaluator"):
+        seat = "plan" if role == "planner" else "evaluate"
+        pat = os.path.join(paths.trajectory_root(output_dir), "outer_*", "roles",
+                           role, seat, f"gen_{genid}.jsonl")
+        hits = sorted(glob.glob(pat))
+        if hits:
+            return hits[-1]
     pat = os.path.join(paths.trajectory_root(output_dir), "outer_*", str(genid), f"{role}.jsonl")
     hits = sorted(glob.glob(pat))
     return hits[-1] if hits else ""
@@ -203,7 +210,9 @@ def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: 
 def _read_gen_session(output_dir: str, outer: Any, genid: Any, role: str,
                       max_chars: int) -> str:
     """Per-generation session read (genid-keyed files; attempt id irrelevant)."""
-    path = paths.session_traj_file(output_dir, outer, genid, role)
+    seat = ("plan" if role == "planner" else
+            "evaluate" if role == "evaluator" else None)
+    path = paths.session_traj_file(output_dir, outer, genid, role, seat=seat)
     if not os.path.isfile(path):
         quarantined = sorted(glob.glob(path + ".unredacted-*"))
         if quarantined:
@@ -222,6 +231,14 @@ def _outer_session_files(output_dir: str, outer: Any, role: str) -> List[str]:
     offline smoke) use ``<role>.jsonl``. Readers accept every shape so an
     attempt-keyed file can never become invisible behind the canonical name;
     rotated parts (``.N``) and quarantine names are excluded by the glob."""
+    seat_dir = paths.role_traj_dir(output_dir, outer, role, "self_improve")
+    if os.path.isdir(seat_dir):
+        cands = [os.path.join(seat_dir, "outer.jsonl")]
+        cands += sorted(glob.glob(os.path.join(seat_dir, "outer__*.jsonl")))
+        existing = [p for p in cands if os.path.isfile(p)]
+        if existing:
+            existing.sort(key=os.path.getmtime, reverse=True)
+            return existing
     d = paths.outer_traj_dir(output_dir, outer)
     if not os.path.isdir(d):
         return []
@@ -239,6 +256,9 @@ def _read_outer_sessions(output_dir: str, outer: Any, role: str,
     files = _outer_session_files(output_dir, outer, role)
     d = paths.outer_traj_dir(output_dir, outer)
     quarantined = sorted(glob.glob(os.path.join(d, f"{role}*.jsonl.unredacted-*")))
+    quarantined += sorted(glob.glob(os.path.join(
+        paths.role_traj_dir(output_dir, outer, role, "self_improve"),
+        "outer*.jsonl.unredacted-*")))
     if not files:
         if quarantined:
             return ("[unavailable] this session trajectory could not be redacted and was "
@@ -257,6 +277,17 @@ def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str
 
     Quarantined (unredactable) sessions are reported explicitly with
     ``quarantined: True`` instead of silently vanishing from the list."""
+    seat = "plan" if role == "planner" else "evaluate"
+    seat_dir = paths.role_traj_dir(output_dir, outer, role, seat)
+    if os.path.isdir(seat_dir):
+        for path in sorted(glob.glob(os.path.join(seat_dir, "gen_*.jsonl"))):
+            name = os.path.basename(path)
+            out.append({"genid": name[4:-6], "bytes": os.path.getsize(path)})
+        for path in sorted(glob.glob(os.path.join(seat_dir, "gen_*.jsonl.unredacted-*"))):
+            name = os.path.basename(path).split(".jsonl", 1)[0]
+            if not any(str(row.get("genid")) == name[4:] for row in out):
+                out.append({"genid": name[4:], "quarantined": True})
+        return out
     d = paths.outer_traj_dir(output_dir, outer)
     out: List[Dict[str, Any]] = []
     if os.path.isdir(d):

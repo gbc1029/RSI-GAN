@@ -6,7 +6,6 @@ own ``plan``/``evaluate`` sessions for each inner generation of the current oute
 all of this outer's sessions (bounded).
 """
 from gan.framework.context import get_access_context
-from gan.framework.trajectory import outer_session_index, read_session
 
 
 def tool_info():
@@ -37,24 +36,27 @@ def tool_function(genid=None, max_chars=6000, **kwargs):
     actx = get_access_context()
     if actx is None:
         return "Error: no access context"
-    output_dir = getattr(actx.broker, "output_dir", None) if actx.broker is not None else None
-    if not output_dir:
-        return "Error: no output directory available"
+    broker = actx.broker
+    if broker is None or not hasattr(broker, "read_session_trajectory"):
+        return "Error: parent session reader is unavailable"
     outer = _outer_of(actx)
     if outer is None:
         return "Error: session trajectories are only available during self-improvement."
     role = actx.role
     cap = int(max_chars or 6000)
     if genid is not None:
-        blob = read_session(output_dir, outer, genid, role, cap)
+        blob = broker.read_session_trajectory(role, actx.node_id, outer, genid,
+                                              cap, seat=actx.seat)
         if not blob:
             return f"No session trajectory for genid {genid}."
         return f"# your session genid={genid}\n{blob}"
-    idx = outer_session_index(output_dir, outer, role)
+    idx = broker.session_trajectory_index(role, actx.node_id, outer,
+                                          seat=actx.seat)
     if not idx:
         return "No session trajectories for this outer yet."
     blob = "\n\n".join(
-        read_session(output_dir, outer, e["genid"], role, cap) for e in idx
+        broker.read_session_trajectory(role, actx.node_id, outer, e["genid"],
+                                       cap, seat=actx.seat) for e in idx
     )
     return f"# your sessions this outer: {[e['genid'] for e in idx]}\n{blob[:cap]}"
 

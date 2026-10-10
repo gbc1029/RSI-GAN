@@ -57,6 +57,7 @@ class AccessBroker:
         self.max_files = int(max_files)
         self.max_bytes = int(max_bytes)
         self.grants: Dict[tuple, List[Dict[str, Any]]] = {}
+        self._trajectory_scopes: Dict[tuple, List[Any]] = {}
         # The result of the LAST grant call, empty before any grant. Readers
         # must not depend on grant() having run first: the attribute is part of
         # the documented audit surface (see the ``grant`` docstring).
@@ -305,3 +306,57 @@ class AccessBroker:
     def log_event(self, event: Dict[str, Any]) -> None:
         from utils import trajectory_log
         trajectory_log.append(paths.events_path(self.output_dir), event)
+
+    # -- parent-owned reads -------------------------------------------------
+    def set_trajectory_scope(self, role: str, node_id: Any,
+                             generation_ids: Optional[List[Any]]) -> None:
+        """Record the generation ids authorized for the active role call.
+
+        The role process supplies only the request; the parent installs this
+        scope from the trusted outer-loop call arguments before sending IPC.
+        """
+        self._trajectory_scopes[(str(role), str(node_id))] = list(generation_ids or [])
+
+    def read_trajectory(self, role: str, node_id: Any, genid: Any,
+                        max_chars: int, *, seat: str) -> str:
+        from gan.framework.trajectory import read
+        allowed = self._trajectory_scopes.get((str(role), str(node_id)), [])
+        if str(genid) not in {str(g) for g in allowed}:
+            raise PermissionError("generation is not visible to this role session")
+        return read(self.output_dir, genid, max_chars=min(int(max_chars), 6000),
+                    role="task")
+
+    def read_session_trajectory(self, role: str, node_id: Any, outer: Any,
+                                genid: Any, max_chars: int, *, seat: str) -> str:
+        from gan.framework.trajectory import read_session
+        if seat != "self_improve":
+            raise PermissionError("session trajectories require self_improve seat")
+        expected = str(node_id).split("__", 1)[0]
+        if expected != f"outer_{outer}":
+            raise PermissionError("session outer does not match the role instance")
+        return read_session(self.output_dir, outer, genid, role,
+                            min(int(max_chars), 6000))
+
+    def session_trajectory_index(self, role: str, node_id: Any, outer: Any,
+                                 *, seat: str) -> List[Dict[str, Any]]:
+        from gan.framework.trajectory import outer_session_index
+        if seat != "self_improve":
+            raise PermissionError("session trajectories require self_improve seat")
+        if str(node_id).split("__", 1)[0] != f"outer_{outer}":
+            raise PermissionError("session outer does not match the role instance")
+        return outer_session_index(self.output_dir, outer, role)
+
+    def build_patch(self, role: str, node_id: Any, *, seat: str) -> str:
+        from gan.patch import build_patch_from_workspace
+        return build_patch_from_workspace(self, role, node_id)
+
+    def editable_paths(self, role: str, node_id: Any, cap: int = 300, *,
+                       seat: str) -> Dict[str, List[str]]:
+        from gan.framework import frozen
+        limit = max(1, min(int(cap), 1000))
+        return {
+            "read_files": frozen.expand_roots(self.repo_root,
+                                               frozen.read_roots(role), cap=limit),
+            "write_files": frozen.expand_roots(
+                self.repo_root, frozen.write_roots(role, seat), cap=limit),
+        }

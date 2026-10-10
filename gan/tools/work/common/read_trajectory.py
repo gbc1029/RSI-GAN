@@ -5,7 +5,6 @@ The visible set is resolved by the loop and passed via ``AccessContext
 Default (no ``genid``) reads the first entry of that set.
 """
 from gan.framework.context import get_access_context
-from gan.framework.trajectory import read
 
 
 def tool_info():
@@ -30,9 +29,9 @@ def tool_function(genid=None, max_chars=6000, **kwargs):
     actx = get_access_context()
     if actx is None:
         return "Error: no access context"
-    output_dir = getattr(actx.broker, "output_dir", None) if actx.broker is not None else None
-    if not output_dir:
-        return "Error: no output directory available"
+    broker = actx.broker
+    if broker is None or not hasattr(broker, "read_trajectory"):
+        return "Error: parent trajectory reader is unavailable"
     allowed = list(getattr(actx, "trajectory_genids", []) or [])
     if not allowed:
         return "No task trajectory is visible for this session."
@@ -40,7 +39,8 @@ def tool_function(genid=None, max_chars=6000, **kwargs):
         genid = allowed[0]
     if genid not in allowed and str(genid) not in [str(g) for g in allowed]:
         return f"Error: generation '{genid}' is not visible (allowed: {allowed})."
-    blob = read(output_dir, genid, max_chars=int(max_chars or 6000), role="task")
+    blob = broker.read_trajectory(actx.role, actx.node_id, genid,
+                                  int(max_chars or 6000), seat=actx.seat)
     if not blob:
         return f"No archived trajectory for generation {genid}."
     return f"# trajectory genid={genid} (redacted)\n{blob}"

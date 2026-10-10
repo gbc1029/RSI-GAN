@@ -158,6 +158,7 @@ class Role(AgentSystem):
         # post-construction stamp in _refresh_roles stays as an idempotent
         # safety net for factories that ignored the argument.
         self.attempt_id = attempt_id
+        self.seat = os.environ.get("GAN_ROLE_SEAT", "").strip() or None
         self.assembly_report: Optional[dict] = None  # last assembly report
         self.outer = None
         if instance and str(instance).startswith("outer_"):
@@ -199,11 +200,14 @@ class Role(AgentSystem):
     def session_trajectory(self, genid: Any = None) -> str:
         """JSONL trajectory file for one session (outer-level if genid is None)."""
         return paths.session_traj_file(self.output_dir, self.outer, genid, self.role,
-                                       attempt=getattr(self, "attempt_id", None))
+                                       attempt=getattr(self, "attempt_id", None),
+                                       seat=self.seat)
 
     def tools_dir_for(self) -> str:
         base = os.path.join(self.output_dir, "toolsets", self.role)
-        return os.path.join(base, self.instance) if self.instance else base
+        if self.instance:
+            base = os.path.join(base, self.instance)
+        return os.path.join(base, self.seat) if self.seat else base
 
     def refresh_tools(self) -> str:
         """(Re)assemble this instance's toolset from the current design.
@@ -292,9 +296,14 @@ class Role(AgentSystem):
         # report only proves what was copied; this catches the files that never
         # imported (or lost their tool API) and folds them into `assembly_report`
         # so the role's next session sees the real capability set.
-        load_report_path = os.path.join(
-            paths.logs_dir(self.output_dir),
-            f"tools_load_{self.role}_{self.instance or 'default'}.json")
+        if self.seat and self.instance:
+            load_report_path = os.path.join(
+                paths.role_logs_dir(self.output_dir, self.role, self.instance, self.seat),
+                "tools_load.json")
+        else:
+            load_report_path = os.path.join(
+                paths.logs_dir(self.output_dir),
+                f"tools_load_{self.role}_{self.instance or 'default'}.json")
         prev_sink = os.environ.get("GAN_TOOLS_LOAD_REPORT")
         os.environ["GAN_TOOLS_LOAD_REPORT"] = load_report_path
         chat_kwargs = {}

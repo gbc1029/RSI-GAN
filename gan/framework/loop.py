@@ -457,6 +457,16 @@ class GanLoop:
         # resolves the OUTER-level file exactly once), otherwise session content
         # and stop records can land on different names. Signature probing keeps
         # legacy single-arg factories (tests, injected instances) working.
+        if self.broker is not None:
+            for role in ("planner", "evaluator"):
+                try:
+                    self.broker.clear_workspace(role)
+                except Exception as e:
+                    soft_fail(f"clear_workspace failed for {role}: {e} — stale "
+                              f"copies may linger on disk; the role's grants were "
+                              f"dropped so they cannot enter a patch, but a "
+                              f"default (if_absent) re-grant keeps them — do not "
+                              f"continue this outer unattended")
         for name, factory in (("planner", self.planner_factory),
                               ("evaluator", self.evaluator_factory)):
             if factory is None:
@@ -469,9 +479,13 @@ class GanLoop:
                 ) or any(p.kind == p.VAR_POSITIONAL for p in params.values())
             except (TypeError, ValueError):
                 accepts_attempt = False
-            setattr(self, name,
-                    factory(outer, self._attempt) if accepts_attempt
-                    else factory(outer))
+            previous = getattr(self, name, None)
+            replacement = (factory(outer, self._attempt) if accepts_attempt
+                           else factory(outer))
+            setattr(self, name, replacement)
+            close = getattr(previous, "close", None)
+            if previous is not replacement and callable(close):
+                close()
         for inst in (self.planner, self.evaluator):
             try:
                 inst.attempt_id = self._attempt
@@ -485,20 +499,6 @@ class GanLoop:
             except Exception as e:
                 soft_fail(f"tool_timeout_s stamp failed for "
                           f"{getattr(inst, 'role', '?')}: {e}")
-        if self.broker is not None:
-            for role in ("planner", "evaluator"):
-                try:
-                    self.broker.clear_workspace(role)
-                except Exception as e:
-                    # The broker dropped this role's grants, so stale copies
-                    # cannot enter a patch -- but their bytes stay on disk, and a
-                    # later default grant keeps them (if_absent). Do not continue
-                    # this outer unattended.
-                    soft_fail(f"clear_workspace failed for {role}: {e} — stale "
-                              f"copies may linger on disk; the role's grants were "
-                              f"dropped so they cannot enter a patch, but a "
-                              f"default (if_absent) re-grant keeps them — do not "
-                              f"continue this outer unattended")
         self.log_event({"type": "role_refresh", "outer": outer})
 
     def _source_access_log(self, outer: Any) -> List[Dict[str, Any]]:
@@ -507,9 +507,10 @@ class GanLoop:
             return []
         akey = f"outer_{outer}"
         out: List[Dict[str, Any]] = []
-        for role in ("planner", "evaluator"):
-            out.extend(self.broker.grants.get((role, akey), []))
-            out.extend(self.broker.grants.get((role, str(akey)), []))
+        for role, seats in (("planner", ("plan", "self_improve")),
+                            ("evaluator", ("evaluate", "self_improve"))):
+            for seat in seats:
+                out.extend(self.broker.grants.get((role, f"{akey}__{seat}"), []))
         return out
 
     def _append_score(self, child: Node) -> None:
@@ -599,9 +600,10 @@ class GanLoop:
             return
         akey = f"outer_{outer}"
         sync_failures: List[str] = []
-        for role in ("planner", "evaluator"):
+        for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
+            seat_key = f"{akey}__{seat}"
             try:
-                src = self.broker.src_dir(role, akey)
+                src = self.broker.src_dir(role, seat_key)
             except Exception as e:
                 sync_failures.append(f"src_dir({role}): {e}")
                 continue
@@ -683,9 +685,10 @@ class GanLoop:
             "truncated": truncated,
         }
         refs = [
-            paths.session_traj_file(self.output_dir, outer, genid, "planner"),
+            paths.session_traj_file(self.output_dir, outer, genid, "planner", seat="plan"),
             paths.session_traj_file(self.output_dir, outer, genid, "task"),
-            paths.session_traj_file(self.output_dir, outer, genid, "evaluator"),
+            paths.session_traj_file(self.output_dir, outer, genid, "evaluator",
+                                    seat="evaluate"),
         ]
         rec = build_receipt(
             genid=genid, role="planner", stage="plan",

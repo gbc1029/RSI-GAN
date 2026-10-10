@@ -37,7 +37,20 @@ def tool_function(cap=300, **kwargs):
     role = getattr(actx, "role", None)
     if not role:
         return "Error: no role in access context"
-    root = getattr(getattr(actx, "broker", None), "repo_root", None)
+    broker = getattr(actx, "broker", None)
+    if broker is None:
+        return "Error: no access broker"
+    if hasattr(broker, "editable_paths"):
+        try:
+            paths = broker.editable_paths(role, actx.node_id, actx.seat,
+                                          int(cap or 300))
+            return json.dumps({"role": role, "seat": actx.seat,
+                               "read_files": paths.get("read_files", []),
+                               "write_files": paths.get("write_files", [])},
+                              ensure_ascii=False, indent=2)
+        except Exception as exc:
+            return f"Error: parent source catalog unavailable: {exc}"
+    root = getattr(broker, "repo_root", None)
     if not root:
         return "Error: no code root available"
     # Writes are seat-specific (reads stay role-wide): an `evaluate` seat has no

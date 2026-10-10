@@ -98,8 +98,13 @@ def outer_traj_dir(output_dir: str, outer) -> str:
     return os.path.join(trajectory_root(output_dir), f"outer_{outer}")
 
 
+def role_traj_dir(output_dir: str, outer, role: str, seat: str) -> str:
+    return os.path.join(outer_traj_dir(output_dir, outer), "roles", role, seat)
+
+
 def session_traj_file(output_dir: str, outer, genid: Optional[object], role: str,
-                      attempt: Optional[str] = None) -> str:
+                      attempt: Optional[str] = None,
+                      seat: Optional[str] = None) -> str:
     """Path of one session's JSONL trajectory, creating its directory.
 
     Per-generation files are keyed by ``genid`` (unique across re-runs because the
@@ -114,6 +119,12 @@ def session_traj_file(output_dir: str, outer, genid: Optional[object], role: str
     newest first. Directly-constructed roles (no attempt id) keep the bare
     ``<role>.jsonl`` name.
     """
+    if role != "task" and seat:
+        base = role_traj_dir(output_dir, outer, role, seat)
+        name = ((f"gen_{genid}.jsonl" if genid is not None else
+                 f"outer__{attempt}.jsonl" if attempt else "outer.jsonl"))
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, name)
     base = outer_traj_dir(output_dir, outer)
     if genid is not None:
         base = os.path.join(base, str(genid))
@@ -138,6 +149,10 @@ def work_dir(output_dir: str, genid: object) -> str:
 
 def workspaces_dir(output_dir: str) -> str:
     return os.path.join(output_dir, "workspaces")
+
+
+def role_logs_dir(output_dir: str, role: str, instance: str, seat: str) -> str:
+    return os.path.join(output_dir, "logs", "roles", role, instance, seat)
 
 
 def ensure(output_dir: str) -> None:

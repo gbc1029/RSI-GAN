@@ -153,8 +153,13 @@ class Evaluator(Role):
         exhausted = False
         patch_str = ""
         try:
-            from gan.framework.trajectory import outer_session_index
-            sessions = outer_session_index(self.output_dir, self.outer, "evaluator")
+            if broker is not None and hasattr(broker, "session_trajectory_index"):
+                sessions = broker.session_trajectory_index(
+                    "evaluator", self.access_key("self"), self.outer,
+                    seat="self_improve")
+            else:
+                from gan.framework.trajectory import outer_session_index
+                sessions = outer_session_index(self.output_dir, self.outer, "evaluator")
             sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
             rr = render_receipt((recent or {}).get("receipt"))
             instruction = (
@@ -182,6 +187,9 @@ class Evaluator(Role):
                 # build failure propagates (session -> evaluator_failed), never
                 # masquerades as a legitimate empty patch.
                 from gan.patch import build_patch_from_workspace
+                if hasattr(broker, "build_patch"):
+                    return broker.build_patch("evaluator", self.access_key("self"),
+                                              seat="self_improve")
                 return build_patch_from_workspace(broker, "evaluator", self.access_key("self"))
 
             last_hash = None
@@ -190,7 +198,12 @@ class Evaluator(Role):
                 if not patch_str or not self.code_root:
                     rejected = None
                     break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str, role="evaluator", seat="self_improve")
+                if broker is not None and hasattr(broker, "check_patch"):
+                    ok, reason = broker.check_patch(
+                        patch_str, role="evaluator", seat="self_improve")
+                else:
+                    ok, reason = code_repo.check_patch(
+                        self.code_root, patch_str, role="evaluator", seat="self_improve")
                 if ok:
                     rejected = None
                     break

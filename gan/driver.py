@@ -34,6 +34,8 @@ def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
 def _outer_env(base: Dict[str, str], *, proxy_socket: str,
                planner_token: str, evaluator_token: str,
                task_broker_socket: str, task_broker_token: str,
+               role_broker_socket: str, role_broker_tokens: Dict[str, str],
+               role_accounts: Dict[str, Dict[str, Any]],
                code_root: str) -> Dict[str, str]:
     """Return the small non-secret environment inherited by outer_worker."""
     allowed = {
@@ -55,6 +57,12 @@ def _outer_env(base: Dict[str, str], *, proxy_socket: str,
     env["GAN_PROXY_EVALUATOR_TOKEN"] = evaluator_token
     env["GAN_TASK_BROKER_UNIX"] = task_broker_socket
     env["GAN_TASK_BROKER_TOKEN"] = task_broker_token
+    env["GAN_ROLE_BROKER_UNIX"] = role_broker_socket
+    env["GAN_ROLE_BROKER_PLANNER_TOKEN"] = role_broker_tokens["planner"]
+    env["GAN_ROLE_BROKER_EVALUATOR_TOKEN"] = role_broker_tokens["evaluator"]
+    for role in ("planner", "evaluator"):
+        env[f"GAN_ROLE_{role.upper()}_UID"] = str(role_accounts[role]["uid"])
+        env[f"GAN_ROLE_{role.upper()}_GID"] = str(role_accounts[role]["gid"])
     return env
 
 
@@ -75,6 +83,7 @@ def _add_empty_parents(command: List[str], path: str, created: set) -> None:
 def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
                           code_root: str, proxy_socket: str,
                           task_broker_socket: Optional[str] = None,
+                          role_broker_socket: Optional[str] = None,
                           env_mask_file: Optional[str] = None) -> List[str]:
     """Run outer_worker in a no-network view with only its run inputs mounted."""
     bwrap = shutil.which("bwrap")
@@ -109,6 +118,8 @@ def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
     sockets = [proxy_socket]
     if task_broker_socket:
         sockets.append(task_broker_socket)
+    if role_broker_socket:
+        sockets.append(role_broker_socket)
     for socket_path in sockets:
         if not os.path.exists(socket_path):
             raise RuntimeError(f"outer sandbox bind source is missing: {socket_path}")
@@ -162,6 +173,36 @@ class _TaskBrokerController:
         if self.process.is_alive():
             print("[WARN] privileged task broker did not exit; it will receive "
                   "the configured parent-death signal when this driver exits")
+
+
+class _RoleBrokerController:
+    def __init__(self, process: Any, control: Any) -> None:
+        self.process = process
+        self.control = control
+
+    def register_outer(self, outer: int, proxy_tokens: Dict[str, str]) -> Dict[str, str]:
+        self.control.send({"op": "register", "outer": int(outer),
+                           "proxy_tokens": dict(proxy_tokens)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged role broker did not register the outer")
+        response = self.control.recv()
+        if not response.get("ok") or set(response.get("tokens") or {}) != {"planner", "evaluator"}:
+            raise RuntimeError(f"privileged role broker registration failed: "
+                               f"{response.get('error', 'invalid response')}")
+        return {k: str(v) for k, v in response["tokens"].items()}
+
+    def close(self) -> None:
+        try:
+            self.control.send({"op": "shutdown"})
+            if self.control.poll(10):
+                self.control.recv()
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        finally:
+            self.control.close()
+        self.process.join(timeout=10)
+        if self.process.is_alive():
+            print("[WARN] privileged role broker did not exit cleanly")
 
 
 def _sudo_invoking_identity() -> tuple[int, int, str]:
@@ -242,6 +283,31 @@ def _start_task_broker(socket_path: str, config: Dict[str, Any]) -> _TaskBrokerC
     return _TaskBrokerController(process, parent_control)
 
 
+def _start_role_broker(socket_path: str, config: Dict[str, Any]) -> _RoleBrokerController:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        raise RuntimeError("secure role launch requires POSIX fork support")
+    from gan.framework.role_broker import broker_process_main
+    context = multiprocessing.get_context("fork")
+    parent_control, child_control = context.Pipe()
+    process = context.Process(
+        target=broker_process_main,
+        args=(child_control, socket_path, config),
+        name="rsi-gan-privileged-role-broker",
+    )
+    process.start()
+    child_control.close()
+    if not parent_control.poll(10):
+        process.terminate()
+        process.join(timeout=5)
+        raise RuntimeError("privileged role broker did not start")
+    response = parent_control.recv()
+    if not response.get("ok"):
+        process.join(timeout=5)
+        raise RuntimeError(f"privileged role broker failed to start: "
+                           f"{response.get('error', 'invalid response')}")
+    return _RoleBrokerController(process, parent_control)
+
+
 def run_gan_driver(
     repo_root: str,
     output_dir: str,
@@ -309,6 +375,22 @@ def run_gan_driver(
         raise RuntimeError(f"sandbox user {sandbox_username!r} does not exist") from exc
     if int(sandbox_account.pw_uid) == 0:
         raise RuntimeError("TaskAgent sandbox user must not be root")
+    role_accounts = {}
+    for role, default_user in (("planner", "rsi_gan_planner"),
+                               ("evaluator", "rsi_gan_evaluator")):
+        env_name = f"GAN_{role.upper()}_SANDBOX_USER"
+        username = os.environ.get(env_name, default_user).strip()
+        try:
+            account = pwd.getpwnam(username)
+        except KeyError as exc:
+            raise RuntimeError(f"role sandbox user {username!r} does not exist") from exc
+        if int(account.pw_uid) == 0:
+            raise RuntimeError(f"{role} sandbox user must not be root")
+        role_accounts[role] = {"username": username, "uid": int(account.pw_uid),
+                               "gid": int(account.pw_gid)}
+    role_uids = {entry["uid"] for entry in role_accounts.values()}
+    if len(role_uids) != 2 or int(sandbox_account.pw_uid) in role_uids or owner_uid in role_uids:
+        raise RuntimeError("planner/evaluator/task/owner identities must be distinct")
 
     setpriv_path = _trusted_root_tool("setpriv")
     setfacl_path = _trusted_root_tool("setfacl")
@@ -331,6 +413,7 @@ def run_gan_driver(
     os.chown(proxy_dir, owner_uid, owner_gid)
     proxy_socket = os.path.join(proxy_dir, "p.sock")
     task_broker_socket = os.path.join(proxy_dir, "task.sock")
+    role_broker_socket = os.path.join(proxy_dir, "role.sock")
     env_mask_file = os.path.join(proxy_dir, "empty.env")
     proxy = ParentLLMProxy(
         output_dir, proxy_socket,
@@ -374,6 +457,25 @@ def run_gan_driver(
         "base_env": safe_broker_env,
     }
     task_broker = _start_task_broker(task_broker_socket, broker_config)
+    try:
+        role_broker = _start_role_broker(role_broker_socket, {
+            "output_dir": output_dir,
+            "code_root": paths.code_root(output_dir),
+            "owner_uid": owner_uid,
+            "owner_gid": owner_gid,
+            "accounts": role_accounts,
+            "python": python_executable,
+            "python_prefix": python_prefix,
+            "setpriv": setpriv_path,
+            "setfacl": setfacl_path,
+            "bwrap": bwrap_path,
+            "proxy_socket": proxy_socket,
+            "llm_timeout_s": str(os.environ.get("GAN_LLM_TIMEOUT_S", "600")),
+        })
+    except Exception:
+        task_broker.close()
+        shutil.rmtree(proxy_dir, ignore_errors=True)
+        raise
     proxy_started = False
     try:
         _drop_driver_privileges(owner_uid, owner_gid, owner_username)
@@ -444,6 +546,7 @@ def run_gan_driver(
                 "evaluator": proxy.issue_scope(
                     "evaluator", str(outer), models["evaluator"]),
             }
+            role_broker_tokens = role_broker.register_outer(outer, tokens)
             task_broker_token = task_broker.register_outer(I_max)
             cmd = [
                 python_executable, "-m", "gan.outer_worker",
@@ -461,12 +564,16 @@ def run_gan_driver(
                 evaluator_token=tokens["evaluator"],
                 task_broker_socket=task_broker_socket,
                 task_broker_token=task_broker_token,
+                role_broker_socket=role_broker_socket,
+                role_broker_tokens=role_broker_tokens,
+                role_accounts=role_accounts,
                 code_root=code_root,
             )
             proc = subprocess.run(
                 _outer_worker_command(
                     cmd, repo_root, output_dir, code_root, proxy_socket,
                     task_broker_socket=task_broker_socket,
+                    role_broker_socket=role_broker_socket,
                     env_mask_file=env_mask_file,
                 ),
                 cwd=code_root, env=env,
@@ -483,4 +590,5 @@ def run_gan_driver(
         if proxy_started:
             proxy.close()
         task_broker.close()
+        role_broker.close()
         shutil.rmtree(proxy_dir, ignore_errors=True)

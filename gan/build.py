@@ -12,11 +12,10 @@ from gan.framework import models as model_registry
 from gan.framework import paths
 from gan.framework.frozen import deny_paths as frozen_deny_paths
 from gan.framework.loader import load_gan_loop_config
+from gan.framework.role_process import RoleProcess
 from gan.design import initial_config
 from gan.design.store import DesignStore
 from gan.framework.loop import GanLoop
-from gan.roles.evaluator import Evaluator
-from gan.roles.planner import Planner
 from gan.framework.task_runner import DomainTaskRunner
 
 
@@ -135,12 +134,12 @@ def build_gan_loop(
     # OUTER-level trajectory file to the attempt-keyed name at construction
     # (session content and stop records share one file; see loop._refresh_roles).
     def _planner_factory(outer: int, attempt: str):
-        return Planner(p_model, output_dir, instance=f"outer_{outer}",
-                       code_root=code_root, attempt_id=attempt)
+        return RoleProcess("planner", p_model, output_dir, instance=f"outer_{outer}",
+                           code_root=code_root, attempt_id=attempt)
 
     def _evaluator_factory(outer: int, attempt: str):
-        return Evaluator(e_model, output_dir, instance=f"outer_{outer}",
-                         code_root=code_root, attempt_id=attempt)
+        return RoleProcess("evaluator", e_model, output_dir, instance=f"outer_{outer}",
+                           code_root=code_root, attempt_id=attempt)
 
     runner = DomainTaskRunner(
         repo_root=repo_root,

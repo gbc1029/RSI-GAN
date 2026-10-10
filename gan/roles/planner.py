@@ -139,6 +139,8 @@ class Planner(Role):
                 # repo file, a builder defect) propagates and fails the session;
                 # the loop then marks the generation planner_failed (B-level)
                 # instead of applying a semantically wrong diff.
+                if hasattr(broker, "build_patch"):
+                    return broker.build_patch("planner", akey, seat="plan")
                 return build_patch_from_workspace(broker, "planner", akey)
 
             patch_str = _build_patch()
@@ -148,7 +150,11 @@ class Planner(Role):
                 if not patch_str or not self.code_root:
                     rejected = None
                     break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str, role="planner", seat="plan")
+                if broker is not None and hasattr(broker, "check_patch"):
+                    ok, reason = broker.check_patch(patch_str, role="planner", seat="plan")
+                else:
+                    ok, reason = code_repo.check_patch(
+                        self.code_root, patch_str, role="planner", seat="plan")
                 if ok:
                     rejected = None
                     break
@@ -203,8 +209,13 @@ class Planner(Role):
         exhausted = False
         patch_str = ""
         try:
-            from gan.framework.trajectory import outer_session_index
-            sessions = outer_session_index(self.output_dir, self.outer, "planner")
+            if broker is not None and hasattr(broker, "session_trajectory_index"):
+                sessions = broker.session_trajectory_index(
+                    "planner", self.access_key("self"), self.outer,
+                    seat="self_improve")
+            else:
+                from gan.framework.trajectory import outer_session_index
+                sessions = outer_session_index(self.output_dir, self.outer, "planner")
             sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
             rr = render_receipt((recent or {}).get("receipt"))
             instruction = (
@@ -228,6 +239,9 @@ class Planner(Role):
                 if broker is None or not has_deep_write(dctx.records):
                     return ""
                 # No catch — see the plan-session _build_patch comment.
+                if hasattr(broker, "build_patch"):
+                    return broker.build_patch("planner", self.access_key("self"),
+                                              seat="self_improve")
                 return build_patch_from_workspace(broker, "planner", self.access_key("self"))
 
             last_hash = None
@@ -236,7 +250,12 @@ class Planner(Role):
                 if not patch_str or not self.code_root:
                     rejected = None
                     break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str, role="planner", seat="self_improve")
+                if broker is not None and hasattr(broker, "check_patch"):
+                    ok, reason = broker.check_patch(
+                        patch_str, role="planner", seat="self_improve")
+                else:
+                    ok, reason = code_repo.check_patch(
+                        self.code_root, patch_str, role="planner", seat="self_improve")
                 if ok:
                     rejected = None
                     break
