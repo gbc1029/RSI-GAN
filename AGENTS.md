@@ -27,7 +27,10 @@ live under `scripts/dgmh/`.
   `workspace.py` (edit/read confinement), `task_execution.py` (design persistence
   + harness glue + minimal run-dir copy), `task_runner.py`, `checkpoint.py`,
   `scores.py`, `trajectory.py`, `preflight.py`, `context.py`, `access.py`,
-  `loop.py`, `tree/`, `reward/`.
+  `loop.py`, `tree/`, `reward/`, `cm/` (context-management frozen core —
+  block model, primitives, the per-turn seam pipeline, fail-open policy
+  runner, trajectory index; STDLIB-ONLY import contract because it is
+  snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
   `read_trajectory`, `read_session_trajectory`, `list_editable`, `list_components`),
@@ -37,7 +40,11 @@ live under `scripts/dgmh/`.
   `assembly.py`.
 - `gan/components/` — **opt-in** tool implementations, one tree per role (batch 6):
   `task/` (tools + the curated `task/knowledge/*.md` base), `evaluator/`,
-  `planner/` (self-authored knowledge/tools).
+  `planner/` (self-authored knowledge/tools); each tree may carry a `cm/`
+  pool of THIN context-management wrappers (``ctx_index``/`ctx_fetch`/
+  `ctx_budget`/`ctx_pin`/`ctx_note`/`ctx_view` — task selects only
+  `ctx_budget`/`ctx_note`; its trajectory access rides the
+  `read_trajectory` slice front-end instead).
 - `gan/registries/` — per-role tool catalog: **one single-writer `json` per role**
   (`task.json` / `planner.json` / `evaluator.json`; no shared file) + `loader.py`.
   Every entry is a TOOL (a callable `tool_info`/`tool_function` module); the legacy
@@ -315,6 +322,27 @@ with a GAN-native data layer.
   `[model_config]` log line for DGM-H; `Node.meta["model"]` per generation; the
   proxy audit adds the caller's `reasoning_effort` per call). Do not read
   `models.yaml` anywhere else.
+- **Reserved cost keys & context management (docs/10 phases C/D)**: the per-role
+  design carries a RESERVED top-level `cost` dict slot — the authority is the frozen
+  `gan/framework/cost_keys.py` (ranges/enums/defaults; `validate_cost_config` shared by
+  `set_config`/schema; `effective_all` the ONLY clamp; `cost_keys_applied` events). Task
+  budget keys ride the harness **stdin payload** (never env) into `chat_with_agent`
+  (`max_tool_calls`/`max_total_tokens` soft stop). Phase D adds the `cm_*` subgroup and
+  the seam: `agent/llm_withtools._counting_llm` is the SINGLE per-turn assembly point —
+  the `CMSession` (`cm=` arg, built by the loop per seat / by `task_worker` from the
+  `.gan_runtime/cm` SNAPSHOT — the run dir has no `gan/`, so the frozen core is copied
+  per generation and imports as top-level `cm`; STDLIB-ONLY by contract) rewrites only
+  what is SENT (shallow copies; sticky view forms; the canonical history and the raw
+  trajectory rows stay untouched — 双记). Modes: `passthrough` (identity, pre-D behavior)
+  / `slice` / `compact_conservative` / `custom` (agent policy module, AST-gated no-LLM/
+  no-network, exec budget + 2-strike wedge breaker, fail-open always). Invariants:
+  pinned blocks survive, `cm_drop_floor_chars` guards tiny blocks, the view cannot
+  fabricate content. Agent face = the `ctx_*` opt-in tools; `read_trajectory`/
+  `read_session_trajectory` gain a slice front-end (structural index first, `fetch=`
+  materializes one segment). Audit: per-turn `cm_view` + `cm_violation`/
+  `cm_policy_failed`/`cm_policy_disabled` events; the session cost record carries a `cm`
+  summary (estimated savings are a DERIVED indicator, never billing — the ledger keeps
+  实付); receipt `budget.kind` gains `cm` when a session's policy degraded.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable. Task
   trajectory visibility is NOT configured here: the loop passes an explicit
   `AccessContext.trajectory_genids` set per session (v4.20) — planner = direct

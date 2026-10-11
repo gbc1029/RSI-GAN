@@ -1,3 +1,57 @@
 {
-  "components": []
+  "components": [
+    {
+      "name": "ctx_index",
+      "module": "planner/cm/ctx_index.py",
+      "description": "Enumerate this session's context blocks (metadata only).",
+      "params_schema": {},
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_fetch",
+      "module": "planner/cm/ctx_fetch.py",
+      "description": "Materialize one context block into the conversation (full/head_tail/excerpt).",
+      "params_schema": {
+        "block_id": "string",
+        "form": "string"
+      },
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_budget",
+      "module": "planner/cm/ctx_budget.py",
+      "description": "Session cost meter: tokens used, tool calls, active budgets, headroom.",
+      "params_schema": {},
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_pin",
+      "module": "planner/cm/ctx_pin.py",
+      "description": "Pin/unpin a context block so view assembly must keep it.",
+      "params_schema": {
+        "block_id": "string",
+        "note": "string",
+        "unpin": "boolean"
+      },
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_note",
+      "module": "planner/cm/ctx_note.py",
+      "description": "Session scratchpad notes (write/read/list); auto-pinned.",
+      "params_schema": {
+        "action": "string",
+        "note_id": "string",
+        "text": "string"
+      },
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_view",
+      "module": "planner/cm/ctx_view.py",
+      "description": "Show the last assembled view: kept/elided/compacted blocks + stats.",
+      "params_schema": {},
+      "kind": "cm"
+    }
+  ]
 }

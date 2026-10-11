@@ -33,7 +33,8 @@ def _load_design():
 
 class TaskAgent(AgentSystem):
     def __init__(self, model, chat_history_file='./outputs/trajectory.jsonl',
-                 reasoning_effort=None, max_tool_calls=None, token_budget=None):
+                 reasoning_effort=None, max_tool_calls=None, token_budget=None,
+                 cm=None):
         super().__init__(model, chat_history_file=chat_history_file)
         # Thinking-intensity knob for this agent's every LLM call (valid values:
         # agent.llm.REASONING_EFFORTS, gateway contract low|high|max). Threaded
@@ -48,6 +49,10 @@ class TaskAgent(AgentSystem):
         # vs the per-question trajectories).
         self.max_tool_calls = max_tool_calls
         self.token_budget = token_budget
+        # Context-management session (docs/10 §11, D6/D7): framework-built
+        # (task_worker, from the .gan_runtime snapshot). None = no seam
+        # (pre-D behaviour). Forwarding only -- no policy lives in the artifact.
+        self.cm = cm
 
     def forward(self, inputs):
         """
@@ -106,6 +111,9 @@ Respond in JSON format with the following schema (wrap the object in <json>...</
                if self.max_tool_calls is not None else {}),
             **({"max_total_tokens": self.token_budget}
                if self.token_budget is not None else {}),
+            # Context-management session (docs/10 §11 D6): forwarded only
+            # when set -- None keeps the chat loop seam-free.
+            **({"cm": self.cm} if self.cm is not None else {}),
         )
 
         # Extract the response. A BLANK prediction (not the string "None") marks

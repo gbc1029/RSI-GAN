@@ -103,6 +103,13 @@ source_access:
 #                            （plan_max_tool_calls/patch_retry_k/
 #                            evaluate_blind_max_tool_calls）缺省回落本文件
 #                            loop.* 值。
+#   上下文管理（cm_*）     -> 同一保留键族（docs/10 §11）：cm_mode 选档
+#                            （passthrough=D 前行为/slice/compact_conservative/
+#                            custom）；窗口/下限/op 预算/policy 执行预算/
+#                            笔记上限随 cost 槽继承，消费点在 seam
+#                            （agent/llm_withtools，task 子代经 .gan_runtime/cm
+#                            快照投递）与 read_*_trajectory 的 slice 前端。
+#                            本文件不设 cm 键——档位是 design 键，不是框架超参。
 # ---------------------------------------------------------------------------
 cost:
   token_budget_per_gen: 200000

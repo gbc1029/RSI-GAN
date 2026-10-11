@@ -366,7 +366,8 @@ class GanLoop:
 
     # -- cost ledger (phases A/B, docs/10 §9) -------------------------------
     def _record_session_cost(self, role: str, seat: str, outer: Any,
-                             genid: Any = None) -> Optional[Dict[str, Any]]:
+                             genid: Any = None,
+                             cm_session: Any = None) -> Optional[Dict[str, Any]]:
         """Settled-session cost record (A5): append to
         ``logs/cost_sessions.jsonl`` + a ``cost_session`` event.
 
@@ -388,6 +389,18 @@ class GanLoop:
                 rec = recs[0] if recs else None
             if rec is None:
                 return None
+            if cm_session is not None:
+                try:
+                    cm_sum = cm_session.summary()
+                    if cm_sum and cm_sum.get("turns"):
+                        rec["cm"] = {k: cm_sum[k] for k in
+                                     ("mode", "turns", "blocks", "ops_total",
+                                      "ops_applied", "ops_refused",
+                                      "policy_failures", "policy_disabled",
+                                      "violations", "est_chars_saved")
+                                     if k in cm_sum}
+                except Exception:  # noqa: BLE001 -- audit-only enrichment
+                    pass
             cost_ledger.append_session_cost(self.output_dir, rec)
             self._session_costs.append(rec)
             self.log_event({"type": "cost_session",
@@ -538,6 +551,27 @@ class GanLoop:
         self.log_event({"type": "cost_keys_applied", "role": role, "seat": seat,
                         "genid": str(genid), "keys": dict(keys or {}),
                         "clamped": list(clamps or [])})
+
+    def _build_cm_session(self, role: str, keys: Optional[Dict[str, Any]]) -> Any:
+        """Per-session context-management session (docs/10 §11 D11): built from
+        this role's ALREADY-CLAMPED effective ``cm_*`` keys; events ride the
+        framework event stream (role-attributed). Advisory: any failure
+        degrades to no seam (pre-D behaviour), never fatal."""
+        if keys is None:
+            return None
+        try:
+            from gan.framework.cm import build_session
+            cm_keys = {k: v for k, v in keys.items()
+                       if isinstance(k, str) and k.startswith("cm_")}
+            session = build_session(cm_keys)
+            session.emit = (lambda r: (lambda e: self.log_event(
+                {**e, "role": r})))(role)
+            return session
+        except Exception as e:  # noqa: BLE001 -- advisory
+            soft_fail(f"cm session build failed ({role}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cm_session_failed", role=role)
+            return None
 
     def _task_budget_keys(self, parent: Any) -> Optional[Dict[str, Any]]:
         """Effective TASK-side reserved keys of the design the child will
@@ -882,23 +916,32 @@ class GanLoop:
 
     def _make_receipt(self, genid: Any, plan_result: Dict[str, Any],
                       parent_cfg: Dict[str, Any], child: Node, outer: Any,
-                      plan_cost: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                      plan_cost: Optional[Dict[str, Any]] = None,
+                      cm_summary: Optional[Dict[str, Any]] = None
+                      ) -> Dict[str, Any]:
         from gan.framework.receipt import build_receipt
         rejected = plan_result.get("patch_rejection") or child.meta.get("task_patch_rejected")
         exhausted = bool(plan_result.get("budget_exhausted"))
         truncated = bool(plan_result.get("truncated"))
         tb_exhausted = bool(plan_result.get("token_budget_exhausted"))
+        # Context management (docs/10 §11 D12): a degraded CM session (policy
+        # disabled / failures) is a budget-state fact of its own kind.
+        cm_degraded = bool(cm_summary and (cm_summary.get("policy_disabled")
+                                           or cm_summary.get("policy_failures")))
         budget = {
             "exhausted": exhausted or truncated or tb_exhausted,
             # Reserved cost keys (docs/10 §10): a token soft stop is a budget
             # outcome of its own kind (distinct from the tool-call cap).
             "kind": ("retries" if exhausted
                      else ("max_tool_calls" if truncated
-                           else ("token_budget" if tb_exhausted else None))),
+                           else ("token_budget" if tb_exhausted
+                                 else ("cm" if cm_degraded else None)))),
             "attempts": plan_result.get("attempts", 0),
             "truncated": truncated,
             "token_budget_exhausted": tb_exhausted,
         }
+        if cm_summary:
+            budget["cm"] = cm_summary
         # Cost facts of THIS round (B6): the task child (proxy audit) and the
         # planner's OWN plan session. The evaluator's session cost is
         # deliberately NOT here — the receipt feeds the PLANNER's next prompt,
@@ -975,14 +1018,20 @@ class GanLoop:
         r = res or {}
         rejected = r.get("patch_rejection")
         tb_exhausted = bool(r.get("token_budget_exhausted"))
+        cm_summary = r.get("cm_summary") if isinstance(r, dict) else None
+        cm_degraded = bool(cm_summary and (cm_summary.get("policy_disabled")
+                                           or cm_summary.get("policy_failures")))
         budget = {
             "exhausted": bool(r.get("budget_exhausted")) or bool(r.get("truncated")) or tb_exhausted,
             "kind": ("retries" if r.get("budget_exhausted")
                      else ("max_tool_calls" if r.get("truncated")
-                           else ("token_budget" if tb_exhausted else None))),
+                           else ("token_budget" if tb_exhausted
+                                 else ("cm" if cm_degraded else None)))),
             "attempts": r.get("attempts", 0), "truncated": bool(r.get("truncated")),
             "token_budget_exhausted": tb_exhausted,
         }
+        if cm_summary:
+            budget["cm"] = cm_summary
         rec = build_receipt(
             genid=f"outer_{outer}", role=role, stage="self_improve",
             records=r.get("records"), patch=r.get("patch_proposed", ""),
@@ -1243,6 +1292,10 @@ class GanLoop:
                     self.planner.session_token_budget = plan_ck.get("plan_token_budget")
                 except Exception as e:  # noqa: BLE001 -- advisory stamp
                     soft_fail(f"session_token_budget stamp failed (planner): {e}")
+                # Context-management session for THIS plan call (docs/10 §11
+                # D11); cleared right after the call (no stamp leak into
+                # self-improve), like ``session_token_budget``.
+                self.planner.cm_session = self._build_cm_session("planner", plan_ck)
                 self._emit_cost_keys_applied("planner", "plan", genid,
                                              plan_ck, plan_clamps)
 
@@ -1289,12 +1342,19 @@ class GanLoop:
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to planner_failed
                 except Exception as e:
+                    self.planner.cm_session = None  # no stamp leak
                     self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
                 # Settled plan session -> cost ledger (A5). Success-only: a
                 # planner_failed round has no settled session to record.
-                plan_cost_rec = self._record_session_cost("planner", "plan", outer, genid)
+                _plan_cm = getattr(self.planner, "cm_session", None)
+                plan_cm_summary = (_plan_cm.summary()
+                                   if _plan_cm is not None else None)
+                plan_cost_rec = self._record_session_cost(
+                    "planner", "plan", outer, genid,
+                    cm_session=_plan_cm)
+                self.planner.cm_session = None  # no stamp leak (§11 D11)
 
                 try:
                     child = self.task_runner(plan=plan_result, parent=parent, genid=genid,
@@ -1389,6 +1449,8 @@ class GanLoop:
                     soft_fail(f"session_token_budget stamp failed (evaluator): {e}")
                 self._emit_cost_keys_applied("evaluator", "evaluate", genid,
                                              eval_ck, eval_clamps)
+                # Context-management session for THIS evaluate call (§11 D11).
+                self.evaluator.cm_session = self._build_cm_session("evaluator", eval_ck)
                 cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair,
                                                            own_budget=eval_ck.get("evaluate_token_budget"))
                 eval_cost_kwargs: Dict[str, Any] = {}
@@ -1435,6 +1497,7 @@ class GanLoop:
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to evaluator_failed
                 except Exception as e:
+                    self.evaluator.cm_session = None  # no stamp leak
                     child.valid_parent = False
                     child.meta["invalid"] = True
                     child.meta["invalid_reason"] = "evaluator_failed"
@@ -1447,7 +1510,13 @@ class GanLoop:
                     self._save_checkpoint("inner", outer, inner)
                     continue
                 # Settled evaluate session -> cost ledger (A5).
-                eval_cost_rec = self._record_session_cost("evaluator", "evaluate", outer, genid)
+                _eval_cm = getattr(self.evaluator, "cm_session", None)
+                eval_cm_summary = (_eval_cm.summary()
+                                   if _eval_cm is not None else None)
+                eval_cost_rec = self._record_session_cost(
+                    "evaluator", "evaluate", outer, genid,
+                    cm_session=_eval_cm)
+                self.evaluator.cm_session = None  # no stamp leak (§11 D11)
 
                 packet = self._build_packet(child, ctx)
                 if getattr(ctx, "predicted_score", None) is not None:
@@ -1468,7 +1537,7 @@ class GanLoop:
                 self._write_gen_cost(genid, outer)
                 child.meta["receipt"] = self._make_receipt(
                     genid, plan_result, parent_cfg, child, outer,
-                    plan_cost=plan_cost_rec)
+                    plan_cost=plan_cost_rec, cm_summary=plan_cm_summary)
                 if child.meta.get("task_patch_files") and self.broker is not None:
                     self._resync_workspace(outer, child.meta["task_patch_files"])
                 if not self.keep_workdirs:
@@ -1589,20 +1658,42 @@ class GanLoop:
                         role_obj.session_token_budget = None
                     except Exception:  # noqa: BLE001 -- advisory stamp
                         pass
-                    session_results[role] = role_obj.self_improve(
+                    # Context-management session for THIS self-improve call
+                    # (docs/10 §11 D11): front-end + ctx tools only for p/e
+                    # in the first increment (no assembly-time policy);
+                    # cleared after the call (no leak across seats).
+                    try:
+                        ck_si = self._effective_cost_keys(role)
+                        role_obj.cm_session = self._build_cm_session(role, ck_si)
+                    except Exception:  # noqa: BLE001 -- advisory stamp
+                        role_obj.cm_session = None
+                    _si_res = role_obj.self_improve(
                         recent={**recent_payload, "receipt": prev_receipt},
                         broker=self.broker,
                         max_tool_calls=self.self_improve_max_tool_calls,
                         tool_repeat_limit=self.tool_repeat_limit,
                         trajectory_genids=si_refs,
                         patch_retry_k=self.patch_retry_k)
+                    if isinstance(_si_res, dict)                             and getattr(role_obj, "cm_session", None) is not None:
+                        try:
+                            _si_res["cm_summary"] = role_obj.cm_session.summary()
+                        except Exception:  # noqa: BLE001 -- audit-only
+                            pass
+                    session_results[role] = _si_res
                     # Settled self-improve session -> cost ledger (A5). Thread
                     # safety: trajectory_log.append is locked and list.append
                     # is GIL-atomic; the parallel sessions write DISJOINT
                     # trajectory files (seat-disjoint by SEAT_WRITE).
-                    self._record_session_cost(role, "self_improve", outer, None)
+                    self._record_session_cost(
+                        role, "self_improve", outer, None,
+                        cm_session=getattr(role_obj, "cm_session", None))
                 except Exception as e:  # noqa: BLE001 -- classified after join
                     session_errors[role] = e
+                finally:
+                    try:
+                        role_obj.cm_session = None
+                    except Exception:  # noqa: BLE001 -- advisory stamp
+                        pass
 
             workers = [
                 threading.Thread(target=_self_session,

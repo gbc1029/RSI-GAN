@@ -19,6 +19,8 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # context-management snapshot (docs/10 §11 D2/D7)
+    "GAN_CM_CORE", "GAN_CM_POLICY",
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -184,6 +186,55 @@ def _write_json_fd(fd: int, payload) -> None:
         os.close(fd)
 
 
+def _build_cm_session():
+    """Reserved cost keys (docs/10 §11 D7): build the context-management
+    session for this child from the per-generation snapshot.
+
+    ``GAN_CM_CORE`` (set by assemble_task_env) points at the frozen core the
+    parent materialized under ``.gan_runtime/cm``; ``GAN_CM_POLICY`` carries
+    the AST-gated policy component (custom mode only). The ``cm_*`` keys come
+    from the ALREADY-CLAMPED design snapshot — a type-guarded pass-through,
+    never a second clamp authority. Any failure returns None: the chat runs
+    with no seam at all (pre-D behaviour, fail-open by absence)."""
+    core = os.environ.get("GAN_CM_CORE") or ""
+    if not os.path.isdir(core):
+        alt = os.path.join(os.getcwd(), ".gan_runtime", "cm")
+        if os.path.isdir(alt):
+            core = alt
+        else:
+            return None
+    parent = os.path.dirname(os.path.abspath(core))
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    try:
+        import cm as cmcore  # the snapshot package (stdlib-only by contract)
+    except Exception as e:  # noqa: BLE001 -- fail-open by absence
+        print(f"[cm] snapshot import failed ({e}); running without seam",
+              flush=True)
+        return None
+    keys: dict = {}
+    try:
+        design_path = os.environ.get("GAN_TASK_DESIGN")
+        if design_path and os.path.isfile(design_path):
+            with open(design_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cost = cfg.get("cost") if isinstance(cfg, dict) else None
+            if isinstance(cost, dict):
+                keys = {k: v for k, v in cost.items()
+                        if isinstance(k, str) and k.startswith("cm_")}
+    except Exception as e:  # noqa: BLE001 -- advisory
+        print(f"[cm] design cm keys unavailable ({e}); using defaults",
+              flush=True)
+    mode = keys.get("cm_mode") if isinstance(keys.get("cm_mode"), str) else "passthrough"
+    policy_path = os.environ.get("GAN_CM_POLICY") if mode == "custom" else None
+    try:
+        return cmcore.build_session(keys, policy_path=policy_path)
+    except Exception as e:  # noqa: BLE001 -- fail-open
+        print(f"[cm] session build failed ({e}); running without seam",
+              flush=True)
+        return None
+
+
 def _run_agent_child(result_fd: int) -> None:
     if "GAN_DATASET_ROOT" in os.environ:
         raise RuntimeError("GAN_DATASET_ROOT must not enter the TaskAgent sandbox")
@@ -209,6 +260,22 @@ def _run_agent_child(result_fd: int) -> None:
                     budget_kwargs.pop(k)
     except (TypeError, ValueError):
         budget_kwargs = {}
+    # Context-management session (docs/10 §11 D7): forwarded like the budget
+    # kwargs -- only when the artifact's __init__ accepts it; a modified
+    # artifact dropping the seam degrades to the pre-D behaviour (the design
+    # snapshot + the cm_view absence are the offline cross-check).
+    cm_session = _build_cm_session()
+    if cm_session is not None:
+        try:
+            params = inspect.signature(TaskAgent.__init__).parameters
+            if any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values()) or "cm" in params:
+                budget_kwargs["cm"] = cm_session
+            else:
+                print("[cost] TaskAgent does not accept ['cm']; "
+                      "running without the context-management seam", flush=True)
+        except (TypeError, ValueError):
+            pass
     agent = TaskAgent(
         model=payload["model"],
         chat_history_file=payload["trajectory_path"],

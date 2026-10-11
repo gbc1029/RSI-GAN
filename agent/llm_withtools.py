@@ -376,6 +376,10 @@ def chat_with_agent(
                           # so concurrent role sessions cannot swap each other's
                           # credentials; None -> ambient env (legacy callers).
     load_report_path=None,  # Explicit sink for the toolset LOAD outcome; None
+    cm=None,  # Reserved cost keys (docs/10 §11): an optional CM session object
+              # (duck-typed: assemble(msgs, tokens_used, budget) -> msgs).
+              # Wired ONLY by framework callers that built it (loop / task
+              # worker); None = pre-D behaviour (no seam at all).
                           # -> $GAN_TOOLS_LOAD_REPORT env fallback (legacy).
 ):
     # One binding covers all call turns below (initial, budget-exhausted,
@@ -394,11 +398,44 @@ def chat_with_agent(
 
     def _counting_llm(**kwargs):
         nonlocal tokens_used
+        # Context-management seam (docs/10 §11 D4): the SINGLE assembly point
+        # every LLM call passes through. The seam returns shallow COPIES for
+        # sending; the canonical history object stays raw (双记: raw rows +
+        # per-turn cm_view events). Any seam failure degrades to the raw
+        # view (fail-open) -- the session must survive its policy.
+        raw_history = kwargs.get("msg_history")
+        raw_msg = kwargs.get("msg")
+        n_viewed = 0
+        if cm is not None:
+            try:
+                send_history, send_msg = cm.assemble_turn(
+                    list(raw_history or []), raw_msg or "",
+                    tokens_used=tokens_used,
+                    budget=(max_total_tokens
+                            if isinstance(max_total_tokens, int)
+                            and max_total_tokens > 0 else None))
+                n_viewed = len(send_history)
+                kwargs["msg_history"] = send_history
+                kwargs["msg"] = send_msg
+            except Exception as e:  # noqa: BLE001 -- fail-open
+                logging(f"[cm] seam degraded to raw view: {e}")
         response, hist, info = get_response_fn(**kwargs)
         usage = (info or {}).get("usage") or {}
         total = usage.get("total_tokens")
         if isinstance(total, (int, float)):
             tokens_used += int(total)
+        if cm is not None and n_viewed and isinstance(hist, list):
+            # keep the CANONICAL (raw) history: the seam's copies were only
+            # for sending; the user turn is rebuilt RAW, the assistant reply
+            # is raw by construction (LLM output).
+            try:
+                new_entries = list(hist[n_viewed:])
+                if new_entries and isinstance(new_entries[0], dict) \
+                        and new_entries[0].get("role") == "user":
+                    new_entries[0] = {"role": "user", "content": raw_msg}
+                hist = list(raw_history or []) + new_entries
+            except Exception:  # noqa: BLE001 -- history shapes vary
+                pass
         return response, hist, info
 
     # Construct message
@@ -414,6 +451,15 @@ def chat_with_agent(
                                tools_dir=tools_dir, report_path=load_report_path)
         tools_dict = {tool['info']['name']: tool for tool in all_tools}
         system_msg = f"{get_tooluse_prompt([tool['info'] for tool in all_tools])}\n\n"
+        if cm is not None:
+            # The seam learns the per-turn header (dedup target) and binds
+            # itself for ctx_* tools (contextvar; process_tool_call copies it
+            # into the dispatch threads).
+            try:
+                cm.set_system_prefix(system_msg)
+                cm.activate()
+            except Exception as e:  # noqa: BLE001 -- advisory wiring
+                logging(f"[cm] session wiring degraded: {e}")
 
         # Call API
         _emit(logging, trajectory_file, "input", text=msg)

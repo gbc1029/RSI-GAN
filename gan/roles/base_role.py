@@ -292,6 +292,7 @@ class Role(AgentSystem):
         tool_timeout_s: Optional[int] = None,
         tool_repeat_limit: Optional[int] = None,
         token_budget: Optional[int] = None,
+        cm: Any = None,
     ):
         full_msg = f"{self.current_prompt()}\n\n# Task\n{instruction}"
         path = trajectory_file or getattr(self, "trajectory_file", None)
@@ -319,6 +320,23 @@ class Role(AgentSystem):
         chat_kwargs = {}
         if tool_repeat_limit is not None:
             chat_kwargs["tool_repeat_limit"] = tool_repeat_limit
+        # Context-management session (docs/10 §11 D10): explicit arg > the
+        # loop's per-session instance stamp (``cm_session``) > None. The loop
+        # builds/stamps/clears it around each seat call (same pattern as
+        # ``session_token_budget``); None keeps the chat loop seam-free.
+        cm_session = cm if cm is not None else getattr(self, "cm_session", None)
+        if cm_session is not None and cm_session.emit is None:
+            # cm events ride the session trajectory (双记 second face; no
+            # content, only refs/sizes/rules)
+            try:
+                from utils import trajectory_log as _tlog
+
+                cm_session.emit = (lambda p: (lambda e: _tlog.append(
+                    p, e)))(path)
+            except Exception:  # noqa: BLE001 -- audit sink optional
+                pass
+        if cm_session is not None:
+            chat_kwargs["cm"] = cm_session
         hist, info = chat_with_agent(
             full_msg,
             model=self.model,

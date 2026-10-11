@@ -1,16 +1,85 @@
 {
   "components": [
-    {"name": "trajectory_quality", "kind": "eval_point",
-     "module": "evaluator/eval_points/trajectory_quality.py",
-     "description": "Process-level judgement of the execution trajectory.", "params_schema": {}},
-    {"name": "hard_failure", "kind": "eval_point",
-     "module": "evaluator/eval_points/hard_failure.py",
-     "description": "Cannot-run / obviously unreasonable -> strong penalty.", "params_schema": {}},
-    {"name": "reward_hacking", "kind": "eval_point",
-     "module": "evaluator/eval_points/reward_hacking.py",
-     "description": "Reward hacking check (may need source access).", "params_schema": {}},
-    {"name": "rule_violation", "kind": "eval_point",
-     "module": "evaluator/eval_points/rule_violation.py",
-     "description": "Cheating / rule violation check (may need source access).", "params_schema": {}}
+    {
+      "name": "trajectory_quality",
+      "kind": "eval_point",
+      "module": "evaluator/eval_points/trajectory_quality.py",
+      "description": "Process-level judgement of the execution trajectory.",
+      "params_schema": {}
+    },
+    {
+      "name": "hard_failure",
+      "kind": "eval_point",
+      "module": "evaluator/eval_points/hard_failure.py",
+      "description": "Cannot-run / obviously unreasonable -> strong penalty.",
+      "params_schema": {}
+    },
+    {
+      "name": "reward_hacking",
+      "kind": "eval_point",
+      "module": "evaluator/eval_points/reward_hacking.py",
+      "description": "Reward hacking check (may need source access).",
+      "params_schema": {}
+    },
+    {
+      "name": "rule_violation",
+      "kind": "eval_point",
+      "module": "evaluator/eval_points/rule_violation.py",
+      "description": "Cheating / rule violation check (may need source access).",
+      "params_schema": {}
+    },
+    {
+      "name": "ctx_index",
+      "module": "evaluator/cm/ctx_index.py",
+      "description": "Enumerate this session's context blocks (metadata only).",
+      "params_schema": {},
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_fetch",
+      "module": "evaluator/cm/ctx_fetch.py",
+      "description": "Materialize one context block into the conversation (full/head_tail/excerpt).",
+      "params_schema": {
+        "block_id": "string",
+        "form": "string"
+      },
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_budget",
+      "module": "evaluator/cm/ctx_budget.py",
+      "description": "Session cost meter: tokens used, tool calls, active budgets, headroom.",
+      "params_schema": {},
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_pin",
+      "module": "evaluator/cm/ctx_pin.py",
+      "description": "Pin/unpin a context block so view assembly must keep it.",
+      "params_schema": {
+        "block_id": "string",
+        "note": "string",
+        "unpin": "boolean"
+      },
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_note",
+      "module": "evaluator/cm/ctx_note.py",
+      "description": "Session scratchpad notes (write/read/list); auto-pinned.",
+      "params_schema": {
+        "action": "string",
+        "note_id": "string",
+        "text": "string"
+      },
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_view",
+      "module": "evaluator/cm/ctx_view.py",
+      "description": "Show the last assembled view: kept/elided/compacted blocks + stats.",
+      "params_schema": {},
+      "kind": "cm"
+    }
   ]
 }

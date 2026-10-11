@@ -85,6 +85,26 @@ def _count(rows: List[Dict[str, Any]], kind: str) -> int:
     return sum(1 for r in rows if r.get("kind") == kind)
 
 
+def _cm_summary(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Aggregate the session's ``cm_*`` trajectory rows (docs/10 §11 D12).
+
+    Returns None when the session had no CM rows (None ≠ 0 — a seam-free
+    session must not read as a zero-ops one). Content-free: the rows already
+    are; this only counts."""
+    if not any(str(r.get("kind", "")).startswith("cm_") for r in rows):
+        return None
+    return {
+        "cm_view_turns": _count(rows, "cm_view"),
+        "cm_violations": _count(rows, "cm_violation"),
+        "cm_policy_failures": (_count(rows, "cm_policy_failed")
+                               + _count(rows, "cm_policy_disabled")
+                               + _count(rows, "cm_policy_overrun")),
+        "cm_budget_warnings": _count(rows, "cm_budget_checkpoint"),
+        "est_chars_saved": sum(int(r.get("stats", {}).get("saved_chars") or 0)
+                               for r in rows if r.get("kind") == "cm_view"),
+    }
+
+
 def _wallclock(rows: List[Dict[str, Any]]) -> Optional[float]:
     ts = [r.get("ts") for r in rows if isinstance(r.get("ts"), (int, float))]
     if len(ts) < 2:
@@ -105,6 +125,7 @@ def session_cost_from_file(path: str, *, role: str, seat: str, outer: Any,
         return None
     rows = _read_rows(path)
     prompt, completion, total, reasoning = _sum_usage(rows)
+    cm_summary = _cm_summary(rows)
     rec: Dict[str, Any] = {
         "role": role, "seat": seat, "outer": outer,
         "genid": (str(genid) if genid is not None else None),
@@ -119,6 +140,11 @@ def session_cost_from_file(path: str, *, role: str, seat: str, outer: Any,
         "wallclock_s": _wallclock(rows),
         "ts": time.time(),
     }
+    if cm_summary is not None:
+        # Context-management session summary (docs/10 §11 D12): ops counts and
+        # the ESTIMATED chars saved — a derived indicator, never billing; the
+        # ledger's tokens stay 实付 (proxy usage sums above).
+        rec["cm"] = cm_summary
     if output_dir:
         try:
             rec["path"] = os.path.relpath(path, output_dir).replace(os.sep, "/")

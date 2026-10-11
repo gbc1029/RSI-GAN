@@ -173,6 +173,12 @@ def preflight_tools(
             # sources -- the counterpart to self-reported tool_info descriptions.
             # Never gating; the operator reads this at startup.
             "observed_capabilities": observed_capabilities(role, code_root=croot),
+            # CM wrappers + policies (docs/10 §11 D13): the wrapper is a normal
+            # agent-owned component (capability-flagged => cannot ride); a
+            # custom-mode policy additionally must pass the frozen no-LLM/
+            # no-network AST gate, or the snapshot would refuse it at
+            # materialization time (fail-open passthrough at the child).
+            "cm": cm_component_problems(role, code_root=croot),
             # Session-seat matrix (frozen policy data, no I/O): a missing seat or a
             # seat wider than the role surface breaks every session of that role.
             "seat_matrix": seat_matrix_problems(role),
@@ -379,3 +385,42 @@ def tools_ok(results: Dict[str, Dict[str, Any]]) -> bool:
         if (r.get("always_on") or {}).get("frozen"):
             return False
     return True
+
+
+def cm_component_problems(role: str, code_root: Optional[str] = None
+                          ) -> List[Dict[str, str]]:
+    """CM pool-B files for one role (docs/10 §11 D13).
+
+    - every ``gan/components/<role>/cm/*.py`` wrapper: the SAME AST policy as
+      any agent-owned tool (raw writes / subprocess / dynamic exec) — a
+      capability-flagged wrapper cannot ride the registry, so a violation is
+      reported as a problem;
+    - a ``policy*.py`` file additionally must pass the frozen no-LLM /
+      no-network gate (``cm.failopen.policy_violations``): the snapshot
+      materialization refuses it otherwise, so report the reason up front.
+
+    Non-fatal (advisory): the snapshot is the enforcement point; preflight
+    only makes the outcome visible before the run starts.
+    """
+    out: List[Dict[str, str]] = []
+    from pathlib import Path as _Path
+    base = (_Path(code_root) / "gan" / "components" / role / "cm") \
+        if code_root else None
+    if base is None or not base.is_dir():
+        return out
+    from gan.framework.ast_checker import policy_reason
+    from gan.framework.cm.failopen import policy_violations
+    for path in sorted(base.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        rel = f"gan/components/{role}/cm/{path.name}"
+        reason = policy_reason(str(path), rel)
+        if reason:
+            out.append({"file": rel, "check": "ast_policy", "reason": reason})
+        if path.name.startswith("policy"):
+            problems = policy_violations(str(path))
+            if problems:
+                out.append({"file": rel, "check": "cm_policy_gate",
+                            "reason": "; ".join(problems)[:200]})
+    return out
+

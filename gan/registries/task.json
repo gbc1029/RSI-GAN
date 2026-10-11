@@ -25,6 +25,24 @@
       "module": "task/tools/write_file.py",
       "description": "Create or overwrite a solution file inside the exercise workspace (polyglot): only the instance's declared solution paths are writable, enforced by the frozen base-layer sandbox primitive (agent/sandbox_write.py); tests/config stay read-only.",
       "params_schema": {}
+    },
+    {
+      "name": "ctx_budget",
+      "module": "task/cm/ctx_budget.py",
+      "description": "Session cost meter: tokens used, tool calls, active budgets, headroom.",
+      "params_schema": {},
+      "kind": "cm"
+    },
+    {
+      "name": "ctx_note",
+      "module": "task/cm/ctx_note.py",
+      "description": "Session scratchpad notes (write/read/list); auto-pinned.",
+      "params_schema": {
+        "action": "string",
+        "note_id": "string",
+        "text": "string"
+      },
+      "kind": "cm"
     }
   ]
 }

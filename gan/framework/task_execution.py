@@ -63,6 +63,9 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # context-management snapshot (docs/10 §11 D2): the frozen seam core and
+    # the selected policy component live under .gan_runtime/cm (no gan/ bind)
+    "GAN_CM_CORE", "GAN_CM_POLICY",
     # timeout plumbing (consumers: domains/harness.py QUESTION_TIMEOUT,
     # agent/llm.py per-call client budget)
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -179,6 +182,86 @@ def persist_design(design_store: DesignStore, config: Dict[str, Any], genid: Any
     return design_store.save(config or {}, "task", node_id=genid)
 
 
+# --- context-management snapshot (docs/10 §11, D2/D13) ----------------------
+
+# The frozen seam core copied verbatim into the sandbox. Copies only exist at
+# materialization time (per-generation snapshot, knowledge-base mechanism):
+# the frozen semantics hold by COPY TIMING + the snapshot event's sha, and the
+# source paths sit in the trust anchor (gan/framework/*) so no agent patch can
+# rewrite what the next snapshot would copy.
+_CM_CORE_FILES = ("__init__.py", "blocks.py", "ops.py", "session.py",
+                  "state.py", "failopen.py", "traj_index.py")
+
+
+def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
+                            code_root: Optional[str] = None
+                            ) -> Dict[str, Any]:
+    """Copy the frozen CM core (+ the policy the task design selects) into
+    ``<run_dir>/.gan_runtime/cm/`` and return the snapshot report.
+
+    Pool-A delivery for the task child (docs/10 §11.0.1): the run dir has no
+    ``gan/``; the snapshot imports as top-level ``cm`` and depends on stdlib
+    only. The policy file is an agent-owned component whose CURRENT SESSION
+    source is preferred when the design seat granted it this generation —
+    the workspace-first rule mirrors ``list_components`` — with the committed
+    tree as fallback, so a session edit survives to its own generation."""
+    report: Dict[str, Any] = {"core_files": [], "policy": None, "skipped": []}
+    core_src = os.path.join(os.path.dirname(__file__), "cm")
+    dst_root = os.path.join(run_dir, ".gan_runtime", "cm")
+    os.makedirs(dst_root, exist_ok=True)
+    import hashlib
+    for name in _CM_CORE_FILES:
+        src = os.path.join(core_src, name)
+        if not os.path.isfile(src):
+            report["skipped"].append({"file": name, "reason": "missing in framework"})
+            continue
+        shutil.copy2(src, os.path.join(dst_root, name))
+        with open(src, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()[:12]
+        report["core_files"].append({"file": name, "sha12": digest})
+
+    mode = (config.get("cost") or {}).get("cm_mode") if isinstance(config, dict) else None
+    if mode not in ("slice", "compact_conservative", "custom"):
+        return report  # passthrough needs no snapshot assets beyond the core
+    policy_name = None
+    if mode == "custom":
+        # The task design names the policy under gan/components/task/cm/ —
+        # resolved against the CODE ROOT the child's patch was (or was not)
+        # applied to, so the snapshot matches the generation's committed
+        # bytes (the run-dir copy itself has no gan/; there is no workspace
+        # dual provenance for the child).
+        if not code_root:
+            report["skipped"].append({"file": "policy",
+                                      "reason": "custom mode without a code root"})
+            return report
+        policy_dir = os.path.join(code_root, "gan", "components", "task", "cm")
+        if os.path.isdir(policy_dir):
+            for fn in sorted(os.listdir(policy_dir)):
+                if fn.endswith(".py") and not fn.startswith("_") \
+                        and fn != "__init__.py":
+                    policy_name = fn
+                    break
+        if not policy_name:
+            report["skipped"].append({"file": "policy",
+                                      "reason": "custom mode has no policy component"})
+            return report
+        from gan.framework.cm.failopen import policy_violations
+        src = os.path.join(policy_dir, policy_name)
+        problems = policy_violations(src)
+        if problems:
+            report["skipped"].append({"file": policy_name,
+                                      "reason": "policy refused by AST gate: "
+                                                + "; ".join(problems)[:160]})
+            return report
+        shutil.copy2(src, os.path.join(dst_root, policy_name))
+        report["policy"] = policy_name
+    return report
+
+
+def _cm_core_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "cm")
+
+
 def heal_design_slots(config: Dict[str, Any], role: str,
                       code_root: Optional[str]) -> List[Dict[str, str]]:
     """Strip slot names the committed tree cannot deliver.
@@ -266,6 +349,16 @@ def assemble_task_env(
     os.makedirs(runtime_dir, exist_ok=True)
     shutil.copy2(design_path, os.path.join(runtime_dir, "design.json"))
 
+    # Context-management snapshot (docs/10 §11 D2): the frozen seam core +
+    # (non-passthrough modes) the design-selected policy component, copied
+    # per generation. The report rides toolset_report.json -> the
+    # task_toolset_assembled event; the snapshot is advisory — a failed
+    # snapshot degrades to passthrough at the child (fail-open by absence).
+    cm_report = materialize_cm_snapshot(run_dir, config, code_root=code_root)
+    env["GAN_CM_CORE"] = "/workspace/.gan_runtime/cm"
+    if cm_report.get("policy"):
+        env["GAN_CM_POLICY"] = "/workspace/.gan_runtime/cm/" + cm_report["policy"]
+
     tools_dir = os.path.join(runtime_dir, "tools")
     # Report what the design selected vs what actually got assembled, PER
     # inner generation (the task toolset is re-assembled here, not only at
@@ -324,7 +417,8 @@ def assemble_task_env(
 
     with open(os.path.join(runtime_dir, "toolset_report.json"), "w",
               encoding="utf-8") as f:
-        json.dump({**toolset_report, "knowledge": knowledge_report},
+        json.dump({**toolset_report, "knowledge": knowledge_report,
+                   "cm": cm_report},
                   f, ensure_ascii=False, indent=2)
     env["GAN_TASK_DESIGN"] = "/workspace/.gan_runtime/design.json"
     env["GAN_TASK_TOOLS_DIR"] = "/workspace/.gan_runtime/tools"

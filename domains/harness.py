@@ -31,6 +31,8 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # context-management snapshot (docs/10 §11 D2/D7)
+    "GAN_CM_CORE", "GAN_CM_POLICY",
     # timeout plumbing (consumers: QUESTION_TIMEOUT above, agent/llm.py
     # per-call client budget). The thinking-intensity knob does NOT ride the
     # env: it is threaded explicitly (CLI --reasoning_effort -> payload).
@@ -229,7 +231,9 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
         ])
     # NOTE: no gan/ ro-bind. The one framework-dependent component imports its
     # frozen write primitive from the base layer (agent.sandbox_write), and
-    # agent/ is bound unconditionally for every domain.
+    # agent/ is bound unconditionally for every domain. The context-management
+    # snapshot lives under .gan_runtime/cm (GAN_CM_CORE) — delivered by the
+    # same ro-bind above, still no gan/ (docs/10 §11.0.1).
     command.extend([
         # Expose only this question's trajectory file, never outputs/ or other
         # questions' trajectories, which may themselves contain benchmark data.

@@ -100,6 +100,43 @@ _SPECS: Dict[str, Dict[str, Dict[str, Any]]] = {
     },
 }
 
+# Context-management keys (docs/10 §5.2.3, §11): SAME reserved family and
+# authority as above — declared here, clamped at the consumption point (the
+# seam / the slice front-end). The mode enum is the CM activation state:
+# ``passthrough`` is the safe default (identity view = pre-D behaviour), the
+# other modes switch on the slice/compact behaviours. The per-role key names
+# are identical (whose keys live in whose design, docs/10 §4); p/e consumption
+# is front-end + fixed pre-segment only in the first increment (§11.0.4).
+_CM_KEYS: Dict[str, Dict[str, Any]] = {
+    "cm_mode": {
+        "type": "str", "enum": ("passthrough", "slice", "compact_conservative", "custom"),
+        "default": "passthrough",
+        "consumer": "cm seam (view assembly) + read_trajectory slice front-end",
+    },
+    "cm_window_k": {
+        "type": "int", "min": 1, "max": 50, "default": 4,
+        "consumer": "cm seam (default pin window; framework floor is the min)",
+    },
+    "cm_drop_floor_chars": {
+        "type": "int", "min": 0, "max": 100_000, "default": 400,
+        "consumer": "cm seam invariant (blocks smaller than this are never dropped/compacted)",
+    },
+    "cm_max_ops_per_turn": {
+        "type": "int", "min": 1, "max": 200, "default": 32,
+        "consumer": "cm seam (policy op budget per turn; excess ops are refused)",
+    },
+    "cm_policy_exec_ms": {
+        "type": "int", "min": 10, "max": 10_000, "default": 200,
+        "consumer": "cm seam (policy execution budget; overruns count toward the wedge breaker)",
+    },
+    "cm_note_cap_chars": {
+        "type": "int", "min": 200, "max": 100_000, "default": 8_000,
+        "consumer": "cm note primitive (scratchpad per-note cap)",
+    },
+}
+for _role in ("task", "planner", "evaluator"):
+    _SPECS[_role].update(_CM_KEYS)
+
 _CEILING_KEY = "per_question_token_budget"
 
 
