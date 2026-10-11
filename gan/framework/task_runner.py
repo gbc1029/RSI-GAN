@@ -78,6 +78,7 @@ class DomainTaskRunner:
         reasoning_effort: Optional[str] = None,
         sample_seed_base: Optional[int] = None,
         anchor_ids: Optional[list] = None,
+        token_budget_per_gen: Optional[int] = None,
     ):
         self.repo_root = os.path.abspath(repo_root)
         self.output_dir = os.path.abspath(output_dir)
@@ -95,6 +96,10 @@ class DomainTaskRunner:
         # the task env (GAN_LLM_REASONING_EFFORT) like GAN_LLM_TIMEOUT_S.
         # Validated upstream by models.resolve_entry(); None -> gateway default.
         self.reasoning_effort = reasoning_effort
+        # Reserved cost-key ceiling (docs/10 §10): loop.yaml
+        # ``cost.token_budget_per_gen`` bounds the task design's
+        # per-question token budget (passed by gan/build.py from the loop cfg).
+        self.token_budget_per_gen = token_budget_per_gen
         self.python = python or sys.executable
         self.timeout = timeout
 
@@ -213,6 +218,26 @@ class DomainTaskRunner:
                      "role": "task", "slot": "tools"}, names=design_stripped))
             except Exception as e:  # noqa: BLE001 -- audit is advisory; stderr covers
                 print(f"[WARN] design_dangling_stripped event write failed: {e}")
+
+        # Reserved cost keys (docs/10 §10, phase C): clamp the task design's
+        # cost slot IN PLACE before the snapshot is persisted, so the persisted
+        # design.json is canonical and the child-side extraction (harness — no
+        # gan/ in the run dir) is a guarded pass-through that cannot drift from
+        # this authority. Deviations are recorded (event + meta -> receipt).
+        try:
+            from gan.framework import cost_keys as _ck
+            cost_clamps = _ck.clamp_cost_config(
+                "task", config, ceiling_token_budget=self.token_budget_per_gen)
+            cost_effective, _ = _ck.effective_all(
+                "task", config, ceiling_token_budget=self.token_budget_per_gen)
+        except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+            from utils.soft_fail import soft_fail
+            soft_fail(f"cost key clamp failed for genid {genid}: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cost_keys_apply_failed", genid=str(genid))
+            cost_clamps, cost_effective = [], {}
+        self._event("cost_keys_applied", genid=str(genid), role="task",
+                    keys=cost_effective, clamped=cost_clamps)
 
         # Framework: persist the design, prepare the minimal code copy, then
         # assemble sandbox-visible design/skills inside that copy.
@@ -485,5 +510,9 @@ class DomainTaskRunner:
                 "invalid_reason": invalid_reason,
                 "toolset_report": toolset_report,
                 "design_stripped": design_stripped or None,
+                # Reserved cost keys of this generation (docs/10 §10): the
+                # effective values that governed the child + the clamp records
+                # (the receipt projects the clamps to the planner).
+                "cost_keys": {"effective": cost_effective, "clamped": cost_clamps},
             },
         )

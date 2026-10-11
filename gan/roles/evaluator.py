@@ -97,17 +97,22 @@ class Evaluator(Role):
         task_brief: Optional[str] = None,
         trajectory_genids: Optional[List[Any]] = None,
         max_tool_calls: Optional[int] = None,
+        reveal_max_tool_calls: Optional[int] = None,
         tool_repeat_limit: Optional[int] = None,
         cost_statement: str = "",
     ) -> EvalContext:
         """Two-phase evaluation: blind first, then reveal benchmark (if provided).
 
         Budget: the blind phase gets ``max_tool_calls`` (the seat's own
-        ``evaluate_max_tool_calls`` -- NOT the planner's budget); the reveal
-        phase is a finalization pass and gets a third of it (min 6). Both
-        phases share ``tool_repeat_limit`` so a no-change re-sweep of the same
-        eval-points (observed: fixed=False throughout, byte-identical outputs)
-        cannot burn the budget.
+        ``evaluate_max_tool_calls`` or this role design's reserved
+        ``cost.evaluate_blind_max_tool_calls`` -- NOT the planner's budget); the
+        reveal phase is a finalization pass and gets ``reveal_max_tool_calls``
+        (the design's reserved key) or, when absent, a third of the blind cap
+        (min 6) as before. Both phases share ``tool_repeat_limit`` so a
+        no-change re-sweep of the same eval-points (observed: fixed=False
+        throughout, byte-identical outputs) cannot burn the budget. The
+        authority stays loop-side: the loop derives both caps from this role's
+        own design through the frozen cost-key table and passes them here.
         """
         ctx = EvalContext()
         tok_eval = set_eval_context(ctx)
@@ -117,7 +122,8 @@ class Evaluator(Role):
                                          seat="evaluate")
                       if broker is not None else None)
         blind_cap = max_tool_calls if max_tool_calls is not None else 30
-        reveal_cap = max(6, blind_cap // 3)
+        reveal_cap = (reveal_max_tool_calls if reveal_max_tool_calls is not None
+                      else max(6, blind_cap // 3))
         try:
             hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief,
                                                     cost_statement=cost_statement),
@@ -229,4 +235,5 @@ class Evaluator(Role):
                 "patch": "" if rejected else patch_str, "patch_proposed": patch_str,
                 "patch_rejection": rejected,
                 "attempts": attempts, "truncated": bool(info.get("truncated")),
-                "budget_exhausted": exhausted}
+                "budget_exhausted": exhausted,
+                "token_budget_exhausted": bool(info.get("token_budget_exhausted"))}

@@ -291,9 +291,17 @@ class Role(AgentSystem):
         trajectory_file: Optional[str] = None,
         tool_timeout_s: Optional[int] = None,
         tool_repeat_limit: Optional[int] = None,
+        token_budget: Optional[int] = None,
     ):
         full_msg = f"{self.current_prompt()}\n\n# Task\n{instruction}"
         path = trajectory_file or getattr(self, "trajectory_file", None)
+        # Reserved cost keys (docs/10 §10): per-session token soft stop. The
+        # loop stamps ``session_token_budget`` on the instance (from the role's
+        # own design, clamped by cost_keys) BEFORE the session it governs and
+        # CLEARS it before self-improve, so the default applies only to the
+        # intended seat -- exactly the ``tool_timeout_s`` stamp pattern. An
+        # explicit argument always wins; callers that pass nothing get the
+        # stamp; None (= nothing stamped) keeps the unlimited pre-C behaviour.
         # Sink for the LOAD outcome of this session's toolset. The assembly
         # report only proves what was copied; this catches the files that never
         # imported (or lost their tool API) and folds them into `assembly_report`
@@ -319,6 +327,10 @@ class Role(AgentSystem):
             tools_available=tools_available,
             tools_dir=self.tools_dir,
             max_tool_calls=max_tool_calls,
+            # Reserved cost key (docs/10 §10): explicit arg > the loop's
+            # instance stamp > None (unlimited, pre-C behavior).
+            max_total_tokens=(token_budget if token_budget is not None
+                              else getattr(self, "session_token_budget", None)),
             trajectory_file=path,
             reasoning_effort=self.reasoning_effort,
             api_key=proxy_token,

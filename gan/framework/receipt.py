@@ -132,13 +132,24 @@ def _design_diff(config: Optional[Dict[str, Any]], parent_config: Optional[Dict[
         v = (d.get("skills") or []) + (d.get("eval_points") or [])
         return set(str(x) for x in v)
     before, after = _tools(par), _tools(cfg)
+    # Reserved cost-key slot (docs/10 §10): a FIXED schema slot, not a dynamic
+    # key — it must not appear in dynamic_keys_added; its per-key changes get
+    # their own structured projection (numbers only, planner-facing receipt).
+    cost_before = par.get("cost") if isinstance(par.get("cost"), dict) else {}
+    cost_after = cfg.get("cost") if isinstance(cfg.get("cost"), dict) else {}
+    cost_changed = {
+        str(k): {"from": cost_before.get(k), "to": cost_after.get(k)}
+        for k in sorted(set(cost_before) | set(cost_after))
+        if cost_before.get(k) != cost_after.get(k)
+    }
     return {
         "prompt_changed": (cfg.get("prompt") != par.get("prompt")),
         "tools_added": sorted(after - before),
         "tools_removed": sorted(before - after),
         "dynamic_keys_added": sorted(set(cfg) - set(par)
                                      - {"prompt", "tools", "params",
-                                        "skills", "eval_points"}),
+                                        "skills", "eval_points", "cost"}),
+        "cost_keys_changed": (cost_changed or None),
     }
 
 

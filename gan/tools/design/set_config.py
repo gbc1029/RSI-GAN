@@ -53,6 +53,16 @@ def tool_function(key, value, **kwargs):
         if err:
             return f"Error: dynamic key '{key}' rejected: {err}"
     extra: dict = {}
+    if key == "cost":
+        # Reserved cost-key slot (docs/10 §10): the subkey authority is the
+        # frozen framework table; an invalid slot is refused WHOLESALE (the
+        # design is untouched) exactly like the component-slot check below.
+        from gan.framework.cost_keys import validate_cost_config
+        problems = validate_cost_config(ctx.role, value)
+        if problems:
+            return ("Error: cost slot rejected: " + "; ".join(problems)
+                    + " (reserved keys only; None unsets a key)")
+        extra["cost_keys"] = sorted(value) if isinstance(value, dict) else []
     if key == _COMPONENT_SLOT:
         # The component slot holds tool references, not free values.
         # Validate exactly like select_component (same authority, same errors).

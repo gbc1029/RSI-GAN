@@ -166,6 +166,10 @@ def build_gan_loop(
         code_root=code_root,
         sample_seed_base=sample_seed_base,
         anchor_ids=anchor_ids,
+        # Reserved cost-key ceiling (docs/10 §10): bounds the task design's
+        # per-question token budget (clamped into the design snapshot by
+        # DomainTaskRunner before persist; cost.token_budget_per_gen).
+        token_budget_per_gen=cfg.get("cost.token_budget_per_gen"),
     )
     # Grants/diffs are against the per-run code baseline when code_repo is on;
     # only the parent harness receives repo_root for loading benchmark labels.

@@ -3,7 +3,7 @@
 # statements live in AGENTS.md / docs, not here (see docs/6_v5改动.md R2).
 # Exception retired (docs/10 §9): the ``cost.*`` section now HAS consumers
 # (record_usage -> runtime ledger + statements; token_budget_per_gen ->
-# statement reference line); clamping consumption remains stage C.
+# statement reference line + the phase-C per-question ceiling, docs/10 §10).
 
 # ---------------------------------------------------------------------------
 # 双循环调度
@@ -91,11 +91,18 @@ source_access:
   max_bytes_per_grant: 52428800 # 50 MiB
 
 # ---------------------------------------------------------------------------
-# 成本（A/B 阶段已接线，docs/10 §9；钳制消费点归 C 阶段）
+# 成本（A/B 阶段已接线，docs/10 §9；C 阶段（docs/10 §10）已接钳制消费点）
 #   record_usage          -> 消费点：GanLoop._record_session_cost/_write_gen_cost/
 #                            对账单注入（false 只停运行时落账，离线聚合器不受影响）
-#   token_budget_per_gen  -> 消费点：成本对账单的参考线（B1）；
-#                            消费点钳制（C）待接线，键保留
+#   token_budget_per_gen  -> 消费点（C）：成本对账单参考线（B1）+ task 保留键
+#                            cost.per_question_token_budget 的上限 ceiling
+#                            （DomainTaskRunner 在设计快照持久化前钳入）。
+#   保留键族              -> 每角色 design 顶层 ``cost`` 槽（权威表：
+#                            gan/framework/cost_keys.py，消费点钳制 + 钳制事件
+#                            cost_keys_applied）；plan/evaluate 会话预算键
+#                            （plan_max_tool_calls/patch_retry_k/
+#                            evaluate_blind_max_tool_calls）缺省回落本文件
+#                            loop.* 值。
 # ---------------------------------------------------------------------------
 cost:
   token_budget_per_gen: 200000

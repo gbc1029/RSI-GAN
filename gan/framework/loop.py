@@ -43,11 +43,12 @@ import threading
 import time
 import uuid
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from gan.design import initial_config
 from gan.framework import checkpoint as ckpt
 from gan.framework import cost_ledger
+from gan.framework import cost_keys
 from gan.framework import paths, scores, trajectory
 from gan.framework.loader import load_registry, resolve_domain
 from gan.framework.reward.evaluator_reward import build_feedback_digest
@@ -436,10 +437,14 @@ class GanLoop:
                       event_type="cost_json_write_failed", genid=str(genid))
 
     def _cost_statement_plan(self, parent: Any, outer: Any, genid: Any,
-                             history_genids: List[Any]) -> str:
+                             history_genids: List[Any],
+                             task_budgets: Optional[Dict[str, Any]] = None,
+                             own_budget: Any = None) -> str:
         """Framework-rendered cost statement for the planner's plan session
         (B2). Advisory: a render failure degrades to an empty statement and is
-        surfaced, never fatal."""
+        surfaced, never fatal. ``task_budgets``/``own_budget`` are the C-phase
+        effective reserved keys (docs/10 §10): what the task child's session
+        will be governed by + the planner's own session budget."""
         if not self.record_usage:
             return ""
         try:
@@ -454,7 +459,8 @@ class GanLoop:
                 parent_task_cost=parent_cost,
                 history_costs=history,
                 own_last=cost_ledger.latest_session_cost(self.output_dir, "planner", "plan"),
-                token_budget=self.token_budget_per_gen)
+                token_budget=self.token_budget_per_gen,
+                task_budgets=task_budgets, own_budget=own_budget)
         except Exception as e:  # noqa: BLE001 -- advisory, never fatal
             soft_fail(f"plan cost statement build failed: {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -462,14 +468,16 @@ class GanLoop:
             return ""
 
     def _cost_statement_eval(self, genid: Any,
-                             task_cost: Optional[tuple] = None) -> str:
+                             task_cost: Optional[tuple] = None,
+                             own_budget: Any = None) -> str:
         if not self.record_usage:
             return ""
         try:
             return cost_ledger.render_evaluate_statement(
                 genid=genid, task_cost=task_cost,
                 own_last=cost_ledger.latest_session_cost(
-                    self.output_dir, "evaluator", "evaluate", exclude_genid=genid))
+                    self.output_dir, "evaluator", "evaluate", exclude_genid=genid),
+                own_budget=own_budget)
         except Exception as e:  # noqa: BLE001 -- advisory, never fatal
             soft_fail(f"evaluate cost statement build failed: {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -498,6 +506,51 @@ class GanLoop:
             return name in inspect.signature(fn).parameters
         except (TypeError, ValueError):
             return False
+
+    def _accepts_kwarg(self, fn: Any, name: str) -> bool:
+        return self._cost_statement_accepted(fn, name)
+
+    def _effective_cost_keys(self, role: str,
+                             fallbacks: Optional[Dict[str, Any]] = None
+                             ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Effective reserved cost keys for a role session (docs/10 §10, phase C).
+
+        Reads the role's OWN design (归位规则: whose keys live in whose design)
+        through the frozen cost-key table — the single clamp authority. Advisory:
+        any failure degrades to the fallbacks/defaults (never fatal).
+        """
+        try:
+            from gan.design.store import DesignStore
+            store = DesignStore(paths.design_root(self.output_dir))
+            cfg = store.load(role)
+        except Exception as e:  # noqa: BLE001 -- advisory
+            soft_fail(f"cost-key design read failed ({role}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cost_keys_apply_failed", role=role)
+            cfg = {}
+        return cost_keys.effective_all(role, cfg, fallbacks=fallbacks)
+
+    def _emit_cost_keys_applied(self, role: str, seat: str, genid: Any,
+                                keys: Dict[str, Any],
+                                clamps: List[Dict[str, Any]]) -> None:
+        """C-phase audit fact (docs/10 §10.3 判据 1): which reserved keys are
+        IN FORCE for this session, and which design requests were clamped."""
+        self.log_event({"type": "cost_keys_applied", "role": role, "seat": seat,
+                        "genid": str(genid), "keys": dict(keys or {}),
+                        "clamped": list(clamps or [])})
+
+    def _task_budget_keys(self, parent: Any) -> Optional[Dict[str, Any]]:
+        """Effective TASK-side reserved keys of the design the child will
+        inherit (the selected parent's config) — the plan statement's
+        "本代预算生效值" section (docs/10 §4). Ceiling applied."""
+        try:
+            cfg = self._parent_config(parent)
+            effective, _clamps = cost_keys.effective_all(
+                "task", cfg, ceiling_token_budget=self.token_budget_per_gen)
+            out = {k: v for k, v in effective.items() if v is not None}
+            return out or None
+        except Exception:  # noqa: BLE001 -- advisory
+            return None
 
     def _finalize_invalid_node(self, node: Node, reason: str, detail: str,
                                outer: Optional[int], inner: Optional[int]) -> None:
@@ -834,11 +887,17 @@ class GanLoop:
         rejected = plan_result.get("patch_rejection") or child.meta.get("task_patch_rejected")
         exhausted = bool(plan_result.get("budget_exhausted"))
         truncated = bool(plan_result.get("truncated"))
+        tb_exhausted = bool(plan_result.get("token_budget_exhausted"))
         budget = {
-            "exhausted": exhausted or truncated,
-            "kind": "retries" if exhausted else ("max_tool_calls" if truncated else None),
+            "exhausted": exhausted or truncated or tb_exhausted,
+            # Reserved cost keys (docs/10 §10): a token soft stop is a budget
+            # outcome of its own kind (distinct from the tool-call cap).
+            "kind": ("retries" if exhausted
+                     else ("max_tool_calls" if truncated
+                           else ("token_budget" if tb_exhausted else None))),
             "attempts": plan_result.get("attempts", 0),
             "truncated": truncated,
+            "token_budget_exhausted": tb_exhausted,
         }
         # Cost facts of THIS round (B6): the task child (proxy audit) and the
         # planner's OWN plan session. The evaluator's session cost is
@@ -852,6 +911,14 @@ class GanLoop:
                          if child.value.cost_tokens is not None else None),
                 "planner_plan": cost_ledger.compact(plan_cost),
             }
+        # Task-side reserved-key clamp records (docs/10 §10): the planner sees
+        # its own clamped decisions (责任内化, docs/10 §6). Rides regardless of
+        # record_usage (a clamp is a design fact, not a usage record); the
+        # evaluator's projection (_receipt_for_evaluator) deliberately excludes it.
+        ck_clamped = ((child.meta.get("cost_keys") or {}).get("clamped")) or []
+        if ck_clamped:
+            cost = dict(cost or {})
+            cost["clamped"] = ck_clamped
         refs = [
             paths.session_traj_file(self.output_dir, outer, genid, "planner"),
             paths.session_traj_file(self.output_dir, outer, genid, "task"),
@@ -907,10 +974,14 @@ class GanLoop:
         from gan.framework.receipt import build_receipt
         r = res or {}
         rejected = r.get("patch_rejection")
+        tb_exhausted = bool(r.get("token_budget_exhausted"))
         budget = {
-            "exhausted": bool(r.get("budget_exhausted")) or bool(r.get("truncated")),
-            "kind": "retries" if r.get("budget_exhausted") else ("max_tool_calls" if r.get("truncated") else None),
+            "exhausted": bool(r.get("budget_exhausted")) or bool(r.get("truncated")) or tb_exhausted,
+            "kind": ("retries" if r.get("budget_exhausted")
+                     else ("max_tool_calls" if r.get("truncated")
+                           else ("token_budget" if tb_exhausted else None))),
             "attempts": r.get("attempts", 0), "truncated": bool(r.get("truncated")),
+            "token_budget_exhausted": tb_exhausted,
         }
         rec = build_receipt(
             genid=f"outer_{outer}", role=role, stage="self_improve",
@@ -1156,12 +1227,33 @@ class GanLoop:
                 evaluator_issues = (parent_feedback or {}).get("issues")
                 parent_ref = [] if str(parent.genid) == "initial" else [parent.genid]
 
+                # Reserved cost keys for the PLAN seat (docs/10 §10, phase C):
+                # effective values from the planner's OWN design (fallbacks =
+                # the loop.yaml values), passed into the session + stamped on
+                # the instance; the applied/clamped record rides the ledger.
+                plan_ck, plan_clamps = self._effective_cost_keys("planner", {
+                    "plan_max_tool_calls": self.plan_max_tool_calls,
+                    "patch_retry_k": self.patch_retry_k,
+                    "plan_token_budget": None,
+                })
+                # Stamp the token soft stop for THIS session only; _self_session
+                # clears it before self-improve (the stamp is otherwise inherited
+                # by a session that has no design key of its own).
+                try:
+                    self.planner.session_token_budget = plan_ck.get("plan_token_budget")
+                except Exception as e:  # noqa: BLE001 -- advisory stamp
+                    soft_fail(f"session_token_budget stamp failed (planner): {e}")
+                self._emit_cost_keys_applied("planner", "plan", genid,
+                                             plan_ck, plan_clamps)
+
                 # Cost statement for the plan session (B2): framework-rendered
                 # facts only; the role injects the text verbatim. Resume-safe:
                 # an older role source without the kwarg keeps working (the
                 # statement is then absent for that session — audited).
                 cost_stmt_plan = self._cost_statement_plan(
-                    parent, outer, genid, [g for g in outer_genids if g != genid])
+                    parent, outer, genid, [g for g in outer_genids if g != genid],
+                    task_budgets=self._task_budget_keys(parent),
+                    own_budget=plan_ck.get("plan_token_budget"))
                 plan_cost_kwargs: Dict[str, Any] = {}
                 if cost_stmt_plan and self._cost_statement_accepted(self.planner.plan):
                     plan_cost_kwargs["cost_statement"] = cost_stmt_plan
@@ -1189,8 +1281,8 @@ class GanLoop:
                         receipt=parent_receipt,
                         parent_predicted_score=parent_predicted_score,
                         parent_benchmark_score=parent_benchmark_score,
-                        patch_retry_k=self.patch_retry_k,
-                        max_tool_calls=self.plan_max_tool_calls,
+                        patch_retry_k=plan_ck.get("patch_retry_k", self.patch_retry_k),
+                        max_tool_calls=plan_ck.get("plan_max_tool_calls", self.plan_max_tool_calls),
                         tool_repeat_limit=self.tool_repeat_limit,
                         **plan_cost_kwargs,
                     ) or {}
@@ -1282,7 +1374,23 @@ class GanLoop:
                 # task cost as a process fact (no scores — blind discipline).
                 task_cost_pair = ((child.value.cost_tokens, child.value.cost_wallclock_s)
                                   if child.value.cost_tokens is not None else None)
-                cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair)
+                # Reserved cost keys for the EVALUATE seat (docs/10 §10, C):
+                # the evaluator's own design (blind/reveal stay SEPARATE — the
+                # mandatory eval-points must never be starved), fallbacks =
+                # the loop.yaml seat budget / the pre-C reveal rule.
+                eval_ck, eval_clamps = self._effective_cost_keys("evaluator", {
+                    "evaluate_blind_max_tool_calls": self.evaluate_max_tool_calls,
+                    "evaluate_reveal_max_tool_calls": None,
+                    "evaluate_token_budget": None,
+                })
+                try:
+                    self.evaluator.session_token_budget = eval_ck.get("evaluate_token_budget")
+                except Exception as e:  # noqa: BLE001 -- advisory stamp
+                    soft_fail(f"session_token_budget stamp failed (evaluator): {e}")
+                self._emit_cost_keys_applied("evaluator", "evaluate", genid,
+                                             eval_ck, eval_clamps)
+                cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair,
+                                                           own_budget=eval_ck.get("evaluate_token_budget"))
                 eval_cost_kwargs: Dict[str, Any] = {}
                 if cost_stmt_eval and self._cost_statement_accepted(self.evaluator.evaluate):
                     eval_cost_kwargs["cost_statement"] = cost_stmt_eval
@@ -1292,6 +1400,13 @@ class GanLoop:
                     self.log_event({"type": "cost_statement_skipped", "seat": "evaluate",
                                     "genid": str(genid),
                                     "reason": "role signature lacks cost_statement"})
+                if eval_ck.get("evaluate_reveal_max_tool_calls") is not None \
+                        and self._accepts_kwarg(self.evaluator.evaluate,
+                                                "reveal_max_tool_calls"):
+                    # Only passed when the design set it (an older code tree
+                    # without the kwarg keeps the pre-C reveal rule — audited).
+                    eval_cost_kwargs["reveal_max_tool_calls"] = \
+                        eval_ck["evaluate_reveal_max_tool_calls"]
                 try:
                     ctx = self.evaluator.evaluate(
                         run_summary={
@@ -1312,7 +1427,8 @@ class GanLoop:
                         broker=self.broker,
                         task_brief=self.task_brief,
                         trajectory_genids=[genid] + parent_ref,
-                        max_tool_calls=self.evaluate_max_tool_calls,
+                        max_tool_calls=(eval_ck.get("evaluate_blind_max_tool_calls")
+                                        or self.evaluate_max_tool_calls),
                         tool_repeat_limit=self.tool_repeat_limit,
                         **eval_cost_kwargs,
                     )
@@ -1465,6 +1581,14 @@ class GanLoop:
             def _self_session(role: str, recent_payload: Dict[str, Any],
                               role_obj: Any, prev_receipt: Any) -> None:
                 try:
+                    # Clear the plan/evaluate seat's token-budget stamp: the
+                    # self-improve session has no design token key of its own
+                    # in phase C (its budget stays loop.yaml) and must not
+                    # inherit the stamp by accident (docs/10 §10.2 C11).
+                    try:
+                        role_obj.session_token_budget = None
+                    except Exception:  # noqa: BLE001 -- advisory stamp
+                        pass
                     session_results[role] = role_obj.self_improve(
                         recent={**recent_payload, "receipt": prev_receipt},
                         broker=self.broker,

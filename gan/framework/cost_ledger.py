@@ -441,9 +441,16 @@ def render_plan_statement(*, parent_genid: Any = None,
                           history_costs: Optional[List[Dict[str, Any]]] = None,
                           own_last: Optional[Dict[str, Any]] = None,
                           token_budget: Any = None,
+                          task_budgets: Optional[Dict[str, Any]] = None,
+                          own_budget: Any = None,
                           max_chars: int = _STATEMENT_MAX_CHARS) -> str:
     """Planner plan-session statement: what the task child COST before you plan
-    the next one (parent + this outer so far) + your own last plan session."""
+    the next one (parent + this outer so far) + your own last plan session.
+
+    Phase C (docs/10 §10): ``task_budgets`` = the effective task-side reserved
+    keys of the design the child will inherit (本代预算生效值, §4);
+    ``own_budget`` = the planner design's own ``cost.plan_token_budget``.
+    """
     lines = ["## Cost statement (framework-measured; prior rounds only)"]
     if parent_task_cost is not None:
         tokens, wall = parent_task_cost
@@ -456,6 +463,28 @@ def render_plan_statement(*, parent_genid: Any = None,
                              f"(parent used {pct:.1f}% of it)")
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
+    if task_budgets:
+        parts = []
+        tqb = task_budgets.get("per_question_token_budget")
+        if isinstance(tqb, (int, float)):
+            parts.append(f"{_fmt_tokens(tqb)} tokens/question")
+        tqm = task_budgets.get("per_question_max_tool_calls")
+        if isinstance(tqm, (int, float)):
+            parts.append(f"{_fmt_calls(tqm)} tool calls/question")
+        eff = task_budgets.get("reasoning_effort")
+        if eff:
+            parts.append(f"reasoning_effort={eff}")
+        if parts:
+            lines.append("- task budget keys in effect (inherited design): " + "; ".join(parts))
+    if isinstance(own_budget, (int, float)):
+        line = f"- your plan session budget: {_fmt_tokens(own_budget)} tokens (your design key)"
+        own_used = (own_last or {}).get("total_tokens")
+        if isinstance(own_used, (int, float)):
+            try:
+                line += f" -- your last session used {float(own_used) / float(own_budget) * 100.0:.1f}% of it"
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        lines.append(line)
     hist = [h for h in (history_costs or []) if h]
     if hist:
         parts = []
@@ -474,9 +503,13 @@ def render_plan_statement(*, parent_genid: Any = None,
 def render_evaluate_statement(*, genid: Any = None,
                               task_cost: Optional[Tuple[float, float]] = None,
                               own_last: Optional[Dict[str, Any]] = None,
+                              own_budget: Any = None,
                               max_chars: int = _STATEMENT_MAX_CHARS) -> str:
     """Evaluator evaluate-session statement: THIS generation's task cost as a
-    PROCESS fact (no scores — blind discipline holds) + your own last session."""
+    PROCESS fact (no scores — blind discipline holds) + your own last session.
+
+    Phase C: ``own_budget`` = the evaluator design's
+    ``cost.evaluate_token_budget`` (effective, clamped by the frozen table)."""
     lines = ["## Cost statement (framework-measured; process facts, no scores)"]
     if task_cost is not None:
         tokens, wall = task_cost
@@ -484,6 +517,15 @@ def render_evaluate_statement(*, genid: Any = None,
                      f"{_fmt_tokens(tokens)} tokens, {_fmt_secs(wall)} wall")
     else:
         lines.append(f"- task child, gen {genid}: no cost recorded (proxy-less run?)")
+    if isinstance(own_budget, (int, float)):
+        line = f"- your evaluate session budget: {_fmt_tokens(own_budget)} tokens (your design key)"
+        own_used = (own_last or {}).get("total_tokens")
+        if isinstance(own_used, (int, float)):
+            try:
+                line += f" -- your last session used {float(own_used) / float(own_budget) * 100.0:.1f}% of it"
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        lines.append(line)
     if own_last is not None:
         gid = own_last.get("genid")
         label = "your last evaluate session" + (f" (gen {gid})" if gid is not None else "")

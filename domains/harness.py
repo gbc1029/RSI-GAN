@@ -43,6 +43,58 @@ def _task_child_env(base_env):
             if key in _TASK_ENV_NAMES or key.startswith("LC_")}
 
 
+def _design_cost_overrides():
+    """Reserved task cost keys -> per-question overrides (docs/10 §10, phase C).
+
+    Reads the framework-persisted design snapshot (``GAN_TASK_DESIGN``). That
+    file was already CLAMPED parent-side (``DomainTaskRunner`` ->
+    ``cost_keys.clamp_cost_config``) before persist, so this extraction is a
+    defensive type-guarded pass-through, NOT a second clamp authority. Legacy
+    direct runs (no design file) return None and behave exactly as before.
+    """
+    path = os.environ.get("GAN_TASK_DESIGN")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    cost = cfg.get("cost") if isinstance(cfg, dict) else None
+    if not isinstance(cost, dict):
+        return None
+    # STDLIB-ONLY import (agent/llm_params): agent.llm would pull litellm whose
+    # import-time load_dotenv crashes under the restricted sandbox uid.
+    from agent.llm_params import REASONING_EFFORTS
+    out = {}
+    v = cost.get("per_question_max_tool_calls")
+    if type(v) is int and v > 0:
+        out["max_tool_calls"] = v
+    v = cost.get("per_question_token_budget")
+    if type(v) is int and v > 0:
+        out["token_budget"] = v
+    # The effort DESIGN KEY overrides the CLI/models value for this child
+    # (docs/10 §10.0.2); the model itself stays models.yaml-owned.
+    v = cost.get("reasoning_effort")
+    if isinstance(v, str) and v in REASONING_EFFORTS:
+        out["reasoning_effort"] = v
+    return out or None
+
+
+def _accepted_kwargs(cls, kwargs):
+    """Filter kwargs to what ``cls.__init__`` accepts (legacy custom TaskAgents)."""
+    if not kwargs:
+        return {}
+    import inspect
+    try:
+        params = inspect.signature(cls.__init__).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
 
 def get_dataset(domain, subset="", dataset_root=None):
     # Only the parent harness receives this path. It is never placed in the
@@ -195,7 +247,7 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
 
 
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
-                         reasoning_effort=None):
+                         reasoning_effort=None, cost_overrides=None):
     run_root = os.path.realpath(os.getcwd())
     trajectory_path = os.path.realpath(trajectory_path)
     os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
@@ -218,6 +270,13 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
         # payload -> TaskAgent), never the environment.
         "reasoning_effort": reasoning_effort,
     }
+    # Reserved cost keys (docs/10 §10): per-question budget fields ride the
+    # same explicit payload chain as reasoning_effort (B21 -- never the env).
+    if cost_overrides:
+        if cost_overrides.get("max_tool_calls") is not None:
+            payload["max_tool_calls"] = int(cost_overrides["max_tool_calls"])
+        if cost_overrides.get("token_budget") is not None:
+            payload["token_budget"] = int(cost_overrides["token_budget"])
     child_env = _task_child_env(os.environ)
 
     # The result channel is an anonymous temporary file. Only the trusted
@@ -256,7 +315,8 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
 
 def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
               question_id_col, sandbox_task_agent=False, agent_path="./task_agent.py",
-              proxy_socket=None, proxy_token=None, reasoning_effort=None):
+              proxy_socket=None, proxy_token=None, reasoning_effort=None,
+              cost_overrides=None):
     question_id = row[question_id_col]
     chat_history_path = os.path.join(evals_folder, f"chat_history_{question_id}.jsonl")
     inputs = format_input_dict(row)
@@ -264,13 +324,20 @@ def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
     if sandbox_task_agent:
         prediction = _run_sandboxed_agent(model, inputs, agent_path, chat_history_path,
                                           proxy_socket, proxy_token,
-                                          reasoning_effort=reasoning_effort)
+                                          reasoning_effort=reasoning_effort,
+                                          cost_overrides=cost_overrides)
         print(f"[timing] question {question_id}: {time.time() - _t0:.1f}s "
               f"(budget {QUESTION_TIMEOUT}s, {'blank' if not str(prediction).strip() else 'prediction produced'})",
               flush=True)
         return prediction
+    # In-process (legacy direct runs): pass the budget fields only when the
+    # loaded TaskAgent actually accepts them (cost_overrides is None for every
+    # legacy direct run, so this is a no-op there).
+    extra = _accepted_kwargs(TaskAgent, {
+        k: cost_overrides[k] for k in ("max_tool_calls", "token_budget")
+        if cost_overrides and cost_overrides.get(k) is not None})
     agent = TaskAgent(model=model, chat_history_file=chat_history_path,
-                      reasoning_effort=reasoning_effort)
+                      reasoning_effort=reasoning_effort, **extra)
     prediction, _ = agent.forward(inputs)
     print(f"[timing] question {question_id}: {time.time() - _t0:.1f}s (in-process)", flush=True)
     return prediction
@@ -419,6 +486,14 @@ def harness(
     sandbox_task_agent = questions_path is not None or dataset_root is not None
     TaskAgent = None if sandbox_task_agent else load_task_agent(agent_path)
 
+    # Reserved cost keys of the task design (docs/10 §10): per-question budget
+    # overrides + the effort override. The DESIGN KEY wins over the CLI/models
+    # effort (both local and broker mode see the same design file); legacy
+    # direct runs have no design file -> no overrides -> unchanged behaviour.
+    cost_overrides = _design_cost_overrides()
+    if cost_overrides and cost_overrides.get("reasoning_effort"):
+        reasoning_effort = cost_overrides["reasoning_effort"]
+
     # Specify output folder
     if resume_from:
         output_folder = os.path.abspath(resume_from)
@@ -495,6 +570,7 @@ def harness(
                         sandbox_task_agent, agent_path,
                         proxy_socket, proxy_token,
                         reasoning_effort=reasoning_effort,
+                        cost_overrides=cost_overrides,
                     ),
                 )
             )

@@ -33,13 +33,21 @@ def _load_design():
 
 class TaskAgent(AgentSystem):
     def __init__(self, model, chat_history_file='./outputs/trajectory.jsonl',
-                 reasoning_effort=None):
+                 reasoning_effort=None, max_tool_calls=None, token_budget=None):
         super().__init__(model, chat_history_file=chat_history_file)
         # Thinking-intensity knob for this agent's every LLM call (valid values:
         # agent.llm.REASONING_EFFORTS, gateway contract low|high|max). Threaded
         # EXPLICITLY from the harness payload / CLI -- no env transport. None
         # keeps the gateway default.
         self.reasoning_effort = reasoning_effort
+        # Reserved cost keys (docs/10 §10, B21 chain: harness payload ->
+        # task_worker -> here). None keeps the framework defaults (40 tool
+        # calls / unlimited tokens = the pre-C behaviour). The framework reads
+        # these from the design; this class only FORWARDS them -- dropping the
+        # forwarding would be visible offline (parent cost_keys_applied event
+        # vs the per-question trajectories).
+        self.max_tool_calls = max_tool_calls
+        self.token_budget = token_budget
 
     def forward(self, inputs):
         """
@@ -92,6 +100,12 @@ Respond in JSON format with the following schema (wrap the object in <json>...</
             # question subprocess is killed (S2 fixed the outer timeout; this
             # keeps a single slow tool from spending the entire question).
             tool_timeout_s=240,
+            # Reserved cost keys (docs/10 §10): forwarded only when set --
+            # None keeps the chat-loop defaults (40 tool calls / no token stop).
+            **({"max_tool_calls": self.max_tool_calls}
+               if self.max_tool_calls is not None else {}),
+            **({"max_total_tokens": self.token_budget}
+               if self.token_budget is not None else {}),
         )
 
         # Extract the response. A BLANK prediction (not the string "None") marks

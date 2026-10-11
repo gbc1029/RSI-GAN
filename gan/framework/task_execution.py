@@ -155,9 +155,19 @@ def heal_design_keys(config: Dict[str, Any], role: str,
     if not isinstance(config, dict) or role not in ("task", "planner", "evaluator"):
         return []
     from gan.design.schema import allowed_keys
+    from gan.framework import cost_keys as _ck
     known = allowed_keys(role, code_root=code_root)
     stripped = []
     for key in list(config):
+        if _ck.is_reserved_slot(key):
+            # Belt and braces (docs/10 §10.3 判据 2): the reserved cost slot
+            # survives the heal EVEN IF the schema declaration is ever missing
+            # — the authority is the frozen cost_keys table, not this catalog.
+            # A non-object slot is still removed (nothing consumable in it).
+            if not isinstance(config[key], dict):
+                stripped.append({"name": str(key), "reason": "cost slot must be an object"})
+                del config[key]
+            continue
         if key not in known:
             stripped.append({"name": str(key), "reason": "not declared in schema"})
             del config[key]
@@ -271,12 +281,21 @@ def assemble_task_env(
     # is the base; the planner curates it by authoring/removing md files through
     # the deep patch channel, not by toggling a config list. Text-only data,
     # per-file and total caps, skips reported like assembly gaps.
+    # Caps are RESERVED cost keys (docs/10 §10): the task runner clamps the
+    # design's cost slot IN PLACE pre-persist, so this consumption point reads
+    # effective values only; defaults equal the pre-C constants.
     knowledge_report = {"total": 0, "files": [], "skipped": []}
     knowledge_src = os.path.join(str(code_root or ""), "gan", "components", "task",
                                  "knowledge")
     knowledge_dir = os.path.join(runtime_dir, "knowledge")
-    _KNOWLEDGE_MAX_FILE = 20_000          # chars per note (mirrors the tool's cap)
-    _KNOWLEDGE_MAX_TOTAL = 200_000        # chars per generation
+    from gan.framework import cost_keys as _ck
+    task_cost_eff, task_cost_clamps = _ck.effective_all("task", config)
+    knowledge_max_file = int(task_cost_eff["knowledge_max_file_chars"])
+    knowledge_max_total = int(task_cost_eff["knowledge_max_total_chars"])
+    knowledge_report["caps"] = {"knowledge_max_file_chars": knowledge_max_file,
+                                "knowledge_max_total_chars": knowledge_max_total}
+    if task_cost_clamps:
+        knowledge_report["cost_clamped"] = task_cost_clamps
     if os.path.isdir(knowledge_src):
         os.makedirs(knowledge_dir, exist_ok=True)
         total = 0
@@ -285,15 +304,15 @@ def assemble_task_env(
                 continue
             src = os.path.join(knowledge_src, f)
             try:
-                text = open(src, "r", encoding="utf-8").read(_KNOWLEDGE_MAX_FILE + 1)
+                text = open(src, "r", encoding="utf-8").read(knowledge_max_file + 1)
             except OSError as e:
                 knowledge_report["skipped"].append({"name": f, "reason": f"unreadable: {e}"})
                 continue
-            if len(text) > _KNOWLEDGE_MAX_FILE:
+            if len(text) > knowledge_max_file:
                 knowledge_report["skipped"].append({"name": f,
                                                     "reason": "note exceeds per-note cap"})
                 continue
-            if total + len(text) > _KNOWLEDGE_MAX_TOTAL:
+            if total + len(text) > knowledge_max_total:
                 knowledge_report["skipped"].append({"name": f,
                                                     "reason": "knowledge total cap reached"})
                 continue

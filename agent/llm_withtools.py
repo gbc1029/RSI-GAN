@@ -349,13 +349,20 @@ def chat_with_agent(
     tools_available=[],  # Empty list means no tools, 'all' means all tools
     multiple_tool_calls=False,  # Whether to allow multiple tool calls in a single response
     max_tool_calls=40,  # Maximum number of tool calls allowed in a single response, -1 for unlimited
+    max_total_tokens=None,  # Reserved cost keys (docs/10 §10): soft per-SESSION
+                          # token budget (summed over the session's usage rows).
+                          # The call that crosses it still completes; the next
+                          # tool turn is replaced by one final no-tools summary
+                          # turn (mirrors the max_tool_calls stop). None/<=0
+                          # disables (default = pre-C behaviour).
     tools_dir=None,  # Optional custom tools directory (GAN roles use their own toolsets)
     tool_timeout_s=None,  # C1: per-CALL budget in seconds (None -> module default 600).
                           # A wedged tool is abandoned at the call level (its thread
                           # keeps running; a per-tool breaker disables repeat offenders)
                           # instead of hanging the whole session.
     trajectory_file=None,  # Optional structured JSONL trajectory sink
-    return_info=False,  # If True, also return {"truncated", "tool_calls"}
+    return_info=False,  # If True, also return {"truncated", "tool_calls",
+                        # "repeat_break", "token_budget_exhausted", "total_tokens"}
     tool_repeat_limit: int = 3,  # Anti-thrash: >= this many CONSECUTIVE identical
                           # (tool, input, output) calls ends the session -- identical
                           # input + identical output cannot produce new information.
@@ -376,6 +383,24 @@ def chat_with_agent(
     # config, identical on every turn.
     get_response_fn = partial(get_response_from_llm,
                               reasoning_effort=reasoning_effort, api_key=api_key)
+    # Reserved cost keys (docs/10 §10): per-SESSION token accumulator over the
+    # usage counters every `output` row already carries (phase A). The soft
+    # stop mirrors the tool-budget stop: the call that CROSSES the budget still
+    # happens (there is no mid-call preemption); the NEXT tool turn is not
+    # started and one final no-tools summary turn closes the session. Generic
+    # mechanism, no GAN semantics: None (default) keeps today's behaviour.
+    tokens_used = 0
+    token_budget_exhausted = False
+
+    def _counting_llm(**kwargs):
+        nonlocal tokens_used
+        response, hist, info = get_response_fn(**kwargs)
+        usage = (info or {}).get("usage") or {}
+        total = usage.get("total_tokens")
+        if isinstance(total, (int, float)):
+            tokens_used += int(total)
+        return response, hist, info
+
     # Construct message
     if msg_history is None:
         msg_history = []
@@ -392,7 +417,7 @@ def chat_with_agent(
 
         # Call API
         _emit(logging, trajectory_file, "input", text=msg)
-        response, new_msg_history, info = get_response_fn(
+        response, new_msg_history, info = _counting_llm(
             msg=system_msg + msg,
             model=model,
             msg_history=new_msg_history,
@@ -414,7 +439,7 @@ def chat_with_agent(
             _emit(logging, trajectory_file, "tool_output", tool="<no_tool_call>",
                   output="first response announced intent but emitted no tool call; "
                          "one feedback turn issued")
-            response, new_msg_history, info = get_response_fn(
+            response, new_msg_history, info = _counting_llm(
                 msg=(system_msg + "\n\n# No tool call emitted\n"
                      "Your previous message described an intention but contained NO "
                      "tool call, so nothing happened. Either emit the tool call now "
@@ -431,6 +456,27 @@ def chat_with_agent(
         _repeat_count = 0
         repeat_break = False
         while tool_uses or retry_tool_use or malformed:
+            # Reserved cost keys (docs/10 §10): per-session token soft stop,
+            # checked BEFORE the next tool turn is started (the call that
+            # crossed the budget already completed; its usage stays in the
+            # trajectory rows -- 实付口径, never rolled back).
+            if max_total_tokens is not None and max_total_tokens > 0 \
+                    and tokens_used >= max_total_tokens:
+                logging("Error: Token budget reached; requesting final summary.")
+                token_budget_exhausted = True
+                _emit(logging, trajectory_file, "token_budget_stop",
+                      tokens_used=tokens_used, budget=max_total_tokens)
+                try:
+                    response, new_msg_history, info = _counting_llm(
+                        msg=(system_msg + "\n\n# Token budget exhausted\n"
+                             "Do NOT call any tool. Provide your final answer/summary now."),
+                        model=model,
+                        msg_history=new_msg_history,
+                    )
+                    _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
+                except Exception as e:
+                    logging(f"Error during final summary turn: {e}")
+                break
             # Check for max tool calls
             if max_tool_calls > 0 and num_tool_calls >= max_tool_calls:
                 # Do NOT end on a half-executed tool call: give the model one
@@ -438,7 +484,7 @@ def chat_with_agent(
                 logging("Error: Maximum number of tool calls reached; requesting final summary.")
                 truncated = True
                 try:
-                    response, new_msg_history, info = get_response_fn(
+                    response, new_msg_history, info = _counting_llm(
                         msg=(system_msg + "\n\n# Tool budget exhausted\n"
                              "Do NOT call any tool. Provide your final answer/summary now."),
                         model=model,
@@ -458,7 +504,7 @@ def chat_with_agent(
                 logging(f"Error: {malformed} malformed tool-call JSON block(s) ignored.")
                 _emit(logging, trajectory_file, "tool_output", tool="<malformed_json>",
                       output=f"{malformed} malformed tool-call JSON block(s) ignored")
-                response, new_msg_history, info = get_response_fn(
+                response, new_msg_history, info = _counting_llm(
                     msg=(system_msg + f"\n\nError: {malformed} tool-call JSON block(s) "
                          f"in your last message were malformed (invalid JSON, or missing "
                          f"tool_name/tool_input) and were IGNORED. Either re-issue the "
@@ -522,7 +568,7 @@ def chat_with_agent(
                         truncated = True
                         repeat_break = True
                         try:
-                            response, new_msg_history, info = get_response_fn(
+                            response, new_msg_history, info = _counting_llm(
                                 msg=(system_msg + "\n\n# Repeated identical tool call\n"
                                      "The same tool call (same input) returned the same "
                                      f"result {_repeat_count} times in a row. The result "
@@ -553,7 +599,7 @@ def chat_with_agent(
                 tool_msgs.append("Error: Output context exceeded. Please try again.")
 
             # Get tool response
-            response, new_msg_history, info = get_response_fn(
+            response, new_msg_history, info = _counting_llm(
                 msg=system_msg + '\n\n'.join(tool_msgs),
                 model=model,
                 msg_history=new_msg_history,
@@ -570,7 +616,9 @@ def chat_with_agent(
 
     if return_info:
         return new_msg_history, {"truncated": truncated, "tool_calls": num_tool_calls,
-                                 "repeat_break": repeat_break}
+                                 "repeat_break": repeat_break,
+                                 "token_budget_exhausted": token_budget_exhausted,
+                                 "total_tokens": (tokens_used if tokens_used else None)}
     return new_msg_history
 
 if __name__ == "__main__":

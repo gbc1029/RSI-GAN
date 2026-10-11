@@ -4,6 +4,7 @@ from __future__ import annotations
 import difflib
 import importlib
 import importlib.util
+import inspect
 import json
 import os
 import subprocess
@@ -189,12 +190,32 @@ def _run_agent_child(result_fd: int) -> None:
 
     payload = json.load(sys.stdin)
     TaskAgent = _load_task_agent(payload["agent_path"])
+    # Reserved cost keys (docs/10 §10): the per-question budget fields ride the
+    # payload (B21 chain, same transport as reasoning_effort). The TaskAgent is
+    # the (agent-editable) artifact, so forward only what its __init__ accepts
+    # and SAY SO when something is dropped -- a modified artifact silently
+    # dropping its budget must stay visible (the parent-side cost_keys_applied
+    # event + the per-question trajectories are the offline cross-check).
+    budget_kwargs = {k: payload[k] for k in ("max_tool_calls", "token_budget")
+                     if payload.get(k) is not None}
+    try:
+        params = inspect.signature(TaskAgent.__init__).parameters
+        if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            dropped = [k for k in budget_kwargs if k not in params]
+            if dropped:
+                print(f"[cost] TaskAgent does not accept {dropped}; "
+                      f"budget fields dropped", flush=True)
+                for k in dropped:
+                    budget_kwargs.pop(k)
+    except (TypeError, ValueError):
+        budget_kwargs = {}
     agent = TaskAgent(
         model=payload["model"],
         chat_history_file=payload["trajectory_path"],
         # Thinking-intensity knob rides the stdin payload (explicit transport,
         # no env); agent/llm.py validates the value.
         reasoning_effort=payload.get("reasoning_effort"),
+        **budget_kwargs,
     )
     inputs = payload["inputs"]
     if inputs.get("domain") == "polyglot":

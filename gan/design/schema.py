@@ -9,14 +9,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, Optional
 
 ROLE_SCHEMAS: Dict[str, Dict[str, Any]] = {
-    "task": {"prompt": str, "tools": list, "params": dict},
-    "planner": {"prompt": str, "tools": list, "params": dict},
-    "evaluator": {"prompt": str, "tools": list, "params": dict},
+    # "cost" is the RESERVED cost-key slot (docs/10 §10): framework-declared,
+    # framework-consumed, clamped at the consumption point. Being a fixed slot
+    # puts it in _RESERVED automatically, so add_config_key can never shadow or
+    # re-declare it; the subkey authority is the frozen
+    # gan/framework/cost_keys.py (NOT this evolvable-by-release file, and never
+    # the agent-editable schema_ext/*.json).
+    "task": {"prompt": str, "tools": list, "params": dict, "cost": dict},
+    "planner": {"prompt": str, "tools": list, "params": dict, "cost": dict},
+    "evaluator": {"prompt": str, "tools": list, "params": dict, "cost": dict},
 }
 _DEFAULTS: Dict[str, Dict[str, Any]] = {
-    "task": {"prompt": "You are an agent.", "tools": [], "params": {}},
-    "planner": {"prompt": "You are a planner that improves a task agent.", "tools": [], "params": {}},
-    "evaluator": {"prompt": "You are an evaluator that finds benchmark-invisible problems.", "tools": [], "params": {}},
+    "task": {"prompt": "You are an agent.", "tools": [], "params": {}, "cost": {}},
+    "planner": {"prompt": "You are a planner that improves a task agent.", "tools": [], "params": {}, "cost": {}},
+    "evaluator": {"prompt": "You are an evaluator that finds benchmark-invisible problems.", "tools": [], "params": {}, "cost": {}},
 }
 _LEGACY_SLOTS = {"skills": "tools", "eval_points": "tools"}
 _RESERVED = set(ROLE_SCHEMAS["task"]) | {"model", "skills", "eval_points"}
@@ -138,6 +144,13 @@ def validate_config(role: str, config: Dict[str, Any], overlay_root: Optional[st
     for k, value in config.items():
         if k not in known:
             problems.append(f"unknown key '{k}' for role '{role}' (declare it with add_config_key)")
+            continue
+        if k == "cost":
+            # Reserved cost-key slot: the authority is the frozen framework
+            # module (deferred import keeps gan.design free of a framework
+            # package import at module load).
+            from gan.framework.cost_keys import validate_cost_config
+            problems.extend(validate_cost_config(role, value))
             continue
         spec = dynamic_key_spec(role, k, overlay_root, code_root)
         if spec:

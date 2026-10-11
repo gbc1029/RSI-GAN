@@ -194,6 +194,10 @@ class Planner(Role):
             "attempts": attempts,
             "truncated": bool(info.get("truncated")),
             "budget_exhausted": exhausted,
+            # Reserved cost keys (docs/10 §10): the per-session token soft stop
+            # fired in this session (evidence: the session trajectory's
+            # token_budget_stop row). The receipt's budget.kind rides this.
+            "token_budget_exhausted": bool(info.get("token_budget_exhausted")),
         }
 
     def self_improve(self, recent: Optional[Dict[str, Any]] = None, broker: Any = None,
@@ -276,4 +280,5 @@ class Planner(Role):
                 "patch": "" if rejected else patch_str, "patch_proposed": patch_str,
                 "patch_rejection": rejected,
                 "attempts": attempts, "truncated": bool(info.get("truncated")),
-                "budget_exhausted": exhausted}
+                "budget_exhausted": exhausted,
+                "token_budget_exhausted": bool(info.get("token_budget_exhausted"))}
