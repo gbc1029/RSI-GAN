@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 
 from gan.framework import frozen
+from gan.framework.access import SourceAccessDisabled
 from gan.framework.context import (get_access_context, get_design_context,
                                    illegal_seat_error)
 from gan.registries.loader import parse_registry_file, write_registry_json
@@ -119,11 +120,16 @@ def tool_function(name, **kwargs):
     # this session, and the resulting patch (entry restored, module still deleted)
     # is rejected by the registry gate. The MODULE is granted even when it is
     # absent from the workspace, so the deletion stays visible to the patch builder.
-    broker.grant(role, node, [rel], intent="modify", reason="unregister", if_absent=True,
-                 seat=actx.seat)
-    if module_rel:
-        broker.grant(role, node, [module_rel], intent="modify", reason="unregister",
+    try:
+        broker.grant(role, node, [rel], intent="modify", reason="unregister",
                      if_absent=True, seat=actx.seat)
+        if module_rel:
+            broker.grant(role, node, [module_rel], intent="modify", reason="unregister",
+                         if_absent=True, seat=actx.seat)
+    except SourceAccessDisabled:
+        return ("Deep source access is DISABLED for this run "
+                "(source_access.deny_deep=true). Do not retry; continue with "
+                "shallow design/config operators only.")
 
     ws_mod = os.path.join(src, module_rel) if module_rel else ""
     if ws_mod:

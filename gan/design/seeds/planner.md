@@ -30,6 +30,9 @@
      （`slot`/`name`/`key`/`value_type`/`consumer`/`paths`/`intent` 等），**不得把自由文本
      rationale 写进 record**——`records` 既决定补丁是否生成，也是评估者可见摘要的唯一来源；
      不记录的改动对循环不可见。
+3. **若本轮禁止深层访问（`source_access.deny_deep=true`，消融臂）**：框架冻结整个深层面——
+   `request_source_access` / `register_component` / `unregister_component` / `update_component`
+   全部被拒。此时**只用浅层算子**（第 1 点），不要调用深层工具：它们会返回 DISABLED 且重试无效。
 
 ## 知识库（md，DATA）
 - 给 task agent 的长期笔记写在 `gan/components/task/knowledge/*.md`：先用 `request_source_access`

@@ -78,8 +78,10 @@ tree:
 source_access:
   deny_deep: false              # true = deny every deep source-access request (deep surface frozen; ablation)
                                 # [renamed from auto_approve, v5+] semantics: NO human approval path exists
-                                # (no TTY/IPC/queue) -> this is a hard deny switch. Wiring pending (code untouched);
-                                # see docs/7_遗留问题与待办.md §3.2.1.
+                                # (no TTY/IPC/queue) -> this is a hard deny switch. WIRED: consumer is
+                                # gan/build.py -> AccessBroker(deny_deep=...) -> grant() raises
+                                # SourceAccessDisabled (audited as source_access_denied); every deep
+                                # tool returns a terminal do-not-retry message.
   # ACCESS BOUNDARY is an allowlist by role, declared once in
   # gan/framework/frozen.py (single source of truth):
   #   - task      : no source access

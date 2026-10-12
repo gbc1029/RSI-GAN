@@ -34,6 +34,15 @@ from gan.framework.context import (  # noqa: F401
 )
 
 
+class SourceAccessDisabled(RuntimeError):
+    """Raised by ``AccessBroker.grant`` when ``source_access.deny_deep`` is on.
+
+    The deep surface is frozen for the whole run (ablation arm): every deep
+    source-access request is refused up front. Deep tools catch this and return
+    a TERMINAL do-not-retry message instead of letting the agent burn turns.
+    """
+
+
 class AccessBroker:
     def __init__(
         self,
@@ -41,7 +50,7 @@ class AccessBroker:
         output_dir: str | os.PathLike,
         workspaces_dir: Optional[str | os.PathLike] = None,
         deny_paths: Optional[List[str]] = None,
-        auto_approve: bool = True,
+        deny_deep: bool = False,
         max_files: int = 500,
         max_bytes: int = 50 * 1024 * 1024,
     ):
@@ -54,7 +63,7 @@ class AccessBroker:
         )
         # explicit extra denies (back-compat / tests); allowlist is authoritative
         self.deny_paths = list(deny_paths or [])
-        self.auto_approve = auto_approve
+        self.deny_deep = deny_deep
         self.max_files = int(max_files)
         self.max_bytes = int(max_bytes)
         self.grants: Dict[tuple, List[Dict[str, Any]]] = {}
@@ -226,8 +235,29 @@ class AccessBroker:
         deletions) and is reported in ``last_result["skipped"]`` / the audit record.
         Callers that deliberately want a pristine re-copy must NOT pass it.
         """
-        if not self.auto_approve:
-            raise PermissionError("source access requires approval (auto_approve=False)")
+        if self.deny_deep:
+            # Ablation arm: freeze the ENTIRE deep surface for the run. Audit
+            # FIRST (the denial must be visible in events.jsonl), set last_result
+            # (deep tools read it), then raise a dedicated exception the deep
+            # tools translate into a TERMINAL do-not-retry message. Deliberately
+            # NOT appended to self.grants: granted_paths()/covers() walk the
+            # "paths" field of grant records, and a denial must never surface as
+            # a grant.
+            req = [str(p) for p in (paths_list or [])]
+            rec = {
+                "type": "source_access_denied",
+                "role": role,
+                "node_id": str(node_id),
+                "paths": req,
+                "intent": intent,
+                "reason": reason,
+                "policy": "source_access.deny_deep",
+                "ts": time.time(),
+            }
+            self.log_event(rec)
+            self.last_result = {"granted": [], "denied": req, "missing": []}
+            raise SourceAccessDisabled(
+                "deep source access is disabled by source_access.deny_deep")
         seat = frozen.assert_seat(role, seat)
         granted: List[str] = []
         denied_list: List[str] = []

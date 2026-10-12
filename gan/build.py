@@ -176,6 +176,7 @@ def build_gan_loop(
     broker = AccessBroker(
         code_root or repo_root, output_dir,
         deny_paths=frozen_deny_paths(),
+        deny_deep=bool(cfg.get("source_access.deny_deep", False)),
         max_files=int(cfg.get("source_access.max_files_per_grant", 500)),
         max_bytes=int(cfg.get("source_access.max_bytes_per_grant", 50 * 1024 * 1024)),
     )

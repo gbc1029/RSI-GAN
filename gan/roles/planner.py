@@ -20,6 +20,15 @@ from gan.roles.base_role import Role, warn_dropped_workspace_edits
 from gan.summary import validate_feedback
 
 
+_DENY_DEEP_NOTE = (
+    "\n## Deep source access is DISABLED this run\n"
+    "`source_access.deny_deep=true`: the deep surface is frozen for this run. "
+    "Do NOT call `request_source_access`, `register_component`, "
+    "`unregister_component` or `update_component` -- they will be refused. "
+    "Proceed with shallow design/config operators only."
+)
+
+
 class Planner(Role):
     def __init__(self, model: str, output_dir: str, instance: Optional[str] = None, **kwargs):
         super().__init__("planner", model, output_dir, load_seed("planner"), instance=instance, **kwargs)
@@ -36,6 +45,7 @@ class Planner(Role):
         parent_predicted_score: Optional[float] = None,
         parent_benchmark_score: Optional[float] = None,
         cost_statement: str = "",
+        deny_deep: bool = False,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -57,6 +67,8 @@ class Planner(Role):
             "component LOGIC still requires a DEEP change: call "
             "`request_source_access` (gated) then edit the granted copies with `edit_source`."
         )
+        if deny_deep:
+            parts.append(_DENY_DEEP_NOTE)
         if parents and len(parents) > 1:
             parts.append(
                 f"\n## Multiple candidate parents (you may CROSSOVER their designs)\n```json\n"
@@ -131,10 +143,13 @@ class Planner(Role):
         exhausted = False
         try:
             hist = self.run(
-                self._plan_instruction(parent_summary or {}, parent_feedback, evaluator_issues,
-                                       parents, task_brief, receipt,
-                                       parent_predicted_score, parent_benchmark_score,
-                                       cost_statement=cost_statement),
+                self._plan_instruction(
+                    parent_summary or {}, parent_feedback, evaluator_issues,
+                    parents, task_brief, receipt,
+                    parent_predicted_score, parent_benchmark_score,
+                    cost_statement=cost_statement,
+                    deny_deep=bool(getattr(broker, "deny_deep", False))
+                    if broker is not None else False),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
 
@@ -236,6 +251,8 @@ class Planner(Role):
                 + ((f"\n{cost_stmt}\n") if cost_stmt else "")
                 + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k not in ('receipt', 'cost_statement')}, ensure_ascii=False)[:2000]}"
             )
+            if getattr(broker, "deny_deep", False):
+                instruction += _DENY_DEEP_NOTE
             hist = self.run(instruction, max_tool_calls=max_tool_calls,
                             tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
 
