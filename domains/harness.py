@@ -33,7 +33,8 @@ _TASK_ENV_NAMES = {
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
     # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
     # audit sidecar (§11.5: rw-bound host file, folded back by task_runner)
-    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_EVENTS",
+    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
+                      "GAN_CM_EVENTS",
     # timeout plumbing (consumers: QUESTION_TIMEOUT above, agent/llm.py
     # per-call client budget). The thinking-intensity knob does NOT ride the
     # env: it is threaded explicitly (CLI --reasoning_effort -> payload).

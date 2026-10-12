@@ -132,6 +132,24 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
         "type": "int", "min": 10, "max": 10_000, "default": 200,
         "consumer": "cm seam (policy execution budget; overruns count toward the wedge breaker)",
     },
+    "cm_assembly_exec_ms": {
+        "type": "int", "min": 10, "max": 10_000, "default": 200,
+        "consumer": "cm seam (agent assembly execution budget per turn; overruns count toward its wedge breaker)",
+    },
+    "cm_policy": {
+        "type": "str", "max_len": 64, "default": None,
+        "consumer": ("cm seam (custom mode: stems the policy module in "
+                     "gan/components/<role>/cm/; named slot, delivered as "
+                     "cm_policy.py — the sort-first legacy scan is only the "
+                     "unnamed fallback)"),
+    },
+    "cm_assembly": {
+        "type": "str", "max_len": 64, "default": None,
+        "consumer": ("cm seam (non-passthrough modes: stems the agent-owned "
+                     "assembly module in gan/components/<role>/cm/; named "
+                     "slot, delivered as cm_assembly.py; replaces the "
+                     "cm_mode preset composition, fail-open to it)"),
+    },
     "cm_note_cap_chars": {
         "type": "int", "min": 200, "max": 100_000, "default": 8_000,
         "consumer": "cm note primitive (scratchpad per-note cap)",
@@ -199,6 +217,9 @@ def _validate_value(spec: Dict[str, Any], value: Any) -> Optional[str]:
         enum = spec.get("enum")
         if enum is not None and value not in enum:
             return f"must be one of {list(enum)}"
+        max_len = spec.get("max_len")
+        if max_len is not None and len(value) > max_len:
+            return f"exceeds max length {max_len}"
         return None
     return "unsupported spec type"
 

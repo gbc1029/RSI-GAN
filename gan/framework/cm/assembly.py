@@ -33,6 +33,10 @@ objects (the frozen primitive surface is documented on ``CMSession``).
 """
 from __future__ import annotations
 
+import ast
+import concurrent.futures
+import importlib.util
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # An assembly function's frozen contract (positional, per CMSession.assemble_turn):
@@ -148,12 +152,101 @@ def resolve(mode: str) -> Tuple[AssembleFn, Optional[str]]:
     authority makes unknown modes unreachable in production, and a direct
     construction must never degrade silently (no-silent-failure rule).
 
-    P1 scope: ``mode`` selects a shipped baseline preset. The P2 source
-    level extends this resolution to a NAMED agent-owned assembly module
-    (the ``cm_assembly`` design key, AST-gated + budgeted + wedge-broken,
-    fail-open to the preset) — this signature is that seam, and the
-    baseline presets remain the fail-open target."""
+    P1 scope: ``mode`` selects a shipped baseline preset. P2 (this file's
+    second half): ``load_assembly`` resolves a NAMED agent-owned assembly
+    module through the same contract, budgeted and wedge-broken by the
+    session — the baseline presets remain the fail-open target."""
     fn = BASELINE_ASSEMBLY.get(mode)
     if fn is None:
         return BASELINE_ASSEMBLY["slice"], "slice"
     return fn, None
+
+
+# ---------------------------------------------------------------------------
+# P2: the named agent-owned assembly (docs/10 §11.8)
+# ---------------------------------------------------------------------------
+
+class AssemblyError(Exception):
+    """An agent-owned assembly violated its load-time contract (AST gate,
+    dual-posture import rule, missing ``assemble``). Fail-open, loudly."""
+
+
+class AssemblyTimeout(Exception):
+    """The assembly exceeded its per-turn execution budget."""
+
+
+# An assembly must be importable in BOTH postures (snapshot top-level ``cm``
+# and in-process ``gan.framework.cm``), so its top-level imports are
+# stdlib-only — plus the guarded dual-idiom import of the core itself. A
+# ``gan.*`` import would work in-process and break the snapshot: banned.
+def _gan_import_problems(path: str) -> List[str]:
+    problems: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+    except (OSError, SyntaxError) as e:
+        return [f"assembly file unreadable/unparsable: {e}"]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "gan":
+                    problems.append(f"banned import: {alias.name} "
+                                    "(dual-posture: stdlib + cm only)")
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] == "gan" and node.level == 0:
+                problems.append(f"banned import: from {node.module} "
+                                "(dual-posture: stdlib + cm only)")
+    return problems
+
+
+def load_assembly(path: str) -> AssembleFn:
+    """Import a named assembly module from an explicit file path (snapshot
+    or component tree) and return its ``assemble`` function.
+
+    Fail-closed at load: the policy AST gate runs first (no LLM, no network,
+    no subprocess, no dynamic exec, no filesystem writes), then the
+    dual-posture import rule (stdlib + guarded ``cm`` imports only), then
+    the contract check (a callable ``assemble``). Any refusal raises
+    :class:`AssemblyError` — the session turns that into ONE loud
+    ``cm_assembly_fallback`` and runs the baseline preset for the session."""
+    from .failopen import policy_violations
+    problems = policy_violations(path) + _gan_import_problems(path)
+    if problems:
+        raise AssemblyError("assembly refused at load: " + "; ".join(problems)[:200])
+    spec = importlib.util.spec_from_file_location("cm_assembly_user", path)
+    if spec is None or spec.loader is None:
+        raise AssemblyError(f"cannot load assembly module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cm_assembly_user"] = module
+    spec.loader.exec_module(module)
+    fn = getattr(module, "assemble", None)
+    if not callable(fn):
+        raise AssemblyError(
+            "assembly exposes no callable assemble(session, msgs, outgoing, "
+            "tokens_used, budget)")
+    return fn
+
+
+def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
+                 outgoing: str, tokens_used: int, budget: Optional[int],
+                 exec_ms: int) -> Tuple[List[Dict[str, Any]], str]:
+    """Execute one agent assembly under its per-turn execution budget
+    (worker thread; same class as the policy runner). Emits
+    ``cm_assembly_overrun`` when the wall exceeded the budget (the result is
+    still honored if it arrived — the budget is advisory for terminating
+    code, binding only through the timeout). Raises on crash/timeout: the
+    session's wedge breaker counts the failure and re-runs the preset."""
+    import time as _time
+    t0 = _time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn, session, msgs, outgoing, tokens_used, budget)
+        try:
+            result = future.result(timeout=max(exec_ms, 1) / 1000.0)
+        except concurrent.futures.TimeoutError as e:
+            future.cancel()
+            raise AssemblyTimeout(f"assembly exceeded {exec_ms}ms") from e
+    over_ms = max(0, int((_time.monotonic() - t0) * 1000) - exec_ms)
+    if over_ms:
+        session._emit({"type": "cm_assembly_overrun", "turn": session.turn,
+                       "over_ms": over_ms})
+    return result

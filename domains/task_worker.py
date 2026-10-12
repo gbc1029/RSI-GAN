@@ -21,7 +21,8 @@ _TASK_ENV_NAMES = {
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
     # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
     # audit sidecar (§11.5: rw bind in the sandbox; cwd fallback locally)
-    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_EVENTS",
+    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
+                      "GAN_CM_EVENTS",
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -266,29 +267,51 @@ def _build_cm_session():
         print(f"[cm] design cm keys unavailable ({e}); using defaults",
               flush=True)
     mode = keys.get("cm_mode") if isinstance(keys.get("cm_mode"), str) else "passthrough"
-    policy_path = os.environ.get("GAN_CM_POLICY") if mode == "custom" else None
-    if mode == "custom" and not policy_path:
-        # custom 档但 env 没带 policy（broker env omission 等接线缺口）：
-        # fail-open 到 passthrough 会把 custom 静默降级 —— 先从快照目录
-        # 自发现：materialize_cm_snapshot 把 policy 组件按原文件名拷到
-        # GAN_CM_CORE 旁，任何不属于冻结核心名单的 .py 就是它。
-        _CORE = {"__init__.py", "blocks.py", "ops.py", "session.py",
-                 "state.py", "failopen.py", "traj_index.py"}
-        try:
-            for fn in sorted(os.listdir(core)):
-                if fn.endswith(".py") and fn not in _CORE:
-                    policy_path = os.path.join(core, fn)
-                    break
-        except OSError:
-            pass
-        if not policy_path:
-            _degrade("design requests cm_mode=custom but no policy is "
-                     "deliverable (no GAN_CM_POLICY env, no policy component "
-                     "in the snapshot); running PASSTHROUGH instead")
-            mode = "passthrough"
+    # Fixed-name delivery (cm_policy.py / cm_assembly.py in the snapshot):
+    # the env pins are static (assemble_task_env and the broker pin the same
+    # values), so resolution is deterministic — no sort-order scan. An env
+    # value whose file is absent means THIS generation delivered nothing;
+    # a design claim without delivery degrades LOUDLY (claim-vs-snapshot
+    # gap), never silently.
+    policy_path = None
+    if mode == "custom":
+        env_policy = os.environ.get("GAN_CM_POLICY") or ""
+        if env_policy and os.path.isfile(env_policy):
+            policy_path = env_policy
+        else:
+            fixed = os.path.join(core, "cm_policy.py")
+            if os.path.isfile(fixed):
+                # legacy/local-run recovery (no env pin): the snapshot's
+                # fixed-name policy IS the only candidate — deterministic.
+                policy_path = fixed
+                if env_policy:
+                    _degrade(f"GAN_CM_POLICY={env_policy!r} does not exist; "
+                             "recovered the snapshot's cm_policy.py")
+            else:
+                named = keys.get("cm_policy")
+                _degrade("design requests cm_mode=custom but no policy is "
+                         f"deliverable (env={env_policy!r}, snapshot has no "
+                         f"cm_policy.py"
+                         + (f", design names {named!r}" if named else "")
+                         + "); running PASSTHROUGH instead")
+                # The degrade CLAIMS passthrough — the keys must say it too,
+                # or apply_keys would still build a custom session whose
+                # every turn fails on the missing policy (observed class).
+                mode = "passthrough"
+                keys = dict(keys)
+                keys["cm_mode"] = "passthrough"
+    assembly_path = None
+    env_asm = os.environ.get("GAN_CM_ASSEMBLY") or ""
+    if env_asm and os.path.isfile(env_asm):
+        assembly_path = env_asm
+    elif keys.get("cm_assembly"):
+        _degrade(f"design names cm_assembly={keys['cm_assembly']!r} but the "
+                 f"snapshot has no cm_assembly.py (env={env_asm!r}); the "
+                 f"baseline preset runs instead")
 
     try:
         return cmcore.build_session(keys, policy_path=policy_path,
+                                    assembly_path=assembly_path,
                                     emit=_cm_emit)
     except Exception as e:  # noqa: BLE001 -- fail-open
         _degrade(f"session build failed ({e})")

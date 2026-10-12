@@ -159,6 +159,15 @@ class _TaskBrokerState:
             # parent-side BEFORE this launch, so the rw-bind source exists.
             "GAN_CM_CORE": "/workspace/.gan_runtime/cm",
             "GAN_CM_EVENTS": "/workspace/cm_events.jsonl",
+            # Agent-owned CM modules are delivered under FIXED names, so the
+            # env pins are static and pinnable here (the runner's env never
+            # crosses this boundary). A generation whose design names no
+            # module leaves the file absent; the child degrades loudly on
+            # that claim-vs-snapshot gap instead of guessing (the pre-P2
+            # sort-first self-discovery picked assembly.py once the core
+            # grew — the ambiguity class this closes).
+            "GAN_CM_POLICY": "/workspace/.gan_runtime/cm/cm_policy.py",
+            "GAN_CM_ASSEMBLY": "/workspace/.gan_runtime/cm/cm_assembly.py",
             # Per-question wall + per-call client budget, pinned at root-side
             # registration (the outer worker cannot influence them). Without
             # these the harness silently used its 300s default regardless of

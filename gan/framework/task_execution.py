@@ -66,7 +66,8 @@ _TASK_ENV_NAMES = {
     # context-management snapshot (docs/10 §11 D2): the frozen seam core and
     # the selected policy component live under .gan_runtime/cm (no gan/ bind);
     # GAN_CM_EVENTS is the child's seam-audit sidecar (rw bind, §11.5)
-    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_EVENTS",
+    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
+                      "GAN_CM_EVENTS",
     # timeout plumbing (consumers: domains/harness.py QUESTION_TIMEOUT,
     # agent/llm.py per-call client budget)
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -193,21 +194,43 @@ def persist_design(design_store: DesignStore, config: Dict[str, Any], genid: Any
 _CM_CORE_FILES = ("__init__.py", "blocks.py", "ops.py", "session.py",
                   "assembly.py", "state.py", "failopen.py", "traj_index.py",
                   "faces.py")
+# Agent-owned CM modules are delivered under FIXED names (cm_policy.py /
+# cm_assembly.py) so the child env pins are static — the task broker builds
+# the child env itself and cannot learn per-generation filenames. A design
+# name that collides with a core stem would be OVERWRITING the frozen core
+# in the snapshot dir, and ``ctx_`` is the tool identity contract: both are
+# refused, never silently rewritten.
+_CM_RESERVED_STEMS = ({os.path.splitext(f)[0] for f in _CM_CORE_FILES}
+                      | {"cm_policy", "cm_assembly"})
 
 
 def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
                             code_root: Optional[str] = None
                             ) -> Dict[str, Any]:
-    """Copy the frozen CM core (+ the policy the task design selects) into
-    ``<run_dir>/.gan_runtime/cm/`` and return the snapshot report.
+    """Copy the frozen CM core (+ the agent-owned CM modules the task design
+    NAMES) into ``<run_dir>/.gan_runtime/cm/`` and return the snapshot report.
 
     Pool-A delivery for the task child (docs/10 §11.0.1): the run dir has no
     ``gan/``; the snapshot imports as top-level ``cm`` and depends on stdlib
-    only. The policy file is an agent-owned component whose CURRENT SESSION
-    source is preferred when the design seat granted it this generation —
-    the workspace-first rule mirrors ``list_components`` — with the committed
-    tree as fallback, so a session edit survives to its own generation."""
-    report: Dict[str, Any] = {"core_files": [], "policy": None, "skipped": []}
+    only. Since P2 (docs/10 §11.8) the agent modules are NAMED SLOTS resolved
+    against the CODE ROOT the child's patch was (or was not) applied to —
+    the committed bytes the generation runs with (the run-dir copy itself
+    has no gan/; there is no workspace dual provenance for the child):
+
+    - ``cost.cm_assembly`` (non-passthrough modes): the agent-owned
+      assembly, delivered as ``cm_assembly.py``; it REPLACES the cm_mode
+      preset composition, failing open to it;
+    - ``cost.cm_policy`` (custom mode): the agent-owned policy, delivered
+      as ``cm_policy.py``. The pre-P2 selection was ``sorted(os.listdir())[0]``
+      — a second candidate file silently changed which one ran — so the
+      named slot is the only authoritative form; the sort-first scan
+      survives ONLY as the loudly-annotated legacy path for unnamed designs
+      (``policy_selection: "legacy_sort_first"``).
+
+    Every refusal lands in ``skipped`` with a reason — a named module that
+    cannot be delivered is a LOUD delivery gap, never a silent fallback."""
+    report: Dict[str, Any] = {"core_files": [], "policy": None, "skipped": [],
+                              "assembly": None, "policy_selection": None}
     core_src = os.path.join(os.path.dirname(__file__), "cm")
     dst_root = os.path.join(run_dir, ".gan_runtime", "cm")
     os.makedirs(dst_root, exist_ok=True)
@@ -222,41 +245,95 @@ def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
             digest = hashlib.sha256(fh.read()).hexdigest()[:12]
         report["core_files"].append({"file": name, "sha12": digest})
 
-    mode = (config.get("cost") or {}).get("cm_mode") if isinstance(config, dict) else None
+    cost = (config.get("cost") or {}) if isinstance(config, dict) else {}
+    mode = cost.get("cm_mode")
     if mode not in ("slice", "compact_conservative", "custom"):
-        return report  # passthrough needs no snapshot assets beyond the core
-    policy_name = None
-    if mode == "custom":
-        # The task design names the policy under gan/components/task/cm/ —
-        # resolved against the CODE ROOT the child's patch was (or was not)
-        # applied to, so the snapshot matches the generation's committed
-        # bytes (the run-dir copy itself has no gan/; there is no workspace
-        # dual provenance for the child).
-        if not code_root:
-            report["skipped"].append({"file": "policy",
-                                      "reason": "custom mode without a code root"})
-            return report
-        policy_dir = os.path.join(code_root, "gan", "components", "task", "cm")
-        if os.path.isdir(policy_dir):
-            for fn in sorted(os.listdir(policy_dir)):
-                if fn.endswith(".py") and not fn.startswith("_") \
-                        and fn != "__init__.py":
-                    policy_name = fn
-                    break
-        if not policy_name:
-            report["skipped"].append({"file": "policy",
-                                      "reason": "custom mode has no policy component"})
-            return report
-        from gan.framework.cm.failopen import policy_violations
-        src = os.path.join(policy_dir, policy_name)
+        # passthrough is the identity posture: no agent CM code is executed,
+        # so none is delivered — but a NAMED assembly under passthrough is a
+        # design claim that must stay visible (the session would ignore it).
+        asm = cost.get("cm_assembly")
+        if isinstance(asm, str) and asm.strip():
+            report["skipped"].append({
+                "file": asm.strip(),
+                "reason": "passthrough is the identity posture; the named "
+                          "assembly is not delivered and would be ignored"})
+        return report
+
+    from gan.framework.cm.failopen import policy_violations
+
+    def _deliver(stem: str, kind: str) -> Optional[str]:
+        """Gate + copy ONE named agent CM module under its fixed delivery
+        name. Returns the delivery filename, or None with a skipped entry."""
+        if stem in _CM_RESERVED_STEMS or stem.startswith("ctx_"):
+            report["skipped"].append({
+                "file": stem,
+                "reason": (f"named {kind} refused: reserved name (core stem "
+                           "or ctx_ tool identity)")})
+            return None
+        src = os.path.join(code_root, "gan", "components", "task", "cm",
+                           stem + ".py") if code_root else None
+        if not src or not os.path.isfile(src):
+            report["skipped"].append({
+                "file": stem,
+                "reason": (f"named {kind} module missing in "
+                           "gan/components/task/cm/ (no code root)"
+                           if not code_root else
+                           f"named {kind} module missing in "
+                           "gan/components/task/cm/")})
+            return None
         problems = policy_violations(src)
         if problems:
-            report["skipped"].append({"file": policy_name,
-                                      "reason": "policy refused by AST gate: "
-                                                + "; ".join(problems)[:160]})
-            return report
-        shutil.copy2(src, os.path.join(dst_root, policy_name))
-        report["policy"] = policy_name
+            report["skipped"].append({
+                "file": stem,
+                "reason": f"{kind} refused by AST gate: " + "; ".join(problems)[:160]})
+            return None
+        delivery = "cm_assembly.py" if kind == "assembly" else "cm_policy.py"
+        shutil.copy2(src, os.path.join(dst_root, delivery))
+        return delivery
+
+    asm = cost.get("cm_assembly")
+    if isinstance(asm, str) and asm.strip():
+        if _deliver(asm.strip(), "assembly"):
+            report["assembly"] = asm.strip()
+
+    if mode == "custom":
+        named = cost.get("cm_policy")
+        if isinstance(named, str) and named.strip():
+            if _deliver(named.strip(), "policy"):
+                report["policy"] = named.strip()
+                report["policy_selection"] = "named"
+        else:
+            # legacy path (unnamed design): the pre-P2 sort-first scan,
+            # loudly annotated — adding a second candidate file changes
+            # which one runs, which is exactly why the named slot exists.
+            policy_name = None
+            if code_root:
+                policy_dir = os.path.join(code_root, "gan", "components",
+                                          "task", "cm")
+                if os.path.isdir(policy_dir):
+                    for fn in sorted(os.listdir(policy_dir)):
+                        stem = os.path.splitext(fn)[0]
+                        if fn.endswith(".py") and not fn.startswith("_") \
+                                and fn != "__init__.py" \
+                                and stem not in _CM_RESERVED_STEMS \
+                                and not stem.startswith("ctx_"):
+                            policy_name = fn
+                            break
+            if not policy_name:
+                report["skipped"].append({"file": "policy",
+                                          "reason": "custom mode has no policy component"})
+                return report
+            src = os.path.join(code_root, "gan", "components", "task", "cm",
+                               policy_name)
+            problems = policy_violations(src)
+            if problems:
+                report["skipped"].append({"file": policy_name,
+                                          "reason": "policy refused by AST gate: "
+                                                    + "; ".join(problems)[:160]})
+                return report
+            shutil.copy2(src, os.path.join(dst_root, "cm_policy.py"))
+            report["policy"] = policy_name
+            report["policy_selection"] = "legacy_sort_first"
     return report
 
 
@@ -358,8 +435,14 @@ def assemble_task_env(
     # snapshot degrades to passthrough at the child (fail-open by absence).
     cm_report = materialize_cm_snapshot(run_dir, config, code_root=code_root)
     env["GAN_CM_CORE"] = "/workspace/.gan_runtime/cm"
+    # Fixed delivery names (cm_policy.py / cm_assembly.py): the env pins are
+    # static, so the broker can pin the SAME values for driver mode — a
+    # generation without a delivery leaves the file absent, and the child
+    # degrades loudly on the claim-vs-snapshot gap.
     if cm_report.get("policy"):
-        env["GAN_CM_POLICY"] = "/workspace/.gan_runtime/cm/" + cm_report["policy"]
+        env["GAN_CM_POLICY"] = "/workspace/.gan_runtime/cm/cm_policy.py"
+    if cm_report.get("assembly"):
+        env["GAN_CM_ASSEMBLY"] = "/workspace/.gan_runtime/cm/cm_assembly.py"
     # Task-child CM audit sidecar (docs/10 §11.5): PRE-CREATED so the
     # sandbox's rw --bind has an existing source; the child appends its seam
     # events (cm_view/cm_violation/...) and task_runner folds them into

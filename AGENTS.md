@@ -32,8 +32,12 @@ live under `scripts/dgmh/`.
   only; the pipeline itself is the baseline assembly ``assembly.py`` — one
   named preset per ``cm_mode``, composed over the session's frozen primitive
   methods; invariants live in the primitives, never in the pipeline source,
-  and ``resolve()`` is the seam where the P2 editable role assembly will
-  plug in), fail-open policy
+  and ``resolve()`` also loads the P2 NAMED agent-owned assembly (``cost.cm_assembly``
+  design key → ``gan/components/<role>/cm/<stem>.py``, delivered as
+  ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the
+  child env pins are static; load-once per session, per-turn exec budget,
+  2-strike wedge breaker, fail-open to the preset — every fallback leaves
+  durable events + ``degraded``/``assembly_disabled`` cm_view stats), fail-open policy
   runner, trajectory index; STDLIB-ONLY import contract because it is
   snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),

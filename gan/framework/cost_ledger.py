@@ -99,6 +99,9 @@ def _cm_summary(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "cm_policy_failures": (_count(rows, "cm_policy_failed")
                                + _count(rows, "cm_policy_disabled")
                                + _count(rows, "cm_policy_overrun")),
+        "cm_assembly_failures": (_count(rows, "cm_assembly_failed")
+                                 + _count(rows, "cm_assembly_disabled")
+                                 + _count(rows, "cm_assembly_overrun")),
         "cm_budget_warnings": _count(rows, "cm_budget_checkpoint"),
         "est_chars_saved": sum(int(r.get("stats", {}).get("saved_chars") or 0)
                                for r in rows if r.get("kind") == "cm_view"),
@@ -123,6 +126,9 @@ def cm_summary_from_events(events: List[Dict[str, Any]]) -> Optional[Dict[str, A
         "cm_policy_failures": (_count("cm_policy_failed")
                                + _count("cm_policy_disabled")
                                + _count("cm_policy_overrun")),
+        "cm_assembly_failures": (_count("cm_assembly_failed")
+                                 + _count("cm_assembly_disabled")
+                                 + _count("cm_assembly_overrun")),
         "cm_budget_warnings": _count("cm_budget_checkpoint"),
         "est_chars_saved": sum(int((e.get("stats") or {}).get("saved_chars") or 0)
                                for e in events if e.get("type") == "cm_view"),

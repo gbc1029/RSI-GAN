@@ -230,6 +230,8 @@ class CMSession:
     emit: Optional[Callable[[Dict[str, Any]], None]] = None
     budget_reader: Optional[Callable[[], Dict[str, Any]]] = None
     policy_path: Optional[str] = None  # custom mode: agent policy module path
+    assembly_path: Optional[str] = None  # P2: named agent-owned assembly module
+    assembly_exec_ms: int = 200          # per-turn budget for that assembly
     system_prefix: str = ""  # per-turn tool-use header (dedup op target)
     turn: int = 0
     universe: Universe = field(default_factory=Universe)
@@ -246,6 +248,20 @@ class CMSession:
     est_chars_saved: int = 0
     _policy_strikes: int = 0
     _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
+    # P2 named-assembly bookkeeping (audit fields materialize WITH the
+    # subsystem they describe: a session without an assembly configured has
+    # no claim to expose; one with a claim shows activity AND absence)
+    assembly_active: bool = False    # the named assembly produced >= 1 turn
+    assembly_failures: int = 0
+    assembly_disabled: bool = False  # wedge-broken for the session
+    _assembly_strikes: int = 0
+    _named_fn: Optional[Callable] = field(default=None, repr=False,
+                                          compare=False)
+    _named_failed: bool = field(default=False, repr=False, compare=False)
+    _assembly_ignored: bool = field(default=False, repr=False, compare=False)
+    _turn_degraded: bool = field(default=False, repr=False, compare=False)
+    _view_emitted_turn: Optional[int] = field(default=None, repr=False,
+                                              compare=False)
     # identity-keyed bookkeeping: rewritten shallow copies are not re-registered
     _by_fp: Dict[str, str] = field(default_factory=dict)  # content fp -> bid
     # resolved assembly (cache: mode is clamped upstream and never mutates)
@@ -271,20 +287,32 @@ class CMSession:
         v = keys.get("cm_policy_exec_ms")
         if type(v) is int and v >= 1:
             self.policy_exec_ms = v
+        v = keys.get("cm_assembly_exec_ms")
+        if type(v) is int and v >= 1:
+            self.assembly_exec_ms = v
         v = keys.get("cm_note_cap_chars")
         if type(v) is int and v >= 1:
             self.note_cap_chars = v
 
     def summary(self) -> Dict[str, Any]:
-        """Session-level CM summary (cost record / receipt ``cm`` node)."""
-        return {"mode": self.mode, "turns": self.turn,
-                "blocks": len(self.universe.blocks),
-                "ops_total": self.ops_total, "ops_applied": self.ops_applied,
-                "ops_refused": self.ops_refused,
-                "policy_failures": self.policy_failures,
-                "policy_disabled": self.policy_disabled,
-                "violations": self.violations,
-                "est_chars_saved": self.est_chars_saved}
+        """Session-level CM summary (cost record / receipt ``cm`` node).
+
+        The assembly fields materialize only when an assembly was CONFIGURED
+        (the design claim creates the observability duty: a configured-but-
+        never-active assembly must read as exactly that, None ≠ 0 style)."""
+        out = {"mode": self.mode, "turns": self.turn,
+               "blocks": len(self.universe.blocks),
+               "ops_total": self.ops_total, "ops_applied": self.ops_applied,
+               "ops_refused": self.ops_refused,
+               "policy_failures": self.policy_failures,
+               "policy_disabled": self.policy_disabled,
+               "violations": self.violations,
+               "est_chars_saved": self.est_chars_saved}
+        if self.assembly_path:
+            out["assembly_active"] = self.assembly_active
+            out["assembly_failures"] = self.assembly_failures
+            out["assembly_disabled"] = self.assembly_disabled
+        return out
 
     # ------------------------------------------------------------------- events
     def _emit(self, event: Dict[str, Any]) -> None:
@@ -379,8 +407,21 @@ class CMSession:
         identical). Resolution is cached; an unknown mode fails open to the
         slice preset with a loud ``cm_assembly_fallback`` event (the clamp
         authority makes that unreachable in production; a direct
-        construction must not degrade silently)."""
+        construction must not degrade silently).
+
+        P2: when the design names an assembly (``assembly_path``), it
+        REPLACES the preset composition for every non-passthrough turn —
+        loaded once per session, executed under ``cm_assembly_exec_ms``,
+        wedge-broken after 2 failures. ``passthrough`` is the ABSOLUTE
+        identity posture: a named assembly is never executed under it (the
+        kill switch must stay absolute; the mismatch is spoken once). ANY
+        assembly failure re-runs the baseline preset on the current state
+        for that turn (sticky forms make the replay safe) and leaves a
+        durable trace: ``cm_assembly_failed`` per failing turn,
+        ``degraded`` on that turn's ``cm_view``, ``assembly_disabled`` in
+        every subsequent ``cm_view`` — a fallback is never silent."""
         self.turn += 1
+        self._turn_degraded = False
         fn = self._assembly_fn
         if fn is None:
             fn, fallback = assembly.resolve(self.mode)
@@ -388,7 +429,95 @@ class CMSession:
             if fallback is not None:
                 self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
                             "mode": self.mode, "to": fallback})
+        if self.assembly_path and self.mode == "passthrough":
+            if not self._assembly_ignored:
+                self._assembly_ignored = True
+                self._emit({"type": "cm_assembly_ignored", "turn": self.turn,
+                            "reason": "passthrough is the identity posture; "
+                                      "the named assembly is never executed "
+                                      "under it"})
+            return fn(self, msgs, outgoing, tokens_used, budget)
+        # after the wedge breaker disables the assembly, the preset runs
+        # directly: no more per-turn attempts, failures, or disabled events —
+        # the standing degradation stays visible via cm_view stats alone
+        named = None if self.assembly_disabled else self._load_named()
+        if named is not None:
+            self._view_emitted_turn = None
+            try:
+                result = assembly.run_assembly(named, self, msgs, outgoing,
+                                               tokens_used, budget,
+                                               self.assembly_exec_ms)
+                if not (isinstance(result, tuple) and len(result) == 2
+                        and isinstance(result[0], list)
+                        and isinstance(result[1], str)):
+                    raise assembly.AssemblyError(
+                        "assembly returned a non-(history, msg) result")
+                self.assembly_active = True
+                if self._view_emitted_turn != self.turn:
+                    # audit completeness is framework-owned: an assembly
+                    # that skips the finalize_turn post segment still gets
+                    # its per-turn cm_view (minimal honest brief)
+                    self._emit_synthetic_view()
+                return result
+            except Exception as e:  # noqa: BLE001 -- fail-open, never break the seam
+                phase = ("contract" if isinstance(e, assembly.AssemblyError)
+                         else "run")
+                self._note_assembly_failure(str(e)[:160], phase=phase)
+                self._turn_degraded = True
+                # fall through: the preset re-runs on the current state
+                # (sticky forms make the replay safe); this turn's cm_view
+                # carries degraded=true
         return fn(self, msgs, outgoing, tokens_used, budget)
+
+    def _load_named(self) -> Optional[Callable]:
+        """Load the named assembly ONCE per session; the result is cached
+        INCLUDING failure (no mid-session hot reload — a self_improve
+        session editing its own assembly must not change its own seam
+        mid-flight). A load failure speaks exactly once
+        (``cm_assembly_fallback``) and the baseline preset runs for the
+        whole session; ``summary()`` shows ``assembly_active: false``."""
+        if self.assembly_path is None:
+            return None
+        if self._named_fn is None and not self._named_failed:
+            try:
+                self._named_fn = assembly.load_assembly(self.assembly_path)
+            except Exception as e:  # noqa: BLE001 -- fail-open, loudly, once
+                self._named_failed = True
+                self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                            "mode": self.mode, "to": self.mode,
+                            "reason": str(e)[:160]})
+        return self._named_fn
+
+    def _note_assembly_failure(self, error: str, phase: str = "run") -> None:
+        """One assembly turn failure: count + emit + strike; 2 strikes
+        disable the named assembly for the session (C1-class wedge breaker)
+        — the preset then runs directly and every subsequent ``cm_view``
+        carries ``assembly_disabled: true`` until the session ends."""
+        self.assembly_failures += 1
+        self._assembly_strikes += 1
+        self._emit({"type": "cm_assembly_failed", "turn": self.turn,
+                    "phase": phase, "error": error,
+                    "struck": self._assembly_strikes,
+                    "fallback": self.mode})
+        if self._assembly_strikes >= _POLICY_STRIKES:
+            self.assembly_disabled = True
+            self._emit({"type": "cm_assembly_disabled", "turn": self.turn,
+                        "strikes": self._assembly_strikes})
+
+    def _emit_synthetic_view(self) -> None:
+        """Per-turn audit completion for an assembly that returned without
+        closing through ``finalize_turn``: one ``cm_view`` brief per
+        assembled turn is the framework's contract, so the seam emits the
+        minimal honest brief itself (ops empty; stats marked)."""
+        self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
+                    "ops": [],
+                    "stats": {"blocks": len(self.universe.blocks),
+                              "substituted": len(self.view.forms),
+                              "saved_chars": 0,
+                              "est_saved_session": self.est_chars_saved,
+                              "policy_disabled": self.policy_disabled,
+                              "assembled_by": "agent_assembly"}})
+        self._view_emitted_turn = self.turn
 
     def assemble(self, msgs: List[Dict[str, Any]],
                  tokens_used: int = 0,
@@ -518,6 +647,15 @@ class CMSession:
             self._note_policy_failure("policy returned a non-list")
             return [{"op": "policy", "ok": False,
                      "error": "policy returned a non-list"}]
+        for rec in records:
+            if not isinstance(rec, dict):
+                # A non-dict record would crash the post-segment count PAST
+                # the wedge breaker (registered docs/10 §11.7): one policy
+                # failure, strike-counted, emitted, fail-open — never a seam
+                # crash with only a log line.
+                self._note_policy_failure("policy returned a non-dict record")
+                return [{"op": "policy", "ok": False,
+                         "error": "policy returned a non-dict record"}]
         self._policy_strikes = 0
         return records
 
@@ -709,22 +847,33 @@ class CMSession:
                               "refs": list(rec.get("refs") or []),
                               "rule": str(rec.get("rule")
                                           or rec.get("form") or "")[:60]})
+        stats: Dict[str, Any] = {"blocks": len(self.universe.blocks),
+                                 "substituted": len(self.view.forms),
+                                 "saved_chars": saved,
+                                 "est_saved_session": self.est_chars_saved,
+                                 "policy_disabled": self.policy_disabled}
+        # conditional audit fields: they materialize only in the states they
+        # describe, so the baseline event shape stays byte-identical while a
+        # degraded turn / a wedge-broken assembly stays visible EVERY turn
+        if self._turn_degraded:
+            stats["degraded"] = True
+        if self.assembly_disabled:
+            stats["assembly_disabled"] = True
         self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
-                    "ops": ops_brief,
-                    "stats": {"blocks": len(self.universe.blocks),
-                              "substituted": len(self.view.forms),
-                              "saved_chars": saved,
-                              "est_saved_session": self.est_chars_saved,
-                              "policy_disabled": self.policy_disabled}})
+                    "ops": ops_brief, "stats": stats})
+        self._view_emitted_turn = self.turn
 
 
 def build_session(keys: Dict[str, Any], *, emit: Optional[Callable] = None,
                   budget_reader: Optional[Callable] = None,
-                  policy_path: Optional[str] = None) -> CMSession:
+                  policy_path: Optional[str] = None,
+                  assembly_path: Optional[str] = None) -> CMSession:
     """Factory: already-clamped effective keys -> a ready session. Unknown or
     out-of-range values are IGNORED here (the clamp authority reported them
-    parent-side); the safe defaults are the passthrough posture."""
+    parent-side); the safe defaults are the passthrough posture. The named
+    assembly path is FRAMEWORK-RESOLVED (the snapshot/component tree), never
+    a design value: keys carry only the name."""
     session = CMSession(emit=emit, budget_reader=budget_reader,
-                        policy_path=policy_path)
+                        policy_path=policy_path, assembly_path=assembly_path)
     session.apply_keys(keys or {})
     return session
