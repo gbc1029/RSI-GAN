@@ -32,13 +32,13 @@ from gan.design.store import DesignStore
 from gan.patch import apply_patch
 from gan.tools.assembly import assemble_tools_dir_reported
 
-_PY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
+_PY_IGNORE = shutil.ignore_patterns(".env", "__pycache__", "*.pyc")
 # Benchmark labels / heavy assets must NOT be present in a task run (leakage
 # isolation). The parent harness reads labels from an explicit CLI path that is
 # never forwarded to the sandboxed task worker.
 _DOMAIN_IGNORE = shutil.ignore_patterns(
     "dataset*.csv", "*bench*.csv", "polyglot-benchmark", "SWE-bench",
-    "saved", "predictions", "logs", "__pycache__", "*.pyc",
+    "saved", "predictions", "logs", ".env", "__pycache__", "*.pyc",
 )
 # Allowlist of what a task run actually needs (never copy the whole repo).
 _RUNTIME_FILES = ["task_agent.py"]
@@ -48,7 +48,9 @@ _RUNTIME_DIRS = ["agent", "utils"]
 # component delegates to gan.framework.sandbox_write). Copied whole-directory
 # -- the same trust tier as agent/ and utils/ -- minus yamls: the child needs
 # none, and this keeps domain score keys out of the sandbox entirely.
-_SANDBOX_FRAMEWORK_IGNORE = shutil.ignore_patterns("*.yaml", "__pycache__", "*.pyc")
+_SANDBOX_FRAMEWORK_IGNORE = shutil.ignore_patterns(
+    ".env", "*.yaml", "__pycache__", "*.pyc",
+)
 _HARNESS_FILES = [
     "domains/__init__.py",
     "domains/harness.py",
@@ -68,6 +70,7 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    "GAN_SECURE_MODE", "PYTHON_DOTENV_DISABLED",
     # timeout plumbing (consumers: domains/harness.py QUESTION_TIMEOUT,
     # agent/llm.py per-call client budget)
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -438,6 +441,8 @@ def assemble_task_env(
     """
     env = dict(base_env)
     env.pop("GAN_DATASET_ROOT", None)
+    env["GAN_SECURE_MODE"] = "1"
+    env["PYTHON_DOTENV_DISABLED"] = "1"
 
     runtime_dir = os.path.join(run_dir, ".gan_runtime")
     os.makedirs(runtime_dir, exist_ok=True)

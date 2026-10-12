@@ -26,6 +26,110 @@ from typing import Any, Dict, List, Optional
 from gan.framework import paths
 
 
+_OUTPUT_SOURCE_MARKERS = frozenset({
+    ".env", ".git", "agent", "baselines", "datasets", "domains", "gan",
+})
+
+
+def _validate_run_paths(repo_root: str, output_dir: str) -> tuple[str, str]:
+    """Reject output trees that overlap the source or expose sensitive roots."""
+    repo = os.path.realpath(os.path.abspath(os.path.expanduser(repo_root)))
+    output_input = os.path.abspath(os.path.expanduser(output_dir))
+    current = output_input
+    while True:
+        if os.path.lexists(current) and os.path.islink(current):
+            raise RuntimeError(f"output_dir path must not contain a symlink: {current}")
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    output = os.path.realpath(output_input)
+    if not os.path.isdir(repo):
+        raise RuntimeError(f"repo_root is not an existing directory: {repo}")
+    if output == os.path.abspath(os.path.sep):
+        raise RuntimeError("output_dir must not be filesystem root")
+    if os.name == "posix":
+        repo_info = os.stat(repo, follow_symlinks=False)
+        repo_identity = (repo_info.st_dev, repo_info.st_ino)
+        current = output_input
+        while not os.path.lexists(current):
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        while True:
+            info = os.stat(current, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) == repo_identity:
+                raise RuntimeError("output_dir is inside a bind-mounted repo_root alias")
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        if os.path.exists(output):
+            output_info = os.stat(output, follow_symlinks=False)
+            output_identity = (output_info.st_dev, output_info.st_ino)
+            current = repo
+            while True:
+                info = os.stat(current, follow_symlinks=False)
+                if (info.st_dev, info.st_ino) == output_identity:
+                    raise RuntimeError(
+                        "output_dir is a bind-mounted alias of a repo_root ancestor"
+                    )
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+    homes = {os.path.realpath(os.path.expanduser("~"))}
+    raw_uid = os.environ.get("SUDO_UID", "")
+    if os.name == "posix" and raw_uid.isdigit():
+        import pwd
+        homes.add(os.path.realpath(pwd.getpwuid(int(raw_uid)).pw_dir))
+    for home in homes:
+        try:
+            contains_home = os.path.commonpath([output, home]) == output
+        except ValueError:
+            contains_home = False
+        if contains_home:
+            raise RuntimeError(
+                "output_dir must not be a home directory or contain one: "
+                f"{output}"
+            )
+        if os.name == "posix" and os.path.exists(output):
+            output_info = os.stat(output, follow_symlinks=False)
+            output_identity = (output_info.st_dev, output_info.st_ino)
+            current = home
+            while True:
+                info = os.stat(current, follow_symlinks=False)
+                if (info.st_dev, info.st_ino) == output_identity:
+                    raise RuntimeError(
+                        "output_dir is a bind-mounted alias of a home ancestor"
+                    )
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+    try:
+        overlap = os.path.commonpath([repo, output]) in {repo, output}
+    except ValueError:
+        overlap = False
+    if overlap:
+        raise RuntimeError(
+            "output_dir must be a separate tree from repo_root "
+            f"(repo_root={repo}, output_dir={output})"
+        )
+    if os.path.exists(output):
+        if not os.path.isdir(output):
+            raise RuntimeError("output_dir exists but is not a directory")
+        present = sorted(name for name in _OUTPUT_SOURCE_MARKERS
+                         if os.path.lexists(os.path.join(output, name)))
+        if present:
+            raise RuntimeError(
+                "output_dir contains source/credential markers: "
+                + ", ".join(present)
+            )
+    return repo, output
+
+
 def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
     from utils import trajectory_log
     trajectory_log.append(paths.events_path(output_dir), event)
@@ -46,6 +150,8 @@ def _outer_env(base: Dict[str, str], *, proxy_socket: str,
            if k in allowed or k.startswith("LC_")}
     env["PYTHONPATH"] = code_root + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["GAN_SECURE_MODE"] = "1"
+    env["PYTHON_DOTENV_DISABLED"] = "1"
     # Per-LLM-call client budget consumed by agent/llm.py (roles +, via the
     # task env allowlist, the task child). Must stay <= the proxy upstream
     # timeout so the proxy is never the first to cut a healthy call.
@@ -370,8 +476,12 @@ def run_gan_driver(
         cfg.get("loop.task_llm_max_calls_per_question", 64))
     if task_llm_calls_per_question < 1:
         raise ValueError("loop.task_llm_max_calls_per_question must be positive")
-    repo_root = os.path.realpath(os.path.abspath(repo_root))
-    output_dir = os.path.realpath(os.path.abspath(output_dir))
+    repo_root, output_dir = _validate_run_paths(repo_root, output_dir)
+    env_file = os.path.join(repo_root, ".env")
+    if os.path.isfile(env_file):
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_file, override=False)
+    os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
     # Domain shape checks (the ONLY default lives in scripts/run_gan.py; here the
     # value is required input). Empty/None and multi-value both fail fast before
@@ -467,6 +577,8 @@ def run_gan_driver(
         if key in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
                    "PYTHONDONTWRITEBYTECODE"} or key.startswith("LC_")
     }
+    safe_broker_env["GAN_SECURE_MODE"] = "1"
+    safe_broker_env["PYTHON_DOTENV_DISABLED"] = "1"
     question_timeout_s = int(domain_config.get("question_timeout_s") or 300)
     harness_timeout = int(num_samples) * question_timeout_s + 900
     broker_config = {

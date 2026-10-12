@@ -66,7 +66,7 @@ OPENAI_API_KEY=<key>
 ```bash
 # GAN dual-loop (paper_review minimal)
 python scripts/run_gan.py --domains paper_review --subset _filtered_100_train \
-  --num_samples 2 --outer 1 --inner 2 --output_dir outputs/gan_paper_review
+  --num_samples 2 --outer 1 --inner 2 --output_dir ../runs/gan_paper_review
 
 # original HyperAgents domain eval (model is explicit; resolved from models.yaml)
 python -m domains.harness --domain paper_review --model openai/gpt-4o \

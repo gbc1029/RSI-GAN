@@ -1,7 +1,7 @@
 """CLI entry for the GAN dual-loop.
 
 Example (paper_review, minimal):
-    python scripts/run_gan.py --repo_root . --output_dir outputs/gan_paper_review \
+    python scripts/run_gan.py --repo_root . --output_dir ../runs/gan_paper_review \
         --domains paper_review --subset _filtered_100_train --num_samples 2 \
         --outer 1 --inner 2
 """
@@ -19,7 +19,8 @@ if REPO_ROOT not in sys.path:
 def main():
     p = argparse.ArgumentParser(description="Run the GAN dual-loop (planner/evaluator/task).")
     p.add_argument("--repo_root", default=".")
-    p.add_argument("--output_dir", default="./outputs/gan_run")
+    p.add_argument("--output_dir", default=None,
+                   help="Run directory outside repo_root (default: ../runs/gan_run)")
     p.add_argument("--domains", default="paper_review",
                    help="Task domain. Currently exactly ONE domain is supported "
                         "(passing multiple values is rejected at this entry; "
@@ -42,6 +43,17 @@ def main():
     p.add_argument("--in-process", action="store_true",
                    help="Run all outers in one process WITHOUT the per-run code repo (legacy).")
     args = p.parse_args()
+
+    repo_root = os.path.realpath(os.path.abspath(os.path.expanduser(args.repo_root)))
+    if args.output_dir is None:
+        args.output_dir = os.path.join(os.path.dirname(repo_root), "runs", "gan_run")
+    from gan.driver import _validate_run_paths
+    args.repo_root, args.output_dir = _validate_run_paths(repo_root, args.output_dir)
+    env_file = os.path.join(args.repo_root, ".env")
+    if os.path.isfile(env_file):
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_file, override=False)
+    os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
     # --domains: the single domain entry. Multi-value / empty are rejected here,
     # BEFORE any task execution. (Multi-domain evaluation is not implemented yet;

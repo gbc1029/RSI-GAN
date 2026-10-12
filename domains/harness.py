@@ -31,6 +31,7 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    "GAN_SECURE_MODE", "PYTHON_DOTENV_DISABLED",
 }
 
 def _task_child_env(base_env):
@@ -190,6 +191,8 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
         "--setenv", "PWD", "/workspace/scratch",
         "--setenv", "PYTHONPATH", "/workspace",
         "--setenv", "GAN_SECURE_CAPABILITY_HOLDER", "1",
+        "--setenv", "GAN_SECURE_MODE", "1",
+        "--setenv", "PYTHON_DOTENV_DISABLED", "1",
         sys.executable,
         "-m", "domains.task_worker",
     ])

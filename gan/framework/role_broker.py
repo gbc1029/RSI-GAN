@@ -772,6 +772,8 @@ class _RoleBrokerState:
                 "--setenv", "GAN_ROLE_INSTANCE", instance,
                 "--setenv", "GAN_ROLE_PROXY_TOKEN_FILE", proxy_token_path,
                 "--setenv", "GAN_SECURE_CAPABILITY_HOLDER", "1",
+                "--setenv", "GAN_SECURE_MODE", "1",
+                "--setenv", "PYTHON_DOTENV_DISABLED", "1",
                 "--setenv", "GAN_LLM_PROXY_UNIX", proxy_socket,
                 "--setenv", "GAN_LLM_TIMEOUT_S", str(cfg["llm_timeout_s"]),
                 str(cfg["python"]), "-m", "gan.framework.role_process", "--worker",

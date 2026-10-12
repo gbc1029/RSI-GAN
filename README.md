@@ -80,8 +80,10 @@ pip install -r requirements_dev.txt
 
 ### 3) LLM credentials (create `.env`, NOT committed)
 
-The repo loads `.env` automatically (`agent/llm.py`), and `litellm` reads
-`OPENAI_API_BASE` / `OPENAI_API_KEY`. Any OpenAI-compatible endpoint works:
+The secure GAN entry loads only `<repo_root>/.env` in the trusted parent;
+sandboxed role/task processes disable dotenv discovery and receive no provider
+credential. `litellm` reads `OPENAI_API_BASE` / `OPENAI_API_KEY` in the parent.
+Any OpenAI-compatible endpoint works:
 
 ```ini
 # .env  (never commit this file)
@@ -113,7 +115,7 @@ python scripts/run_gan.py \
   --subset _filtered_100_train \
   --num_samples 2 \
   --outer 1 --inner 2 \
-  --output_dir outputs/gan_paper_review
+  --output_dir ../runs/gan_paper_review
 ```
 
 Outputs (under `--output_dir`): `logs/events.jsonl`,

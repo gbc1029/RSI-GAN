@@ -39,7 +39,9 @@ EXERCISES_DIR_DEFAULT = "polyglot-benchmark"
 app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
 
 
-load_dotenv(override=True)
+if (os.environ.get("GAN_SECURE_MODE") != "1" and
+        os.environ.get("PYTHON_DOTENV_DISABLED") != "1"):
+    load_dotenv(override=True)
 
 
 def find_latest_benchmark_dir():
