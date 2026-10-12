@@ -28,7 +28,12 @@ live under `scripts/dgmh/`.
   + harness glue + minimal run-dir copy), `task_runner.py`, `checkpoint.py`,
   `scores.py`, `trajectory.py`, `preflight.py`, `context.py`, `access.py`,
   `loop.py`, `tree/`, `reward/`, `cm/` (context-management frozen core —
-  block model, primitives, the per-turn seam pipeline, fail-open policy
+  block model, primitives, the per-turn seam (``assemble_turn`` DISPATCHES
+  only; the pipeline itself is the baseline assembly ``assembly.py`` — one
+  named preset per ``cm_mode``, composed over the session's frozen primitive
+  methods; invariants live in the primitives, never in the pipeline source,
+  and ``resolve()`` is the seam where the P2 editable role assembly will
+  plug in), fail-open policy
   runner, trajectory index; STDLIB-ONLY import contract because it is
   snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),

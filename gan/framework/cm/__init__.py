@@ -15,6 +15,7 @@ authority parent-side); events are emitted through an injected sink callable.
 from .blocks import (Block, Universe, View, PLACEHOLDER_OVERHEAD,
                        MIN_COMPACT_SAVE, EXCERPT_KEEP, HEAD_TAIL_KEEP,
                        estimate_tokens, cut, placeholder, render_form)
+from .assembly import BASELINE_ASSEMBLY, resolve as resolve_assembly
 from .session import CMSession, ViewHandle, build_session, WINDOW_K_FLOOR
 from .state import activate, deactivate, current_session, current_handle
 from .traj_index import build_traj_index, render_index_text, segment_text
@@ -24,6 +25,7 @@ __all__ = [
     "Block", "Universe", "View", "PLACEHOLDER_OVERHEAD", "MIN_COMPACT_SAVE",
     "EXCERPT_KEEP", "HEAD_TAIL_KEEP", "estimate_tokens", "cut", "placeholder",
     "render_form",
+    "BASELINE_ASSEMBLY", "resolve_assembly",
     "CMSession", "ViewHandle", "build_session", "WINDOW_K_FLOOR",
     "activate", "deactivate", "current_session", "current_handle",
     "build_traj_index", "render_index_text", "segment_text",
