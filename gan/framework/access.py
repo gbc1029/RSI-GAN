@@ -21,6 +21,7 @@ import glob
 import json
 import os
 import shutil
+import stat
 import time
 from typing import Any, Dict, List, Optional
 
@@ -95,6 +96,53 @@ class AccessBroker:
                 self._drop_role_grants(role)
                 raise
         self._drop_role_grants(role)
+
+    @staticmethod
+    def _purge_dir_fd(fd: int) -> None:
+        for name in os.listdir(fd):
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+                try:
+                    AccessBroker._purge_dir_fd(child)
+                finally:
+                    os.close(child)
+                os.rmdir(name, dir_fd=fd)
+            else:
+                os.unlink(name, dir_fd=fd)
+
+    def _reset_session(self, role: str, node_id: Any) -> None:
+        key = (str(role), str(node_id))
+        root = os.path.join(self.workspaces_dir, str(role), str(node_id))
+        if os.path.lexists(root):
+            if os.name == "posix":
+                fd = os.open(
+                    root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                )
+                try:
+                    self._purge_dir_fd(fd)
+                finally:
+                    os.close(fd)
+            else:
+                for name in os.listdir(root):
+                    path = os.path.join(root, name)
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.unlink(path)
+        self.grants.pop(key, None)
+        self._trajectory_scopes.pop(key, None)
+
+    def begin_session(self, role: str, node_id: Any) -> None:
+        """Start with no grant, trajectory, or workspace state from an earlier call."""
+        self._reset_session(role, node_id)
+
+    def end_session(self, role: str, node_id: Any) -> None:
+        """Revoke one exact role/seat call's filesystem and read capabilities."""
+        self._reset_session(role, node_id)
 
     def _drop_role_grants(self, role: str) -> None:
         for k in [k for k in self.grants if k[0] == role]:

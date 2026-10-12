@@ -5,12 +5,12 @@ import ctypes
 import json
 import os
 import re
-import secrets
 import selectors
 import signal
 import socket
 import socketserver
 import stat
+import struct
 import subprocess
 import threading
 import shutil
@@ -24,6 +24,10 @@ _ROLE_SEATS = {
     "planner": {"plan", "self_improve"},
     "evaluator": {"evaluate", "self_improve"},
 }
+
+
+class _OuterNotActive(RuntimeError):
+    pass
 
 
 def _set_parent_death_signal() -> None:
@@ -63,6 +67,88 @@ def _open_dir(path: str) -> int:
         os.close(fd)
         raise RuntimeError(f"role sandbox source is not a directory: {path}")
     return fd
+
+
+def _proc_parent_starttime(pid: int) -> Tuple[int, int]:
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="ascii") as handle:
+            raw = handle.read()
+    except (OSError, ValueError) as exc:
+        raise PermissionError("role broker peer process is unavailable") from exc
+    end = raw.rfind(")")
+    fields = raw[end + 2:].split() if end >= 0 else []
+    if len(fields) < 20:
+        raise PermissionError("role broker peer process identity is malformed")
+    try:
+        return int(fields[1]), int(fields[19])
+    except ValueError as exc:
+        raise PermissionError("role broker peer process identity is malformed") from exc
+
+
+def _proc_real_ids(pid: int) -> Tuple[int, int]:
+    try:
+        with open(f"/proc/{int(pid)}/status", "r", encoding="ascii") as handle:
+            fields = {}
+            for line in handle:
+                if line.startswith(("Uid:", "Gid:")):
+                    key, value = line.split(":", 1)
+                    fields[key] = value.split()
+    except (OSError, ValueError) as exc:
+        raise PermissionError("role broker peer process is unavailable") from exc
+    try:
+        return int(fields["Uid"][0]), int(fields["Gid"][0])
+    except (KeyError, IndexError, ValueError) as exc:
+        raise PermissionError("role broker peer credentials are malformed") from exc
+
+
+def _is_descendant(pid: int, ancestor_pid: int, ancestor_starttime: int) -> bool:
+    try:
+        _parent, current_starttime = _proc_parent_starttime(ancestor_pid)
+    except PermissionError:
+        return False
+    if current_starttime != ancestor_starttime:
+        return False
+    current = int(pid)
+    seen = set()
+    for _ in range(256):
+        if current == ancestor_pid:
+            return True
+        if current <= 1 or current in seen:
+            return False
+        seen.add(current)
+        try:
+            current, _starttime = _proc_parent_starttime(current)
+        except PermissionError:
+            return False
+    return False
+
+
+def _sealed_secret_fd(value: str) -> int:
+    if not hasattr(os, "memfd_create"):
+        raise RuntimeError("secure role token injection requires memfd_create")
+    import fcntl
+
+    data = str(value).encode("utf-8")
+    if not data or len(data) > 4096 or b"\x00" in data:
+        raise RuntimeError("invalid role proxy capability")
+    flags = int(getattr(os, "MFD_CLOEXEC", 0x0001)) | int(
+        getattr(os, "MFD_ALLOW_SEALING", 0x0002))
+    fd = os.memfd_create("rsi-gan-role-proxy", flags)
+    try:
+        offset = 0
+        while offset < len(data):
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                raise OSError("short write while sealing role proxy capability")
+            offset += written
+        os.lseek(fd, 0, os.SEEK_SET)
+        seals = (fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+                 fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, seals)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _copy_runtime_projection(code_root: str, role: str) -> str:
@@ -105,7 +191,7 @@ def _copy_runtime_projection(code_root: str, role: str) -> str:
 
     for rel in ("gan/__init__.py", "gan/patch.py", "gan/summary.py",
                 "gan/tools/__init__.py", "gan/tools/assembly.py",
-                "gan/roles/__init__.py", "gan/roles/base_role.py",
+                "gan/roles/base_role.py",
                 f"gan/roles/{role}.py"):
         src = os.path.join(code_root, rel)
         if os.path.isfile(src):
@@ -373,8 +459,10 @@ class _RoleBrokerState:
         self._lock = threading.Lock()
         self._acl_lock = threading.Lock()
         self._active: Dict[str, int] = {}
-        self._tokens: Dict[str, Dict[str, Any]] = {}
+        self._scopes: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        self._outers: Dict[int, Dict[str, int]] = {}
         self._runtime_dirs: Dict[int, str] = {}
+        self._proxy_tokens_by_pid: Dict[int, str] = {}
         self._traverse_refs: Dict[Tuple[int, int, int], int] = {}
         self._traverse_by_pid: Dict[int, List[Tuple[int, Tuple[int, int, int]]]] = {}
 
@@ -451,36 +539,103 @@ class _RoleBrokerState:
             else:
                 self._active[role] = remaining
 
-    def register_outer(self, outer: int, proxy_tokens: Dict[str, str]) -> Dict[str, str]:
+    def register_outer(self, outer: int,
+                       proxy_tokens: Dict[str, Dict[str, str]]) -> None:
         if outer < 1 or set(proxy_tokens) != set(_ROLE_SEATS):
             raise ValueError("invalid role broker outer registration")
-        issued = {}
-        with self._lock:
-            for role, seats in _ROLE_SEATS.items():
-                token = "rb-gan-" + secrets.token_urlsafe(32)
-                self._tokens[token] = {
-                    "role": role, "outer": int(outer), "seats": set(seats),
-                    "proxy_token": str(proxy_tokens[role]),
+        normalized: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        seen_tokens = set()
+        for role, seats in _ROLE_SEATS.items():
+            supplied = proxy_tokens.get(role)
+            if not isinstance(supplied, dict) or set(supplied) != seats:
+                raise ValueError("invalid role broker seat registration")
+            for seat in seats:
+                token = supplied.get(seat)
+                if (not isinstance(token, str) or not token.startswith("sk-gan-")
+                        or len(token.encode("utf-8")) > 4096 or "\x00" in token
+                        or token in seen_tokens):
+                    raise ValueError("invalid role proxy capability")
+                seen_tokens.add(token)
+                normalized[(int(outer), role, seat)] = {
+                    "role": role,
+                    "seat": seat,
+                    "outer": int(outer),
+                    "instance": f"outer_{int(outer)}",
+                    "proxy_token": token,
+                    "consumed": False,
                 }
-                issued[role] = token
-        return issued
+        with self._lock:
+            if any(key in self._scopes for key in normalized) or outer in self._outers:
+                raise ValueError("role broker outer was already registered")
+            self._scopes.update(normalized)
 
-    def reserve(self, token: str, role: str, seat: str, instance: str) -> Dict[str, Any]:
+    def activate_outer(self, outer: int, supervisor_pid: int) -> None:
+        if outer < 1 or supervisor_pid <= 1:
+            raise ValueError("invalid role broker outer activation")
+        _parent, starttime = _proc_parent_starttime(supervisor_pid)
+        real_uid, real_gid = _proc_real_ids(supervisor_pid)
+        if (real_uid != int(self.config["owner_uid"])
+                or real_gid != int(self.config["owner_gid"])):
+            raise PermissionError("outer supervisor has an unexpected owner")
+        with self._lock:
+            if not any(key[0] == outer for key in self._scopes):
+                raise ValueError("role broker outer was not registered")
+            if outer in self._outers:
+                raise ValueError("role broker outer was already activated")
+            self._outers[outer] = {
+                "pid": int(supervisor_pid), "starttime": int(starttime),
+            }
+
+    def release_outer(self, outer: int) -> None:
+        tokens = []
+        with self._lock:
+            self._outers.pop(int(outer), None)
+            for key in [key for key in self._scopes if key[0] == int(outer)]:
+                scope = self._scopes.pop(key, None)
+                if scope:
+                    tokens.append(str(scope["proxy_token"]))
+        for token in tokens:
+            self._revoke_proxy(token)
+
+    def _revoke_proxy(self, token: str) -> None:
+        from gan.framework.llm_proxy import revoke_token
+        revoke_token(
+            str(self.config["proxy_socket"]),
+            str(self.config["proxy_control_token"]), token,
+        )
+
+    def reserve(self, role: str, seat: str, instance: str, *,
+                peer_pid: int, peer_uid: int, peer_gid: int) -> Dict[str, Any]:
         match = _INSTANCE_RE.fullmatch(instance)
         if role not in _ROLE_SEATS or seat not in _ROLE_SEATS[role] or not match:
             raise PermissionError("invalid role launch scope")
+        outer = int(match.group(1))
+        owner_uid = int(self.config["owner_uid"])
+        owner_gid = int(self.config["owner_gid"])
+        if peer_uid != owner_uid or peer_gid != owner_gid:
+            raise PermissionError("role broker peer has an unexpected identity")
         with self._lock:
-            scope = self._tokens.get(token)
-            if scope is None or scope["role"] != role or scope["outer"] != int(match.group(1)):
-                raise PermissionError("invalid role launch capability")
-            if seat not in scope["seats"]:
+            active = dict(self._outers.get(outer) or {})
+            scope = self._scopes.get((outer, role, seat))
+            if not active:
+                raise _OuterNotActive("role broker outer is not active")
+            if scope is None or scope["instance"] != instance:
+                raise PermissionError("invalid role launch capability descriptor")
+            if scope["consumed"]:
                 raise PermissionError("role seat was already launched")
-            scope["seats"].remove(seat)
+            if not _is_descendant(
+                    peer_pid, int(active["pid"]), int(active["starttime"])):
+                raise PermissionError("role broker peer is outside the active outer process tree")
+            scope["consumed"] = True
             return dict(scope)
 
-    def launch(self, token: str, role: str, seat: str,
-               instance: str) -> Tuple[subprocess.Popen[bytes], List[int]]:
-        scope = self.reserve(token, role, seat, instance)
+    def launch(self, role: str, seat: str, instance: str, *,
+               peer_pid: int, peer_uid: int,
+               peer_gid: int) -> Tuple[subprocess.Popen[bytes], List[int]]:
+        scope = self.reserve(
+            role, seat, instance,
+            peer_pid=peer_pid, peer_uid=peer_uid, peer_gid=peer_gid,
+        )
         cfg = self.config
         owner_uid, owner_gid = int(cfg["owner_uid"]), int(cfg["owner_gid"])
         account = dict(cfg["accounts"])[role]
@@ -518,6 +673,7 @@ class _RoleBrokerState:
         _setfacl(str(cfg["setfacl"]), runtime_fd, "-m", f"u:{role_uid}:r-x")
         writable_fds: List[int] = []
         readonly_file_fds: List[int] = []
+        secret_fds: List[int] = []
         traverse_entries: List[Tuple[int, Tuple[int, int, int]]] = []
         process: subprocess.Popen[bytes] | None = None
         allowed_uids = {owner_uid, role_uid}
@@ -601,18 +757,27 @@ class _RoleBrokerState:
             proxy_socket = str(cfg["proxy_socket"])
             _add_empty_parents(command, proxy_socket, created)
             command.extend(["--ro-bind", proxy_socket, proxy_socket])
+            proxy_token_fd = _sealed_secret_fd(str(scope["proxy_token"]))
+            secret_fds.append(proxy_token_fd)
+            proxy_token_path = "/run/rsi-gan/proxy-token"
+            _add_empty_parents(command, proxy_token_path, created)
+            command.extend(["--ro-bind-data", str(proxy_token_fd), proxy_token_path])
             command.extend([
                 "--chdir", code_root, "--setenv", "HOME", "/tmp",
                 "--setenv", "PYTHONPATH", code_root,
                 "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
+                "--setenv", "GAN_ROLE_BOUNDARY", "1",
+                "--setenv", "GAN_ROLE_NAME", role,
                 "--setenv", "GAN_ROLE_SEAT", seat,
+                "--setenv", "GAN_ROLE_INSTANCE", instance,
+                "--setenv", "GAN_ROLE_PROXY_TOKEN_FILE", proxy_token_path,
+                "--setenv", "GAN_SECURE_CAPABILITY_HOLDER", "1",
                 "--setenv", "GAN_LLM_PROXY_UNIX", proxy_socket,
-                "--setenv", f"GAN_PROXY_{role.upper()}_TOKEN", str(scope["proxy_token"]),
                 "--setenv", "GAN_LLM_TIMEOUT_S", str(cfg["llm_timeout_s"]),
                 str(cfg["python"]), "-m", "gan.framework.role_process", "--worker",
             ])
             pass_fds = tuple([
-                output_fd, runtime_fd, *writable_fds, *readonly_file_fds,
+                output_fd, runtime_fd, *writable_fds, *readonly_file_fds, *secret_fds,
             ])
             process = subprocess.Popen(
                 _setpriv_command(str(cfg["setpriv"]), role_uid, role_gid, command),
@@ -623,7 +788,11 @@ class _RoleBrokerState:
             for fd in readonly_file_fds:
                 os.close(fd)
             readonly_file_fds.clear()
+            for fd in secret_fds:
+                os.close(fd)
+            secret_fds.clear()
             self._runtime_dirs[process.pid] = runtime_root
+            self._proxy_tokens_by_pid[process.pid] = str(scope["proxy_token"])
             self._traverse_by_pid[process.pid] = traverse_entries
             traverse_entries = []
             return process, [output_fd, runtime_fd, *writable_fds]
@@ -645,7 +814,8 @@ class _RoleBrokerState:
                     self._release_output_acl(role, output_fd, role_uid)
                 except Exception:
                     pass
-            for fd in [output_fd, runtime_fd, *writable_fds, *readonly_file_fds]:
+            for fd in [output_fd, runtime_fd, *writable_fds,
+                       *readonly_file_fds, *secret_fds]:
                 try:
                     os.close(fd)
                 except OSError:
@@ -678,6 +848,12 @@ class _RoleBrokerState:
                 except OSError:
                     pass
             if pid is not None:
+                proxy_token = self._proxy_tokens_by_pid.pop(pid, None)
+                if proxy_token:
+                    try:
+                        self._revoke_proxy(proxy_token)
+                    except Exception as exc:
+                        errors.append(f"role proxy revoke failed: {exc}")
                 runtime_root = self._runtime_dirs.pop(pid, None)
                 if runtime_root:
                     shutil.rmtree(runtime_root, ignore_errors=True)
@@ -702,15 +878,23 @@ class _RoleRequestHandler(socketserver.StreamRequestHandler):
         authenticated = False
         try:
             request = json.loads(raw.decode("utf-8"))
-            if not isinstance(request, dict) or set(request) != {"token", "role", "seat", "instance"}:
+            if not isinstance(request, dict) or set(request) != {"role", "seat", "instance"}:
                 raise ValueError("unexpected role broker request fields")
+            if not hasattr(socket, "SO_PEERCRED"):
+                raise PermissionError("role broker peer credentials are unavailable")
+            credentials = self.request.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            peer_pid, peer_uid, peer_gid = struct.unpack("3i", credentials)
             role = str(request["role"])
             process, fds = self.server.state.launch(  # type: ignore[attr-defined]
-                str(request["token"]), role, str(request["seat"]), str(request["instance"])
+                role, str(request["seat"]), str(request["instance"]),
+                peer_pid=peer_pid, peer_uid=peer_uid, peer_gid=peer_gid,
             )
             _reply(self, {"ok": True})
             authenticated = True
             _relay(self.request, process)
+        except _OuterNotActive as exc:
+            _reply(self, {"ok": False, "error": str(exc), "retry": True})
         except PermissionError as exc:
             _reply(self, {"ok": False, "error": str(exc), "denied": True})
         except Exception as exc:  # noqa: BLE001
@@ -764,8 +948,21 @@ def broker_process_main(control: Connection, socket_path: str, config: Dict[str,
             operation = message.get("op") if isinstance(message, dict) else None
             if operation == "register":
                 try:
-                    tokens = state.register_outer(int(message["outer"]), dict(message["proxy_tokens"]))
-                    control.send({"ok": True, "tokens": tokens})
+                    state.register_outer(int(message["outer"]), dict(message["proxy_tokens"]))
+                    control.send({"ok": True})
+                except Exception as exc:  # noqa: BLE001
+                    control.send({"ok": False, "error": str(exc)})
+            elif operation == "activate":
+                try:
+                    state.activate_outer(
+                        int(message["outer"]), int(message["supervisor_pid"]))
+                    control.send({"ok": True})
+                except Exception as exc:  # noqa: BLE001
+                    control.send({"ok": False, "error": str(exc)})
+            elif operation == "release":
+                try:
+                    state.release_outer(int(message["outer"]))
+                    control.send({"ok": True})
                 except Exception as exc:  # noqa: BLE001
                     control.send({"ok": False, "error": str(exc)})
             elif operation == "shutdown":

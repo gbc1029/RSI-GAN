@@ -32,9 +32,8 @@ def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
 
 
 def _outer_env(base: Dict[str, str], *, proxy_socket: str,
-               planner_token: str, evaluator_token: str,
-               task_broker_socket: str, task_broker_token: str,
-               role_broker_socket: str, role_broker_tokens: Dict[str, str],
+               task_broker_socket: str, outer: int,
+               role_broker_socket: str,
                role_accounts: Dict[str, Dict[str, Any]],
                code_root: str) -> Dict[str, str]:
     """Return the small non-secret environment inherited by outer_worker."""
@@ -53,13 +52,9 @@ def _outer_env(base: Dict[str, str], *, proxy_socket: str,
     env["GAN_LLM_TIMEOUT_S"] = str(
         os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
     env["GAN_LLM_PROXY_UNIX"] = proxy_socket
-    env["GAN_PROXY_PLANNER_TOKEN"] = planner_token
-    env["GAN_PROXY_EVALUATOR_TOKEN"] = evaluator_token
     env["GAN_TASK_BROKER_UNIX"] = task_broker_socket
-    env["GAN_TASK_BROKER_TOKEN"] = task_broker_token
+    env["GAN_TASK_BROKER_OUTER"] = str(int(outer))
     env["GAN_ROLE_BROKER_UNIX"] = role_broker_socket
-    env["GAN_ROLE_BROKER_PLANNER_TOKEN"] = role_broker_tokens["planner"]
-    env["GAN_ROLE_BROKER_EVALUATOR_TOKEN"] = role_broker_tokens["evaluator"]
     for role in ("planner", "evaluator"):
         env[f"GAN_ROLE_{role.upper()}_UID"] = str(role_accounts[role]["uid"])
         env[f"GAN_ROLE_{role.upper()}_GID"] = str(role_accounts[role]["gid"])
@@ -150,15 +145,34 @@ class _TaskBrokerController:
         self.process = process
         self.control = control
 
-    def register_outer(self, budget: int) -> str:
-        self.control.send({"op": "register", "budget": int(budget)})
+    def register_outer(self, outer: int, budget: int) -> None:
+        self.control.send({"op": "register", "outer": int(outer),
+                           "budget": int(budget)})
         if not self.control.poll(10):
             raise RuntimeError("privileged task broker did not register the outer budget")
         response = self.control.recv()
-        if not response.get("ok") or not response.get("token"):
+        if not response.get("ok"):
             raise RuntimeError(f"privileged task broker registration failed: "
                                f"{response.get('error', 'invalid response')}")
-        return str(response["token"])
+
+    def activate_outer(self, outer: int, supervisor_pid: int) -> None:
+        self.control.send({"op": "activate", "outer": int(outer),
+                           "supervisor_pid": int(supervisor_pid)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged task broker did not activate the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged task broker activation failed: "
+                               f"{response.get('error', 'invalid response')}")
+
+    def release_outer(self, outer: int) -> None:
+        self.control.send({"op": "release", "outer": int(outer)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged task broker did not release the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged task broker release failed: "
+                               f"{response.get('error', 'invalid response')}")
 
     def close(self) -> None:
         try:
@@ -180,16 +194,35 @@ class _RoleBrokerController:
         self.process = process
         self.control = control
 
-    def register_outer(self, outer: int, proxy_tokens: Dict[str, str]) -> Dict[str, str]:
+    def register_outer(self, outer: int,
+                       proxy_tokens: Dict[str, Dict[str, str]]) -> None:
         self.control.send({"op": "register", "outer": int(outer),
                            "proxy_tokens": dict(proxy_tokens)})
         if not self.control.poll(10):
             raise RuntimeError("privileged role broker did not register the outer")
         response = self.control.recv()
-        if not response.get("ok") or set(response.get("tokens") or {}) != {"planner", "evaluator"}:
+        if not response.get("ok"):
             raise RuntimeError(f"privileged role broker registration failed: "
                                f"{response.get('error', 'invalid response')}")
-        return {k: str(v) for k, v in response["tokens"].items()}
+
+    def activate_outer(self, outer: int, supervisor_pid: int) -> None:
+        self.control.send({"op": "activate", "outer": int(outer),
+                           "supervisor_pid": int(supervisor_pid)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged role broker did not activate the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged role broker activation failed: "
+                               f"{response.get('error', 'invalid response')}")
+
+    def release_outer(self, outer: int) -> None:
+        self.control.send({"op": "release", "outer": int(outer)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged role broker did not release the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged role broker release failed: "
+                               f"{response.get('error', 'invalid response')}")
 
     def close(self) -> None:
         try:
@@ -333,6 +366,10 @@ def run_gan_driver(
     cfg = load_gan_loop_config(cfg_overrides)
     G = int(cfg.get("loop.outer_generations", 2))
     I_max = int(cfg.get("loop.inner_max", 3))
+    task_llm_calls_per_question = int(
+        cfg.get("loop.task_llm_max_calls_per_question", 64))
+    if task_llm_calls_per_question < 1:
+        raise ValueError("loop.task_llm_max_calls_per_question must be positive")
     repo_root = os.path.realpath(os.path.abspath(repo_root))
     output_dir = os.path.realpath(os.path.abspath(output_dir))
 
@@ -454,6 +491,10 @@ def run_gan_driver(
         "sandbox_username": sandbox_username,
         "proxy_socket": proxy_socket,
         "proxy_control_token": proxy_control_token,
+        "task_llm_max_calls": (
+            max(1, int(num_samples)) *
+            task_llm_calls_per_question
+        ),
         "base_env": safe_broker_env,
     }
     task_broker = _start_task_broker(task_broker_socket, broker_config)
@@ -470,6 +511,7 @@ def run_gan_driver(
             "setfacl": setfacl_path,
             "bwrap": bwrap_path,
             "proxy_socket": proxy_socket,
+            "proxy_control_token": proxy_control_token,
             "llm_timeout_s": str(os.environ.get("GAN_LLM_TIMEOUT_S", "600")),
         })
     except Exception:
@@ -540,48 +582,81 @@ def run_gan_driver(
         proxy.start()
         proxy_started = True
         for outer in range(start, G + 1):
-            tokens = {
-                "planner": proxy.issue_scope(
-                    "planner", str(outer), models["planner"]),
-                "evaluator": proxy.issue_scope(
-                    "evaluator", str(outer), models["evaluator"]),
+            role_proxy_tokens = {
+                "planner": {
+                    seat: proxy.issue_scope(
+                        "planner", str(outer), models["planner"], seat=seat)
+                    for seat in ("plan", "self_improve")
+                },
+                "evaluator": {
+                    seat: proxy.issue_scope(
+                        "evaluator", str(outer), models["evaluator"], seat=seat)
+                    for seat in ("evaluate", "self_improve")
+                },
             }
-            role_broker_tokens = role_broker.register_outer(outer, tokens)
-            task_broker_token = task_broker.register_outer(I_max)
-            cmd = [
-                python_executable, "-m", "gan.outer_worker",
-                "--repo_root", repo_root, "--output_dir", output_dir,
-                "--outer", str(outer), "--domains", domain,
-                "--subset", subset, "--num_samples", str(num_samples),
-            ]
-            if inner is not None:
-                cmd.extend(["--inner", str(inner)])
-            if resume:
-                cmd += ["--resume-boundary", "outer"]
-            env = _outer_env(
-                os.environ, proxy_socket=proxy_socket,
-                planner_token=tokens["planner"],
-                evaluator_token=tokens["evaluator"],
-                task_broker_socket=task_broker_socket,
-                task_broker_token=task_broker_token,
-                role_broker_socket=role_broker_socket,
-                role_broker_tokens=role_broker_tokens,
-                role_accounts=role_accounts,
-                code_root=code_root,
-            )
-            proc = subprocess.run(
-                _outer_worker_command(
-                    cmd, repo_root, output_dir, code_root, proxy_socket,
+            role_broker.register_outer(outer, role_proxy_tokens)
+            proc = None
+            try:
+                task_broker.register_outer(outer, I_max)
+                cmd = [
+                    python_executable, "-m", "gan.outer_worker",
+                    "--repo_root", repo_root, "--output_dir", output_dir,
+                    "--outer", str(outer), "--domains", domain,
+                    "--subset", subset, "--num_samples", str(num_samples),
+                ]
+                if inner is not None:
+                    cmd.extend(["--inner", str(inner)])
+                if resume:
+                    cmd += ["--resume-boundary", "outer"]
+                env = _outer_env(
+                    os.environ, proxy_socket=proxy_socket,
                     task_broker_socket=task_broker_socket,
+                    outer=outer,
                     role_broker_socket=role_broker_socket,
-                    env_mask_file=env_mask_file,
-                ),
-                cwd=code_root, env=env,
-            )
-            if proc.returncode != 0:
+                    role_accounts=role_accounts,
+                    code_root=code_root,
+                )
+                proc = subprocess.Popen(
+                    _outer_worker_command(
+                        cmd, repo_root, output_dir, code_root, proxy_socket,
+                        task_broker_socket=task_broker_socket,
+                        role_broker_socket=role_broker_socket,
+                        env_mask_file=env_mask_file,
+                    ),
+                    cwd=code_root, env=env,
+                )
+                task_broker.activate_outer(outer, proc.pid)
+                role_broker.activate_outer(outer, proc.pid)
+                returncode = proc.wait()
+            except BaseException:
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                raise
+            finally:
+                failed = sys.exc_info()[0] is not None
+                release_errors = []
+                try:
+                    task_broker.release_outer(outer)
+                except Exception as exc:
+                    release_errors.append(f"task broker: {exc}")
+                try:
+                    role_broker.release_outer(outer)
+                except Exception as exc:
+                    release_errors.append(f"role broker: {exc}")
+                if release_errors:
+                    if not failed:
+                        raise RuntimeError("; ".join(release_errors))
+                    print(f"[WARN] privileged broker release failed: "
+                          f"{'; '.join(release_errors)}")
+            if returncode != 0:
                 _log_event(output_dir, {"type": "outer_worker_failed", "outer": outer,
-                                        "rc": proc.returncode})
-                raise RuntimeError(f"outer worker failed at outer {outer} (rc={proc.returncode})")
+                                        "rc": returncode})
+                raise RuntimeError(f"outer worker failed at outer {outer} (rc={returncode})")
             # Role self-edits are applied+committed by the worker itself.
         _log_event(output_dir, {"type": "driver_done", "code_root": code_root,
                                 "duration_s": round(time.time() - _driver_t0, 1)})

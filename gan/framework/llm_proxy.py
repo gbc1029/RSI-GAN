@@ -60,6 +60,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/__gan__/issue-task":
             self._issue_task()
             return
+        if self.path == "/__gan__/revoke":
+            self._revoke()
+            return
         if self.path != "/v1/chat/completions":
             self.proxy.audit_denied(None, "unknown endpoint", self.path)
             self._reply(404, {"error": {"message": "unknown endpoint"}})
@@ -90,11 +93,39 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             self._reply(403, {"error": {"message": "registration capability denied"}})
             return
         body = self._read_json()
-        if not body or not body.get("scope_id") or not body.get("model"):
-            self._reply(400, {"error": {"message": "scope_id and model are required"}})
+        if (not body or not body.get("scope_id") or not body.get("model")
+                or type(body.get("ttl_s")) not in {int, float}
+                or type(body.get("max_calls")) is not int):
+            self._reply(400, {"error": {"message":
+                "scope_id, model, ttl_s and max_calls are required"}})
             return
-        self._reply(200, {"token": self.proxy.issue_scope(
-            "task", str(body["scope_id"]), str(body["model"]))})
+        try:
+            issued = self.proxy.issue_scope(
+                "task", str(body["scope_id"]), str(body["model"]),
+                ttl_s=float(body["ttl_s"]), max_calls=int(body["max_calls"]),
+            )
+        except ValueError as exc:
+            self._reply(400, {"error": {"message": str(exc)}})
+            return
+        self._reply(200, {"token": issued})
+
+    def _revoke(self) -> None:
+        if not self.is_unix:
+            self._reply(403, {"error": {"message": "framework revoke requires Unix transport"}})
+            return
+        control = self.proxy._bearer(self.headers.get("Authorization"))
+        scope = self.proxy.scope_for(control)
+        if not scope or scope.get("role") != "framework":
+            self.proxy.audit_denied(scope, "scope revoke denied", self.path)
+            self._reply(403, {"error": {"message": "revoke capability denied"}})
+            return
+        body = self._read_json()
+        token = body.get("token") if body else None
+        if not isinstance(token, str) or not token:
+            self._reply(400, {"error": {"message": "token is required"}})
+            return
+        self.proxy.revoke_scope(token)
+        self._reply(200, {"revoked": True})
 
 
 class ParentLLMProxy:
@@ -138,15 +169,40 @@ class ParentLLMProxy:
     def audit_denied(self, scope: Optional[Dict[str, Any]], reason: str, path: str) -> None:
         scope = scope or {}
         self._audit({"role": scope.get("role"), "scope_type": scope.get("scope_type"),
-                     "scope_id": scope.get("scope_id"), "model": scope.get("model"),
+                     "scope_id": scope.get("scope_id"), "seat": scope.get("seat"),
+                     "model": scope.get("model"),
                      "status": 403, "allow": False, "reason": reason, "path": path})
 
-    def issue_scope(self, role: str, scope_id: str, model: str) -> str:
+    def issue_scope(self, role: str, scope_id: str, model: str, *,
+                    seat: Optional[str] = None,
+                    ttl_s: Optional[float] = None,
+                    max_calls: Optional[int] = None) -> str:
+        role_seats = {
+            "planner": {"plan", "self_improve"},
+            "evaluator": {"evaluate", "self_improve"},
+        }
+        if role in role_seats:
+            if seat not in role_seats[role]:
+                raise ValueError(f"invalid LLM proxy seat for {role}: {seat!r}")
+        elif seat is not None:
+            raise ValueError(f"LLM proxy seat is not valid for role {role!r}")
+        if role == "task":
+            if ttl_s is None or ttl_s <= 0:
+                raise ValueError("task LLM scope TTL must be positive")
+            if max_calls is None or max_calls < 1:
+                raise ValueError("task LLM scope call budget must be positive")
+        elif ttl_s is not None or max_calls is not None:
+            raise ValueError("TTL and call budget are valid only for task scopes")
         token = "sk-gan-" + secrets.token_urlsafe(32)
         with self._token_lock:
             self._tokens[token] = {"role": str(role),
                                    "scope_type": "genid" if role == "task" else "outer",
-                                   "scope_id": str(scope_id), "model": str(model)}
+                                   "scope_id": str(scope_id), "seat": seat,
+                                   "model": str(model),
+                                   "expires_at": (time.monotonic() + float(ttl_s)
+                                                  if ttl_s is not None else None),
+                                   "remaining_calls": max_calls,
+                                   "revoked": False}
         return token
 
     def issue_framework_scope(self, outer: int) -> str:
@@ -158,6 +214,34 @@ class ParentLLMProxy:
         with self._token_lock:
             scope = self._tokens.get(token)
             return dict(scope) if scope else None
+
+    def revoke_scope(self, token: str) -> None:
+        with self._token_lock:
+            scope = self._tokens.get(token)
+            if scope is not None:
+                scope["revoked"] = True
+
+    def _authorize_completion(self, token: Optional[str]) -> tuple[Optional[Dict[str, Any]], str]:
+        if not token:
+            return None, "invalid or non-agent capability token"
+        with self._token_lock:
+            scope = self._tokens.get(token)
+            if scope is None or scope.get("role") not in {"task", "planner", "evaluator"}:
+                return (dict(scope) if scope else None,
+                        "invalid or non-agent capability token")
+            if scope.get("revoked"):
+                return dict(scope), "revoked proxy capability"
+            expires_at = scope.get("expires_at")
+            if expires_at is not None and time.monotonic() >= float(expires_at):
+                scope["revoked"] = True
+                return dict(scope), "expired proxy capability"
+            remaining = scope.get("remaining_calls")
+            if remaining is not None:
+                if int(remaining) < 1:
+                    scope["revoked"] = True
+                    return dict(scope), "proxy call budget exhausted"
+                scope["remaining_calls"] = int(remaining) - 1
+            return dict(scope), ""
 
     @staticmethod
     def _bearer(value: Optional[str]) -> Optional[str]:
@@ -200,9 +284,9 @@ class ParentLLMProxy:
 
     def handle_completion(self, handler: _ProxyHandler) -> None:
         token = self._bearer(handler.headers.get("Authorization"))
-        scope = self.scope_for(token)
-        if not scope or scope.get("role") not in {"task", "planner", "evaluator"}:
-            self.audit_denied(scope, "invalid or non-agent capability token", handler.path)
+        scope, denied = self._authorize_completion(token)
+        if denied:
+            self.audit_denied(scope, denied, handler.path)
             handler._reply(403, {"error": {"message": "invalid proxy capability"}})
             return
         body = handler._read_json()
@@ -284,29 +368,46 @@ def stat_is_socket(path: str) -> bool:
         return False
 
 
-def request_task_token(socket_path: str, control_token: str, scope_id: str, model: str) -> str:
-    """Ask the parent proxy for one generation-bound task capability."""
-    body = json.dumps({"scope_id": str(scope_id), "model": str(model)}).encode("utf-8")
+def _control_request(socket_path: str, control_token: str, path: str,
+                     body: Dict[str, Any]) -> Dict[str, Any]:
+    encoded = json.dumps(body).encode("utf-8")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(10)
         sock.connect(socket_path)
-        request = (b"POST /__gan__/issue-task HTTP/1.1\r\n"
-                   b"Host: localhost\r\n"
+        request = (f"POST {path} HTTP/1.1\r\n".encode("ascii")
+                   + b"Host: localhost\r\n"
                    + f"Authorization: Bearer {control_token}\r\n".encode("ascii")
                    + b"Content-Type: application/json\r\n"
-                   + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
-                   + body)
+                   + f"Content-Length: {len(encoded)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                   + encoded)
         sock.sendall(request)
         response = http.client.HTTPResponse(sock)
         response.begin()
         raw = response.read(1024 * 1024)
         if response.status != 200:
-            raise RuntimeError(f"proxy task scope registration denied (HTTP {response.status})")
+            raise RuntimeError(f"proxy control request denied (HTTP {response.status})")
         payload = json.loads(raw.decode("utf-8"))
-        token = payload.get("token") if isinstance(payload, dict) else None
-        if not isinstance(token, str) or not token:
-            raise RuntimeError("proxy task scope registration returned no token")
-        return token
+        if not isinstance(payload, dict):
+            raise RuntimeError("proxy control request returned an invalid response")
+        return payload
     finally:
         sock.close()
+
+
+def request_task_token(socket_path: str, control_token: str, scope_id: str,
+                       model: str, *, ttl_s: float, max_calls: int) -> str:
+    """Ask the parent proxy for one generation-bound task capability."""
+    payload = _control_request(socket_path, control_token, "/__gan__/issue-task", {
+        "scope_id": str(scope_id), "model": str(model),
+        "ttl_s": float(ttl_s), "max_calls": int(max_calls),
+    })
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("proxy task scope registration returned no token")
+    return token
+
+
+def revoke_token(socket_path: str, control_token: str, token: str) -> None:
+    """Revoke an issued agent capability through the framework-only channel."""
+    _control_request(socket_path, control_token, "/__gan__/revoke", {"token": token})

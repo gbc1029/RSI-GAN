@@ -18,6 +18,7 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    "GAN_SECURE_CAPABILITY_HOLDER",
 }
 
 
@@ -27,8 +28,9 @@ def _task_child_env(base_env):
 
 
 class _LocalRelay:
-    def __init__(self, unix_path):
+    def __init__(self, unix_path, proxy_token):
         self.unix_path = unix_path
+        self.proxy_token = proxy_token
         self.listener = None
         self.port = 0
 
@@ -53,6 +55,26 @@ class _LocalRelay:
             upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             upstream.settimeout(10)
             upstream.connect(self.unix_path)
+            header = b""
+            while b"\r\n\r\n" not in header:
+                chunk = client.recv(65536)
+                if not chunk or len(header) + len(chunk) > 128 * 1024:
+                    raise OSError("invalid relay request header")
+                header += chunk
+            raw_head, pending = header.split(b"\r\n\r\n", 1)
+            lines = raw_head.split(b"\r\n")
+            if not lines or not lines[0]:
+                raise OSError("invalid relay request line")
+            filtered = []
+            for line in lines[1:]:
+                if not line or line[:1] in b" \t" or b":" not in line:
+                    raise OSError("invalid relay request header")
+                name, _value = line.split(b":", 1)
+                if name.strip().lower() != b"authorization":
+                    filtered.append(line)
+            auth = f"Authorization: Bearer {self.proxy_token}".encode("ascii")
+            upstream.sendall(b"\r\n".join([lines[0], *filtered, auth])
+                             + b"\r\n\r\n" + pending)
             threads = []
             for source, target in ((client, upstream), (upstream, client)):
                 thread = threading.Thread(target=self._copy, args=(source, target),
@@ -201,14 +223,14 @@ def _run_trusted_worker() -> None:
     try:
         child_env = _task_child_env(os.environ)
         proxy_socket = payload.get("proxy_socket")
-        proxy_token = payload.get("proxy_token")
+        proxy_token = payload.pop("proxy_token", None)
         if proxy_socket:
             if not proxy_token:
                 raise RuntimeError("Task proxy socket requires a scoped token")
-            relay = _LocalRelay(proxy_socket)
+            relay = _LocalRelay(proxy_socket, proxy_token)
             port = relay.start()
             child_env["OPENAI_API_BASE"] = f"http://127.0.0.1:{port}/v1"
-            child_env["OPENAI_API_KEY"] = str(proxy_token)
+            child_env["OPENAI_API_KEY"] = "rsi-gan-local-relay"
         with tempfile.TemporaryFile(mode="w+b") as child_result_file:
             child_result_fd = child_result_file.fileno()
             child = subprocess.Popen(

@@ -189,6 +189,7 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
         "--setenv", "TMPDIR", "/tmp",
         "--setenv", "PWD", "/workspace/scratch",
         "--setenv", "PYTHONPATH", "/workspace",
+        "--setenv", "GAN_SECURE_CAPABILITY_HOLDER", "1",
         sys.executable,
         "-m", "domains.task_worker",
     ])
@@ -567,8 +568,21 @@ if __name__ == "__main__":
         help="Questions-only CSV prepared by the GAN parent process.",
     )
     parser.add_argument("--proxy_socket", type=str, default=None)
-    parser.add_argument("--proxy_token", type=str, default=None)
+    parser.add_argument("--proxy_token_file", type=str, default=None)
     args = parser.parse_args()
+
+    proxy_token = None
+    if args.proxy_token_file:
+        with open(args.proxy_token_file, "rb") as handle:
+            raw_token = handle.read(4097)
+        if (not raw_token or len(raw_token) > 4096 or b"\x00" in raw_token):
+            parser.error("proxy token file is invalid")
+        try:
+            proxy_token = raw_token.decode("utf-8")
+        except UnicodeDecodeError:
+            parser.error("proxy token file is invalid")
+        if not proxy_token.startswith("sk-gan-"):
+            parser.error("proxy token file is invalid")
 
     domain = args.domain
    # Make proofs_dname required for imo_proof_grading
@@ -592,7 +606,7 @@ if __name__ == "__main__":
             dataset_root=args.dataset_root,
             questions_path=args.questions_path,
             proxy_socket=args.proxy_socket,
-            proxy_token=args.proxy_token,
+            proxy_token=proxy_token,
         )
 
     # Polyglot (Arch 2): questions-only CSV + sandboxed TaskAgent + parent-side
@@ -614,7 +628,7 @@ if __name__ == "__main__":
             dataset_root=args.dataset_root,
             questions_path=args.questions_path,
             proxy_socket=args.proxy_socket,
-            proxy_token=args.proxy_token,
+            proxy_token=proxy_token,
         )
 
     # Balrog game domains

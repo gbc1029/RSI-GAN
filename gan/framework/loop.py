@@ -459,14 +459,7 @@ class GanLoop:
         # legacy single-arg factories (tests, injected instances) working.
         if self.broker is not None:
             for role in ("planner", "evaluator"):
-                try:
-                    self.broker.clear_workspace(role)
-                except Exception as e:
-                    soft_fail(f"clear_workspace failed for {role}: {e} — stale "
-                              f"copies may linger on disk; the role's grants were "
-                              f"dropped so they cannot enter a patch, but a "
-                              f"default (if_absent) re-grant keeps them — do not "
-                              f"continue this outer unattended")
+                self.broker.clear_workspace(role)
         for name, factory in (("planner", self.planner_factory),
                               ("evaluator", self.evaluator_factory)):
             if factory is None:

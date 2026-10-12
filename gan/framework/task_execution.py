@@ -73,7 +73,7 @@ _TASK_ENV_NAMES = {
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
 }
 _TASK_PARENT_ENV_NAMES = _TASK_ENV_NAMES | {
-    "GAN_LLM_PROXY_UNIX", "GAN_TASK_BROKER_UNIX", "GAN_TASK_BROKER_TOKEN",
+    "GAN_LLM_PROXY_UNIX", "GAN_TASK_BROKER_UNIX", "GAN_TASK_BROKER_OUTER",
 }
 
 def _task_safe_env(base_env: Dict[str, str]) -> Dict[str, str]:
@@ -795,6 +795,7 @@ def _harness_bwrap_command(
     read_only_assets: List[str],
     proxy_socket: Optional[str],
     child_command: List[str],
+    proxy_token_fd: Optional[int] = None,
 ) -> List[str]:
     """Build the fixed G6c mount/network policy around the domain harness."""
     command = [
@@ -832,6 +833,10 @@ def _harness_bwrap_command(
     if proxy_socket:
         _add_bwrap_empty_parents(command, proxy_socket, created)
         command.extend(["--ro-bind", proxy_socket, proxy_socket])
+    if proxy_token_fd is not None:
+        token_path = "/run/rsi-gan/task-proxy-token"
+        _add_bwrap_empty_parents(command, token_path, created)
+        command.extend(["--ro-bind-data", str(int(proxy_token_fd)), token_path])
 
     command.extend([
         "--chdir", run_dir,
@@ -950,15 +955,15 @@ def run_harness_and_report(
     """Run the frozen harness; parent-side reporting happens separately."""
     broker_socket = env.get("GAN_TASK_BROKER_UNIX")
     if broker_socket:
-        broker_token = env.get("GAN_TASK_BROKER_TOKEN")
-        if not broker_token or not scope_id:
-            raise RuntimeError("task broker requires a launch capability and generation id")
+        outer = env.get("GAN_TASK_BROKER_OUTER")
+        if not outer or not scope_id:
+            raise RuntimeError("task broker requires an outer id and generation id")
         if (log_path and os.name == "posix" and hasattr(os, "geteuid") and
                 os.geteuid() == 0):
             raise RuntimeError("refusing to write a task log from a root broker caller")
         from gan.framework.task_broker import request_task_run
         result = request_task_run(
-            broker_socket, broker_token, str(scope_id), int(timeout),
+            broker_socket, int(outer), str(scope_id), int(timeout),
         )
         if log_path:
             rc, output = result
@@ -990,7 +995,7 @@ def _run_harness_and_report_local(
     scope_id: Optional[str] = None,
     log_path: Optional[str] = None,
     proxy_socket: Optional[str] = None,
-    proxy_token: Optional[str] = None,
+    proxy_token_fd: Optional[int] = None,
     expected_owner_uid: Optional[int] = None,
     expected_owner_gid: Optional[int] = None,
     setpriv_path: Optional[str] = None,
@@ -1009,25 +1014,18 @@ def _run_harness_and_report_local(
         "--num_samples", str(num_samples),
     ]
     proxy_socket = proxy_socket or env.get("GAN_LLM_PROXY_UNIX")
-    if proxy_socket and proxy_token is None:
-        if not scope_id:
-            raise RuntimeError("LLM proxy task scope requires a generation id")
-        control_token = env.get("GAN_PROXY_CONTROL_TOKEN")
-        if not control_token:
-            raise RuntimeError("LLM proxy task scope requires framework control capability")
-        from gan.framework.llm_proxy import request_task_token
-        proxy_token = request_task_token(
-            proxy_socket, control_token, str(scope_id), model)
+    if proxy_socket and proxy_token_fd is None:
+        raise RuntimeError("LLM proxy task scope requires a sealed token descriptor")
 
     if questions_path:
         harness_args.extend(["--questions_path", os.path.abspath(questions_path)])
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
         harness_args.extend(["--dataset_root", os.path.abspath(dataset_root)])
-    if proxy_token:
+    if proxy_token_fd is not None:
         harness_args.extend([
             "--proxy_socket", os.path.abspath(proxy_socket),
-            "--proxy_token", proxy_token,
+            "--proxy_token_file", "/run/rsi-gan/task-proxy-token",
         ])
 
     broker_launch = expected_owner_uid is not None
@@ -1065,7 +1063,7 @@ def _run_harness_and_report_local(
             harness_child = _harness_bwrap_command(
                 str(bwrap_path), str(python_prefix), run_dir, output_dir,
                 list(sandbox_profile["read_only_assets"]), proxy_socket,
-                harness_child,
+                harness_child, proxy_token_fd=proxy_token_fd,
             )
         harness_cmd = _sandbox_setpriv_command(setpriv, uid, gid, harness_child)
         username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
@@ -1088,6 +1086,7 @@ def _run_harness_and_report_local(
     proc = subprocess.run(
         harness_cmd, cwd=run_dir, env=child_env, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
+        pass_fds=((int(proxy_token_fd),) if proxy_token_fd is not None else ()),
     )
     out = proc.stdout or ""
     if log_path:

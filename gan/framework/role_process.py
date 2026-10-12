@@ -7,9 +7,11 @@ import dataclasses
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from typing import Any, Dict, Optional, TextIO
 
@@ -68,6 +70,36 @@ def _exact_keys(value: Dict[str, Any], expected: set[str], label: str) -> None:
         raise RoleProcessError(
             f"invalid {label} fields: expected {sorted(expected)}, got {sorted(value)}"
         )
+
+
+def _purge_dir_fd(fd: int) -> None:
+    for name in os.listdir(fd):
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=fd,
+            )
+            try:
+                _purge_dir_fd(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=fd)
+        else:
+            os.unlink(name, dir_fd=fd)
+
+
+def _purge_role_workspace(output_dir: str, role: str, instance: str) -> None:
+    root = os.path.join(output_dir, "workspaces", role, instance)
+    if not os.path.exists(root):
+        return
+    fd = os.open(
+        root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        _purge_dir_fd(fd)
+    finally:
+        os.close(fd)
 
 
 def _dict_list(value: Any, label: str) -> None:
@@ -201,27 +233,52 @@ class RoleProcess:
         self._prepare_paths(seat)
         broker_socket = os.environ.get("GAN_ROLE_BROKER_UNIX", "").strip()
         if broker_socket:
-            token = os.environ.get(f"GAN_ROLE_BROKER_{self.role.upper()}_TOKEN", "")
-            if not token or not self.instance:
+            if not self.instance:
                 raise RoleProcessError("role broker launch capability is missing")
-            channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            channel.connect(broker_socket)
-            channel.sendall(_json_bytes({
-                "token": token, "role": self.role, "seat": seat,
-                "instance": self.instance,
-            }) + b"\n")
-            auth_reader = channel.makefile("r", encoding="utf-8", errors="strict")
-            auth = _read_message(auth_reader)
-            if not auth.get("ok"):
-                auth_reader.close()
-                channel.close()
-                raise RoleProcessError(f"role broker denied launch: {auth.get('error', 'invalid reply')}")
+            channel = None
+            auth_reader = None
+            for attempt in range(51):
+                channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    channel.connect(broker_socket)
+                    channel.sendall(_json_bytes({
+                        "role": self.role, "seat": seat,
+                        "instance": self.instance,
+                    }) + b"\n")
+                    auth_reader = channel.makefile(
+                        "r", encoding="utf-8", errors="strict")
+                    auth = _read_message(auth_reader)
+                    if auth.get("ok"):
+                        break
+                    retry = auth.get("retry") is True
+                    auth_reader.close()
+                    auth_reader = None
+                    channel.close()
+                    channel = None
+                    if retry and attempt < 50:
+                        time.sleep(0.1)
+                        continue
+                    raise RoleProcessError(
+                        f"role broker denied launch: {auth.get('error', 'invalid reply')}")
+                except Exception:
+                    if auth_reader is not None:
+                        auth_reader.close()
+                    if channel is not None:
+                        channel.close()
+                    raise
+            if channel is None or auth_reader is None:
+                raise RoleProcessError("role broker launch did not become active")
             self._socket = channel
             self._reader = auth_reader
             self._writer = channel.makefile("w", encoding="utf-8", errors="strict")
         else:
             env = os.environ.copy()
-            env.update({"PYTHONUNBUFFERED": "1", "GAN_ROLE_SEAT": seat})
+            env.update({
+                "PYTHONUNBUFFERED": "1",
+                "GAN_ROLE_NAME": self.role,
+                "GAN_ROLE_SEAT": seat,
+                "GAN_ROLE_INSTANCE": self.instance or "",
+            })
             process = subprocess.Popen(
                 [sys.executable, "-m", "gan.framework.role_process", "--worker"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, text=True,
@@ -264,7 +321,9 @@ class RoleProcess:
                 or runtime.get("egid") != int(expected_gid)
                 or runtime.get("no_new_privs") != "1"
                 or str(runtime.get("cap_eff", "")).strip("0")
+                or runtime.get("role") != self.role
                 or runtime.get("seat") != seat
+                or runtime.get("instance") != self.instance
             ):
                 raise RoleProcessError(f"role runtime boundary is not active: {runtime}")
             self.assembly_report = report
@@ -340,62 +399,77 @@ class RoleProcess:
                 raise RoleProcessError("role worker channel is not running")
             self._call_id += 1
             call_id = self._call_id
-            if broker is not None and hasattr(broker, "set_trajectory_scope"):
-                scope_index = {"plan": 8, "evaluate": 7,
-                               "self_improve": 3}.get(method)
-                scope = None
-                if scope_index is not None and len(call_args) > scope_index:
-                    scope = call_args[scope_index]
-                if scope is None:
-                    scope = call_kwargs.get("trajectory_genids")
-                broker.set_trajectory_scope(
-                    self.role, f"{self.instance}__{seat}",
-                    scope if isinstance(scope, list) else [])
-            _write_message(self._writer, {
-                "v": _PROTOCOL_VERSION,
-                "type": "call",
-                "id": call_id,
-                "method": method,
-                "args": call_args,
-                "kwargs": call_kwargs,
-                "has_broker": broker is not None,
-                "broker_info": ({"repo_root": broker.repo_root,
-                                 "output_dir": broker.output_dir}
-                                if broker is not None else None),
-                "role_state": {
-                    "attempt_id": self.attempt_id,
-                    "tool_timeout_s": self.tool_timeout_s,
-                },
-            })
-            while True:
-                try:
-                    reply = _read_message(self._reader)
-                except EOFError as exc:
-                    code = self._process.poll() if self._process is not None else None
-                    raise RoleProcessError(f"role worker exited during {method} (exit={code})") from exc
-                if reply.get("type") == "event":
-                    self._handle_event(reply)
-                    continue
-                if reply.get("type") == "broker_call":
-                    self._handle_broker_call(reply, call_id, method, broker)
-                    continue
-                if reply.get("type") == "error":
-                    _exact_keys(reply, {"v", "type", "id", "error"}, "call error")
-                    if reply["id"] != call_id:
-                        raise RoleProcessError("role IPC call id mismatch")
-                    _raise_remote(reply["error"])
-                _exact_keys(
-                    reply, {"v", "type", "id", "result", "assembly_report"},
-                    "call reply",
-                )
-                if (reply["v"] != _PROTOCOL_VERSION or reply["type"] != "result"
-                        or reply["id"] != call_id):
-                    raise RoleProcessError("unexpected role worker call reply")
-                report = reply["assembly_report"]
-                if report is not None and not isinstance(report, dict):
-                    raise RoleProcessError("assembly_report must be an object or null")
-                self.assembly_report = report
-                return _validated_result(method, reply["result"])
+            session_node = f"{self.instance}__{seat}"
+            session_started = False
+            call_succeeded = False
+            try:
+                if broker is not None and hasattr(broker, "begin_session"):
+                    broker.begin_session(self.role, session_node)
+                    session_started = True
+                if broker is not None and hasattr(broker, "set_trajectory_scope"):
+                    scope_index = {"plan": 8, "evaluate": 7,
+                                   "self_improve": 3}.get(method)
+                    scope = None
+                    if scope_index is not None and len(call_args) > scope_index:
+                        scope = call_args[scope_index]
+                    if scope is None:
+                        scope = call_kwargs.get("trajectory_genids")
+                    broker.set_trajectory_scope(
+                        self.role, session_node,
+                        scope if isinstance(scope, list) else [])
+                _write_message(self._writer, {
+                    "v": _PROTOCOL_VERSION,
+                    "type": "call",
+                    "id": call_id,
+                    "method": method,
+                    "args": call_args,
+                    "kwargs": call_kwargs,
+                    "has_broker": broker is not None,
+                    "broker_info": ({"repo_root": broker.repo_root,
+                                     "output_dir": broker.output_dir}
+                                    if broker is not None else None),
+                    "role_state": {
+                        "attempt_id": self.attempt_id,
+                        "tool_timeout_s": self.tool_timeout_s,
+                    },
+                })
+                while True:
+                    try:
+                        reply = _read_message(self._reader)
+                    except EOFError as exc:
+                        code = self._process.poll() if self._process is not None else None
+                        raise RoleProcessError(
+                            f"role worker exited during {method} (exit={code})") from exc
+                    if reply.get("type") == "event":
+                        self._handle_event(reply)
+                        continue
+                    if reply.get("type") == "broker_call":
+                        self._handle_broker_call(reply, call_id, method, broker)
+                        continue
+                    if reply.get("type") == "error":
+                        _exact_keys(reply, {"v", "type", "id", "error"}, "call error")
+                        if reply["id"] != call_id:
+                            raise RoleProcessError("role IPC call id mismatch")
+                        _raise_remote(reply["error"])
+                    _exact_keys(
+                        reply, {"v", "type", "id", "result", "assembly_report"},
+                        "call reply",
+                    )
+                    if (reply["v"] != _PROTOCOL_VERSION or reply["type"] != "result"
+                            or reply["id"] != call_id):
+                        raise RoleProcessError("unexpected role worker call reply")
+                    report = reply["assembly_report"]
+                    if report is not None and not isinstance(report, dict):
+                        raise RoleProcessError("assembly_report must be an object or null")
+                    self.assembly_report = report
+                    result = _validated_result(method, reply["result"])
+                    call_succeeded = True
+                    return result
+            finally:
+                if not call_succeeded:
+                    self._stop_worker()
+                if session_started:
+                    broker.end_session(self.role, session_node)
 
     def _handle_event(self, request: Dict[str, Any]) -> None:
         _exact_keys(request, {"v", "type", "event"}, "role event")
@@ -645,7 +719,9 @@ def _runtime_report() -> Dict[str, Any]:
         "pid": os.getpid(),
         "euid": os.geteuid() if hasattr(os, "geteuid") else None,
         "egid": os.getegid() if hasattr(os, "getegid") else None,
+        "role": os.environ.get("GAN_ROLE_NAME"),
         "seat": os.environ.get("GAN_ROLE_SEAT"),
+        "instance": os.environ.get("GAN_ROLE_INSTANCE") or None,
         "no_new_privs": status.get("NoNewPrivs"),
         "cap_eff": status.get("CapEff"),
     }
@@ -666,6 +742,29 @@ def _worker_main() -> None:
         role_name = init["role"]
         if role_name not in _ROLE_METHODS:
             raise ValueError(f"unsupported role process: {role_name}")
+        expected_role = os.environ.get("GAN_ROLE_NAME", "")
+        expected_seat = os.environ.get("GAN_ROLE_SEAT", "")
+        expected_instance = os.environ.get("GAN_ROLE_INSTANCE", "")
+        if (expected_role != role_name
+                or expected_seat not in {_METHOD_SEAT[m] for m in _ROLE_METHODS[role_name]}
+                or expected_instance != str(init["instance"] or "")):
+            raise PermissionError("role worker capability descriptor does not match init")
+        if os.environ.get("GAN_ROLE_BOUNDARY") == "1":
+            token_path = os.environ.get("GAN_ROLE_PROXY_TOKEN_FILE", "")
+            if not token_path:
+                raise PermissionError("role worker proxy capability is missing")
+            with open(token_path, "rb") as handle:
+                proxy_token_raw = handle.read(4097)
+            if (not proxy_token_raw or len(proxy_token_raw) > 4096
+                    or b"\x00" in proxy_token_raw):
+                raise PermissionError("role worker proxy capability is invalid")
+            try:
+                proxy_token = proxy_token_raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise PermissionError("role worker proxy capability is invalid") from exc
+            if not proxy_token.startswith("sk-gan-"):
+                raise PermissionError("role worker proxy capability is invalid")
+            os.environ[f"GAN_PROXY_{role_name.upper()}_TOKEN"] = proxy_token
         from gan.framework import paths as role_paths
         from utils import trajectory_log as role_trajectory_log
         original_append = role_trajectory_log.append
@@ -721,6 +820,7 @@ def _worker_main() -> None:
             method = request["method"]
             if (request["v"] != _PROTOCOL_VERSION or request["type"] != "call"
                     or type(call_id) is not int or method not in _ROLE_METHODS[role_name]
+                    or _METHOD_SEAT.get(method) != expected_seat
                     or not isinstance(request["args"], list)
                     or not isinstance(request["kwargs"], dict)):
                 raise RoleProcessError("invalid role call request")
@@ -742,8 +842,13 @@ def _worker_main() -> None:
                     args[index] = remote
                 else:
                     kwargs["broker"] = remote
-            with contextlib.redirect_stdout(sys.stderr):
-                result = getattr(role, method)(*args, **kwargs)
+            try:
+                with contextlib.redirect_stdout(sys.stderr):
+                    result = getattr(role, method)(*args, **kwargs)
+            finally:
+                _purge_role_workspace(
+                    init["output_dir"], role_name,
+                    f"{init['instance']}__{expected_seat}")
             if dataclasses.is_dataclass(result):
                 result = dataclasses.asdict(result)
             _json_bytes(result)

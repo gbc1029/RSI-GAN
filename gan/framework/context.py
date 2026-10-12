@@ -153,6 +153,7 @@ class AccessContext:
     # Explicit set of task generations whose trajectory this session may read
     # (resolved by the loop; avoids relying on the node already being in the tree).
     trajectory_genids: List[Any] = field(default_factory=list)
+    active: bool = True
 
     def __post_init__(self) -> None:
         from gan.framework.frozen import assert_seat
@@ -167,10 +168,14 @@ def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None, 
 
 
 def get_access_context() -> Optional[AccessContext]:
-    return _ACCESS_CTX.get()
+    value = _ACCESS_CTX.get()
+    return value if value is not None and value.active else None
 
 
 def reset_access_context(token) -> None:
+    value = _ACCESS_CTX.get()
+    if value is not None:
+        value.active = False
     _ACCESS_CTX.reset(token)
 
 
