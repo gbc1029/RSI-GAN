@@ -332,15 +332,31 @@ with a GAN-native data layer.
   the `CMSession` (`cm=` arg, built by the loop per seat / by `task_worker` from the
   `.gan_runtime/cm` SNAPSHOT — the run dir has no `gan/`, so the frozen core is copied
   per generation and imports as top-level `cm`; STDLIB-ONLY by contract) rewrites only
-  what is SENT (shallow copies; sticky view forms; the canonical history and the raw
-  trajectory rows stay untouched — 双记). Modes: `passthrough` (identity, pre-D behavior)
+  what is SENT (per-ENTRY copies — the client's text->content conversion pops keys from
+  the dicts it is handed, so the canonical history and the raw trajectory rows stay
+  untouched — 双记; sticky view forms). Binding reads BOTH `content`- and `text`-keyed
+  entries (`_msg_text`); the session's FIRST user turn (the instruction + cost
+  statement) is pinned by default, whose only exemption is the `dedup` prefix-elision.
+  Modes: `passthrough` (identity, pre-D behavior)
   / `slice` / `compact_conservative` / `custom` (agent policy module, AST-gated no-LLM/
-  no-network, exec budget + 2-strike wedge breaker, fail-open always). Invariants:
+  no-network, exec budget + 2-strike wedge breaker, fail-open always; compact_conservative
+  excerpts big old USER turns — tool outputs ride inside user turns in this protocol,
+  so a separate tool_output kind never materializes). Invariants:
   pinned blocks survive, `cm_drop_floor_chars` guards tiny blocks, the view cannot
-  fabricate content. Agent face = the `ctx_*` opt-in tools; `read_trajectory`/
-  `read_session_trajectory` gain a slice front-end (structural index first, `fetch=`
-  materializes one segment). Audit: per-turn `cm_view` + `cm_violation`/
-  `cm_policy_failed`/`cm_policy_disabled` events; the session cost record carries a `cm`
+  fabricate content (face-enforced; the handle's `ctx._s` private reference is NOT a
+  security boundary). Agent face = the `ctx_*` opt-in tools (`ctx_view` included —
+  `view_state` is on the agent face; `ctx_budget` is a LIVE meter: `chat_with_agent`
+  attaches a reader over the run's authoritative usage totals, 实付口径, completed
+  tool calls only); `read_trajectory`/`read_session_trajectory` gain a slice front-end
+  (structural index first, `fetch=` materializes one segment) whose mode rides
+  `AccessContext.session_cm_mode` — stamped per session from the session OWNER's own
+  design, presentation-only (trajectory_genids/redaction stay the sole permission
+  surface). Audit: per-turn `cm_view` (aggregate stats + per-op brief with block
+  refs/rules, no content) + `cm_violation`/`cm_policy_failed`/`cm_policy_disabled`
+  events; the task child's seam events land in a `cm_events.jsonl` sidecar (rw-bound
+  as `/workspace/cm_events.jsonl`) that `DomainTaskRunner._ingest_cm_events` folds
+  into events.jsonl with role=task attribution (`cost.json` carries the `task_cm`
+  summary); the session cost record carries a `cm`
   summary (estimated savings are a DERIVED indicator, never billing — the ledger keeps
   实付); receipt `budget.kind` gains `cm` when a session's policy degraded.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable. Task

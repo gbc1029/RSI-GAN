@@ -21,7 +21,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import ops
 from .blocks import (Block, Universe, View, cut, placeholder, estimate_tokens,
-                       EXCERPT_KEEP, HEAD_TAIL_KEEP)
+                       excerpt_saving, EXCERPT_KEEP, HEAD_TAIL_KEEP,
+                       MIN_COMPACT_SAVE)
 
 # Framework floor (docs/10 §5.2.3: K 是带框架下限的键) — the clamping
 # authority owns the ranges; this is the hard invariant this layer adds.
@@ -54,6 +55,26 @@ def _parse_view_marker(content: str) -> Optional[str]:
 def _fingerprint(content: str) -> str:
     import hashlib
     return hashlib.sha1(content.encode("utf-8", "replace")).hexdigest()
+
+
+def _msg_text(m: Any) -> Optional[str]:
+    """The text of one history entry, in EITHER key convention.
+
+    This repo's canonical history is ``text``-keyed (``agent/llm.py`` converts
+    content->text on return; ``task_agent`` reads ``['text']``) while the
+    seam's user-turn rebuild in the chat loop writes ``content`` — the binding
+    must not depend on which form a given entry happens to carry (docs/10
+    §11.5 erratum: the seam previously read ``content`` only and silently
+    failed to bind the canonical history)."""
+    if not isinstance(m, dict):
+        return None
+    v = m.get("content")
+    if isinstance(v, str) and v:
+        return v
+    v = m.get("text")
+    if isinstance(v, str) and v:
+        return v
+    return None
 
 
 class ViewHandle:
@@ -104,7 +125,7 @@ class ViewHandle:
             return err
         return ops.view_state(self._s.universe, self._s.view)
 
-    def budget_query(self, tokens_used: int = 0,
+    def budget_query(self, tokens_used: Optional[int] = None,
                      budget: Optional[int] = None) -> Dict[str, Any]:
         if err := self._gate("budget_query"):
             return err
@@ -194,6 +215,7 @@ class CMSession:
     violations: int = 0
     est_chars_saved: int = 0
     _policy_strikes: int = 0
+    _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
     # identity-keyed bookkeeping: rewritten shallow copies are not re-registered
     _by_fp: Dict[str, str] = field(default_factory=dict)  # content fp -> bid
 
@@ -252,8 +274,8 @@ class CMSession:
         rendered copy must not grow a second block or the view would fight
         its own output. Blocks carry their latest msg_index for rendering."""
         for i, m in enumerate(msgs):
-            content = m.get("content") if isinstance(m, dict) else None
-            if not isinstance(content, str) or not content:
+            content = _msg_text(m)
+            if not content:
                 continue  # tool-call carriers etc. — no text to manage
             bid = _parse_view_marker(content)
             if bid is not None and bid in self.universe.blocks:
@@ -266,22 +288,16 @@ class CMSession:
                 continue
             role = str(m.get("role", "user"))
             kind = _KIND_FOR_ROLE.get(role, "turn_output")
-            block = self.universe.register(kind, content, self.turn, source=role)
+            # The session's FIRST user turn (the instruction, carrying the cost
+            # statement) is pinned by default (docs/10 §5.2.3: 当前问题默认
+            # pin) — whichever way it arrives (history entry or outgoing).
+            first_user = role == "user" and not self._seen_user
+            block = self.universe.register(kind, content, self.turn,
+                                           source=role, pinned=first_user)
+            if role == "user":
+                self._seen_user = True
             block.msg_index = i
             self._by_fp[fp] = block.block_id
-
-    def register_note(self, text: str) -> Tuple[Optional[str], str]:
-        """Scratchpad note write: the note block is auto-pinned (never dropped)."""
-        self.note_seq += 1
-        note_id = f"n{self.note_seq}"
-        text = str(text or "")
-        if len(text) > self.note_cap_chars:
-            return None, f"note exceeds cap ({self.note_cap_chars})"
-        self.notes[note_id] = text
-        block = self.universe.register(
-            "note", f"{_NOTE_PREFIX} {note_id}\n{text}", self.turn,
-            source=f"note:{note_id}", pinned=True)
-        return block.block_id, note_id
 
     def register_note(self, text: str) -> Tuple[Optional[str], str]:
         """Scratchpad note write: the note block is auto-pinned (never dropped)."""
@@ -315,22 +331,32 @@ class CMSession:
         out_block = self._register_outgoing(outgoing)
         if self.mode == "passthrough":
             self._emit_view(0)
-            return msgs, outgoing
+            # Per-ENTRY copies: the LLM client's text->content conversion POPS
+            # keys from the dicts it is handed (agent/llm.py); handing it the
+            # canonical dicts would strip them in place and the rebuild below
+            # would keep the husks (observed as content-less history turns).
+            # The canonical history must stay RAW (双记) — copies all the way.
+            return [dict(m) if isinstance(m, dict) else m for m in msgs], outgoing
 
         records: List[Dict[str, Any]] = []
         bc = self._budget_checkpoint(tokens_used, budget)
         if bc is not None:
             records.append(bc)
+        if self.mode == "compact_conservative":
+            # Excerpt-eligible blocks BEFORE the window pass: the window pass
+            # skips already-substituted blocks (sticky forms), so an excerpted
+            # turn is not placeholder-dropped on top of its excerpt (docs/10
+            # §11.5 erratum — conservative compaction targets the old user
+            # turns that carry the embedded tool outputs).
+            records += self._conservative_compaction()
         records += self._window_defaults()
         if self.system_prefix:
             records += self._dedup_prefix(msgs)
-        if self.mode == "compact_conservative":
-            records += self._conservative_compaction()
         if self.mode == "custom":
             records += self._run_policy()
 
         saved = self._count(records)
-        self._emit_view(saved)
+        self._emit_view(saved, records)
         send_history = self._render(msgs)
         send_msg = outgoing
         if out_block is not None \
@@ -344,8 +370,15 @@ class CMSession:
     def _register_outgoing(self, outgoing: str) -> Optional["Block"]:
         if not isinstance(outgoing, str) or not outgoing:
             return None
-        return self.universe.register("turn_output", outgoing, self.turn,
-                                      source="user")
+        # The outgoing text is registered NOW and re-bound to its canonical
+        # history entry next turn (fingerprint below; without it the same
+        # content was registered TWICE — an orphan that inflated savings).
+        first_user = not self._seen_user
+        block = self.universe.register("turn_output", outgoing, self.turn,
+                                       source="user", pinned=first_user)
+        self._seen_user = True
+        self._by_fp[_fingerprint(outgoing)] = block.block_id
+        return block
 
     def assemble(self, msgs: List[Dict[str, Any]],
                  tokens_used: int = 0,
@@ -409,6 +442,9 @@ class CMSession:
                 continue
             if self.view.form_of(block.block_id) != "full":
                 continue  # already substituted in an earlier turn (sticky)
+            if block.pinned:
+                continue  # pre-checked so the primitive's refusal (a pinned
+                # block must never drop) does not become violation noise
             if block.chars < self.drop_floor_chars:
                 continue
             out.append(ops.drop(self.universe, self.view, block.block_id,
@@ -417,25 +453,35 @@ class CMSession:
         return out
 
     def _conservative_compaction(self) -> List[Dict[str, Any]]:
-        """compact_conservative adds: tool_outputs older than the pin window
-        whose excerpt actually saves >= MIN_COMPACT_SAVE chars."""
+        """compact_conservative adds: history turns older than the pin window
+        whose mechanical excerpt actually saves >= MIN_COMPACT_SAVE chars
+        become EXCERPTS (head+tail kept) instead of the slice mode's
+        whole-turn placeholder.
+
+        Erratum (docs/10 §11.5): the compaction target is the old USER turn —
+        this chat protocol embeds tool outputs in the next user message, so a
+        separate ``tool_output`` kind never materializes and the original
+        tool_output-only targeting made this tier identical to ``slice``."""
         out: List[Dict[str, Any]] = []
         rounds = 0
         for block in reversed([b for b in self.universe.ordered()
                                if b.kind in ("turn_output", "tool_output")]):
             if block.kind == "turn_output":
                 rounds += 1
-                continue
             if rounds <= max(self.window_k, WINDOW_K_FLOOR):
                 continue
-            if self.view.form_of(block.block_id) != "full":
+            if block.pinned:
                 continue
+            if self.view.form_of(block.block_id) != "full":
+                continue  # already substituted in an earlier turn (sticky)
+            if excerpt_saving(block) < MIN_COMPACT_SAVE:
+                continue  # the excerpt would save nothing: leave to the window
             out.append(ops.compact(self.universe, self.view,
                                    [block.block_id], "first_last",
                                    self.drop_floor_chars))
         return out
 
-    def budget_snapshot(self, tokens_used: int = 0,
+    def budget_snapshot(self, tokens_used: Optional[int] = None,
                         budget: Optional[int] = None) -> Dict[str, Any]:
         return ops.budget_query(self.budget_reader, tokens_used, budget)
 
@@ -450,22 +496,32 @@ class CMSession:
         try:
             records, over_ms = run_policy(self.policy_path, handle,
                                           self.policy_exec_ms)
-        except Exception:  # noqa: BLE001 -- fail-open, never break the session
-            self.policy_failures += 1
-            self._policy_strikes += 1
-            if self._policy_strikes >= _POLICY_STRIKES:
-                self.policy_disabled = True
-                self._emit({"type": "cm_policy_disabled", "turn": self.turn,
-                            "strikes": self._policy_strikes})
+        except Exception as e:  # noqa: BLE001 -- fail-open, never break the session
+            self._note_policy_failure(str(e)[:160])
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         if over_ms:
             self._emit({"type": "cm_policy_overrun", "turn": self.turn,
                         "over_ms": over_ms})
         if not isinstance(records, list):
+            # A non-list return is a policy failure like any other (failopen
+            # contract): strike-counted, emitted, fail-open.
+            self._note_policy_failure("policy returned a non-list")
             return [{"op": "policy", "ok": False,
                      "error": "policy returned a non-list"}]
         self._policy_strikes = 0
         return records
+
+    def _note_policy_failure(self, error: str) -> None:
+        """One policy failure: count + emit, and disable after 2 strikes
+        (C1-class wedge breaker; docs/10 §5.2 分三)."""
+        self.policy_failures += 1
+        self._policy_strikes += 1
+        self._emit({"type": "cm_policy_failed", "turn": self.turn,
+                    "error": error})
+        if self._policy_strikes >= _POLICY_STRIKES:
+            self.policy_disabled = True
+            self._emit({"type": "cm_policy_disabled", "turn": self.turn,
+                        "strikes": self._policy_strikes})
 
     # -- post segment: audit the applied records -----------------------------------
     def _count(self, records: List[Dict[str, Any]]) -> int:
@@ -538,14 +594,16 @@ class CMSession:
                 continue
             by_msg.setdefault(block.msg_index, []).append(block)
         if not by_msg:
-            return msgs
-        out = list(msgs)
+            # still copy every entry: the client pops keys from what it gets
+            # (see assemble_turn passthrough) — canonical must stay raw
+            return [dict(m) if isinstance(m, dict) else m for m in msgs]
+        out = [dict(m) if isinstance(m, dict) else m for m in msgs]
         for idx, blocks in by_msg.items():
             if idx < 0 or idx >= len(out):
                 continue
             m = out[idx]
-            content = m.get("content") if isinstance(m, dict) else None
-            if not isinstance(content, str):
+            content = _msg_text(m)
+            if content is None:
                 continue
             new_content = content
             for block in blocks:
@@ -581,7 +639,11 @@ class CMSession:
                     break
             if new_content != content:
                 shallow = dict(m)
-                shallow["content"] = new_content
+                # write back under the entry's OWN key: the canonical history
+                # mixes ``text``-form and ``content``-form entries, and the
+                # client's text->content conversion keys off exactly these
+                shallow["content" if isinstance(m.get("content"), str)
+                        else "text"] = new_content
                 out[idx] = shallow
         return out
 
@@ -598,8 +660,22 @@ class CMSession:
                     "op": rec.get("op"), "refs": rec.get("refs"),
                     "error": rec.get("error")})
 
-    def _emit_view(self, saved: int) -> None:
+    def _emit_view(self, saved: int,
+                   records: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Per-turn assembly event. ``ops`` is the applied-mutation brief
+        (op name + block refs + rule, NO content) — the 对账 half of the 双记
+        audit: what was kept/dropped, by which rule, addressable by block id
+        (docs/10 §5.2.3; the aggregate ``stats`` stay alongside)."""
+        ops_brief: List[Dict[str, Any]] = []
+        for rec in (records or [])[:max(1, self.max_ops_per_turn)]:
+            if not rec.get("ok") or rec.get("op") == "policy":
+                continue  # refusals ride cm_violation; the run itself is not a view op
+            ops_brief.append({"op": rec.get("op"),
+                              "refs": list(rec.get("refs") or []),
+                              "rule": str(rec.get("rule")
+                                          or rec.get("form") or "")[:60]})
         self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
+                    "ops": ops_brief,
                     "stats": {"blocks": len(self.universe.blocks),
                               "substituted": len(self.view.forms),
                               "saved_chars": saved,

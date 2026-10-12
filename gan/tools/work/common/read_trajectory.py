@@ -43,20 +43,33 @@ def tool_info():
     }
 
 
+_CM_MODES = ("passthrough", "slice", "compact_conservative", "custom")
+
+
 def _session_cm_mode(actx) -> Optional[str]:
-    """The session's effective ``cost.cm_mode`` from ITS design context
-    (already clamped by the frozen authority parent-side). None when the
-    session has no design context or no cost slot."""
+    """The session's effective ``cost.cm_mode`` — PRESENTATION ONLY.
+
+    Primary source: the loop's per-session stamp on the AccessContext (the
+    session OWNER's design, already clamped by the frozen authority; docs/10
+    §11.5 档位归座). Fallback: the session's design context (legacy wiring).
+    This never touches permissions: the visible genid set and redaction are
+    decided by ``AccessContext.trajectory_genids`` + the archive pipeline and
+    stay untouched — selection can only shrink the universe."""
     try:
+        stamped = getattr(actx, "session_cm_mode", None)
+        if isinstance(stamped, str) and stamped in _CM_MODES:
+            return stamped
         from gan.framework.context import get_design_context
         from gan.framework.cost_keys import cost_config
         dctx = get_design_context()
         if dctx is None:
             return None
         mode = cost_config(dctx.config).get("cm_mode")
-        return str(mode) if isinstance(mode, str) else None
+        if isinstance(mode, str) and mode in _CM_MODES:
+            return mode
     except Exception:  # noqa: BLE001 -- advisory; degrade to passthrough
         return None
+    return None
 
 
 def _traj_path(output_dir, genid):

@@ -60,5 +60,5 @@ state即任务、当前步骤、历史轨迹、可用上下文块、工具输出
 
 
 # 延后
-parent选择器层面，延后
+parent选择器层面，延后，现仅记录
 将成本纳入task agent甚至roles的parent选择。

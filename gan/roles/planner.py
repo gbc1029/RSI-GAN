@@ -123,7 +123,8 @@ class Planner(Role):
         akey = self.access_key(node_id)
         tok_access = (set_access_context(broker, "planner", akey,
                                          trajectory_genids=trajectory_genids,
-                                         seat="plan")
+                                         seat="plan",
+                                         session_cm_mode=getattr(self, "session_cm_mode", None))
                       if broker is not None else None)
         traj = self.session_trajectory(node_id)
         attempts = 0
@@ -208,7 +209,8 @@ class Planner(Role):
         tok = set_design_context(dctx)
         tok_access = (set_access_context(broker, "planner", self.access_key("self"),
                                          trajectory_genids=trajectory_genids,
-                                         seat="self_improve")
+                                         seat="self_improve",
+                                         session_cm_mode=getattr(self, "session_cm_mode", None))
                       if broker is not None else None)
         traj = self.session_trajectory(None)
         attempts = 0

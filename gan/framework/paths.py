@@ -29,7 +29,10 @@ Everything a run writes lives under ONE of the main buckets:
         scores.jsonl
       runs/<genid>/   small evidence (packet.json, eval.json, feedback_digest.md,
                       patch_receipt.json, patch_proposed.diff)
-      work/<genid>/   EPHEMERAL run dir (repo copy, with .gan_runtime/{tools,knowledge}) -> pruned after run
+      work/<genid>/   EPHEMERAL run dir (repo copy, with .gan_runtime/{tools,knowledge,cm}
+                      + cm_events.jsonl — the task child's seam-audit sidecar,
+                      folded into logs/events.jsonl by DomainTaskRunner, §11.5)
+                      -> pruned after run
       workspaces/<role>/...  granted source copies (cleared per outer)
 
 This module is the single place that knows these paths; other framework modules
@@ -84,6 +87,16 @@ def cost_sessions_path(output_dir: str) -> str:
     loop); this file is the append-only stream the cost statements read back
     ("your last <seat> session")."""
     return os.path.join(logs_dir(output_dir), "cost_sessions.jsonl")
+
+
+def cm_events_path(run_dir: str) -> str:
+    """The task child's CM seam-event sidecar (docs/10 §11.5): pre-created by
+    ``assemble_task_env`` under the (ephemeral) run dir, rw-bound into the
+    sandbox at ``/workspace/cm_events.jsonl``, appended by the child's session
+    emit sink and folded into ``logs/events.jsonl`` (role=task attribution)
+    by ``DomainTaskRunner._ingest_cm_events``. Not an output-dir path — it
+    lives and dies with the pruned work dir."""
+    return os.path.join(run_dir, "cm_events.jsonl")
 
 
 def tree_path(output_dir: str, name: str) -> str:

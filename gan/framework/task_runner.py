@@ -126,6 +126,44 @@ class DomainTaskRunner:
         except Exception as e:  # noqa: BLE001 -- audit write failure: stderr covers
             print(f"[WARN] {event_type} event write failed: {e}")
 
+    def _ingest_cm_events(self, run_dir: str, genid: Any) -> None:
+        """Fold the child's CM seam-event sidecar into events.jsonl (docs/10
+        §11.5): each line is re-emitted with role=task attribution so the
+        per-generation cost record and the offline reconcilers see the seam
+        activity in the ONE audit stream. Advisory end to end: a missing or
+        unreadable sidecar (no seam / passthrough / local failure) is simply
+        no events, never a run failure. The sidecar dies with the pruned work
+        dir either way."""
+        sidecar = paths.cm_events_path(run_dir)
+        if not os.path.isfile(sidecar):
+            return
+        try:
+            with open(sidecar, "r", encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        except OSError as e:
+            from utils.soft_fail import soft_fail
+            soft_fail(f"cm events sidecar unreadable (genid {genid}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cm_events_ingest_failed", genid=str(genid))
+            return
+        emitted = 0
+        for ln in lines:
+            try:
+                e = json.loads(ln)
+            except json.JSONDecodeError:
+                continue  # a torn last line must not sink the rest
+            if not isinstance(e, dict):
+                continue
+            etype = str(e.pop("type", "cm_event"))
+            self._event(etype, role="task", genid=str(genid), **e)
+            emitted += 1
+        try:
+            os.remove(sidecar)
+        except OSError:
+            pass  # the work-dir prune is the backstop
+        if emitted:
+            self._event("cm_events_ingested", genid=str(genid), events=emitted)
+
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,
                  genid: Any = None, base: Optional[str] = None) -> Node:
@@ -391,6 +429,10 @@ class DomainTaskRunner:
                 soft_fail(f"existing-domain report failed for genid {genid}: {e}",
                           event_path=paths.events_path(self.output_dir),
                           event_type="existing_domain_report_failed", genid=str(genid))
+        # Context-management audit exit (docs/10 §11.5): fold the child's
+        # seam events into events.jsonl on EVERY post-harness path (the child
+        # may have run a seam session even when scoring later failed).
+        self._ingest_cm_events(run_dir, genid)
         # Persist per-question failure diagnostics into runs/<genid>/: the work
         # dir is pruned at generation end, so anything left only under
         # run_dir/outputs/<run_id>/agent_evals dies before it can be read

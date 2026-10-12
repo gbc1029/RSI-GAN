@@ -6,8 +6,9 @@ The seam never re-checks: these functions ARE the enforcement for their own
 op, and the post-segment only counts + emits.
 
 FACES (双形态暴露): the agent face exposes index/fetch/budget_query/pin/
-unpin/note (+ read/list); the policy face may additionally drop/compact/
-substitute/order/peek/view_state. Agent-side ``drop`` is deliberately NOT a
+unpin/note/view_state (``ctx_view`` is the agent's 知情权 tool, docs/10
+§5.2.3); the policy face may additionally drop/compact/substitute/order/peek.
+Agent-side ``drop`` is deliberately NOT a
 tool — eviction can only happen at the view layer (an agent "drop" call's
 output would itself enter the history).
 """
@@ -18,7 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from .blocks import (Block, Universe, View, cut, excerpt_saving, placeholder,
                        PLACEHOLDER_OVERHEAD, MIN_COMPACT_SAVE)
 
-AGENT_FACES = ("index", "fetch", "budget_query", "pin", "unpin", "note")
+AGENT_FACES = ("index", "fetch", "budget_query", "pin", "unpin", "note",
+               "view_state")
 POLICY_FACES = ("index", "fetch", "peek", "pin", "unpin", "drop", "compact",
                 "substitute", "order", "budget_query", "view_state", "note")
 
@@ -219,17 +221,23 @@ def note_list(notes: Dict[str, str]) -> Dict[str, Any]:
             "notes": [{"id": k, "chars": len(v)} for k, v in sorted(notes.items())]}
 
 
-def budget_query(reader: Any, tokens_used: int = 0,
+def budget_query(reader: Any, tokens_used: Optional[int] = None,
                  budget: Optional[int] = None) -> Dict[str, Any]:
-    """Ledger-sourced usage snapshot (meter 与它同一实现, §5.2 分二)."""
+    """Live usage snapshot (meter 与它同一实现, §5.2 分二).
+
+    ``reader`` is the loop-attached ledger of THIS chat run (attached by
+    ``chat_with_agent``; docs/10 §11.5): the contract keys are
+    ``tokens_used`` / ``budget`` / ``tool_calls`` / ``wallclock_s`` (all
+    optional, 实付口径). Explicit arguments OVERRIDE the reader's same-named
+    keys; ``None`` arguments never shadow reader data."""
     snap: Dict[str, Any] = {}
     if reader is not None:
         try:
             snap.update(reader() or {})
         except Exception as e:  # noqa: BLE001 -- advisory read
             snap = {"error": str(e)[:120]}
-    if tokens_used:
-        snap["tokens_used"] = tokens_used
+    if tokens_used is not None:
+        snap["tokens_used"] = int(tokens_used)
     if budget is not None:
         snap["budget"] = budget
     return {"op": "budget_query", "ok": True, **snap}

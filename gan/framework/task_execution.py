@@ -64,8 +64,9 @@ _TASK_ENV_NAMES = {
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
     # context-management snapshot (docs/10 §11 D2): the frozen seam core and
-    # the selected policy component live under .gan_runtime/cm (no gan/ bind)
-    "GAN_CM_CORE", "GAN_CM_POLICY",
+    # the selected policy component live under .gan_runtime/cm (no gan/ bind);
+    # GAN_CM_EVENTS is the child's seam-audit sidecar (rw bind, §11.5)
+    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_EVENTS",
     # timeout plumbing (consumers: domains/harness.py QUESTION_TIMEOUT,
     # agent/llm.py per-call client budget)
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -358,6 +359,17 @@ def assemble_task_env(
     env["GAN_CM_CORE"] = "/workspace/.gan_runtime/cm"
     if cm_report.get("policy"):
         env["GAN_CM_POLICY"] = "/workspace/.gan_runtime/cm/" + cm_report["policy"]
+    # Task-child CM audit sidecar (docs/10 §11.5): PRE-CREATED so the
+    # sandbox's rw --bind has an existing source; the child appends its seam
+    # events (cm_view/cm_violation/...) and task_runner folds them into
+    # events.jsonl after the child exits. Without the file the child simply
+    # has no audit sink (advisory end to end).
+    try:
+        from gan.framework import paths as _paths
+        open(_paths.cm_events_path(run_dir), "a").close()
+        env["GAN_CM_EVENTS"] = "/workspace/cm_events.jsonl"
+    except OSError:
+        pass
 
     tools_dir = os.path.join(runtime_dir, "tools")
     # Report what the design selected vs what actually got assembled, PER

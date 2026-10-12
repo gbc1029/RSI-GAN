@@ -19,8 +19,9 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
-    # context-management snapshot (docs/10 §11 D2/D7)
-    "GAN_CM_CORE", "GAN_CM_POLICY",
+    # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
+    # audit sidecar (§11.5: rw bind in the sandbox; cwd fallback locally)
+    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_EVENTS",
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -227,8 +228,33 @@ def _build_cm_session():
               flush=True)
     mode = keys.get("cm_mode") if isinstance(keys.get("cm_mode"), str) else "passthrough"
     policy_path = os.environ.get("GAN_CM_POLICY") if mode == "custom" else None
+
+    def _cm_events_path():
+        """Where this child appends its seam events (docs/10 §11.5).
+
+        Sandbox: GAN_CM_EVENTS is the rw-bound sidecar host file
+        (/workspace/cm_events.jsonl <-> <run_dir>/cm_events.jsonl). Local
+        (non-sandbox) runs: the env points at the sandbox view, which does
+        not exist — fall back to the cwd (the run dir)."""
+        path = os.environ.get("GAN_CM_EVENTS") or ""
+        if path and os.path.isdir(os.path.dirname(path) or "."):
+            return path
+        return os.path.join(os.getcwd(), "cm_events.jsonl")
+
+    def _cm_emit(event):
+        """Audit sink for the child's seam events (cm_view/cm_violation/...):
+        appended to the sidecar and folded into events.jsonl by task_runner.
+        The sink must never break the session."""
+        try:
+            with open(_cm_events_path(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(dict(event), ensure_ascii=False,
+                                   default=str) + "\n")
+        except OSError:
+            pass
+
     try:
-        return cmcore.build_session(keys, policy_path=policy_path)
+        return cmcore.build_session(keys, policy_path=policy_path,
+                                    emit=_cm_emit)
     except Exception as e:  # noqa: BLE001 -- fail-open
         print(f"[cm] session build failed ({e}); running without seam",
               flush=True)

@@ -47,17 +47,31 @@ def _outer_of(actx):
     return None
 
 
+_CM_MODES = ("passthrough", "slice", "compact_conservative", "custom")
+
+
 def _session_cm_mode(actx) -> str | None:
+    """The session's effective ``cost.cm_mode`` — PRESENTATION ONLY.
+
+    Primary source: the loop's per-session stamp on the AccessContext (the
+    session OWNER's design; docs/10 §11.5 档位归座). Fallback: the session's
+    design context (legacy wiring). Never a permission surface: the visible
+    session files and redaction stay untouched."""
     try:
+        stamped = getattr(actx, "session_cm_mode", None)
+        if isinstance(stamped, str) and stamped in _CM_MODES:
+            return stamped
         from gan.framework.context import get_design_context
         from gan.framework.cost_keys import cost_config
         dctx = get_design_context()
         if dctx is None:
             return None
         mode = cost_config(dctx.config).get("cm_mode")
-        return str(mode) if isinstance(mode, str) else None
+        if isinstance(mode, str) and mode in _CM_MODES:
+            return mode
     except Exception:  # noqa: BLE001 -- advisory; degrade to passthrough
         return None
+    return None
 
 
 def _session_paths(output_dir, outer, role, genid):

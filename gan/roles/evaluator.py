@@ -119,7 +119,8 @@ class Evaluator(Role):
         akey = self.access_key(node_id)
         tok_access = (set_access_context(broker, "evaluator", akey,
                                          trajectory_genids=trajectory_genids,
-                                         seat="evaluate")
+                                         seat="evaluate",
+                                         session_cm_mode=getattr(self, "session_cm_mode", None))
                       if broker is not None else None)
         blind_cap = max_tool_calls if max_tool_calls is not None else 30
         reveal_cap = (reveal_max_tool_calls if reveal_max_tool_calls is not None
@@ -159,7 +160,8 @@ class Evaluator(Role):
         tok = set_design_context(dctx)
         tok_access = (set_access_context(broker, "evaluator", self.access_key("self"),
                                          trajectory_genids=trajectory_genids,
-                                         seat="self_improve")
+                                         seat="self_improve",
+                                         session_cm_mode=getattr(self, "session_cm_mode", None))
                       if broker is not None else None)
         traj = self.session_trajectory(None)
         attempts = 0
@@ -172,6 +174,13 @@ class Evaluator(Role):
             sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
             rr = render_receipt((recent or {}).get("receipt"))
             cost_stmt = str((recent or {}).get("cost_statement") or "")
+            # B5 symmetry (docs/10 §11.5): the planner receives its
+            # recent.costs inside the structured outcomes JSON; the
+            # evaluator's hand-built instruction gets the same structured
+            # per-session cost facts as a dedicated section (whitelisted
+            # compact records only — no free text, no other role's costs).
+            costs = (recent or {}).get("costs") or {}
+            costs_json = json.dumps(costs, ensure_ascii=False) if costs else ""
             instruction = (
                 "Improve YOURSELF (the evaluator's own design) using only design operators "
                 "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
@@ -186,6 +195,8 @@ class Evaluator(Role):
                 f"\n## Your session trajectories this outer (use read_session_trajectory)\n{sess_line}\n"
                 + (("\n" + rr + "\n") if rr else "")
                 + ((f"\n{cost_stmt}\n") if cost_stmt else "")
+                + ((f"\n## Recent costs (per-session, framework-measured; your own sessions)\n"
+                    f"{costs_json}\n") if costs_json else "")
                 + f"\n## Feedback digests\n{digest_text}"
             )
             hist = self.run(instruction, max_tool_calls=max_tool_calls,

@@ -5,6 +5,7 @@ import io
 import re
 import sys
 import json
+import time
 from functools import partial
 
 from agent.llm import get_response_from_llm
@@ -396,6 +397,22 @@ def chat_with_agent(
     tokens_used = 0
     token_budget_exhausted = False
 
+    # Live meter source for the CM session (docs/10 §11.5): the chat loop owns
+    # the authoritative running totals, so it hands the session a reader
+    # closure over them instead of letting the meter keep a second counter.
+    # Reader contract (gan/framework/cm/session.py): keys tokens_used / budget
+    # / tool_calls / wallclock_s, all optional, 实付口径 (proxy usage sums).
+    cm_started = time.time()
+    cm_token = None
+
+    def _cm_usage_reader():
+        out = {"tokens_used": tokens_used,
+               "tool_calls": num_tool_calls,
+               "wallclock_s": round(time.time() - cm_started, 1)}
+        if isinstance(max_total_tokens, int) and max_total_tokens > 0:
+            out["budget"] = max_total_tokens
+        return out
+
     def _counting_llm(**kwargs):
         nonlocal tokens_used
         # Context-management seam (docs/10 §11 D4): the SINGLE assembly point
@@ -427,12 +444,14 @@ def chat_with_agent(
         if cm is not None and n_viewed and isinstance(hist, list):
             # keep the CANONICAL (raw) history: the seam's copies were only
             # for sending; the user turn is rebuilt RAW, the assistant reply
-            # is raw by construction (LLM output).
+            # is raw by construction (LLM output). Text-key form — the
+            # canonical convention (agent/llm.py returns text-form entries;
+            # get_response's entry conversion text->content handles the send).
             try:
                 new_entries = list(hist[n_viewed:])
                 if new_entries and isinstance(new_entries[0], dict) \
                         and new_entries[0].get("role") == "user":
-                    new_entries[0] = {"role": "user", "content": raw_msg}
+                    new_entries[0] = {"role": "user", "text": raw_msg}
                 hist = list(raw_history or []) + new_entries
             except Exception:  # noqa: BLE001 -- history shapes vary
                 pass
@@ -454,10 +473,14 @@ def chat_with_agent(
         if cm is not None:
             # The seam learns the per-turn header (dedup target) and binds
             # itself for ctx_* tools (contextvar; process_tool_call copies it
-            # into the dispatch threads).
+            # into the dispatch threads). The live meter reader rides the same
+            # wiring: ctx_budget reads THIS chat run's authoritative totals
+            # instead of an empty snapshot (docs/10 §11.5).
             try:
                 cm.set_system_prefix(system_msg)
-                cm.activate()
+                if hasattr(cm, "budget_reader"):
+                    cm.budget_reader = _cm_usage_reader
+                cm_token = cm.activate()
             except Exception as e:  # noqa: BLE001 -- advisory wiring
                 logging(f"[cm] session wiring degraded: {e}")
 
@@ -659,6 +682,15 @@ def chat_with_agent(
     except Exception as e:
         logging(f"Error: {str(e)}")
         raise e
+    finally:
+        # Reset the contextvar binding: the session object must not leak into
+        # whatever runs later on this thread (parallel role sessions reuse
+        # threads through the dispatch executor).
+        if cm_token is not None:
+            try:
+                cm.deactivate(cm_token)
+            except Exception:  # noqa: BLE001 -- contextvar reset must not fail the session
+                pass
 
     if return_info:
         return new_msg_history, {"truncated": truncated, "tool_calls": num_tool_calls,

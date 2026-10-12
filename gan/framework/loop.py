@@ -428,10 +428,14 @@ class GanLoop:
             task = cost_ledger.task_cost_for_gen(self.output_dir, genid)
             sess = cost_ledger.gen_session_costs(self.output_dir, outer, genid)
             task_traj = cost_ledger.task_trajectory_cost(self.output_dir, outer, genid)
+            task_cm = cost_ledger.task_cm_summary(self.output_dir, genid)
             payload: Dict[str, Any] = {
                 "genid": str(genid), "outer": outer,
                 "task": ({"cost_tokens": task[0], "cost_wallclock_s": task[1],
                           "source": "proxy_audit"} if task is not None else None),
+                # Task child's seam audit (docs/10 §11.5): ingested sidecar
+                # events; None when the session had no CM activity.
+                "task_cm": task_cm,
                 "task_trajectory": ({"total_tokens": task_traj.get("total_tokens"),
                                      "wallclock_s": task_traj.get("wallclock_s"),
                                      "llm_calls": task_traj.get("llm_calls"),
@@ -490,7 +494,8 @@ class GanLoop:
                 genid=genid, task_cost=task_cost,
                 own_last=cost_ledger.latest_session_cost(
                     self.output_dir, "evaluator", "evaluate", exclude_genid=genid),
-                own_budget=own_budget)
+                own_budget=own_budget,
+                token_budget=self.token_budget_per_gen)
         except Exception as e:  # noqa: BLE001 -- advisory, never fatal
             soft_fail(f"evaluate cost statement build failed: {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -1290,6 +1295,11 @@ class GanLoop:
                 # by a session that has no design key of its own).
                 try:
                     self.planner.session_token_budget = plan_ck.get("plan_token_budget")
+                    # slice 前端档位归座 (docs/10 §11.5): the PLAN session's
+                    # read_trajectory presentation follows the PLANNER's own
+                    # design cm_mode (stamped onto the AccessContext by the
+                    # role) — visible sets are untouched.
+                    self.planner.session_cm_mode = plan_ck.get("cm_mode")
                 except Exception as e:  # noqa: BLE001 -- advisory stamp
                     soft_fail(f"session_token_budget stamp failed (planner): {e}")
                 # Context-management session for THIS plan call (docs/10 §11
@@ -1445,6 +1455,11 @@ class GanLoop:
                 })
                 try:
                     self.evaluator.session_token_budget = eval_ck.get("evaluate_token_budget")
+                    # slice 前端档位归座 (docs/10 §11.5): the evaluator's OWN
+                    # design governs its read_trajectory presentation (the
+                    # evaluate seat previously had no DesignContext and was
+                    # stuck on passthrough).
+                    self.evaluator.session_cm_mode = eval_ck.get("cm_mode")
                 except Exception as e:  # noqa: BLE001 -- advisory stamp
                     soft_fail(f"session_token_budget stamp failed (evaluator): {e}")
                 self._emit_cost_keys_applied("evaluator", "evaluate", genid,
@@ -1624,6 +1639,12 @@ class GanLoop:
                                for r in cost_ledger.self_session_costs(self.output_dir, outer, role)]
                         payload["costs"] = {"own_sessions": [r for r in own if r]}
                         payload["cost_statement"] = self._cost_statement_self(role, outer)
+                        # Injection fact (B2, self seat): same bytes audit the
+                        # plan/evaluate statements get (docs/10 §11.5 gap fix).
+                        if payload["cost_statement"]:
+                            self.log_event({"type": "cost_statement",
+                                            "seat": "self_improve", "role": role,
+                                            "bytes": len(payload["cost_statement"])})
                     except Exception as e:  # noqa: BLE001 -- advisory, never fatal
                         soft_fail(f"self cost payload failed ({role}): {e}",
                                   event_path=paths.events_path(self.output_dir),
@@ -1664,6 +1685,10 @@ class GanLoop:
                     # cleared after the call (no leak across seats).
                     try:
                         ck_si = self._effective_cost_keys(role)
+                        # slice 前端档位归座 (docs/10 §11.5): the self seat
+                        # follows the role's OWN self-design (no leak from the
+                        # plan/evaluate stamps above).
+                        role_obj.session_cm_mode = ck_si.get("cm_mode")
                         role_obj.cm_session = self._build_cm_session(role, ck_si)
                     except Exception:  # noqa: BLE001 -- advisory stamp
                         role_obj.cm_session = None
