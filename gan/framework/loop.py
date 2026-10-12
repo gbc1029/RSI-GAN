@@ -1679,8 +1679,10 @@ class GanLoop:
                               role_obj: Any, prev_receipt: Any) -> None:
                 try:
                     # Clear the plan/evaluate seat's token-budget stamp: the
-                    # self-improve session has no design token key of its own
-                    # in phase C (its budget stays loop.yaml) and must not
+                    # self-improve session has NO design token key of its own
+                    # in phase C (phase C defines no self-seat budget key at
+                    # all — the session runs UNLIMITED token-wise; its only
+                    # cap is self_improve_max_tool_calls) and must not
                     # inherit the stamp by accident (docs/10 §10.2 C11).
                     try:
                         role_obj.session_token_budget = None

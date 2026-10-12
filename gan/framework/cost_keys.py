@@ -43,6 +43,9 @@ COST_SLOT = "cost"
 _SPECS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "task": {
         # Soft per-question token budget (chat-level stop; docs/10 §10.2 C8).
+        # SOFT semantics: the call that crosses it completes and the forced
+        # final summary turn spends MORE on top — actual spend > budget is the
+        # designed outcome, never a mid-call cut (docs/10 §10.2).
         "per_question_token_budget": {
             "type": "int", "min": 2_000, "max": 5_000_000, "default": None,
             "consumer": "harness payload -> agent.llm_withtools max_total_tokens",

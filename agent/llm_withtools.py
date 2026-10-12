@@ -409,7 +409,12 @@ def chat_with_agent(
         out = {"tokens_used": tokens_used,
                "tool_calls": num_tool_calls,
                "wallclock_s": round(time.time() - cm_started, 1)}
-        if isinstance(max_total_tokens, int) and max_total_tokens > 0:
+        # budget_armed must be EXPLICIT in both states (no-silent-fail rule):
+        # a missing "budget" key alone reads as "a budget exists somewhere
+        # else" — it does not; unset means NO token soft stop for this run
+        # (only tool-call caps and the time walls constrain it).
+        out["budget_armed"] = isinstance(max_total_tokens, int) and max_total_tokens > 0
+        if out["budget_armed"]:
             out["budget"] = max_total_tokens
         return out
 

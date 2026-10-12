@@ -1,55 +1,31 @@
-"""ctx_budget — report the session's usage vs its active budgets (the meter)
+"""ctx_budget — canonical face adapter (framework-synced stub).
 
-Frozen-core wrapper (docs/10 §5.2.3, pool B): the CM session is framework
-owned; this tool only adapts parameters. Without an active CM session the
-tool degrades loudly (the design selected it but no seam is wired). Dual
-import posture: role sessions import the framework package; the task child
-imports the per-generation snapshot (``GAN_CM_CORE``).
+Do NOT specialize this file: the face contract lives in the frozen core
+(``gan/framework/cm/faces.py``, snapshot-delivered as ``cm.faces``). To
+specialize, register a NEW component or move the logic into the cm policy
+layer — editing this stub only creates drift against the canonical face
+(source_sha stamping and the sync check in scripts/local/test_cm.py flag it).
 """
 from __future__ import annotations
-
-import json as _json
 
 
 def _core():
     try:
         from gan.framework import cm as _cm
-        return _cm
     except ImportError:  # task child: the per-generation snapshot
-        import os as _os
-        import sys as _sys
-        core = _os.environ.get("GAN_CM_CORE")
-        if core and _os.path.isdir(core):
-            parent = _os.path.dirname(_os.path.abspath(core))
-            if parent not in _sys.path:
-                _sys.path.insert(0, parent)
         import cm as _cm
-        return _cm
+    return _cm
 
 
-def _handle():
-    cm = _core()
-    return cm.current_handle("agent")
+_INFO, _FN = _core().make_face_tool("ctx_budget")
 
 
 def tool_info():
-    return {
-        "name": "ctx_budget",
-        "description": ("Report this session's cost accounting: tokens used (with reasoning split when available), tool calls, and the active budget keys with remaining headroom. Pull-based meter."),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    }
+    return dict(_INFO)
 
 
-def tool_function():
-    handle = _handle()
-    if handle is None:
-        return "Error: no context-management session is active for this chat"
-    out = handle.budget_query()
-    return _json.dumps(out, ensure_ascii=False)
+def tool_function(*args, **kwargs):
+    return _FN(*args, **kwargs)
 
 
 op_info = tool_info

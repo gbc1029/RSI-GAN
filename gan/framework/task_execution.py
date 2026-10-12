@@ -191,7 +191,7 @@ def persist_design(design_store: DesignStore, config: Dict[str, Any], genid: Any
 # source paths sit in the trust anchor (gan/framework/*) so no agent patch can
 # rewrite what the next snapshot would copy.
 _CM_CORE_FILES = ("__init__.py", "blocks.py", "ops.py", "session.py",
-                  "state.py", "failopen.py", "traj_index.py")
+                  "state.py", "failopen.py", "traj_index.py", "faces.py")
 
 
 def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],

@@ -18,6 +18,7 @@ from .blocks import (Block, Universe, View, PLACEHOLDER_OVERHEAD,
 from .session import CMSession, ViewHandle, build_session, WINDOW_K_FLOOR
 from .state import activate, deactivate, current_session, current_handle
 from .traj_index import build_traj_index, render_index_text, segment_text
+from .faces import make_face_tool
 
 __all__ = [
     "Block", "Universe", "View", "PLACEHOLDER_OVERHEAD", "MIN_COMPACT_SAVE",
@@ -26,4 +27,5 @@ __all__ = [
     "CMSession", "ViewHandle", "build_session", "WINDOW_K_FLOOR",
     "activate", "deactivate", "current_session", "current_handle",
     "build_traj_index", "render_index_text", "segment_text",
+    "make_face_tool",
 ]

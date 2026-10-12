@@ -168,6 +168,18 @@ class Evaluator(Role):
         rejected = None
         exhausted = False
         patch_str = ""
+        # Receipt aggregation (§4.1): see planner plan() — OR the flags
+        # across the session's runs (main + rejection retries) instead of
+        # reading only the last one.
+        tb_exhausted_any = False
+        truncated_any = False
+
+        def _absorb_run_flags() -> None:
+            nonlocal tb_exhausted_any, truncated_any
+            _info = getattr(self, "last_run_info", {}) or {}
+            tb_exhausted_any = tb_exhausted_any or bool(_info.get("token_budget_exhausted"))
+            truncated_any = truncated_any or bool(_info.get("truncated"))
+
         try:
             from gan.framework.trajectory import outer_session_index
             sessions = outer_session_index(self.output_dir, self.outer, "evaluator")
@@ -201,6 +213,7 @@ class Evaluator(Role):
             )
             hist = self.run(instruction, max_tool_calls=max_tool_calls,
                             tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
+            _absorb_run_flags()
 
             def _build_patch() -> str:
                 if broker is None or not has_deep_write(dctx.records):
@@ -232,6 +245,7 @@ class Evaluator(Role):
                     f"{reason}\nFix the problem, then stop. Do not repeat the same action.",
                     msg_history=hist, max_tool_calls=max_tool_calls,
                     tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
+                _absorb_run_flags()
                 attempts += 1
         finally:
             reset_design_context(tok)
@@ -241,10 +255,9 @@ class Evaluator(Role):
                                      dctx.records, self.output_dir, patch_str,
                                      exhausted=exhausted, rejected=rejected)
         self.save_self_config(cfg)
-        info = getattr(self, "last_run_info", {}) or {}
         return {"records": dctx.records, "self_design": self.self_design_path(),
                 "patch": "" if rejected else patch_str, "patch_proposed": patch_str,
                 "patch_rejection": rejected,
-                "attempts": attempts, "truncated": bool(info.get("truncated")),
+                "attempts": attempts, "truncated": truncated_any,
                 "budget_exhausted": exhausted,
-                "token_budget_exhausted": bool(info.get("token_budget_exhausted"))}
+                "token_budget_exhausted": tb_exhausted_any}

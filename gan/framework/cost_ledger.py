@@ -540,7 +540,7 @@ def render_plan_statement(*, parent_genid: Any = None,
             try:
                 pct = float(tokens) / float(token_budget) * 100.0
                 lines.append(f"- budget reference: {_fmt_tokens(token_budget)} tokens/gen "
-                             f"(parent used {pct:.1f}% of it)")
+                             f"(parent used {pct:.1f}% of it; reference only, not enforced)")
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
     if task_budgets:
@@ -565,6 +565,12 @@ def render_plan_statement(*, parent_genid: Any = None,
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
         lines.append(line)
+    else:
+        # Unset must SPEAK (no-silent-fail rule): a silently-absent budget
+        # line reads as "a budget exists somewhere" — it does not; only
+        # tool-call caps and the time walls constrain this session.
+        lines.append("- your plan session token budget: unset (no token soft "
+                     "stop armed; tool-call caps and time walls still apply)")
     hist = [h for h in (history_costs or []) if h]
     if hist:
         parts = []
@@ -603,7 +609,7 @@ def render_evaluate_statement(*, genid: Any = None,
             try:
                 pct = float(tokens) / float(token_budget) * 100.0
                 lines.append(f"- budget reference: {_fmt_tokens(token_budget)} tokens/gen "
-                             f"(task used {pct:.1f}% of it)")
+                             f"(task used {pct:.1f}% of it; reference only, not enforced)")
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
     else:
@@ -617,6 +623,9 @@ def render_evaluate_statement(*, genid: Any = None,
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
         lines.append(line)
+    else:
+        lines.append("- your evaluate session token budget: unset (no token soft "
+                     "stop armed; tool-call caps and time walls still apply)")
     if own_last is not None:
         gid = own_last.get("genid")
         label = "your last evaluate session" + (f" (gen {gid})" if gid is not None else "")
