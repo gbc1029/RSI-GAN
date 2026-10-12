@@ -434,8 +434,15 @@ class GanLoop:
                 "task": ({"cost_tokens": task[0], "cost_wallclock_s": task[1],
                           "source": "proxy_audit"} if task is not None else None),
                 # Task child's seam audit (docs/10 §11.5): ingested sidecar
-                # events; None when the session had no CM activity.
-                "task_cm": task_cm,
+                # events. None is now ALWAYS explained: the runner emits
+                # cm_events_ingest_empty / the child emits
+                # cm_session_degraded, so a bare null here would mean the
+                # cost record was written before the ingest ran (a bug).
+                "task_cm": (task_cm if task_cm is not None else
+                            {"absent": True,
+                             "reason": "no role=task cm events ingested for "
+                                       "this generation (see cm_events_ingest_empty "
+                                       "/ cm_session_degraded events)"}),
                 "task_trajectory": ({"total_tokens": task_traj.get("total_tokens"),
                                      "wallclock_s": task_traj.get("wallclock_s"),
                                      "llm_calls": task_traj.get("llm_calls"),
@@ -1684,13 +1691,28 @@ class GanLoop:
                     # in the first increment (no assembly-time policy);
                     # cleared after the call (no leak across seats).
                     try:
-                        ck_si = self._effective_cost_keys(role)
+                        # Returns (values, clamps) -- UNPACK the tuple (the
+                        # plan/evaluate seats do; the bare assignment made
+                        # ``ck_si`` the tuple itself, and ``.get`` raised
+                        # AttributeError that the except below swallowed:
+                        # every self-improve session ran with NO cm session
+                        # and NO cm_mode stamp, silently -- observed in the
+                        # 2026-10-12 real round: self rows in
+                        # cost_sessions.jsonl carried ``cm: null``).
+                        ck_si, _si_clamps = self._effective_cost_keys(role)
                         # slice 前端档位归座 (docs/10 §11.5): the self seat
                         # follows the role's OWN self-design (no leak from the
                         # plan/evaluate stamps above).
                         role_obj.session_cm_mode = ck_si.get("cm_mode")
                         role_obj.cm_session = self._build_cm_session(role, ck_si)
-                    except Exception:  # noqa: BLE001 -- advisory stamp
+                    except Exception as e:  # noqa: BLE001 -- advisory stamp
+                        # A swallowed degradation must SPEAK (no-silent-fail
+                        # rule, AGENTS.md): without this event the session's
+                        # cm: null row is indistinguishable from "no keys".
+                        soft_fail(f"self-seat cm session build failed ({role}): {e}",
+                                  event_path=paths.events_path(self.output_dir),
+                                  event_type="cm_session_failed", role=role,
+                                  seat="self_improve")
                         role_obj.cm_session = None
                     _si_res = role_obj.self_improve(
                         recent={**recent_payload, "receipt": prev_receipt},

@@ -500,6 +500,24 @@ with a GAN-native data layer.
    these implement: **abort only when nobody can
   repair the state OR continuing would produce a silently wrong result; otherwise
   strip/repair, record, and feed the owner.**
+- **No silent failures/degradations (fail-open must SPEAK; 拒绝所有静默失败/降级).**
+  Fail-open is the availability contract; audit persistence is the truth contract.
+  BOTH are required — fail-open is NEVER fail-silent. Every advisory path that
+  changes behavior — a swallowed exception, a degraded mode, a missing audit
+  artifact, a `None` that means "absent" — must leave a DURABLE trace in the
+  audit stream (events.jsonl / the cm sidecar / a `soft_fail` event), at the
+  point where the degradation happens. A bare `print` is NOT durable: child
+  stdout is PIPE-captured and log windows truncate, so prints vanish exactly
+  when needed. Rule of thumb: **an `except` that restores a default without a
+  same-path audit write is a bug**; `except: pass` needs a comment naming the
+  auditor that observes the case, and an optional subsystem's ABSENCE must be
+  as visible as its activity (e.g. emit the ingest event even at zero events).
+  Rationale (2026-10-12 real-API round): the driver-mode task child ran EVERY
+  generation with no CM seam at all while three fail-open layers stacked into
+  total silence (broker env omission + cwd fallback miss + a swallowed
+  tuple-unpack AttributeError at the self seat) — only the offline record
+  cross-check caught it. When introducing or editing such a path, add the
+  degradation event in the SAME patch.
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - **Planner→evaluator isolation (batch 8): facts flow, rhetoric does not.** Every
   evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) —

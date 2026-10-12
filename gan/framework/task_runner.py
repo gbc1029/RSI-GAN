@@ -130,12 +130,17 @@ class DomainTaskRunner:
         """Fold the child's CM seam-event sidecar into events.jsonl (docs/10
         §11.5): each line is re-emitted with role=task attribution so the
         per-generation cost record and the offline reconcilers see the seam
-        activity in the ONE audit stream. Advisory end to end: a missing or
-        unreadable sidecar (no seam / passthrough / local failure) is simply
-        no events, never a run failure. The sidecar dies with the pruned work
-        dir either way."""
+        activity in the ONE audit stream. Advisory end to end: never a run
+        failure -- but NEVER silent (no-silent-fail rule, AGENTS.md): a
+        MISSING or EMPTY sidecar is itself a finding (the runner pre-creates
+        the file, so absence/emptiness means the child had no seam at all)
+        and gets its own event. The sidecar dies with the pruned work dir
+        either way."""
         sidecar = paths.cm_events_path(run_dir)
         if not os.path.isfile(sidecar):
+            self._event("cm_events_ingest_empty", genid=str(genid),
+                        reason="sidecar file missing (child never created "
+                               "or never bound it)")
             return
         try:
             with open(sidecar, "r", encoding="utf-8") as f:
@@ -163,6 +168,13 @@ class DomainTaskRunner:
             pass  # the work-dir prune is the backstop
         if emitted:
             self._event("cm_events_ingested", genid=str(genid), events=emitted)
+        else:
+            # A zero-event sidecar after a real harness run means the child
+            # had no seam session (or its emit never reached the file):
+            # exactly the failure mode that used to be invisible.
+            self._event("cm_events_ingest_empty", genid=str(genid),
+                        reason="sidecar present but no seam events (child "
+                               "ran without a cm session)")
 
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,

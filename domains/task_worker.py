@@ -191,44 +191,19 @@ def _build_cm_session():
     """Reserved cost keys (docs/10 §11 D7): build the context-management
     session for this child from the per-generation snapshot.
 
-    ``GAN_CM_CORE`` (set by assemble_task_env) points at the frozen core the
-    parent materialized under ``.gan_runtime/cm``; ``GAN_CM_POLICY`` carries
-    the AST-gated policy component (custom mode only). The ``cm_*`` keys come
-    from the ALREADY-CLAMPED design snapshot — a type-guarded pass-through,
-    never a second clamp authority. Any failure returns None: the chat runs
-    with no seam at all (pre-D behaviour, fail-open by absence)."""
-    core = os.environ.get("GAN_CM_CORE") or ""
-    if not os.path.isdir(core):
-        alt = os.path.join(os.getcwd(), ".gan_runtime", "cm")
-        if os.path.isdir(alt):
-            core = alt
-        else:
-            return None
-    parent = os.path.dirname(os.path.abspath(core))
-    if parent not in sys.path:
-        sys.path.insert(0, parent)
-    try:
-        import cm as cmcore  # the snapshot package (stdlib-only by contract)
-    except Exception as e:  # noqa: BLE001 -- fail-open by absence
-        print(f"[cm] snapshot import failed ({e}); running without seam",
-              flush=True)
-        return None
-    keys: dict = {}
-    try:
-        design_path = os.environ.get("GAN_TASK_DESIGN")
-        if design_path and os.path.isfile(design_path):
-            with open(design_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            cost = cfg.get("cost") if isinstance(cfg, dict) else None
-            if isinstance(cost, dict):
-                keys = {k: v for k, v in cost.items()
-                        if isinstance(k, str) and k.startswith("cm_")}
-    except Exception as e:  # noqa: BLE001 -- advisory
-        print(f"[cm] design cm keys unavailable ({e}); using defaults",
-              flush=True)
-    mode = keys.get("cm_mode") if isinstance(keys.get("cm_mode"), str) else "passthrough"
-    policy_path = os.environ.get("GAN_CM_POLICY") if mode == "custom" else None
-
+    ``GAN_CM_CORE`` (set by assemble_task_env / the task broker) points at
+    the frozen core the parent materialized under ``.gan_runtime/cm``;
+    ``GAN_CM_POLICY`` carries the AST-gated policy component (custom mode
+    only). The ``cm_*`` keys come from the ALREADY-CLAMPED design snapshot —
+    a type-guarded pass-through, never a second clamp authority. Any failure
+    returns None: the chat runs with no seam at all (pre-D behaviour,
+    fail-open) — but NEVER silently: every degradation writes a
+    ``cm_session_degraded`` line into the audit sidecar (folded into
+    events.jsonl by task_runner) AND keeps its stderr print. The one
+    legit-abstain path (no GAN_CM_CORE anywhere) is a LOCAL/manual run, not
+    a GAN generation — recorded for exactly that reason."""
+    # The sidecar path resolves BEFORE anything can fail, so every
+    # degradation below can leave a durable trace (no-silent-fail rule).
     def _cm_events_path():
         """Where this child appends its seam events (docs/10 §11.5).
 
@@ -252,12 +227,71 @@ def _build_cm_session():
         except OSError:
             pass
 
+    def _degrade(reason: str) -> None:
+        """Fail-open LOUDLY: sidecar line + stderr print (the print alone is
+        not durable — harness captures child stdout and the log keeps only a
+        window; the sidecar line is what the audit fold sees)."""
+        _cm_emit({"type": "cm_session_degraded", "reason": reason})
+        print(f"[cm] {reason}; running without seam", flush=True)
+
+    core = os.environ.get("GAN_CM_CORE") or ""
+    if not os.path.isdir(core):
+        alt = os.path.join(os.getcwd(), ".gan_runtime", "cm")
+        if os.path.isdir(alt):
+            core = alt
+        else:
+            _degrade(f"no CM core snapshot (GAN_CM_CORE={core!r} and no "
+                     f".gan_runtime/cm under cwd); local/manual run or a "
+                     f"broker env without the CM keys")
+            return None
+    parent = os.path.dirname(os.path.abspath(core))
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    try:
+        import cm as cmcore  # the snapshot package (stdlib-only by contract)
+    except Exception as e:  # noqa: BLE001 -- fail-open by absence
+        _degrade(f"snapshot import failed ({e})")
+        return None
+    keys: dict = {}
+    try:
+        design_path = os.environ.get("GAN_TASK_DESIGN")
+        if design_path and os.path.isfile(design_path):
+            with open(design_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cost = cfg.get("cost") if isinstance(cfg, dict) else None
+            if isinstance(cost, dict):
+                keys = {k: v for k, v in cost.items()
+                        if isinstance(k, str) and k.startswith("cm_")}
+    except Exception as e:  # noqa: BLE001 -- advisory
+        print(f"[cm] design cm keys unavailable ({e}); using defaults",
+              flush=True)
+    mode = keys.get("cm_mode") if isinstance(keys.get("cm_mode"), str) else "passthrough"
+    policy_path = os.environ.get("GAN_CM_POLICY") if mode == "custom" else None
+    if mode == "custom" and not policy_path:
+        # custom 档但 env 没带 policy（broker env omission 等接线缺口）：
+        # fail-open 到 passthrough 会把 custom 静默降级 —— 先从快照目录
+        # 自发现：materialize_cm_snapshot 把 policy 组件按原文件名拷到
+        # GAN_CM_CORE 旁，任何不属于冻结核心名单的 .py 就是它。
+        _CORE = {"__init__.py", "blocks.py", "ops.py", "session.py",
+                 "state.py", "failopen.py", "traj_index.py"}
+        try:
+            for fn in sorted(os.listdir(core)):
+                if fn.endswith(".py") and fn not in _CORE:
+                    policy_path = os.path.join(core, fn)
+                    break
+        except OSError:
+            pass
+        if not policy_path:
+            _degrade("design requests cm_mode=custom but no policy is "
+                     "deliverable (no GAN_CM_POLICY env, no policy component "
+                     "in the snapshot); running PASSTHROUGH instead")
+            mode = "passthrough"
+
     try:
         return cmcore.build_session(keys, policy_path=policy_path,
                                     emit=_cm_emit)
     except Exception as e:  # noqa: BLE001 -- fail-open
-        print(f"[cm] session build failed ({e}); running without seam",
-              flush=True)
+        _degrade(f"session build failed ({e})")
         return None
 
 

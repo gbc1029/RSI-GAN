@@ -58,11 +58,14 @@ def _seed_self_designs(output_dir: str) -> None:
         # schema defaults + seed prompt; initial_config applies the non-empty
         # guard, so a missing/blank seed can no longer blank the prompt.
         cfg = initial_config(role)
-        # capability tools are optional but selected by default (evolvable later);
-        # The single ``tools`` slot, name-keyed registry
-        if role == "evaluator":
+        # Capability tools are optional but selected by default (evolvable
+        # later); the single ``tools`` slot, name-keyed registry. BOTH roles
+        # preselect their full registry at gen-0 (unification): the planner's
+        # seed prompt promises the ctx_* faces, but an empty tools slot meant
+        # the promise was false at gen-0 while the evaluator's was true.
+        if role in ("planner", "evaluator"):
             from gan.registries.loader import load_registry_for_role
-            reg = load_registry_for_role("evaluator")
+            reg = load_registry_for_role(role)
             cfg["tools"] = reg.names()
         store.save(cfg, role)
 

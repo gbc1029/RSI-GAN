@@ -313,8 +313,12 @@ def clamp_cost_config(role: str, config: Any,
     for key in list(new_slot):
         if new_slot[key] is None and slot.get(key) is None:
             del new_slot[key]
-    if new_slot:
-        config[COST_SLOT] = new_slot
-    else:
-        config.pop(COST_SLOT, None)
+    # The slot is ALWAYS materialized (even as {}): a design whose reserved
+    # cost slot silently vanishes looks like "this design never carried cost
+    # keys" in later audits, indistinguishable from a lossy serialization
+    # (observed: gen-0 task designs lost the schema-guaranteed slot, so
+    # ``ckpt/design/task/<g>/config.json`` had three keys where the schema
+    # promises four). An explicit empty slot means the same thing to
+    # ``effective_all`` (all defaults) but stays auditable.
+    config[COST_SLOT] = new_slot
     return records
