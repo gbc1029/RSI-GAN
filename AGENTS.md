@@ -351,9 +351,15 @@ with a GAN-native data layer.
   untouched — 双记; sticky view forms). Binding reads BOTH `content`- and `text`-keyed
   entries (`_msg_text`); the session's FIRST user turn (the instruction + cost
   statement) is pinned by default, whose only exemption is the `dedup` prefix-elision.
-  Modes: `passthrough` (identity, pre-D behavior)
+  Modes: `passthrough` (identity, pre-D behavior — an absolute kill switch:
+  a named `cm_assembly` is never executed under it, spoken once)
   / `slice` / `compact_conservative` / `custom` (agent policy module, AST-gated no-LLM/
-  no-network, exec budget + 2-strike wedge breaker, fail-open always; compact_conservative
+  no-network, exec budget + 2-strike wedge breaker, fail-open always; since P2
+  the design NAMES the policy (`cost.cm_policy`) and may name a whole
+  agent-owned assembly (`cost.cm_assembly`) replacing the preset composition —
+  delivered under fixed names, loaded once per session, wedge-broken, and a
+  degraded session marks receipt `budget.kind` = `cm` (policy OR assembly
+  degradation); compact_conservative
   excerpts big old USER turns — tool outputs ride inside user turns in this protocol,
   so a separate tool_output kind never materializes). Invariants:
   pinned blocks survive, `cm_drop_floor_chars` guards tiny blocks, the view cannot

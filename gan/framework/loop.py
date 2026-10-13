@@ -1015,9 +1015,16 @@ class GanLoop:
         truncated = bool(plan_result.get("truncated"))
         tb_exhausted = bool(plan_result.get("token_budget_exhausted"))
         # Context management (docs/10 §11 D12): a degraded CM session (policy
-        # disabled / failures) is a budget-state fact of its own kind.
-        cm_degraded = bool(cm_summary and (cm_summary.get("policy_disabled")
-                                           or cm_summary.get("policy_failures")))
+        # disabled / failures) is a budget-state fact of its own kind. P2
+        # (docs/10 §11.8): assembly degradation degrades the seam the same
+        # way — the receipt must say so too (the summary only carries the
+        # assembly fields when an assembly was configured, so a baseline
+        # session is unaffected).
+        cm_degraded = bool(cm_summary and (
+            cm_summary.get("policy_disabled")
+            or cm_summary.get("policy_failures")
+            or cm_summary.get("assembly_disabled")
+            or cm_summary.get("assembly_failures")))
         budget = {
             "exhausted": exhausted or truncated or tb_exhausted,
             # Reserved cost keys (docs/10 §10): a token soft stop is a budget
@@ -1109,8 +1116,11 @@ class GanLoop:
         rejected = r.get("patch_rejection")
         tb_exhausted = bool(r.get("token_budget_exhausted"))
         cm_summary = r.get("cm_summary") if isinstance(r, dict) else None
-        cm_degraded = bool(cm_summary and (cm_summary.get("policy_disabled")
-                                           or cm_summary.get("policy_failures")))
+        cm_degraded = bool(cm_summary and (
+            cm_summary.get("policy_disabled")
+            or cm_summary.get("policy_failures")
+            or cm_summary.get("assembly_disabled")
+            or cm_summary.get("assembly_failures")))
         budget = {
             "exhausted": bool(r.get("budget_exhausted")) or bool(r.get("truncated")) or tb_exhausted,
             "kind": ("retries" if r.get("budget_exhausted")

@@ -1,9 +1,10 @@
 """Context-management core (docs/10 §5.2, §11; phase D).
 
 The frozen pool-A implementation of the seam 三分架构: block model, the
-primitive set, the per-turn assembly pipeline (fixed pre-segment -> optional
-policy -> post-segment audits), the trajectory index builder and the
-fail-open policy runner.
+frozen primitive surface, the per-turn seam DISPATCH (``session.assemble_turn``
+resolves the pipeline from ``assembly.py`` — the named baseline presets per
+``cm_mode``, and since P2 the named agent-owned assemblies/policies), the
+trajectory index builder and the fail-open policy runner.
 
 IMPORT CONTRACT (load-bearing): this package is copied VERBATIM into the task
 sandbox each generation (``.gan_runtime/cm/``, the knowledge-base mechanism)
