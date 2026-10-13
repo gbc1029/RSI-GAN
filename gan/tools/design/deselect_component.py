@@ -11,7 +11,7 @@ tool *logic* is also DEEP (source edit); see AGENTS.md, "Shallow vs deep".
 One ``tools`` slot per role; the legacy ``skills``/``eval_points`` names are
 accepted as aliases.
 """
-from gan.framework.context import get_design_context
+from gan.framework.context import get_design_context, shallow_op_error
 
 _SLOT_ALIASES = {"skills": "tools", "eval_points": "tools"}
 
@@ -41,6 +41,9 @@ def tool_function(slot, name, **kwargs):
     if ctx is None:
         return "Error: no design context"
     slot = _SLOT_ALIASES.get(str(slot), str(slot))
+    err = shallow_op_error("deselect_component")
+    if err:
+        return err
     if slot != "tools":
         return f"Error: unknown slot '{slot}' (the design config has exactly one component slot: 'tools')"
     if "tools" not in ctx.config:

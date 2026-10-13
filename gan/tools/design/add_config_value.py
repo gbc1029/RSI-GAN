@@ -1,6 +1,6 @@
 """Design operator: add one value to a declared enum key."""
 from __future__ import annotations
-from gan.framework.context import get_design_context, session_overlay_root
+from gan.framework.context import get_design_context, session_overlay_root, shallow_op_error
 from gan.design.schema import dynamic_key_spec, load_dynamic_specs, MAX_ENUM_VALUES, value_token_valid
 from gan.tools.design.add_config_key import _write
 
@@ -12,6 +12,8 @@ def tool_info():
 def tool_function(key, value, **kwargs):
     ctx = get_design_context()
     if ctx is None: return "Error: no design context"
+    err = shallow_op_error("add_config_value", key=str(key))
+    if err: return err
     role = ctx.role; overlay = session_overlay_root()
     specs = load_dynamic_specs(role, overlay)
     spec = specs.get(str(key))

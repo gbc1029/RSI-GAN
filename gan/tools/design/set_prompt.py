@@ -1,7 +1,7 @@
 """Design operator: set the prompt (a config key)."""
 from typing import Optional
 
-from gan.framework.context import get_design_context
+from gan.framework.context import get_design_context, shallow_op_error
 from gan.framework.receipt import prompt_change_facts
 
 
@@ -36,6 +36,9 @@ def tool_function(text="", **kwargs):
     ctx = get_design_context()
     if ctx is None:
         return "Error: no design context"
+    err = shallow_op_error("set_prompt")
+    if err:
+        return err
     # Capture the value being replaced BEFORE the overwrite -- this is the
     # only point that sees both sides (the projections receive records only).
     # The record carries structural facts only: never the prompt text, which

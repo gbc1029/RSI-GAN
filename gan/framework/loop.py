@@ -161,6 +161,23 @@ class GanLoop:
         # instance (dispatch-level net lives in agent.llm_withtools; roles pass
         # the instance attribute through Role.run).
         self.tool_call_timeout_s = int(cfg.get("loop.tool_call_timeout_s", 600))
+        # Ablation switches (docs/11_消融实验设计.md is the authority). B1 lives
+        # under source_access.deny_deep (consumed by build.py -> AccessBroker);
+        # everything else is read here and consumed in run() / the tool layer.
+        self.ablation = {
+            "disable_planner": bool(cfg.get("ablation.disable_planner", False)),
+            "disable_evaluator": bool(cfg.get("ablation.disable_evaluator", False)),
+            "disable_self_improve": bool(cfg.get("ablation.disable_self_improve", False)),
+            "disable_planner_self_improve": bool(cfg.get("ablation.disable_planner_self_improve", False)),
+            "disable_evaluator_self_improve": bool(cfg.get("ablation.disable_evaluator_self_improve", False)),
+            "task_only_single_round": bool(cfg.get("ablation.task_only_single_round", False)),
+            "disable_blind": bool(cfg.get("ablation.disable_blind", False)),
+            "feedback_numeric_only": bool(cfg.get("ablation.feedback_numeric_only", False)),
+            "feedback_no_diff_summary": bool(cfg.get("ablation.feedback_no_diff_summary", False)),
+            "feedback_predicted_score_only": bool(cfg.get("ablation.feedback_predicted_score_only", False)),
+            "trajectory_visibility": str(cfg.get("ablation.trajectory_visibility", "parent")),
+            "freeze_evaluator": bool(cfg.get("ablation.freeze_evaluator", False)),
+        }
         self.code_root = os.path.abspath(code_root) if code_root else None
         # The rolling mirrors below carry PARENT-CHILD semantics only --
         # they are refreshed at parent selection (from parent.meta) and are NEVER
@@ -255,6 +272,101 @@ class GanLoop:
         # cannot pass ``skills``/``eval_points`` down the inheritance chain
         from gan.design.schema import normalize_config
         return normalize_config(cfg)
+
+    # -- ablation helpers (docs/11) ---------------------------------------
+    def _ab(self, key: str) -> bool:
+        """Ablation switch accessor (docs/11_消融实验设计.md)."""
+        return bool(self.ablation.get(key, False))
+
+    def _empty_plan_result(self, parent_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """A1/A6: a no-op plan result that runs the task on the parent config.
+
+        Satisfies every downstream ``plan_result.get(...)`` consumer
+        (``_make_receipt`` / ``build_diff_summary`` / ``_settle_feedback_digest``)
+        with empty structural fields -- no planner session ever ran.
+        """
+        cfg = deepcopy(parent_cfg) if isinstance(parent_cfg, dict) else self._initial_task_config()
+        return {
+            "records": [],
+            "responses": [],
+            "config": cfg,
+            "patch": "",
+            "patch_proposed": "",
+            "patch_rejection": None,
+            "attempts": 0,
+            "truncated": False,
+            "budget_exhausted": False,
+            "token_budget_exhausted": False,
+        }
+
+    def _traj_vis(self, own: List[Any], parents: List[Any]) -> List[Any]:
+        """D-group: resolve the visible trajectory genids for a seat.
+
+        ``own`` = genids this seat directly owns (e.g. the current generation for
+        evaluate), ``parents`` = the parent history. The baseline ("parent") is
+        the seat's default set; "current" drops the parent history; "all" unions
+        every existing non-initial generation.
+        """
+        vis = str(self.ablation.get("trajectory_visibility", "parent"))
+        if vis == "current":
+            return [g for g in list(own) if g is not None]
+        if vis == "all":
+            all_gens = [n.genid for n in self.task_tree.nodes.values()
+                        if str(n.genid) != "initial"]
+            out: List[Any] = []
+            for g in list(own) + list(parents) + all_gens:
+                if g is not None and g not in out:
+                    out.append(g)
+            return out
+        # "parent" (baseline): own + parents, deduped, order-preserving
+        out = []
+        for g in list(own) + list(parents):
+            if g is not None and g not in out:
+                out.append(g)
+        return out
+
+    def _run_task_only_single_round(self) -> TreeStore:
+        """A6: run the gen0 task agent once (seed config), archive, score, return.
+
+        The lowest baseline -- measures the TOTAL gain of the whole evolution
+        mechanism. No planner, no evaluator, no inner/outer loop: exactly one
+        task generation on the generation-0 seed config.
+        """
+        from gan.framework import code_repo
+        parent = self.task_tree.get("initial")
+        genid = self._gen_counter
+        self._gen_counter += 1
+        base = self._align_code_base(parent, 1, genid)
+        plan_result = self._empty_plan_result(self._initial_task_config())
+        try:
+            child = self.task_runner(plan=plan_result, parent=parent,
+                                     genid=genid, base=base)
+        except code_repo.RepoIntegrityError:
+            raise
+        except Exception as e:
+            self._archive_invalid("task_runner_failed", parent, [parent], genid,
+                                  str(e), outer=1, inner=1)
+            return self.task_tree
+        if child is None:
+            self._archive_invalid("task_runner_none", parent, [parent], genid,
+                                  outer=1, inner=1)
+            return self.task_tree
+        child.parents = [parent.genid]
+        child.parent_genid = parent.genid
+        child.meta["config_dict"] = plan_result["config"]
+        self._finalize_child(child, parent)
+        try:
+            trajectory.collect(child.meta.get("run_dir", ""), f"gan_{genid}",
+                               self.output_dir, 1, genid)
+        except Exception as e:
+            soft_fail(f"A6 trajectory archive failed for genid {genid}: {e}")
+        self.task_tree.add_node(child)
+        self._append_score(child)
+        self.log_event({"type": "ablation_task_only", "genid": genid,
+                        "score": child.value.score,
+                        "score_status": child.value.score_status})
+        return self.task_tree
+
 
     def _build_packet(self, child: Node, ctx: Any) -> RewardPacket:
         return RewardPacket(
@@ -1219,6 +1331,10 @@ class GanLoop:
             self.task_tree.add_node(Node(genid="initial", value=NodeValue(score=None)))
             self.log_event({"type": "init", "task_tree": "initial"})
 
+        # A6 ablation: task-only single round -- no planner/evaluator/evolution.
+        if self._ab("task_only_single_round"):
+            return self._run_task_only_single_round()
+
         # only_outer: run exactly one outer generation (used by the per-outer worker)
         if only_outer is not None:
             start_outer = int(only_outer)
@@ -1275,6 +1391,23 @@ class GanLoop:
                 parent_benchmark_score = parent_meta.get("benchmark_score")
                 evaluator_issues = (parent_feedback or {}).get("issues")
                 parent_ref = [] if str(parent.genid) == "initial" else [parent.genid]
+                # Ablation projections for the plan session (docs/11).
+                disable_plan = self._ab("disable_planner")
+                plan_feedback = parent_feedback
+                plan_issues = evaluator_issues
+                plan_pred = parent_predicted_score
+                plan_bench = parent_benchmark_score
+                if self._ab("feedback_numeric_only"):
+                    # C2: only the objective benchmark score reaches the planner.
+                    plan_feedback = None
+                    plan_issues = None
+                if self._ab("feedback_predicted_score_only"):
+                    # C4: numeric reward (predicted_score) replaces text feedback;
+                    # the objective score is dropped too, isolating the signal.
+                    plan_feedback = None
+                    plan_issues = None
+                    plan_bench = None
+                traj_plan = self._traj_vis([], parent_ref)
 
                 # Reserved cost keys for the PLAN seat (docs/10 §10, phase C):
                 # effective values from the planner's OWN design (fallbacks =
@@ -1321,24 +1454,31 @@ class GanLoop:
                                     "reason": "role signature lacks cost_statement"})
 
                 try:
-                    plan_result = self.planner.plan(
-                        parent_summary=self._parent_summary(parent),
-                        parents=[self._parent_summary(p) for p in parents],
-                        parent_feedback=parent_feedback,
-                        evaluator_issues=evaluator_issues,
-                        config=parent_cfg,
-                        node_id=genid,
-                        broker=self.broker,
-                        task_brief=self.task_brief,
-                        trajectory_genids=parent_ref,
-                        receipt=parent_receipt,
-                        parent_predicted_score=parent_predicted_score,
-                        parent_benchmark_score=parent_benchmark_score,
-                        patch_retry_k=plan_ck.get("patch_retry_k", self.patch_retry_k),
-                        max_tool_calls=plan_ck.get("plan_max_tool_calls", self.plan_max_tool_calls),
-                        tool_repeat_limit=self.tool_repeat_limit,
-                        **plan_cost_kwargs,
-                    ) or {}
+                    if disable_plan:
+                        # A1: skip the planner -- task runs on the parent (seed)
+                        # config; evaluator still judges. Downstream consumers all
+                        # tolerate an empty plan_result.
+                        plan_result = self._empty_plan_result(parent_cfg)
+                        self.log_event({"type": "ablation_skip_plan", "genid": str(genid)})
+                    else:
+                        plan_result = self.planner.plan(
+                            parent_summary=self._parent_summary(parent),
+                            parents=[self._parent_summary(p) for p in parents],
+                            parent_feedback=plan_feedback,
+                            evaluator_issues=plan_issues,
+                            config=parent_cfg,
+                            node_id=genid,
+                            broker=self.broker,
+                            task_brief=self.task_brief,
+                            trajectory_genids=traj_plan,
+                            receipt=parent_receipt,
+                            parent_predicted_score=plan_pred,
+                            parent_benchmark_score=plan_bench,
+                            patch_retry_k=plan_ck.get("patch_retry_k", self.patch_retry_k),
+                            max_tool_calls=plan_ck.get("plan_max_tool_calls", self.plan_max_tool_calls),
+                            tool_repeat_limit=self.tool_repeat_limit,
+                            **plan_cost_kwargs,
+                        ) or {}
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to planner_failed
                 except Exception as e:
@@ -1418,6 +1558,9 @@ class GanLoop:
 
                 # evaluator (execute even for missing bench; pass imputed info, not as anchor)
                 benchmark_for_eval = None if child.meta.get("imputed") else child.value.score
+                # Ablation switches for the evaluate seat (docs/11).
+                disable_eval = self._ab("disable_evaluator")
+                traj_eval = self._traj_vis([genid], parent_ref)
                 # BLIND hygiene: never expose the objective score/accuracy in the
                 # blind-phase run summary (score is revealed separately).
                 # ALLOWLIST, not denylist — the planner's node meta
@@ -1470,30 +1613,40 @@ class GanLoop:
                     eval_cost_kwargs["reveal_max_tool_calls"] = \
                         eval_ck["evaluate_reveal_max_tool_calls"]
                 try:
-                    ctx = self.evaluator.evaluate(
-                        run_summary={
-                            "genid": genid,
-                            "meta": meta_view,
-                            "report_summary": report_view,
-                            "score_status": child.value.score_status,
-                            "imputed": bool(child.meta.get("imputed")),
-                            # Projection, not the whole receipt —
-                            # `code_patch.rejected_reason` quotes the planner's own
-                            # artifacts, `grants` carries agent free text, and
-                            # `design.ops` duplicate the diff_summary channel.
-                            "receipt": _receipt_for_evaluator(self._parent_receipt),
-                        },
-                        parent_feedback={**(parent_feedback or {}), "digest": self._parent_digest},
-                        benchmark_score=benchmark_for_eval,
-                        node_id=genid,
-                        broker=self.broker,
-                        task_brief=self.task_brief,
-                        trajectory_genids=[genid] + parent_ref,
-                        max_tool_calls=(eval_ck.get("evaluate_blind_max_tool_calls")
-                                        or self.evaluate_max_tool_calls),
-                        tool_repeat_limit=self.tool_repeat_limit,
-                        **eval_cost_kwargs,
-                    )
+                    if disable_eval:
+                        # A2: skip the evaluator — the planner's only signal
+                        # becomes the objective benchmark score (written to
+                        # child.meta["benchmark_score"] below). Downstream
+                        # consumers tolerate an empty EvalContext.
+                        from gan.framework.context import EvalContext
+                        ctx = EvalContext()
+                        self.log_event({"type": "ablation_skip_eval", "genid": str(genid)})
+                    else:
+                        ctx = self.evaluator.evaluate(
+                            run_summary={
+                                "genid": genid,
+                                "meta": meta_view,
+                                "report_summary": report_view,
+                                "score_status": child.value.score_status,
+                                "imputed": bool(child.meta.get("imputed")),
+                                # Projection, not the whole receipt —
+                                # `code_patch.rejected_reason` quotes the planner's own
+                                # artifacts, `grants` carries agent free text, and
+                                # `design.ops` duplicate the diff_summary channel.
+                                "receipt": _receipt_for_evaluator(self._parent_receipt),
+                            },
+                            parent_feedback={**(parent_feedback or {}), "digest": self._parent_digest},
+                            benchmark_score=benchmark_for_eval,
+                            node_id=genid,
+                            broker=self.broker,
+                            task_brief=self.task_brief,
+                            trajectory_genids=traj_eval,
+                            blind_enabled=not self._ab("disable_blind"),
+                            max_tool_calls=(eval_ck.get("evaluate_blind_max_tool_calls")
+                                            or self.evaluate_max_tool_calls),
+                            tool_repeat_limit=self.tool_repeat_limit,
+                            **eval_cost_kwargs,
+                        )
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to evaluator_failed
                 except Exception as e:
@@ -1548,7 +1701,8 @@ class GanLoop:
                 # parameter no longer exists to be misused), and the digest takes
                 # no diff_summary -- the inventory's single evaluator-facing
                 # carrier is the feedback.diff_summary JSON block.
-                diff_summary = build_diff_summary(plan_result.get("records"))
+                diff_summary = (None if self._ab("feedback_no_diff_summary")
+                                else build_diff_summary(plan_result.get("records")))
                 digest = self._settle_feedback_digest(
                     plan_result, ctx, genid,
                     parent_feedback=parent_feedback, parent_meta=parent_meta)
@@ -1590,6 +1744,11 @@ class GanLoop:
                     diff_summary=diff_summary,
                     penalties=packet.penalties,
                 )
+                if self._ab("feedback_no_diff_summary"):
+                    # C3: make_feedback coerces None -> {}; force None so the
+                    # planner/evaluator prompt builders (which test
+                    # ``is not None``) skip the diff block entirely.
+                    child.meta["feedback"]["diff_summary"] = None
                 # receipt / feedback_digest / feedback are attached AFTER
                 # add_node, so persist the updated meta explicitly to keep
                 # replayed trees complete.
@@ -1631,12 +1790,14 @@ class GanLoop:
                                   seat="self_improve")
             # visible task trajectories for self-improvement: this outer's gens
             # + the direct parent of the last generation (read-only).
-            si_refs = list(outer_genids)
+            si_own = list(outer_genids)
+            si_parents: List[Any] = []
             if outer_genids:
                 last = self.task_tree.get(outer_genids[-1])
                 p = getattr(last, "parent_genid", None) if last is not None else None
-                if p is not None and str(p) != "initial" and p not in si_refs:
-                    si_refs.append(p)
+                if p is not None and str(p) != "initial":
+                    si_parents = [p]
+            si_refs = self._traj_vis(si_own, si_parents)
             # The two self-improve sessions are INDEPENDENT (each role reads its
             # own trajectory/design and writes only its own seat surface --
             # frozen.SEAT_WRITE guarantees the path sets are disjoint) and run
@@ -1695,16 +1856,29 @@ class GanLoop:
                     except Exception:  # noqa: BLE001 -- advisory stamp
                         pass
 
-            workers = [
-                threading.Thread(target=_self_session,
-                                 args=("evaluator", recent_eval, self.evaluator,
-                                       self._self_receipts.get("evaluator")),
-                                 name="self-improve-evaluator"),
-                threading.Thread(target=_self_session,
-                                 args=("planner", recent_plan, self.planner,
-                                       self._self_receipts.get("planner")),
-                                 name="self-improve-planner"),
-            ]
+            # A3/A4/A5 + E freeze_evaluator: filter the self-improve workers.
+            skip_planner_si = (self._ab("disable_self_improve")
+                               or self._ab("disable_planner_self_improve"))
+            skip_evaluator_si = (self._ab("disable_self_improve")
+                                 or self._ab("disable_evaluator_self_improve")
+                                 or self._ab("freeze_evaluator"))
+            workers = []
+            if not skip_evaluator_si:
+                workers.append(threading.Thread(
+                    target=_self_session,
+                    args=("evaluator", recent_eval, self.evaluator,
+                          self._self_receipts.get("evaluator")),
+                    name="self-improve-evaluator"))
+            if not skip_planner_si:
+                workers.append(threading.Thread(
+                    target=_self_session,
+                    args=("planner", recent_plan, self.planner,
+                          self._self_receipts.get("planner")),
+                    name="self-improve-planner"))
+            if skip_evaluator_si or skip_planner_si:
+                self.log_event({"type": "ablation_skip_self_improve",
+                                "evaluator": bool(skip_evaluator_si),
+                                "planner": bool(skip_planner_si)})
             for t in workers:
                 t.start()
             for t in workers:

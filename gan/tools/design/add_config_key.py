@@ -1,7 +1,7 @@
 """Design operator: declare a dynamic config key with a real consumer."""
 from __future__ import annotations
 import json, os
-from gan.framework.context import get_design_context, get_access_context, session_overlay_root
+from gan.framework.context import get_design_context, get_access_context, session_overlay_root, shallow_op_error
 from gan.design.schema import (ROLE_SCHEMAS, _ALLOWED_TYPES, _KEY_RE, _RESERVED,
                                MAX_DYNAMIC_KEYS, MAX_DESCRIPTION_CHARS, MAX_ENUM_VALUES,
                                _valid_spec, load_dynamic_specs, validate_dynamic_value,
@@ -35,6 +35,8 @@ def _write(role, specs):
 def tool_function(key, value_type, consumer, description="", enum=None, initial_value=None, **kwargs):
     ctx = get_design_context()
     if ctx is None: return "Error: no design context"
+    err = shallow_op_error("add_config_key", key=str(key))
+    if err: return err
     key = str(key); role = ctx.role
     if key in ROLE_SCHEMAS.get(role, {}) or key in _RESERVED or not _KEY_RE.fullmatch(key):
         return f"Error: invalid or reserved config key '{key}'"

@@ -13,7 +13,7 @@ rests on the successful-exit heal, the assembly report and the ability to
 re-select next outer. The write is atomic: if ANY name fails, the whole call is
 refused and the design is untouched.
 """
-from gan.framework.context import get_design_context, session_overlay_root
+from gan.framework.context import get_design_context, session_overlay_root, shallow_op_error
 from gan.framework.receipt import prompt_change_facts
 from gan.design.schema import allowed_keys, dynamic_key_spec, validate_dynamic_value
 from gan.registries.loader import load_registry_for_role
@@ -44,6 +44,9 @@ def tool_function(key, value, **kwargs):
     if ctx is None:
         return "Error: no design context"
     key = _SLOT_ALIASES.get(str(key), str(key))
+    err = shallow_op_error("set_config", key=key)
+    if err:
+        return err
     if key not in allowed_keys(ctx.role, session_overlay_root()):
         return (f"Error: '{key}' is not in the {ctx.role} design schema; "
                 "declare it with add_config_key first")

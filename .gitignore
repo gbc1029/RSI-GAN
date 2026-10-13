@@ -50,3 +50,4 @@ domains/*/predictions/
 # RQGM baseline bridge: generated data (re-run convert.py to regenerate)
 # ---------------------------------------------------------------------------
 baselines/rqgm_bridge/data/
+.env

@@ -51,6 +51,9 @@ class AccessBroker:
         workspaces_dir: Optional[str | os.PathLike] = None,
         deny_paths: Optional[List[str]] = None,
         deny_deep: bool = False,
+        deep_view_only: bool = False,
+        shallow_prompt_only: bool = False,
+        disable_shallow: bool = False,
         max_files: int = 500,
         max_bytes: int = 50 * 1024 * 1024,
     ):
@@ -64,6 +67,16 @@ class AccessBroker:
         # explicit extra denies (back-compat / tests); allowlist is authoritative
         self.deny_paths = list(deny_paths or [])
         self.deny_deep = deny_deep
+        # B-group ablation switches (docs/11):
+        #   deep_view_only     (B2) -- view grants ok, modify grants refused
+        #   shallow_prompt_only(B3) -- deep surface frozen entirely (like
+        #                             deny_deep) + shallow limited to prompt
+        #   disable_shallow    (B4) -- shallow design operators frozen (deep ok)
+        # B4 (disable_shallow) is enforced at the DESIGN tool layer, not here;
+        # the broker only gates the deep (source-access) surface.
+        self.deep_view_only = bool(deep_view_only)
+        self.shallow_prompt_only = bool(shallow_prompt_only)
+        self.disable_shallow = bool(disable_shallow)
         self.max_files = int(max_files)
         self.max_bytes = int(max_bytes)
         self.grants: Dict[tuple, List[Dict[str, Any]]] = {}
@@ -212,6 +225,24 @@ class AccessBroker:
             shutil.copy2(s, d)
         granted.append(rel)
 
+    # -- deep-access policy ------------------------------------------------
+    def _deep_access_policy(self, intent: str) -> Optional[str]:
+        """Return the ablation policy that forbids this source-access request.
+
+        ``None`` = allowed (falls through to the allowlist). B1 (deny_deep) and
+        B3 (shallow_prompt_only) freeze the ENTIRE deep surface; B2
+        (deep_view_only) only forbids ``modify`` while keeping ``view``.
+        B4 (disable_shallow) does not appear here -- it gates the shallow
+        design surface at the design-tool layer, not the source gate.
+        """
+        if self.deny_deep:
+            return "source_access.deny_deep"
+        if self.shallow_prompt_only:
+            return "ablation.shallow_prompt_only"
+        if self.deep_view_only and intent == "modify":
+            return "ablation.deep_view_only"
+        return None
+
     # -- grant -------------------------------------------------------------
     def grant(
         self,
@@ -235,14 +266,15 @@ class AccessBroker:
         deletions) and is reported in ``last_result["skipped"]`` / the audit record.
         Callers that deliberately want a pristine re-copy must NOT pass it.
         """
-        if self.deny_deep:
-            # Ablation arm: freeze the ENTIRE deep surface for the run. Audit
-            # FIRST (the denial must be visible in events.jsonl), set last_result
-            # (deep tools read it), then raise a dedicated exception the deep
-            # tools translate into a TERMINAL do-not-retry message. Deliberately
-            # NOT appended to self.grants: granted_paths()/covers() walk the
-            # "paths" field of grant records, and a denial must never surface as
-            # a grant.
+        policy = self._deep_access_policy(intent)
+        if policy is not None:
+            # Ablation arm: freeze the deep surface (or just its write side) for
+            # the run. Audit FIRST (the denial must be visible in events.jsonl),
+            # set last_result (deep tools read it), then raise a dedicated
+            # exception the deep tools translate into a TERMINAL do-not-retry
+            # message. Deliberately NOT appended to self.grants:
+            # granted_paths()/covers() walk the "paths" field of grant records,
+            # and a denial must never surface as a grant.
             req = [str(p) for p in (paths_list or [])]
             rec = {
                 "type": "source_access_denied",
@@ -251,13 +283,13 @@ class AccessBroker:
                 "paths": req,
                 "intent": intent,
                 "reason": reason,
-                "policy": "source_access.deny_deep",
+                "policy": policy,
                 "ts": time.time(),
             }
             self.log_event(rec)
             self.last_result = {"granted": [], "denied": req, "missing": []}
             raise SourceAccessDisabled(
-                "deep source access is disabled by source_access.deny_deep")
+                f"deep source access is disabled by {policy}")
         seat = frozen.assert_seat(role, seat)
         granted: List[str] = []
         denied_list: List[str] = []

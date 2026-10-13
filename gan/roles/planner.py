@@ -28,6 +28,22 @@ _DENY_DEEP_NOTE = (
     "Proceed with shallow design/config operators only."
 )
 
+_SHALLOW_PROMPT_ONLY_NOTE = (
+    "\n## Shallow evolution is LIMITED to prompt edits this run\n"
+    "`ablation.shallow_prompt_only=true`: only `set_prompt` / "
+    "`set_config(key=\"prompt\")` are allowed. Component selection "
+    "(`select_component` / `deselect_component`) and deep source access are "
+    "frozen. Do not retry them."
+)
+
+_DISABLE_SHALLOW_NOTE = (
+    "\n## Shallow design operators are DISABLED this run\n"
+    "`ablation.disable_shallow=true`: the design config is frozen. "
+    "`set_prompt` / `set_config` / `select_component` / `deselect_component` "
+    "will be refused. Improve the agent only via deep source access "
+    "(`request_source_access` + `edit_source`)."
+)
+
 
 class Planner(Role):
     def __init__(self, model: str, output_dir: str, instance: Optional[str] = None, **kwargs):
@@ -46,6 +62,8 @@ class Planner(Role):
         parent_benchmark_score: Optional[float] = None,
         cost_statement: str = "",
         deny_deep: bool = False,
+        shallow_prompt_only: bool = False,
+        disable_shallow: bool = False,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -69,6 +87,10 @@ class Planner(Role):
         )
         if deny_deep:
             parts.append(_DENY_DEEP_NOTE)
+        if shallow_prompt_only:
+            parts.append(_SHALLOW_PROMPT_ONLY_NOTE)
+        if disable_shallow:
+            parts.append(_DISABLE_SHALLOW_NOTE)
         if parents and len(parents) > 1:
             parts.append(
                 f"\n## Multiple candidate parents (you may CROSSOVER their designs)\n```json\n"
@@ -149,6 +171,10 @@ class Planner(Role):
                     parent_predicted_score, parent_benchmark_score,
                     cost_statement=cost_statement,
                     deny_deep=bool(getattr(broker, "deny_deep", False))
+                    if broker is not None else False,
+                    shallow_prompt_only=bool(getattr(broker, "shallow_prompt_only", False))
+                    if broker is not None else False,
+                    disable_shallow=bool(getattr(broker, "disable_shallow", False))
                     if broker is not None else False),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
@@ -253,6 +279,10 @@ class Planner(Role):
             )
             if getattr(broker, "deny_deep", False):
                 instruction += _DENY_DEEP_NOTE
+            if getattr(broker, "shallow_prompt_only", False):
+                instruction += _SHALLOW_PROMPT_ONLY_NOTE
+            if getattr(broker, "disable_shallow", False):
+                instruction += _DISABLE_SHALLOW_NOTE
             hist = self.run(instruction, max_tool_calls=max_tool_calls,
                             tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
 
