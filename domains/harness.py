@@ -733,8 +733,9 @@ if __name__ == "__main__":
         "--reasoning_effort", type=str, default=None,
         help="Thinking-intensity knob for reasoning models, forwarded as the "
              "reasoning_effort body field (gateway contract: low|high|max). "
-             "Validated against agent.llm.REASONING_EFFORTS; default = gateway "
-             "default. Resolved from gan/framework/models.yaml by the GAN driver.",
+             "Validated against agent.llm_params.REASONING_EFFORTS; default = "
+             "gateway default. Resolved from gan/framework/models.yaml by the "
+             "GAN driver.",
     )
     args = parser.parse_args()
     if args.reasoning_effort is not None:

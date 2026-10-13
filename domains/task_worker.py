@@ -188,6 +188,56 @@ def _write_json_fd(fd: int, payload) -> None:
         os.close(fd)
 
 
+def _cm_events_path():
+    """Where this child appends its seam events (docs/10 §11.5).
+
+    Sandbox: GAN_CM_EVENTS is the rw-bound sidecar host file
+    (/workspace/cm_events.jsonl <-> <run_dir>/cm_events.jsonl). Local
+    (non-sandbox) runs: the env points at the sandbox view, which does
+    not exist — fall back to the cwd (the run dir). Module-level so BOTH
+    the seam session and the payload-forwarding degradations below can
+    leave a durable trace (no-silent-fail rule)."""
+    path = os.environ.get("GAN_CM_EVENTS") or ""
+    if path and os.path.isdir(os.path.dirname(path) or "."):
+        return path
+    return os.path.join(os.getcwd(), "cm_events.jsonl")
+
+
+def _cm_emit(event):
+    """Audit sink for the child's seam events (cm_view/cm_violation/...):
+    appended to the sidecar and folded into events.jsonl by task_runner.
+    The sink must never break the session — but a failed append is not
+    silent either: the line is preserved in a sibling fallback file and
+    echoed to stderr (when the durable channel itself fails, these two are
+    the only channels left in-process; the fallback file shares the work
+    dir's lifetime, so it is best-effort by design)."""
+    line = json.dumps(dict(event), ensure_ascii=False, default=str)
+    try:
+        with open(_cm_events_path(), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return
+    except OSError as e:
+        fallback = os.path.join(os.getcwd(), "cm_events_failed.jsonl")
+        landed = False
+        try:
+            with open(fallback, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            landed = True
+        except OSError:
+            pass
+        print(f"[cm] sidecar append failed ({e}); event line "
+              + (f"preserved at {fallback}" if landed else "follows")
+              + f": {line[:300]}", flush=True)
+
+
+def _degrade(reason: str, consequence: str = "; running without seam") -> None:
+    """Fail-open LOUDLY: sidecar line + stderr print (the print alone is
+    not durable — harness captures child stdout and the log keeps only a
+    window; the sidecar line is what the audit fold sees)."""
+    _cm_emit({"type": "cm_session_degraded", "reason": reason})
+    print(f"[cm] {reason}{consequence}", flush=True)
+
+
 def _build_cm_session():
     """Reserved cost keys (docs/10 §11 D7): build the context-management
     session for this child from the per-generation snapshot.
@@ -203,37 +253,6 @@ def _build_cm_session():
     events.jsonl by task_runner) AND keeps its stderr print. The one
     legit-abstain path (no GAN_CM_CORE anywhere) is a LOCAL/manual run, not
     a GAN generation — recorded for exactly that reason."""
-    # The sidecar path resolves BEFORE anything can fail, so every
-    # degradation below can leave a durable trace (no-silent-fail rule).
-    def _cm_events_path():
-        """Where this child appends its seam events (docs/10 §11.5).
-
-        Sandbox: GAN_CM_EVENTS is the rw-bound sidecar host file
-        (/workspace/cm_events.jsonl <-> <run_dir>/cm_events.jsonl). Local
-        (non-sandbox) runs: the env points at the sandbox view, which does
-        not exist — fall back to the cwd (the run dir)."""
-        path = os.environ.get("GAN_CM_EVENTS") or ""
-        if path and os.path.isdir(os.path.dirname(path) or "."):
-            return path
-        return os.path.join(os.getcwd(), "cm_events.jsonl")
-
-    def _cm_emit(event):
-        """Audit sink for the child's seam events (cm_view/cm_violation/...):
-        appended to the sidecar and folded into events.jsonl by task_runner.
-        The sink must never break the session."""
-        try:
-            with open(_cm_events_path(), "a", encoding="utf-8") as f:
-                f.write(json.dumps(dict(event), ensure_ascii=False,
-                                   default=str) + "\n")
-        except OSError:
-            pass
-
-    def _degrade(reason: str) -> None:
-        """Fail-open LOUDLY: sidecar line + stderr print (the print alone is
-        not durable — harness captures child stdout and the log keeps only a
-        window; the sidecar line is what the audit fold sees)."""
-        _cm_emit({"type": "cm_session_degraded", "reason": reason})
-        print(f"[cm] {reason}; running without seam", flush=True)
 
     core = os.environ.get("GAN_CM_CORE") or ""
     if not os.path.isdir(core):
@@ -263,9 +282,13 @@ def _build_cm_session():
             if isinstance(cost, dict):
                 keys = {k: v for k, v in cost.items()
                         if isinstance(k, str) and k.startswith("cm_")}
-    except Exception as e:  # noqa: BLE001 -- advisory
-        print(f"[cm] design cm keys unavailable ({e}); using defaults",
-              flush=True)
+    except Exception as e:  # noqa: BLE001 -- fail-open, must SPEAK
+        # The keys degrade to the snapshot defaults: an audible degrade with
+        # a durable sidecar line (no-silent-fail rule; the print alone is
+        # not durable). The seam still RUNS — only its configuration is
+        # downgraded — so the consequence differs from a lost seam.
+        _degrade(f"design cm keys unavailable ({e}); snapshot defaults apply",
+                 consequence="; using default cm keys")
     mode = keys.get("cm_mode") if isinstance(keys.get("cm_mode"), str) else "passthrough"
     # Fixed-name delivery (cm_policy.py / cm_assembly.py in the snapshot):
     # the env pins are static (assemble_task_env and the broker pin the same
@@ -286,7 +309,9 @@ def _build_cm_session():
                 policy_path = fixed
                 if env_policy:
                     _degrade(f"GAN_CM_POLICY={env_policy!r} does not exist; "
-                             "recovered the snapshot's cm_policy.py")
+                             "recovered the snapshot's cm_policy.py",
+                             consequence="; seam runs on the recovered "
+                                         "fixed-name policy")
             else:
                 named = keys.get("cm_policy")
                 _degrade("design requests cm_mode=custom but no policy is "
@@ -339,10 +364,19 @@ def _run_agent_child(result_fd: int) -> None:
             if dropped:
                 print(f"[cost] TaskAgent does not accept {dropped}; "
                       f"budget fields dropped", flush=True)
+                # Print is not durable (PIPE-captured child stdout): the
+                # sidecar line is what the audit fold sees (no-silent-fail).
+                _cm_emit({"type": "cm_session_degraded",
+                          "reason": f"TaskAgent does not accept {dropped}; "
+                                    "budget fields dropped"})
                 for k in dropped:
                     budget_kwargs.pop(k)
-    except (TypeError, ValueError):
-        budget_kwargs = {}
+    except (TypeError, ValueError) as e:
+        # Signature unreadable -> EVERY budget field is dropped: the largest
+        # silent-budget regression this file can produce. Degrade loudly
+        # (sidecar + stderr), never bare.
+        _degrade(f"TaskAgent.__init__ signature unreadable ({e}); ALL payload "
+                 "budget fields dropped", consequence="")
     # Context-management session (docs/10 §11 D7): forwarded like the budget
     # kwargs -- only when the artifact's __init__ accepts it; a modified
     # artifact dropping the seam degrades to the pre-D behaviour (the design
@@ -357,8 +391,17 @@ def _run_agent_child(result_fd: int) -> None:
             else:
                 print("[cost] TaskAgent does not accept ['cm']; "
                       "running without the context-management seam", flush=True)
-        except (TypeError, ValueError):
-            pass
+                # Durable trace: the session was built but is not forwarded,
+                # so its own emit sink (the sidecar) never fires — without
+                # this line the lost seam is indistinguishable from a
+                # passthrough design (no-silent-fail rule).
+                _cm_emit({"type": "cm_session_degraded",
+                          "reason": "TaskAgent does not accept ['cm']; "
+                                    "running without the context-management "
+                                    "seam"})
+        except (TypeError, ValueError) as e:
+            _degrade(f"TaskAgent.__init__ signature unreadable ({e}); the "
+                     "built cm session is NOT forwarded")
     agent = TaskAgent(
         model=payload["model"],
         chat_history_file=payload["trajectory_path"],

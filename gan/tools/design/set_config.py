@@ -1,7 +1,10 @@
 """Design operator: set an EXISTING config key (shallow).
 
-Only keys already defined in the role schema may be set. Adding a NEW key is a
-source-level (deep) change, not a shallow operator.
+Settable: keys already defined in the role schema (the static slots, incl. the
+reserved ``cost`` slot) plus keys DECLARED dynamic via ``add_config_key`` (the
+operator's own text says so and refuses undeclared names). Adding a genuinely
+NEW key is therefore a source-level (deep) change, not a shallow operator: it
+must first be declared (declaration + consumer in the same patch).
 
 The ``tools`` slot (one component slot per role; legacy ``skills``/
 ``eval_points`` names are aliases) goes through the SAME tool validation as

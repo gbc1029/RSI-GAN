@@ -265,14 +265,18 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         blob = read_session(output_dir, outer, genid, role, cap)
         if not blob:
             return f"No session trajectory for genid {genid}."
-        return f"# your session genid={genid}\n{blob}"
+        # The passthrough filter notice must ride the response (it was
+        # computed but never prepended — the exact silent-ignore class this
+        # tool's sibling read_trajectory fixed): empty by default, so the
+        # unfiltered default call stays byte-identical.
+        return note + f"# your session genid={genid}\n{blob}"
     idx = outer_session_index(output_dir, outer, role)
     if not idx:
         return "No session trajectories for this outer yet."
     blob = "\n\n".join(
         read_session(output_dir, outer, e["genid"], role, cap) for e in idx
     )
-    return f"# your sessions this outer: {[e['genid'] for e in idx]}\n{blob[:cap]}"
+    return note + f"# your sessions this outer: {[e['genid'] for e in idx]}\n{blob[:cap]}"
 
 
 op_info = tool_info

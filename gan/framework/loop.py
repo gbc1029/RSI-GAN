@@ -397,7 +397,8 @@ class GanLoop:
                                      ("mode", "turns", "blocks", "ops_total",
                                       "ops_applied", "ops_refused",
                                       "policy_failures", "policy_disabled",
-                                      "violations", "est_chars_saved")
+                                      "violations", "est_chars_saved",
+                                      "emit_failures")
                                      if k in cm_sum}
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass
@@ -1453,7 +1454,8 @@ class GanLoop:
                     # role) — visible sets are untouched.
                     self.planner.session_cm_mode = plan_ck.get("cm_mode")
                 except Exception as e:  # noqa: BLE001 -- advisory stamp
-                    soft_fail(f"session_token_budget stamp failed (planner): {e}")
+                    soft_fail(f"session cost stamp failed (planner: token "
+                              f"budget / cm_mode): {e}")
                 # Context-management session for THIS plan call (docs/10 §11
                 # D11); cleared right after the call (no stamp leak into
                 # self-improve), like ``session_token_budget``.
@@ -1615,7 +1617,8 @@ class GanLoop:
                     # stuck on passthrough).
                     self.evaluator.session_cm_mode = eval_ck.get("cm_mode")
                 except Exception as e:  # noqa: BLE001 -- advisory stamp
-                    soft_fail(f"session_token_budget stamp failed (evaluator): {e}")
+                    soft_fail(f"session cost stamp failed (evaluator: token "
+                              f"budget / cm_mode): {e}")
                 self._emit_cost_keys_applied("evaluator", "evaluate", genid,
                                              eval_ck, eval_clamps)
                 # Context-management session for THIS evaluate call (§11 D11).

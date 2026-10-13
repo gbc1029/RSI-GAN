@@ -378,7 +378,9 @@ def chat_with_agent(
                           # credentials; None -> ambient env (legacy callers).
     load_report_path=None,  # Explicit sink for the toolset LOAD outcome; None
     cm=None,  # Reserved cost keys (docs/10 §11): an optional CM session object
-              # (duck-typed: assemble(msgs, tokens_used, budget) -> msgs).
+              # (duck-typed: assemble_turn(msgs, outgoing, tokens_used, budget)
+              # -> (history_to_send, msg_to_send); `assemble()` is the
+              # direct-form variant for tests/non-chat callers).
               # Wired ONLY by framework callers that built it (loop / task
               # worker); None = pre-D behaviour (no seam at all).
                           # -> $GAN_TOOLS_LOAD_REPORT env fallback (legacy).

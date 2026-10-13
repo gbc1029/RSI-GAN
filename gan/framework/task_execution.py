@@ -451,8 +451,15 @@ def assemble_task_env(
         from gan.framework import paths as _paths
         open(_paths.cm_events_path(run_dir), "a").close()
         env["GAN_CM_EVENTS"] = "/workspace/cm_events.jsonl"
-    except OSError:
-        pass
+    except OSError as e:
+        # The sidecar is the task child's ONLY durable audit channel — its
+        # absence must be as visible as its activity (no-silent-fail rule).
+        # There is no events path in scope here, so the snapshot report is
+        # the trace vehicle: it rides toolset_report.json -> the
+        # task_toolset_assembled event (task_runner folds the whole report).
+        cm_report["sidecar_unavailable"] = str(e)[:160]
+        print(f"[WARN] cm events sidecar unavailable ({e}); the task child "
+              "has no cm audit sink this generation", flush=True)
 
     tools_dir = os.path.join(runtime_dir, "tools")
     # Report what the design selected vs what actually got assembled, PER

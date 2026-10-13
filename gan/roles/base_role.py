@@ -11,6 +11,7 @@ from gan.design.store import DesignStore
 from gan.framework import paths
 from gan.registries.loader import load_registry_for_role
 from gan.tools.assembly import assemble_tools_dir_reported
+from utils.soft_fail import soft_fail
 
 
 def _load_failures(report: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -149,7 +150,7 @@ class Role(AgentSystem):
         # Thinking-intensity knob for this role's every LLM call (resolved from
         # gan/framework/models.yaml by the loop factory). Explicitly threaded --
         # planner/evaluator share one worker process, so env cannot separate
-        # them. None -> GAN_LLM_REASONING_EFFORT env -> gateway default.
+        # them. None -> gateway default (deliberately NO environment fallback).
         self.reasoning_effort = reasoning_effort
         self.output_dir = os.path.abspath(output_dir)
         self.code_root = code_root
@@ -333,8 +334,19 @@ class Role(AgentSystem):
 
                 cm_session.emit = (lambda p: (lambda e: _tlog.append(
                     p, e)))(path)
-            except Exception:  # noqa: BLE001 -- audit sink optional
-                pass
+            except Exception as e:  # noqa: BLE001 -- fail-open, must SPEAK
+                # The session stays alive, but a sink that never attached
+                # means the seam runs UNAUDITED (session._emit no-ops on
+                # emit=None). That difference is exactly what the audit
+                # stream exists to record — so it lands on events.jsonl
+                # (no-silent-fail rule; a bare print is not durable).
+                soft_fail(f"cm emit sink attach failed ({self.role}/"
+                          f"{self.instance or 'default'}): {e}; this "
+                          "session's cm events will not reach the "
+                          "trajectory",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="cm_emit_sink_attach_failed",
+                          role=self.role)
         if cm_session is not None:
             chat_kwargs["cm"] = cm_session
         hist, info = chat_with_agent(

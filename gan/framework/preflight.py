@@ -395,9 +395,13 @@ def cm_component_problems(role: str, code_root: Optional[str] = None
       any agent-owned tool (raw writes / subprocess / dynamic exec) — a
       capability-flagged wrapper cannot ride the registry, so a violation is
       reported as a problem;
-    - a ``policy*.py`` file additionally must pass the frozen no-LLM /
-      no-network gate (``cm.failopen.policy_violations``): the snapshot
-      materialization refuses it otherwise, so report the reason up front.
+    - EVERY pool file (wrapper included) additionally passes the frozen
+      no-LLM / no-network gate (``cm.failopen.policy_violations``) plus the
+      dual-posture import ban (``gan.*`` banned): any pool file can be NAMED
+      as per-turn-executed agent code (``cost.cm_policy`` /
+      ``cost.cm_assembly``, docs/10 §11.8/§11.9), so the gate is pool-wide —
+      the snapshot materialization / session load refuses on it, and this
+      reports the reason before the run starts.
 
     Non-fatal (advisory): the snapshot is the enforcement point; preflight
     only makes the outcome visible before the run starts.

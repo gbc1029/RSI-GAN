@@ -35,18 +35,6 @@ SEGMENT_KINDS = ("turn_output", "tool_call", "tool_output", "plan_ops",
 SEGMENT_FLAGS = ("truncated", "budget_stop", "repeat_break", "traceback")
 
 
-def _iter_lines(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-
 def _classify(row: Dict[str, Any]) -> Optional[str]:
     kind = row.get("kind")
     if kind in ("input", "output"):
@@ -94,29 +82,48 @@ def _flag(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _scan_file(path: str, label: str) -> List[Dict[str, Any]]:
-    """One pass over one file -> segment dicts (metadata + ``text``).
+def _scan_file(path: str, label: str) -> Tuple[List[Dict[str, Any]], int]:
+    """One pass over one file -> (segment dicts, malformed rows skipped).
 
     Every segment is addressable by its ``seg_id`` (``<label>:<line>``) and
     carries its content under ``text`` — the caller projects metadata-only
-    views from the same dicts, so classification never runs twice."""
+    views from the same dicts, so classification never runs twice.
+
+    The line number is the PHYSICAL line in the file — the same number
+    :func:`segment_entry` resolves — so an address stays bound to its row
+    even when the file carries blank/malformed lines (a yielded-row
+    numbering would silently shift every later seg_id and make fetch hit a
+    neighbor). A malformed row is skipped but COUNTED: the count rides the
+    index payload (``skipped_rows``, only when non-zero) so a scan that
+    dropped lines is not indistinguishable from one that read everything
+    (no-silent-fail rule)."""
     segs: List[Dict[str, Any]] = []
-    for lineno, row in enumerate(_iter_lines(path), start=1):
-        kind = _classify(row)
-        if kind is None:
-            continue
-        spec = _segment_content(row)
-        if spec is None:
-            continue
-        text, tool = spec
-        segs.append({
-            "seg_id": f"{label}:{lineno}",
-            "file": label, "line_no": lineno, "kind": kind,
-            "tool": tool,
-            "chars": len(text), "token_est": len(text) // 4,
-            "flag": _flag(row), "text": text,
-        })
-    return segs
+    skipped = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            kind = _classify(row)
+            if kind is None:
+                continue
+            spec = _segment_content(row)
+            if spec is None:
+                continue
+            text, tool = spec
+            segs.append({
+                "seg_id": f"{label}:{lineno}",
+                "file": label, "line_no": lineno, "kind": kind,
+                "tool": tool,
+                "chars": len(text), "token_est": len(text) // 4,
+                "flag": _flag(row), "text": text,
+            })
+    return segs, skipped
 
 
 def _pair(paths: List[str], labels: Optional[List[str]]) -> List[Tuple[str, str]]:
@@ -137,15 +144,23 @@ def build_traj_index(paths: List[str],
     keep several generations' files unambiguous in one index)."""
     segments: List[Dict[str, Any]] = []
     used: List[str] = []
+    skipped = 0
     for path, label in _pair(paths, labels):
         if not path or not os.path.isfile(path):
             continue
         used.append(label)
-        for seg in _scan_file(path, label):
+        file_segs, file_skipped = _scan_file(path, label)
+        skipped += file_skipped
+        for seg in file_segs:
             seg.pop("text", None)
             segments.append(seg)
-    return {"files": used, "segments": segments,
-            "total_chars": sum(s["chars"] for s in segments)}
+    payload: Dict[str, Any] = {"files": used, "segments": segments,
+                               "total_chars": sum(s["chars"] for s in segments)}
+    if skipped:
+        # Absence = a clean scan; presence = the reader knows lines were
+        # dropped (render_index_text surfaces the count).
+        payload["skipped_rows"] = skipped
+    return payload
 
 
 def build_traj_materialization(files: List[Tuple[str, str]]
@@ -155,21 +170,28 @@ def build_traj_materialization(files: List[Tuple[str, str]]
     The payload is the SAME shape ``build_traj_index`` returns (metadata
     only); the texts travel separately so the caller registers content as
     blocks while the index face renders metadata. Missing files are skipped
-    (and absent from ``files`` in the payload)."""
+    (and absent from ``files`` in the payload); malformed rows are skipped
+    and counted (``skipped_rows``)."""
     paths = [p for _l, p in files]
     labels = [l for l, _p in files]
     segments: List[Dict[str, Any]] = []
     texts: Dict[str, str] = {}
     used: List[str] = []
+    skipped = 0
     for path, label in _pair(paths, labels):
         if not path or not os.path.isfile(path):
             continue
         used.append(label)
-        for seg in _scan_file(path, label):
+        file_segs, file_skipped = _scan_file(path, label)
+        skipped += file_skipped
+        for seg in file_segs:
             texts[seg["seg_id"]] = seg.pop("text")
             segments.append(seg)
-    return ({"files": used, "segments": segments,
-             "total_chars": sum(s["chars"] for s in segments)}, texts)
+    payload: Dict[str, Any] = {"files": used, "segments": segments,
+                               "total_chars": sum(s["chars"] for s in segments)}
+    if skipped:
+        payload["skipped_rows"] = skipped
+    return payload, texts
 
 
 def parse_seg_id(text: str) -> Tuple[str, int]:
@@ -256,6 +278,12 @@ def render_index_text(index: Dict[str, Any], max_segments: int = 80,
     if hidden > 0:
         lines.append(f"... {hidden} more segments "
                      "(narrow with kind=/tool=/flag=, page with offset=)")
+    skipped = index.get("skipped_rows")
+    if skipped:
+        # A scan that dropped malformed rows must say so — an index that
+        # silently omits archive lines reads as complete (no-silent-fail).
+        lines.append(f"- note: {skipped} malformed archive row(s) skipped "
+                     "by the scan")
     out = "\n".join(lines)
     if len(out) > max_chars:
         out = out[:max_chars] + "\n...[index truncated; use filters/offset]"

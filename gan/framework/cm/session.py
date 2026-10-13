@@ -266,6 +266,7 @@ class CMSession:
     policy_disabled: bool = False
     violations: int = 0
     est_chars_saved: int = 0
+    emit_failures: int = 0
     _policy_strikes: int = 0
     _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
     # Named-assembly bookkeeping (audit fields materialize WITH the
@@ -344,6 +345,10 @@ class CMSession:
                "policy_disabled": self.policy_disabled,
                "violations": self.violations,
                "est_chars_saved": self.est_chars_saved}
+        if self.emit_failures:
+            # Conditional audit field (absence = a healthy sink): a session
+            # whose event sink dropped lines must not read as fully audited.
+            out["emit_failures"] = self.emit_failures
         if self.assembly_path:
             out["assembly_active"] = self.assembly_active
             out["assembly_failures"] = self.assembly_failures
@@ -359,7 +364,13 @@ class CMSession:
         try:
             self.emit(event)
         except Exception:
-            pass  # the audit sink must never break the session
+            # The audit sink must never break the session — but a sink that
+            # FAILS is a degradation the session must carry, not hide: the
+            # counter surfaces in summary() (the cost record ``cm`` node and
+            # the receipt), which is this module's durable channel exactly
+            # when the event sink itself is the broken part. Recursing into
+            # the broken sink to report the breakage is not an option.
+            self.emit_failures += 1
 
     # ---------------------------------------------------- block registration
     def register_history(self, msgs: List[Dict[str, Any]]) -> None:

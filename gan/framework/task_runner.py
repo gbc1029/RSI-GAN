@@ -93,7 +93,8 @@ class DomainTaskRunner:
         self.sample_seed_base = sample_seed_base
         self.anchor_ids = list(anchor_ids or [])
         # Thinking-intensity knob for the task child's every LLM call; rides
-        # the task env (GAN_LLM_REASONING_EFFORT) like GAN_LLM_TIMEOUT_S.
+        # the stdin payload (explicit transport, never an env — same chain as
+        # the budget fields; the CLI --reasoning_effort argument feeds it).
         # Validated upstream by models.resolve_entry(); None -> gateway default.
         self.reasoning_effort = reasoning_effort
         # Reserved cost-key ceiling (docs/10 §10): loop.yaml

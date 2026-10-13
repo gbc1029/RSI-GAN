@@ -42,8 +42,15 @@ live under `scripts/dgmh/`.
   session build (``loop._resolve_cm_module``, no sort-order discovery — an
   unresolved claim is a loud ``cm_module_unresolved`` and custom degrades to
   the slice preset with its keys rewritten), with per-path sys.modules keys
-  for the parallel self-improve threads and a preflight pool gate), fail-open policy
-  runner, trajectory index; STDLIB-ONLY import contract because it is
+  for the parallel self-improve threads and a preflight pool gate; named
+  modules may export a ``METHODS`` dict of custom methods (harvested
+  all-or-nothing with ``cm_methods_refused``, assembly > policy shadowing,
+  invoked same-level/same-callee via ``handle.call``/``session.call_method``
+  — the caller's own privilege, never an escalation), fail-open policy
+  runner, trajectory index (``materialize_traj`` snapshots the seat's visible
+  trajectories as pinned ``traj_seg`` blocks — one scan per session; the
+  read tools and the ``ctx_`` faces share that single genid-qualified
+  address space); STDLIB-ONLY import contract because it is
   snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
@@ -368,15 +375,29 @@ with a GAN-native data layer.
   `view_state` is on the agent face; `ctx_budget` is a LIVE meter: `chat_with_agent`
   attaches a reader over the run's authoritative usage totals, 实付口径, completed
   tool calls only); `read_trajectory`/`read_session_trajectory` gain a slice front-end
-  (structural index first, `fetch=` materializes one segment) whose mode rides
+  (structural index first, `fetch=` materializes one segment — real params
+  `genid/max_chars/fetch/kind/tool/flag/offset`; segment addresses are
+  genid-qualified `<genid>/<file>:<line>`, ambiguous or stale addresses are
+  refused loudly) whose mode rides
   `AccessContext.session_cm_mode` — stamped per session from the session OWNER's own
   design, presentation-only (trajectory_genids/redaction stay the sole permission
-  surface). Audit: per-turn `cm_view` (aggregate stats + per-op brief with block
+  surface); non-passthrough sessions additionally materialize their visible
+  trajectories as pinned `traj_seg` blocks (`materialize_traj`, one scan per
+  session) so the read tools and the `ctx_` faces share one address space.
+  Audit: per-turn `cm_view` (aggregate stats + per-op brief with block
   refs/rules, no content) + `cm_violation`/`cm_policy_failed`/`cm_policy_disabled`
-  events; the task child's seam events land in a `cm_events.jsonl` sidecar (rw-bound
+  events plus the assembly/policy-surface events (`cm_assembly_fallback`/
+  `cm_assembly_failed`/`cm_assembly_disabled`/`cm_assembly_overrun`/
+  `cm_assembly_ignored`, `cm_module_unresolved`, `cm_methods_refused`,
+  `cm_budget_checkpoint`, `cm_traj_materialized`/`cm_traj_materialize_failed`);
+  a session whose event sink dropped lines carries `emit_failures` in its `cm`
+  summary (absence = a healthy sink); the task child's seam events land in a
+  `cm_events.jsonl` sidecar (rw-bound
   as `/workspace/cm_events.jsonl`) that `DomainTaskRunner._ingest_cm_events` folds
   into events.jsonl with role=task attribution (`cost.json` carries the `task_cm`
-  summary); the session cost record carries a `cm`
+  summary) — every child-side degradation writes a `cm_session_degraded`
+  sidecar line (prints are not durable), and a failed sidecar append falls
+  back to `cm_events_failed.jsonl` + stderr; the session cost record carries a `cm`
   summary (estimated savings are a DERIVED indicator, never billing — the ledger keeps
   实付); receipt `budget.kind` gains `cm` when a session's policy degraded.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable. Task

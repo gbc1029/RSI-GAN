@@ -6,14 +6,22 @@ actually SENT. A block's full text lives only in the universe (and in the raw
 trajectory rows, which are the untouched audit record — 双记); the view
 references it.
 
-Kinds (closed vocabulary — audit texts and policies may only use these):
+Kinds (closed vocabulary — audit texts and policies may only use these;
+RETAINED names nothing materializes yet are marked, so an agent-facing kind
+list must not advertise them):
 ``turn_output``  one LLM turn's text (assistant/user message content)
-``tool_output``  one tool result carried into the conversation
+``tool_output``  one tool result carried into the conversation (in THIS chat
+                 protocol tool results ride inside user turns, so this kind
+                 never materializes here — vocabulary retained, docs/10 §11.5)
 ``traj_seg``     one segment of a prebuilt trajectory index (fetch materializes)
-``kb_note``      one knowledge-base note (materialized read)
+``kb_note``      RETAINED vocabulary, never materialized (knowledge notes are
+                 read via the knowledge tool, not as blocks — docs/10 §12.3 T2)
 ``note``         scratchpad note (ctx_note; auto-pinned — never dropped)
-``boundary``     task question boundary marker
+``boundary``     RETAINED vocabulary: question-boundary marker, no materializing
+                 code path in v1 (multi-question sessions only, docs/10 §11.4)
 ``derived``      compaction product; id ``derived:<op>:<n>``, refs its sources
+                 (v1: ``compact`` marks the source blocks instead — register_derived
+                 is unused; enabled with L4, docs/10 §11.5/§11.7)
 
 View forms: ``full`` | ``head_tail`` | ``excerpt`` | ``placeholder`` | ``template``.
 Rendering is PURE: every form derives from the block's own text or is a
