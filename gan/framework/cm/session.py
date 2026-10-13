@@ -1,7 +1,6 @@
 """CM session: per-chat-run Universe/View + the frozen primitive surface.
 
-The seam (docs/10 §5.2 分一, restructured by the P0/P1 source-level upgrade,
-§11.7): every LLM call passes the session's message history through
+The seam: every LLM call passes the session's message history through
 :meth:`CMSession.assemble_turn` — a DISPATCHER that resolves the session's
 assembly (``cm/assembly.py``: the baseline presets, one per ``cm_mode``)
 and hands the turn to it. The assembly is pure orchestration; the rules
@@ -22,13 +21,13 @@ live in the PRIMITIVES below, each of which validates before it mutates
         outgoing dedup contract
     render / count_ops / emit_view / note_violation                   audit
         and no-fabrication primitives the post segment composes
-    call_method (P3)                       the assembly-face entry to the
+    call_method                            the assembly-face entry to the
         session's registered custom methods — same-level, same-callee: the
         method runs with a policy-face handle whose budget resets each turn
 
-This surface is FROZEN (P1): the baseline presets are named compositions
-over exactly these methods, and the P2 editable assembly resolves through
-the same contract — an assembly can reorder or extend stages, but every
+This surface is FROZEN: the baseline presets are named compositions
+over exactly these methods, and the named agent assemblies resolve
+through the same contract — an assembly can reorder or extend stages, but every
 mutation still passes a validating primitive, so pipeline freedom cannot
 buy rule evasion. View forms PERSIST across turns (a block compacted last
 turn stays compacted; ``fetch`` restores it).
@@ -214,7 +213,7 @@ class ViewHandle:
         return ops.note_list(self._s.notes)
 
     def call(self, name: str, **kwargs) -> Dict[str, Any]:
-        """P3 (docs/10 §11.10): invoke a registered custom method at the
+        """Invoke a registered custom method at the
         CALLER's privilege — the method receives THIS handle (policy face:
         the same op budget, continuous, with ``call`` itself costing one
         unit; agent face: agent-level ops only). Never raises: unknown
@@ -247,7 +246,7 @@ class CMSession:
     emit: Optional[Callable[[Dict[str, Any]], None]] = None
     budget_reader: Optional[Callable[[], Dict[str, Any]]] = None
     policy_path: Optional[str] = None  # custom mode: agent policy module path
-    assembly_path: Optional[str] = None  # P2: named agent-owned assembly module
+    assembly_path: Optional[str] = None  # named agent-owned assembly module
     assembly_exec_ms: int = 200          # per-turn budget for that assembly
     system_prefix: str = ""  # per-turn tool-use header (dedup op target)
     turn: int = 0
@@ -265,7 +264,7 @@ class CMSession:
     est_chars_saved: int = 0
     _policy_strikes: int = 0
     _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
-    # P2 named-assembly bookkeeping (audit fields materialize WITH the
+    # Named-assembly bookkeeping (audit fields materialize WITH the
     # subsystem they describe: a session without an assembly configured has
     # no claim to expose; one with a claim shows activity AND absence)
     assembly_active: bool = False    # the named assembly produced >= 1 turn
@@ -281,7 +280,7 @@ class CMSession:
                                               compare=False)
     # identity-keyed bookkeeping: rewritten shallow copies are not re-registered
     _by_fp: Dict[str, str] = field(default_factory=dict)  # content fp -> bid
-    # P3 custom methods (docs/10 §11.10): registered per session from the
+    # Custom methods: registered per session from the
     # named modules' METHODS export — same-level, same-callee surface. The
     # assembly's harvest registers first; the policy's merges at its first
     # successful load (shadowed names refuse, assembly > policy).
@@ -429,13 +428,12 @@ class CMSession:
         user text for this call. Returns ``(history_to_send, msg_to_send)``.
         The PIPELINE itself is the resolved assembly (``cm/assembly.py``):
         a named preset composition over this session's primitive methods —
-        ``passthrough`` being the identity view (pre-D behaviour, byte
-        identical). Resolution is cached; an unknown mode fails open to the
+        ``passthrough`` being the identity view. Resolution is cached; an unknown mode fails open to the
         slice preset with a loud ``cm_assembly_fallback`` event (the clamp
         authority makes that unreachable in production; a direct
         construction must not degrade silently).
 
-        P2: when the design names an assembly (``assembly_path``), it
+        When the design names an assembly (``assembly_path``), it
         REPLACES the preset composition for every non-passthrough turn —
         loaded once per session, executed under ``cm_assembly_exec_ms``,
         wedge-broken after 2 failures. ``passthrough`` is the ABSOLUTE
@@ -448,7 +446,7 @@ class CMSession:
         every subsequent ``cm_view`` — a fallback is never silent."""
         self.turn += 1
         self._turn_degraded = False
-        self._method_face = None  # per-turn method-face budget reset (P3)
+        self._method_face = None  # per-turn method-face budget reset
         fn = self._assembly_fn
         if fn is None:
             fn, fallback = assembly.resolve(self.mode)
@@ -521,7 +519,7 @@ class CMSession:
 
     def _merge_methods(self, methods: Dict[str, Callable],
                        problems: List[str], source: str) -> None:
-        """Register one named module's custom methods (P3). Refusals speak
+        """Register one named module's custom methods. Refusals speak
         exactly once per source (``cm_methods_refused``, reasons included);
         a policy method whose name an assembly already registered refuses as
         shadowed (assembly > policy, deterministic precedence). All-or-
@@ -560,7 +558,7 @@ class CMSession:
         return rec
 
     def call_method(self, name: str, **kwargs) -> Dict[str, Any]:
-        """Assembly-face entry (P3): run a registered custom method with the
+        """Assembly-face entry: run a registered custom method with the
         session's method-face handle (policy face; budget =
         ``cm_max_ops_per_turn`` reset each turn, so an assembly looping
         calls stays bounded — the call itself costs one unit, exactly like
@@ -735,17 +733,17 @@ class CMSession:
         for rec in records:
             if not isinstance(rec, dict):
                 # A non-dict record would crash the post-segment count PAST
-                # the wedge breaker (registered docs/10 §11.7): one policy
-                # failure, strike-counted, emitted, fail-open — never a seam
-                # crash with only a log line.
+                # the wedge breaker: one policy failure, strike-counted,
+                # emitted, fail-open — never a seam crash with only a log
+                # line.
                 self._note_policy_failure("policy returned a non-dict record")
                 return [{"op": "policy", "ok": False,
                          "error": "policy returned a non-dict record"}]
         self._policy_strikes = 0
-        # P3: harvest the policy's METHODS once per session (a crashing
-        # first turn leaves the flag unset — the next successful load
-        # retries); assembly registrations take precedence (shadowed policy
-        # names refuse with a recorded reason).
+        # Harvest the policy's METHODS once per session (a crashing first
+        # turn leaves the flag unset — the next successful load retries);
+        # assembly registrations take precedence (shadowed policy names
+        # refuse with a recorded reason).
         if not self._methods_policy_done:
             self._methods_policy_done = True
             self._merge_methods(methods, method_problems, source="policy")

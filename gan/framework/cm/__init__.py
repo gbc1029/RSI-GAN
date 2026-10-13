@@ -3,7 +3,7 @@
 The frozen pool-A implementation of the seam 三分架构: block model, the
 frozen primitive surface, the per-turn seam DISPATCH (``session.assemble_turn``
 resolves the pipeline from ``assembly.py`` — the named baseline presets per
-``cm_mode``, and since P2 the named agent-owned assemblies/policies), the
+``cm_mode`` plus the named agent-owned assemblies/policies), the
 trajectory index builder and the fail-open policy runner.
 
 IMPORT CONTRACT (load-bearing): this package is copied VERBATIM into the task

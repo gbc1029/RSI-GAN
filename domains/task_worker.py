@@ -296,7 +296,7 @@ def _build_cm_session():
                          + "); running PASSTHROUGH instead")
                 # The degrade CLAIMS passthrough — the keys must say it too,
                 # or apply_keys would still build a custom session whose
-                # every turn fails on the missing policy (observed class).
+                # every turn fails on the missing policy.
                 mode = "passthrough"
                 keys = dict(keys)
                 keys["cm_mode"] = "passthrough"

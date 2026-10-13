@@ -163,9 +163,7 @@ class _TaskBrokerState:
             # env pins are static and pinnable here (the runner's env never
             # crosses this boundary). A generation whose design names no
             # module leaves the file absent; the child degrades loudly on
-            # that claim-vs-snapshot gap instead of guessing (the pre-P2
-            # sort-first self-discovery picked assembly.py once the core
-            # grew — the ambiguity class this closes).
+            # that claim-vs-snapshot gap instead of guessing at candidates.
             "GAN_CM_POLICY": "/workspace/.gan_runtime/cm/cm_policy.py",
             "GAN_CM_ASSEMBLY": "/workspace/.gan_runtime/cm/cm_assembly.py",
             # Per-question wall + per-call client budget, pinned at root-side

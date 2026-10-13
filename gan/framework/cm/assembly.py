@@ -1,4 +1,4 @@
-"""Baseline CM assembly — the SOURCE-level pipeline layer (docs/10 §11.7).
+"""Baseline CM assembly — the source-level pipeline layer.
 
 The per-turn seam is no longer welded into ``CMSession``: each ``cm_mode``
 preset is a NAMED COMPOSITION over the session's frozen primitive methods,
@@ -8,16 +8,16 @@ management path the user asked for:
 
     view = context_manager(state)   ==   assemble(session, ...)(state)
 
-through "原语/自定义方法 经排列组合、条件选择组建". The P2 source level (the
-``cm_assembly`` design key — governance review pending) resolves an
-agent-owned assembly through exactly this module's contract:
+The pipeline composes primitives (and custom methods) by arrangement and
+conditional selection; a named agent-owned assembly (the ``cm_assembly``
+design key) resolves through exactly this module's contract:
 
     assemble(session, msgs, outgoing, tokens_used, budget)
         -> (history_to_send, msg_to_send)
 
 so config level (``cm_*`` keys -> session parameters + preset selection)
-and source level (this file, later an editable component) are two entry
-points into the SAME mechanism.
+and source level (this file plus the named agent assemblies) are two
+entry points into the SAME mechanism.
 
 Invariants do NOT live here — every mutation goes through a session
 primitive that validates before it mutates (拒绝即不动), and the post
@@ -53,7 +53,7 @@ def assemble_passthrough(session, msgs, outgoing,
                          tokens_used: int = 0,
                          budget: Optional[int] = None
                          ) -> Tuple[List[Dict[str, Any]], str]:
-    """``passthrough`` preset — the identity view (pre-D behaviour).
+    """``passthrough`` preset — the identity view.
 
     Register everything for the audit face, send everything, substitute
     nothing. The sent history is per-ENTRY copies: the LLM client's
@@ -98,9 +98,9 @@ def assemble_compact_conservative(session, msgs, outgoing,
     kept) instead of the slice preset's whole-turn placeholder. The excerpt
     pass runs BEFORE the window pass because the window skips
     already-substituted blocks (sticky forms): an excerpted turn is not
-    placeholder-dropped on top of its excerpt (docs/10 §11.5 erratum — the
-    compaction target is the old USER turn, which carries the embedded
-    tool outputs in this chat protocol)."""
+    placeholder-dropped on top of its excerpt (the compaction target is the
+    old USER turn, which carries the embedded tool outputs in this chat
+    protocol)."""
     session.register_history(msgs)
     out_block = session.register_outgoing(outgoing)
     records: List[Dict[str, Any]] = []
@@ -134,9 +134,9 @@ def assemble_custom(session, msgs, outgoing,
     return session.finalize_turn(msgs, outgoing, out_block, records)
 
 
-# The shipped baseline presets (docs/10 §5.2 分一: the fixed pipeline order
-# becomes the slice/compact_conservative/custom compositions; passthrough
-# stays the identity). Frozen in v1 — editing a preset is a framework batch.
+# The shipped baseline presets: the fixed pipeline order as named
+# compositions (passthrough stays the identity). Editing a preset is a
+# framework batch — the agent extensibility point is the named assembly.
 BASELINE_ASSEMBLY: Dict[str, AssembleFn] = {
     "passthrough": assemble_passthrough,
     "slice": assemble_slice,
@@ -154,10 +154,10 @@ def resolve(mode: str) -> Tuple[AssembleFn, Optional[str]]:
     authority makes unknown modes unreachable in production, and a direct
     construction must never degrade silently (no-silent-failure rule).
 
-    P1 scope: ``mode`` selects a shipped baseline preset. P2 (this file's
-    second half): ``load_assembly`` resolves a NAMED agent-owned assembly
-    module through the same contract, budgeted and wedge-broken by the
-    session — the baseline presets remain the fail-open target."""
+    ``mode`` selects a shipped baseline preset; ``load_assembly`` resolves
+    a NAMED agent-owned assembly module through the same contract, budgeted
+    and wedge-broken by the session — the baseline presets remain the
+    fail-open target."""
     fn = BASELINE_ASSEMBLY.get(mode)
     if fn is None:
         return BASELINE_ASSEMBLY["slice"], "slice"
@@ -165,7 +165,7 @@ def resolve(mode: str) -> Tuple[AssembleFn, Optional[str]]:
 
 
 # ---------------------------------------------------------------------------
-# P2: the named agent-owned assembly (docs/10 §11.8)
+# Named agent-owned assemblies
 # ---------------------------------------------------------------------------
 
 class AssemblyError(Exception):
@@ -178,7 +178,7 @@ class AssemblyTimeout(Exception):
 
 
 # ---------------------------------------------------------------------------
-# P3: custom methods (docs/10 §11.10) — same-level, same-callee surface
+# Custom methods — same-level, same-callee surface
 # ---------------------------------------------------------------------------
 
 _METHOD_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -194,7 +194,7 @@ def _reserved_names() -> "set[str]":
 
 
 def method_problems(name: Any) -> Optional[str]:
-    """The registration rule for ONE custom-method name (docs/10 §11.10):
+    """The registration rule for ONE custom-method name:
     lowercase identifier, no leading underscore / dunder, no ``ctx_`` prefix
     (the tool identity contract), never a reserved primitive/handle name."""
     if not isinstance(name, str) or not _METHOD_NAME_RE.match(name):
@@ -292,7 +292,7 @@ def load_assembly(path: str) -> Tuple[Callable, Dict[str, Callable], List[str]]:
     the contract check (a callable ``assemble``). Any refusal raises
     :class:`AssemblyError` — the session turns that into ONE loud
     ``cm_assembly_fallback`` and runs the baseline preset for the session.
-    ``METHODS`` harvest (P3) is ADDITIVE: its problems are returned, never
+    The ``METHODS`` harvest is ADDITIVE: its problems are returned, never
     raised — a module with an illegal method group still runs as the
     pipeline; the caller speaks the refusal (``cm_methods_refused``)."""
     from .failopen import policy_violations

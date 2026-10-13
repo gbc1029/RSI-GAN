@@ -210,22 +210,21 @@ def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
     """Copy the frozen CM core (+ the agent-owned CM modules the task design
     NAMES) into ``<run_dir>/.gan_runtime/cm/`` and return the snapshot report.
 
-    Pool-A delivery for the task child (docs/10 §11.0.1): the run dir has no
-    ``gan/``; the snapshot imports as top-level ``cm`` and depends on stdlib
-    only. Since P2 (docs/10 §11.8) the agent modules are NAMED SLOTS resolved
-    against the CODE ROOT the child's patch was (or was not) applied to —
-    the committed bytes the generation runs with (the run-dir copy itself
-    has no gan/; there is no workspace dual provenance for the child):
+    Pool-A delivery for the task child: the run dir has no ``gan/``; the
+    snapshot imports as top-level ``cm`` and depends on stdlib only. The
+    agent modules are NAMED SLOTS resolved against the CODE ROOT the
+    child's patch was (or was not) applied to — the committed bytes the
+    generation runs with (the run-dir copy itself has no gan/; there is no
+    workspace dual provenance for the child):
 
     - ``cost.cm_assembly`` (non-passthrough modes): the agent-owned
       assembly, delivered as ``cm_assembly.py``; it REPLACES the cm_mode
       preset composition, failing open to it;
     - ``cost.cm_policy`` (custom mode): the agent-owned policy, delivered
-      as ``cm_policy.py``. The pre-P2 selection was ``sorted(os.listdir())[0]``
-      — a second candidate file silently changed which one ran — so the
-      named slot is the only authoritative form; the sort-first scan
-      survives ONLY as the loudly-annotated legacy path for unnamed designs
-      (``policy_selection: "legacy_sort_first"``).
+      as ``cm_policy.py``. Selection is BY NAME only; the sort-first scan
+      survives as the loudly-annotated legacy path for unnamed designs
+      (``policy_selection: "legacy_sort_first"``) — under sort order, adding
+      a second candidate file silently changes which one runs.
 
     Every refusal lands in ``skipped`` with a reason — a named module that
     cannot be delivered is a LOUD delivery gap, never a silent fallback."""
@@ -303,9 +302,9 @@ def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
                 report["policy"] = named.strip()
                 report["policy_selection"] = "named"
         else:
-            # legacy path (unnamed design): the pre-P2 sort-first scan,
-            # loudly annotated — adding a second candidate file changes
-            # which one runs, which is exactly why the named slot exists.
+            # legacy path (unnamed design): the sort-first scan, loudly
+            # annotated — under sort order adding a second candidate file
+            # changes which one runs; the named slot prevents exactly that.
             policy_name = None
             if code_root:
                 policy_dir = os.path.join(code_root, "gan", "components",

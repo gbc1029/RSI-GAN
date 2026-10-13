@@ -566,7 +566,7 @@ class GanLoop:
 
     def _resolve_cm_module(self, role: str, stem: Any,
                            outer: Any = None) -> Optional[str]:
-        """P3 (docs/10 §11.9): resolve a design-named CM module
+        """Resolve a design-named CM module
         (``cost.cm_policy`` / ``cost.cm_assembly``) to a loadable path —
         WORKSPACE-FIRST (the role's live self-edit surface for this outer),
         committed tree second, the same rule ``list_components`` and the deep
@@ -601,24 +601,24 @@ class GanLoop:
         framework event stream (role-attributed). Advisory: any failure
         degrades to no seam (pre-D behaviour), never fatal.
 
-        P3 (docs/10 §11.9): the design may NAME agent-owned CM modules —
+        The design may NAME agent-owned CM modules —
         resolved workspace-first at build time and handed to the session, so
-        the P2 execution contract (load gate, per-turn budget, wedge breaker,
+        the execution contract (load gate, per-turn budget, wedge breaker,
         loud fallback) applies unchanged in-process. A named module that
         cannot be resolved is a LOUD claim-vs-tree gap
         (``cm_module_unresolved``): an assembly claim degrades to the
         baseline preset; ``cm_mode=custom`` without a resolvable policy
         degrades to the slice preset — the keys' ``cm_mode`` is rewritten
-        too, so the degrade says what it actually runs (mirroring the task
-        worker's fix; a bare local ``mode`` swap left a session that failed
-        on the missing policy every turn)."""
+        too, so the degrade says what it actually runs (rewriting only a
+        local variable would leave the session building ``custom`` and
+        failing on the missing policy every turn)."""
         if keys is None:
             return None
         try:
             from gan.framework.cm import build_session
             cm_keys = {k: v for k, v in keys.items()
                        if isinstance(k, str) and k.startswith("cm_")}
-            # P3 named slots: resolve claims against the role's OWN tree.
+            # Named slots: resolve claims against the role's OWN tree.
             assembly_path = None
             named_asm = cm_keys.get("cm_assembly")
             if isinstance(named_asm, str) and named_asm.strip():
@@ -1014,10 +1014,10 @@ class GanLoop:
         exhausted = bool(plan_result.get("budget_exhausted"))
         truncated = bool(plan_result.get("truncated"))
         tb_exhausted = bool(plan_result.get("token_budget_exhausted"))
-        # Context management (docs/10 §11 D12): a degraded CM session (policy
-        # disabled / failures) is a budget-state fact of its own kind. P2
-        # (docs/10 §11.8): assembly degradation degrades the seam the same
-        # way — the receipt must say so too (the summary only carries the
+        # Context management: a degraded CM session (policy disabled /
+        # failures) is a budget-state fact of its own kind. Assembly
+        # degradation degrades the seam the same way — the receipt must say
+        # so too (the summary only carries the
         # assembly fields when an assembly was configured, so a baseline
         # session is unaffected).
         cm_degraded = bool(cm_summary and (

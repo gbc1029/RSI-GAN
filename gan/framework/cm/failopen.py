@@ -64,7 +64,7 @@ def policy_violations(path: str) -> List[str]:
 def load_policy(path: str):
     """Import the policy module from an explicit file path (snapshot).
     Returns ``(module, methods, method_problems)``. The AST gate runs first
-    (fail-closed); the ``METHODS`` harvest (P3, docs/10 §11.10) is ADDITIVE
+    (fail-closed); the ``METHODS`` harvest is ADDITIVE
     — its problems are returned, never raised.
 
     The sys.modules registration key is UNIQUE PER PATH (hash suffix): the
@@ -94,7 +94,7 @@ def run_policy(path: Optional[str], handle: Any, exec_ms: int
                ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any], List[str]]:
     """Execute the policy's apply() under the execution budget.
 
-    Returns ``(records, over_ms, methods, method_problems)`` — the P3
+    Returns ``(records, over_ms, methods, method_problems)`` — the
     ``METHODS`` harvest rides the successful load (the caller merges it
     once per session). Raises on crash/timeout (the session's wedge breaker
     counts the failure and fails open)."""
