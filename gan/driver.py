@@ -135,12 +135,13 @@ def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
     trajectory_log.append(paths.events_path(output_dir), event)
 
 
-def _outer_env(base: Dict[str, str], *, proxy_socket: str,
-               task_broker_socket: str, outer: int,
+def _outer_env(base: Dict[str, str], *, task_broker_socket: str, outer: int,
                role_broker_socket: str,
                role_accounts: Dict[str, Dict[str, Any]],
-               code_root: str) -> Dict[str, str]:
+               code_root: str,
+               proxy_socket: Optional[str] = None) -> Dict[str, str]:
     """Return the small non-secret environment inherited by outer_worker."""
+    del proxy_socket  # compatibility argument; the outer must not receive this endpoint
     allowed = {
         "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
         "PYTHONPATH", "PYTHONDONTWRITEBYTECODE",
@@ -157,7 +158,6 @@ def _outer_env(base: Dict[str, str], *, proxy_socket: str,
     # timeout so the proxy is never the first to cut a healthy call.
     env["GAN_LLM_TIMEOUT_S"] = str(
         os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
-    env["GAN_LLM_PROXY_UNIX"] = proxy_socket
     env["GAN_TASK_BROKER_UNIX"] = task_broker_socket
     env["GAN_TASK_BROKER_OUTER"] = str(int(outer))
     env["GAN_ROLE_BROKER_UNIX"] = role_broker_socket
@@ -182,11 +182,13 @@ def _add_empty_parents(command: List[str], path: str, created: set) -> None:
 
 
 def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
-                          code_root: str, proxy_socket: str,
+                          code_root: str,
+                          proxy_socket: Optional[str] = None,
                           task_broker_socket: Optional[str] = None,
                           role_broker_socket: Optional[str] = None,
                           env_mask_file: Optional[str] = None) -> List[str]:
     """Run outer_worker in a no-network view with only its run inputs mounted."""
+    del proxy_socket  # compatibility argument; role/task brokers mount it directly
     bwrap = shutil.which("bwrap")
     if not bwrap:
         raise RuntimeError(
@@ -216,7 +218,7 @@ def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
             raise RuntimeError(f"outer sandbox bind source is missing: {source}")
         _add_empty_parents(command, target, created)
         command.extend([mode, source, target])
-    sockets = [proxy_socket]
+    sockets = []
     if task_broker_socket:
         sockets.append(task_broker_socket)
     if role_broker_socket:
@@ -397,6 +399,20 @@ def _trusted_root_tool(name: str) -> str:
     return path
 
 
+def _trusted_ipc_parent() -> str:
+    """Choose a root-controlled parent that cannot rename the IPC directory."""
+    for path in ("/run", "/tmp"):
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if (stat.S_ISDIR(info.st_mode) and info.st_uid == 0
+                and ((info.st_mode & 0o022) == 0
+                     or (info.st_mode & stat.S_ISVTX) != 0)):
+            return path
+    raise RuntimeError("secure IPC requires a root-owned /run or sticky /tmp")
+
+
 def _start_task_broker(socket_path: str, config: Dict[str, Any]) -> _TaskBrokerController:
     if "fork" not in multiprocessing.get_all_start_methods():
         raise RuntimeError("secure TaskAgent launch requires POSIX fork support")
@@ -555,9 +571,8 @@ def run_gan_driver(
         "planner": model_registry.resolve("gan.planner"),
         "evaluator": model_registry.resolve("gan.evaluator"),
     }
-    proxy_dir = tempfile.mkdtemp(prefix="rsi-gan-proxy-")
-    os.chmod(proxy_dir, 0o755)
-    os.chown(proxy_dir, owner_uid, owner_gid)
+    proxy_dir = tempfile.mkdtemp(prefix="rsi-gan-proxy-", dir=_trusted_ipc_parent())
+    os.chmod(proxy_dir, 0o711)
     proxy_socket = os.path.join(proxy_dir, "p.sock")
     task_broker_socket = os.path.join(proxy_dir, "task.sock")
     role_broker_socket = os.path.join(proxy_dir, "role.sock")
@@ -570,8 +585,14 @@ def run_gan_driver(
         # (observed: default 120s cut thinking calls at 121s -> 502 -> the
         # question budget burned on doomed retries).
         timeout=float(cfg.get("loop.llm_proxy_timeout_s", 700)),
+        socket_uids=[
+            int(sandbox_account.pw_uid),
+            int(role_accounts["planner"]["uid"]),
+            int(role_accounts["evaluator"]["uid"]),
+        ],
+        setfacl_path=setfacl_path,
     )
-    proxy_control_token = proxy.issue_framework_scope(0)
+    proxy_control_token = proxy.issue_framework_scope(0, peer_uid=0)
     safe_broker_env = {
         key: value for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -601,6 +622,7 @@ def run_gan_driver(
         "setfacl": setfacl_path,
         "bwrap": bwrap_path,
         "sandbox_username": sandbox_username,
+        "sandbox_uid": int(sandbox_account.pw_uid),
         "proxy_socket": proxy_socket,
         "proxy_control_token": proxy_control_token,
         "task_llm_max_calls": (
@@ -609,7 +631,11 @@ def run_gan_driver(
         ),
         "base_env": safe_broker_env,
     }
-    task_broker = _start_task_broker(task_broker_socket, broker_config)
+    try:
+        task_broker = _start_task_broker(task_broker_socket, broker_config)
+    except Exception:
+        shutil.rmtree(proxy_dir, ignore_errors=True)
+        raise
     try:
         role_broker = _start_role_broker(role_broker_socket, {
             "output_dir": output_dir,
@@ -625,13 +651,17 @@ def run_gan_driver(
             "proxy_socket": proxy_socket,
             "proxy_control_token": proxy_control_token,
             "llm_timeout_s": str(os.environ.get("GAN_LLM_TIMEOUT_S", "600")),
+            "ipc_dir": proxy_dir,
         })
     except Exception:
         task_broker.close()
         shutil.rmtree(proxy_dir, ignore_errors=True)
         raise
-    proxy_started = False
     try:
+        with open(env_mask_file, "w", encoding="utf-8"):
+            pass
+        os.chmod(env_mask_file, 0o444)
+        proxy.bind()
         _drop_driver_privileges(owner_uid, owner_gid, owner_username)
         os.makedirs(output_dir, exist_ok=True)
         if not os.access(output_dir, os.R_OK | os.W_OK | os.X_OK):
@@ -688,21 +718,19 @@ def run_gan_driver(
             if not preflight_mod.all_ok(results):
                 raise RuntimeError(f"model preflight failed: {results}")
 
-        with open(env_mask_file, "w", encoding="utf-8"):
-            pass
-        os.chmod(env_mask_file, 0o400)
         proxy.start()
-        proxy_started = True
         for outer in range(start, G + 1):
             role_proxy_tokens = {
                 "planner": {
                     seat: proxy.issue_scope(
-                        "planner", str(outer), models["planner"], seat=seat)
+                        "planner", str(outer), models["planner"], seat=seat,
+                        peer_uid=int(role_accounts["planner"]["uid"]))
                     for seat in ("plan", "self_improve")
                 },
                 "evaluator": {
                     seat: proxy.issue_scope(
-                        "evaluator", str(outer), models["evaluator"], seat=seat)
+                        "evaluator", str(outer), models["evaluator"], seat=seat,
+                        peer_uid=int(role_accounts["evaluator"]["uid"]))
                     for seat in ("evaluate", "self_improve")
                 },
             }
@@ -721,8 +749,7 @@ def run_gan_driver(
                 if resume:
                     cmd += ["--resume-boundary", "outer"]
                 env = _outer_env(
-                    os.environ, proxy_socket=proxy_socket,
-                    task_broker_socket=task_broker_socket,
+                    os.environ, task_broker_socket=task_broker_socket,
                     outer=outer,
                     role_broker_socket=role_broker_socket,
                     role_accounts=role_accounts,
@@ -730,7 +757,7 @@ def run_gan_driver(
                 )
                 proc = subprocess.Popen(
                     _outer_worker_command(
-                        cmd, repo_root, output_dir, code_root, proxy_socket,
+                        cmd, repo_root, output_dir, code_root,
                         task_broker_socket=task_broker_socket,
                         role_broker_socket=role_broker_socket,
                         env_mask_file=env_mask_file,
@@ -774,8 +801,11 @@ def run_gan_driver(
                                 "duration_s": round(time.time() - _driver_t0, 1)})
         return code_root
     finally:
-        if proxy_started:
+        try:
             proxy.close()
-        task_broker.close()
-        role_broker.close()
-        shutil.rmtree(proxy_dir, ignore_errors=True)
+        finally:
+            try:
+                task_broker.close()
+            finally:
+                role_broker.close()
+                shutil.rmtree(proxy_dir, ignore_errors=True)

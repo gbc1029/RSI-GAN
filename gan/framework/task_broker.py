@@ -240,6 +240,7 @@ class _TaskBrokerState:
             model,
             ttl_s=float(self.config["timeout"]) + 60.0,
             max_calls=int(self.config["task_llm_max_calls"]),
+            peer_uid=int(self.config["sandbox_uid"]),
         )
         try:
             proxy_token_fd = _sealed_secret_fd(proxy_token)
@@ -296,11 +297,35 @@ class _TaskBrokerState:
 
 
 class _TaskRequestHandler(socketserver.StreamRequestHandler):
+    def setup(self) -> None:
+        super().setup()
+        self._deadline = threading.Timer(10.0, self._expire_deadline)
+        self._deadline.daemon = True
+        self._deadline.start()
+
+    def finish(self) -> None:
+        self._clear_deadline()
+        super().finish()
+
+    def _expire_deadline(self) -> None:
+        try:
+            self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _clear_deadline(self) -> None:
+        deadline = getattr(self, "_deadline", None)
+        if deadline is not None:
+            deadline.cancel()
+            self._deadline = None
+
     def handle(self) -> None:
         raw = self.rfile.readline(_MAX_REQUEST_BYTES + 1)
         if not raw or len(raw) > _MAX_REQUEST_BYTES:
             _reply(self, {"ok": False, "error": "invalid task broker request"})
             return
+        self._clear_deadline()
+        self.request.settimeout(None)
         try:
             request = json.loads(raw.decode("utf-8"))
             if not isinstance(request, dict) or set(request) != {"outer", "scope_id"}:
@@ -329,6 +354,32 @@ _UnixStreamServer = getattr(socketserver, "UnixStreamServer", socketserver.TCPSe
 
 class _TaskUnixServer(socketserver.ThreadingMixIn, _UnixStreamServer):
     daemon_threads = True
+    request_queue_size = 8
+
+    def server_activate(self) -> None:
+        self._connection_slots = threading.BoundedSemaphore(8)
+        super().server_activate()
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(10.0)
+        return request, address
+
+    def process_request(self, request, client_address) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
 
 
 def broker_process_main(control: Connection, socket_path: str,
@@ -340,7 +391,7 @@ def broker_process_main(control: Connection, socket_path: str,
     thread = None
     try:
         if os.path.lexists(socket_path):
-            os.unlink(socket_path)
+            raise RuntimeError(f"task broker socket path already exists: {socket_path}")
         state = _TaskBrokerState(config)
         server = _TaskUnixServer(socket_path, _TaskRequestHandler)
         server.state = state  # type: ignore[attr-defined]

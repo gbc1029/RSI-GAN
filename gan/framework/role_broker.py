@@ -869,11 +869,35 @@ def _reply(handler: socketserver.StreamRequestHandler, payload: Dict[str, Any]) 
 
 
 class _RoleRequestHandler(socketserver.StreamRequestHandler):
+    def setup(self) -> None:
+        super().setup()
+        self._deadline = threading.Timer(10.0, self._expire_deadline)
+        self._deadline.daemon = True
+        self._deadline.start()
+
+    def finish(self) -> None:
+        self._clear_deadline()
+        super().finish()
+
+    def _expire_deadline(self) -> None:
+        try:
+            self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _clear_deadline(self) -> None:
+        deadline = getattr(self, "_deadline", None)
+        if deadline is not None:
+            deadline.cancel()
+            self._deadline = None
+
     def handle(self) -> None:
         raw = self.rfile.readline(_MAX_AUTH_BYTES + 1)
         if not raw or len(raw) > _MAX_AUTH_BYTES:
             _reply(self, {"ok": False, "error": "invalid role broker request"})
             return
+        self._clear_deadline()
+        self.request.settimeout(None)
         process = None
         fds: List[int] = []
         role = ""
@@ -927,6 +951,42 @@ _UnixStreamServer = getattr(socketserver, "UnixStreamServer", socketserver.TCPSe
 
 class _RoleUnixServer(socketserver.ThreadingMixIn, _UnixStreamServer):
     daemon_threads = True
+    request_queue_size = 8
+
+    def server_activate(self) -> None:
+        self._connection_slots = threading.BoundedSemaphore(8)
+        super().server_activate()
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(10.0)
+        return request, address
+
+    def process_request(self, request, client_address) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
+
+
+def _cleanup_ipc_dir(config: Dict[str, Any], socket_path: str) -> None:
+    ipc_dir = os.path.realpath(str(config["ipc_dir"]))
+    if os.path.dirname(os.path.realpath(socket_path)) != ipc_dir:
+        raise RuntimeError("role broker IPC directory does not contain its socket")
+    info = os.lstat(ipc_dir)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        raise RuntimeError("role broker IPC directory has an unexpected owner or type")
+    shutil.rmtree(ipc_dir)
 
 
 def broker_process_main(control: Connection, socket_path: str, config: Dict[str, Any]) -> None:
@@ -935,7 +995,7 @@ def broker_process_main(control: Connection, socket_path: str, config: Dict[str,
     thread = None
     try:
         if os.path.lexists(socket_path):
-            os.unlink(socket_path)
+            raise RuntimeError(f"role broker socket path already exists: {socket_path}")
         state = _RoleBrokerState(config)
         server = _RoleUnixServer(socket_path, _RoleRequestHandler)
         server.state = state  # type: ignore[attr-defined]
@@ -990,4 +1050,8 @@ def broker_process_main(control: Connection, socket_path: str, config: Dict[str,
                 os.unlink(socket_path)
         except OSError:
             pass
+        try:
+            _cleanup_ipc_dir(config, socket_path)
+        except Exception as exc:  # noqa: BLE001 -- preserve the protected directory
+            print(f"[ERROR] role broker IPC directory cleanup failed: {exc}", flush=True)
         control.close()

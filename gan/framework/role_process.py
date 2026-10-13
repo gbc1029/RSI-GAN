@@ -730,6 +730,7 @@ def _runtime_report() -> Dict[str, Any]:
 def _worker_main() -> None:
     reader = sys.stdin
     protocol_writer = sys.stdout
+    relay = None
     try:
         init = _read_message(reader)
         _exact_keys(
@@ -765,6 +766,14 @@ def _worker_main() -> None:
             if not proxy_token.startswith("sk-gan-"):
                 raise PermissionError("role worker proxy capability is invalid")
             os.environ[f"GAN_PROXY_{role_name.upper()}_TOKEN"] = proxy_token
+            proxy_socket = os.environ.get("GAN_LLM_PROXY_UNIX", "")
+            if not proxy_socket:
+                raise PermissionError("role worker proxy socket is missing")
+            from gan.framework.llm_relay import LocalLLMRelay
+            relay = LocalLLMRelay(proxy_socket, proxy_token)
+            relay_port = relay.start()
+            os.environ["OPENAI_API_BASE"] = f"http://127.0.0.1:{relay_port}/v1"
+            os.environ.pop("OPENAI_API_KEY", None)
         from gan.framework import paths as role_paths
         from utils import trajectory_log as role_trajectory_log
         original_append = role_trajectory_log.append
@@ -801,6 +810,8 @@ def _worker_main() -> None:
         _write_message(protocol_writer, {
             "v": _PROTOCOL_VERSION, "type": "error", "error": _error_payload(exc)
         })
+        if relay is not None:
+            relay.close()
         return
 
     while True:
@@ -809,6 +820,8 @@ def _worker_main() -> None:
             request = _read_message(reader)
             if request.get("type") == "shutdown":
                 _exact_keys(request, {"v", "type"}, "shutdown request")
+                if relay is not None:
+                    relay.close()
                 return
             _exact_keys(
                 request,
@@ -860,6 +873,8 @@ def _worker_main() -> None:
                 "assembly_report": role.assembly_report,
             })
         except EOFError:
+            if relay is not None:
+                relay.close()
             return
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)
