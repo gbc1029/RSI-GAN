@@ -315,7 +315,13 @@ with a GAN-native data layer.
   self-written code or adversarial leakage must be ruled out (see v4.14).
 - **Tool dispatch net (batch 27)**: the tool loop's single execution chokepoint
   `agent/llm_withtools.py:process_tool_call` packages every call with three
-  dispatch-level guarantees — **C1** a per-call timeout (`loop.tool_call_timeout_s`,
+  dispatch-level guarantees — **P-b required pre-check**: a call missing its
+  declared `input_schema.required` params is refused BEFORE tool code runs with
+  a uniform `dispatch_rejected` error (presence-only, no type checks — an
+  unvalidated schema must not false-reject; a missing/malformed `required`
+  skips the check and the TypeError fallback in `_run_captured` stays as the
+  schema/signature-drift backstop; edit_source additionally has its own
+  hand-rolled declared-input precheck); **C1** a per-call timeout (`loop.tool_call_timeout_s`,
   roles via `Role.run` → instance attribute; task child 240s under the harness
   QUESTION_TIMEOUT) with a per-tool wedge breaker (2 wedges → disabled for the
   session, events `tool_wedged`/`tool_disabled`; wedged threads are non-daemon, so

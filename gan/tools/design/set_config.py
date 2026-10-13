@@ -90,10 +90,13 @@ def tool_function(key, value, **kwargs):
         # Frozen framework setting: role model is not an evolvable design value.
         value = {k: v for k, v in value.items() if k != "model"}
     if key == "prompt":
-        # ``set_config(key="prompt")`` is the same act as set_prompt. Capture the
-        # replaced value BEFORE the assignment and record the same structural
-        # facts.
-        from gan.tools.design.set_prompt import _seed_prompt
+        # ``set_config(key="prompt")`` is the same act as set_prompt: the SAME
+        # P-a validation (shared chokepoint, cannot drift), then the same
+        # structural facts. Capture the replaced value BEFORE the assignment.
+        from gan.tools.design.set_prompt import _seed_prompt, prompt_write_error
+        err = prompt_write_error(value)
+        if err:
+            return err
         prev = (ctx.config or {}).get("prompt") or ""
         extra.update(prompt_change_facts(prev, value, seed=_seed_prompt(ctx.role)))
     ctx.config[key] = value

@@ -142,6 +142,31 @@ def _dispatch_precheck(tool_name, tool_input):
     return None
 
 
+def _required_missing(entry, tool_input):
+    """Generic ``input_schema.required`` presence check (P-b, dispatch level).
+
+    Refuses a call whose REQUIRED parameters are absent BEFORE tool code runs,
+    replacing the bare ``TypeError`` fallback with a uniform, fixable message.
+    Deliberately minimal:
+    - the schema is trusted only STRUCTURALLY -- a missing or malformed
+      ``required`` (schemas are not structure-validated; ops_review R-a③)
+      skips the check entirely and falls back to the TypeError backstop;
+    - presence only, NO type checks: an unvalidated schema must not be able
+      to reject calls the tool itself would accept;
+    - a non-dict ``tool_input`` counts as missing everything declared;
+    - the TypeError fallback in ``_run_captured`` stays as the backstop for
+      schema/signature drift (a C1/C2 concern never arises here: the call
+      fails before any tool work starts).
+    """
+    info = entry.get("info") if isinstance(entry, dict) else None
+    schema = info.get("input_schema") if isinstance(info, dict) else None
+    req = schema.get("required") if isinstance(schema, dict) else None
+    if not isinstance(req, list):
+        return []
+    given = tool_input if isinstance(tool_input, dict) else {}
+    return [k for k in req if isinstance(k, str) and k not in given]
+
+
 def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
     """Execute one tool call with the dispatch-level safety net.
 
@@ -150,6 +175,8 @@ def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
 
     - ``wedged`` / ``wedge_limit`` / ``tool_disabled`` -- C1 timeouts and the
       per-tool breaker;
+    - ``dispatch_rejected``                        -- input refused BEFORE tool
+      code (edit_source declared-input checks / missing required params, P-b);
     - ``truncated`` / ``original_chars``             -- C2 central cap;
     - ``tool_stdout`` / ``tool_stderr``              -- C3 captured output
       (stderr means the tool escaped its own error handling; audit-only).
@@ -170,6 +197,13 @@ def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
         return (f"Error: tool '{tool_name}' is DISABLED for this session: it wedged "
                 f"{meta['wedges']} time(s). Fix the tool's hang cause before retrying "
                 f"(or use another tool to make progress).", {"tool_disabled": True})
+
+    # P-b: refuse calls missing their declared REQUIRED params before any tool
+    # code runs (uniform message instead of the raw TypeError fallback).
+    missing = _required_missing(entry, tool_input)
+    if missing:
+        return (f"Error: tool '{tool_name}' is missing required parameter(s): "
+                f"{', '.join(missing)}", {"dispatch_rejected": True})
 
     fn = entry["function"]
     ctx = contextvars.copy_context()

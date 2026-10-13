@@ -299,21 +299,21 @@
 |---|---|---|---|
 | S-a | **B5 止血**：`bash`/`editor` 移出 task 可选面（从 `shared.json` 拆出 task 专用注册表，或 `select_component` 对 task 加 kind/name 黑名单） | `gan/registries/shared.json`、`select_component.py:41-45` | **高** |
 | S-b | task 侧新增独立工具预算键（如 `loop.task_max_tool_calls`）并在 `task_agent.py` 传入 → N8 | `loop.yaml:14-15`、`task_agent.py:58-66` | 低 |
-| S-c | task 的 design 快照与实际装配结果做一致性回执（哪些 skills 实际加载/被跳过） | `task_execution.py:76`、`task_runner.py` | 低 |
+| S-c | task 的 design 快照与实际装配结果做一致性回执（哪些 skills 实际加载/被跳过） | `task_execution.py:76`、`task_runner.py` | 低 |【✅ 判定闭合·2026-10-13 审查轮】B27 装配报告+第 14 批加载报告已构成完整对账链（heal→逐代快照→selected/assembled/skipped 带因→load 结果→events+node meta→evaluator/planner 双投影），skipped 即带因差额；见已办留档 §6.1 处置批（二）。
 
 ### 9.3 装配
 
 | # | 建议 | 落点 | 优先级 |
 |---|---|---|---|
-| A-a | **同名检测（T1 完整版）**：装配时对目标目录做 basename 唯一性检查，冲突即报错（或加命名空间前缀）。注意按 N1 扩大到**整个目标目录**（含 design/deep 与 opt-in 之间） | `gan/tools/assembly.py:106-114` | 中 |
+| A-a | **同名检测（T1 完整版）**：装配时对目标目录做 basename 唯一性检查，冲突即报错（或加命名空间前缀）。注意按 N1 扩大到**整个目标目录**（含 design/deep 与 opt-in 之间） | `gan/tools/assembly.py:106-114` | 中 |【复核闭合·2026-10-13 审查轮】四道门（B16 注册期硬拒/B17+第 28 批提交期差分/preflight 启动期/`py_files_in` 同源）逐一在位核实，可达可持久面已封死；残余=装配期本体检查（=T1，暂不做，docs/7 L1036）+`loop.toolset_preflight: false` 退出边+会话内 ws-first 遮蔽（不可持久）；见已办留档 §6.1 处置批（二）。
 | A-b | **选择静默降级 → 显式化**：`selected_module_paths` 遇 `p=None` 时记 `events.jsonl` 事件 + 写入 receipt 字段（"design 声称 X，实际未装配"） | `assembly.py:50-67`；`receipt.py` | 中 |
 
 ### 9.4 提示词注入 / 调用 / 返回
 
 | # | 建议 | 落点 | 优先级 |
 |---|---|---|---|
-| P-a | `set_prompt` 增加长度上限与空值校验（与 `set_config` 共用同一写入函数，消除 N9 双写） | `set_prompt.py:17-23`、`set_config.py:29-35` | 低 |
-| P-b | 参数按 `input_schema.required` 在 `process_tool_call` 前置校验（缺失/类型不符 → 明确 Error 而非 `TypeError` 兜底） | `agent/llm_withtools.py:81-88` | 低 |
+| P-a | `set_prompt` 增加长度上限与空值校验（与 `set_config` 共用同一写入函数，消除 N9 双写） | `set_prompt.py:17-23`、`set_config.py:29-35` | 低 |【✅ 兑现·2026-10-13】共享校验器 `prompt_write_error`+`PROMPT_MAX_CHARS=20_000`（seed ≤5.6k，~3.5× 余量），`set_prompt` 与 `set_config(key="prompt")` 双路径于任何写入/record 之前接入；空/纯空白/非 str/超限拒绝（空值语义裁决=拒绝，非"重置为 seed"）；"消 N9 双写"半边此前已由 B29 闭合。见已办留档 §6.1 处置批（二）。 |
+| P-b | 参数按 `input_schema.required` 在 `process_tool_call` 前置校验（缺失/类型不符 → 明确 Error 而非 `TypeError` 兜底） | `agent/llm_withtools.py:81-88` | 低 |【✅ 兑现·2026-10-13】`process_tool_call` 前置 `_required_missing`（presence-only 不查类型——未校验 schema 不得误拒；schema 缺失/畸形跳过检查，R-a③ 维持登记；`_run_captured` TypeError 保留为 schema/签名漂移兜底）。见已办留档 §6.1 处置批（二）。 |
 | P-c | 工具返回值统一 cap（在回填处对 `tool_output` 做全局截断，而非依赖各工具自带） | `llm_withtools.py:167-173` | 低 |
 
 ### 9.5 信息传递（与 F1/R4/G5 同批）
