@@ -62,3 +62,16 @@ state即任务、当前步骤、历史轨迹、可用上下文块、工具输出
 # 延后
 parent选择器层面，延后，现仅记录
 将成本纳入task agent甚至roles的parent选择。
+
+# 预期设计：
+主管理路径：
+    view = context_manager(state),
+    context_manager通过“原语”/自定义方法 经排列组合、条件选择组建
+辅助管理：
+    read-trajectory的slice索引策略和自由筛选策略（后者即select-trajectory，理论属于context_manager的子集）。
+    当前read-trajectory冻结不可变，需要另外修改。
+    索引策略基本落地，自由筛选未实现
+主反馈路径：
+    在会话中直接注入成本信息
+    （已基本实现）
+通过tools为agent提供主动成本探查能力，并辅助成本和上下文管理，而不是主力
