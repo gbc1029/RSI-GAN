@@ -43,7 +43,10 @@ def tool_info():
                 "genid": {"description": "Target generation id (must be visible)."},
                 "max_chars": {"type": "integer"},
                 "fetch": {"description": "Materialize one segment by seg_id "
-                                        "(slice mode only)."},
+                                        "(any mode: the slice index lists the "
+                                        "seg_ids; without it the segment is "
+                                        "resolved directly from the archived "
+                                        "trajectory)."},
                 "kind": {"description": "Index filter: segment kind "
                                         "(turn_output|tool_call|tool_output|plan_ops|stop_record)."},
                 "tool": {"description": "Index filter: tool name."},
