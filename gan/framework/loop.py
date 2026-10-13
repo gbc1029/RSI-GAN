@@ -564,18 +564,96 @@ class GanLoop:
                         "genid": str(genid), "keys": dict(keys or {}),
                         "clamped": list(clamps or [])})
 
-    def _build_cm_session(self, role: str, keys: Optional[Dict[str, Any]]) -> Any:
+    def _resolve_cm_module(self, role: str, stem: Any,
+                           outer: Any = None) -> Optional[str]:
+        """P3 (docs/10 §11.9): resolve a design-named CM module
+        (``cost.cm_policy`` / ``cost.cm_assembly``) to a loadable path —
+        WORKSPACE-FIRST (the role's live self-edit surface for this outer),
+        committed tree second, the same rule ``list_components`` and the deep
+        tools scan with. Resolved ONCE at session build; the session runs
+        that version all session long (no mid-session hot reload). No
+        sort-order discovery: the named slot is the only form for in-process
+        roles — an unnamed or unresolvable claim degrades LOUDLY (the caller
+        emits ``cm_module_unresolved``)."""
+        if not isinstance(stem, str) or not stem.strip():
+            return None
+        stem = stem.strip()
+        rel = os.path.join("gan", "components", role, "cm", stem + ".py")
+        if outer is not None and self.broker is not None:
+            try:
+                cand = os.path.join(self.broker.src_dir(role, f"outer_{outer}"),
+                                    rel)
+                if os.path.isfile(cand):
+                    return cand
+            except Exception:  # noqa: BLE001 -- advisory resolution; the
+                # committed-tree fallback below still applies
+                pass
+        if self.code_root:
+            cand = os.path.join(self.code_root, rel)
+            if os.path.isfile(cand):
+                return cand
+        return None
+
+    def _build_cm_session(self, role: str, keys: Optional[Dict[str, Any]],
+                          outer: Any = None) -> Any:
         """Per-session context-management session (docs/10 §11 D11): built from
         this role's ALREADY-CLAMPED effective ``cm_*`` keys; events ride the
         framework event stream (role-attributed). Advisory: any failure
-        degrades to no seam (pre-D behaviour), never fatal."""
+        degrades to no seam (pre-D behaviour), never fatal.
+
+        P3 (docs/10 §11.9): the design may NAME agent-owned CM modules —
+        resolved workspace-first at build time and handed to the session, so
+        the P2 execution contract (load gate, per-turn budget, wedge breaker,
+        loud fallback) applies unchanged in-process. A named module that
+        cannot be resolved is a LOUD claim-vs-tree gap
+        (``cm_module_unresolved``): an assembly claim degrades to the
+        baseline preset; ``cm_mode=custom`` without a resolvable policy
+        degrades to the slice preset — the keys' ``cm_mode`` is rewritten
+        too, so the degrade says what it actually runs (mirroring the task
+        worker's fix; a bare local ``mode`` swap left a session that failed
+        on the missing policy every turn)."""
         if keys is None:
             return None
         try:
             from gan.framework.cm import build_session
             cm_keys = {k: v for k, v in keys.items()
                        if isinstance(k, str) and k.startswith("cm_")}
-            session = build_session(cm_keys)
+            # P3 named slots: resolve claims against the role's OWN tree.
+            assembly_path = None
+            named_asm = cm_keys.get("cm_assembly")
+            if isinstance(named_asm, str) and named_asm.strip():
+                assembly_path = self._resolve_cm_module(role, named_asm, outer)
+                if assembly_path is None:
+                    soft_fail(
+                        f"cm_assembly={named_asm.strip()!r} unresolved for "
+                        f"{role} (no workspace/committed module); the "
+                        "baseline preset runs instead",
+                        event_path=paths.events_path(self.output_dir),
+                        event_type="cm_module_unresolved", role=role,
+                        kind="assembly", stem=named_asm.strip())
+            policy_path = None
+            if cm_keys.get("cm_mode") == "custom":
+                named_pol = cm_keys.get("cm_policy")
+                if isinstance(named_pol, str) and named_pol.strip():
+                    policy_path = self._resolve_cm_module(role, named_pol, outer)
+                if policy_path is None:
+                    stem = (named_pol.strip()
+                            if isinstance(named_pol, str) and named_pol.strip()
+                            else None)
+                    soft_fail(
+                        f"cm_mode=custom without a resolvable policy for "
+                        f"{role} (stem={stem!r}); degrading to the slice "
+                        "preset for this session",
+                        event_path=paths.events_path(self.output_dir),
+                        event_type="cm_module_unresolved", role=role,
+                        kind="policy", stem=stem)
+                    # The degrade CLAIMS the slice preset — the keys must say
+                    # it too, or apply_keys would still build a custom
+                    # session whose every turn fails on the missing policy.
+                    cm_keys = dict(cm_keys)
+                    cm_keys["cm_mode"] = "slice"
+            session = build_session(cm_keys, policy_path=policy_path,
+                                    assembly_path=assembly_path)
             session.emit = (lambda r: (lambda e: self.log_event(
                 {**e, "role": r})))(role)
             return session
@@ -1312,7 +1390,8 @@ class GanLoop:
                 # Context-management session for THIS plan call (docs/10 §11
                 # D11); cleared right after the call (no stamp leak into
                 # self-improve), like ``session_token_budget``.
-                self.planner.cm_session = self._build_cm_session("planner", plan_ck)
+                self.planner.cm_session = self._build_cm_session("planner", plan_ck,
+                                                                 outer=outer)
                 self._emit_cost_keys_applied("planner", "plan", genid,
                                              plan_ck, plan_clamps)
 
@@ -1472,7 +1551,8 @@ class GanLoop:
                 self._emit_cost_keys_applied("evaluator", "evaluate", genid,
                                              eval_ck, eval_clamps)
                 # Context-management session for THIS evaluate call (§11 D11).
-                self.evaluator.cm_session = self._build_cm_session("evaluator", eval_ck)
+                self.evaluator.cm_session = self._build_cm_session("evaluator", eval_ck,
+                                                                   outer=outer)
                 cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair,
                                                            own_budget=eval_ck.get("evaluate_token_budget"))
                 eval_cost_kwargs: Dict[str, Any] = {}
@@ -1706,7 +1786,7 @@ class GanLoop:
                         # follows the role's OWN self-design (no leak from the
                         # plan/evaluate stamps above).
                         role_obj.session_cm_mode = ck_si.get("cm_mode")
-                        role_obj.cm_session = self._build_cm_session(role, ck_si)
+                        role_obj.cm_session = self._build_cm_session(role, ck_si, outer=outer)
                     except Exception as e:  # noqa: BLE001 -- advisory stamp
                         # A swallowed degradation must SPEAK (no-silent-fail
                         # rule, AGENTS.md): without this event the session's

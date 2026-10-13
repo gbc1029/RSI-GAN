@@ -37,7 +37,12 @@ live under `scripts/dgmh/`.
   ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the
   child env pins are static; load-once per session, per-turn exec budget,
   2-strike wedge breaker, fail-open to the preset — every fallback leaves
-  durable events + ``degraded``/``assembly_disabled`` cm_view stats), fail-open policy
+  durable events + ``degraded``/``assembly_disabled`` cm_view stats; the P3
+  in-process p/e seats resolve the SAME named slots workspace-first at
+  session build (``loop._resolve_cm_module``, no sort-order discovery — an
+  unresolved claim is a loud ``cm_module_unresolved`` and custom degrades to
+  the slice preset with its keys rewritten), with per-path sys.modules keys
+  for the parallel self-improve threads and a preflight pool gate), fail-open policy
   runner, trajectory index; STDLIB-ONLY import contract because it is
   snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),

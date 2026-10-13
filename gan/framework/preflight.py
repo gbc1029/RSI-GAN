@@ -410,6 +410,7 @@ def cm_component_problems(role: str, code_root: Optional[str] = None
         return out
     from gan.framework.ast_checker import policy_reason
     from gan.framework.cm.failopen import policy_violations
+    from gan.framework.cm.assembly import _gan_import_problems
     for path in sorted(base.glob("*.py")):
         if path.name == "__init__.py":
             continue
@@ -417,10 +418,16 @@ def cm_component_problems(role: str, code_root: Optional[str] = None
         reason = policy_reason(str(path), rel)
         if reason:
             out.append({"file": rel, "check": "ast_policy", "reason": reason})
-        if path.name.startswith("policy"):
-            problems = policy_violations(str(path))
-            if problems:
-                out.append({"file": rel, "check": "cm_policy_gate",
-                            "reason": "; ".join(problems)[:200]})
+        # P3 (docs/10 §11.9): ANY cm-pool file may be named as agent CM code
+        # (cost.cm_policy / cost.cm_assembly) and then executed EVERY turn
+        # in-process — so the frozen agent-code gate + the dual-posture
+        # import rule run over the whole pool here, before the run starts.
+        # Advisory early signal; the load-time gate remains the enforcement
+        # point (and the snapshot refuses at materialization).
+        problems = (policy_violations(str(path))
+                    + _gan_import_problems(str(path)))
+        if problems:
+            out.append({"file": rel, "check": "cm_agent_gate",
+                        "reason": "; ".join(problems)[:200]})
     return out
 

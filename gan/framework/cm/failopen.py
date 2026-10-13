@@ -63,11 +63,20 @@ def policy_violations(path: str) -> List[str]:
 
 def load_policy(path: str):
     """Import the policy module from an explicit file path (snapshot).
-    Returns the module or raises. The AST gate runs first (fail-closed)."""
+    Returns the module or raises. The AST gate runs first (fail-closed).
+
+    The sys.modules registration key is UNIQUE PER PATH (hash suffix): the
+    in-process p/e seats run in PARALLEL threads and may load different
+    policy modules concurrently — a fixed name would let them clobber each
+    other's registration. Same path replaces its own entry (no unbounded
+    growth: the per-turn reload reuses one key)."""
+    import hashlib
     problems = policy_violations(path)
     if problems:
         raise ImportError("policy refused by AST gate: " + "; ".join(problems))
-    name = "cm_policy_user"
+    name = ("cm_policy_user_"
+            + hashlib.sha1(os.path.abspath(path).encode("utf-8", "replace")
+                           ).hexdigest()[:10])
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load policy module from {path}")

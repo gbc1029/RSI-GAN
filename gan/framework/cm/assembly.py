@@ -36,6 +36,7 @@ from __future__ import annotations
 import ast
 import concurrent.futures
 import importlib.util
+import os
 import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -213,11 +214,19 @@ def load_assembly(path: str) -> AssembleFn:
     problems = policy_violations(path) + _gan_import_problems(path)
     if problems:
         raise AssemblyError("assembly refused at load: " + "; ".join(problems)[:200])
-    spec = importlib.util.spec_from_file_location("cm_assembly_user", path)
+    # sys.modules key UNIQUE PER PATH: parallel in-process sessions (p/e
+    # self-improve threads) loading DIFFERENT assemblies must not clobber
+    # each other's registration; same path replaces its own entry (the
+    # session loads once, so growth is bounded by distinct modules anyway).
+    import hashlib
+    name = ("cm_assembly_user_"
+            + hashlib.sha1(os.path.abspath(path).encode("utf-8", "replace")
+                           ).hexdigest()[:10])
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise AssemblyError(f"cannot load assembly module from {path}")
     module = importlib.util.module_from_spec(spec)
-    sys.modules["cm_assembly_user"] = module
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     fn = getattr(module, "assemble", None)
     if not callable(fn):
