@@ -50,6 +50,7 @@ from gan.framework import checkpoint as ckpt
 from gan.framework import cost_ledger
 from gan.framework import cost_keys
 from gan.framework import paths, scores, trajectory
+from gan.framework import ledger as ledger_mod
 from gan.framework.loader import load_registry, resolve_domain
 from gan.framework.reward.evaluator_reward import build_feedback_digest
 from gan.framework.reward.packet import RewardPacket
@@ -126,8 +127,15 @@ class GanLoop:
         planner_factory: Optional[Callable[[int], Any]] = None,
         evaluator_factory: Optional[Callable[[int], Any]] = None,
         code_root: Optional[str] = None,
+        ledger_writer: Optional[Any] = None,
     ):
         self.output_dir = os.path.abspath(output_dir)
+        # B46 step-1 gate: the per-run WriterToken guards every decision-grade
+        # artifact write (scores / design configs / checkpoints). build_gan_loop
+        # mints one and threads it everywhere; a directly-constructed loop
+        # auto-mints so legacy constructions keep working (the token gates the
+        # WRITE API surface, it is not a secret).
+        self.ledger_writer = ledger_writer or ledger_mod.open_run(self.output_dir)
         self.domains = list(domains)
         self.cfg = cfg
         self.planner = planner
@@ -833,6 +841,7 @@ class GanLoop:
             designs=ckpt.snapshot_designs(self.output_dir, ["planner", "evaluator"]),
             index=(outer if boundary == "outer" else None),
             code=code,
+            writer=self.ledger_writer,
         )
 
     def _refresh_roles(self, outer: int) -> None:
@@ -916,7 +925,7 @@ class GanLoop:
                 "coverage": child.value.coverage,
                 "report_sha": child.meta.get("report_sha"),
                 "valid_parent": child.valid_parent,
-            })
+            }, writer=self.ledger_writer)
         except Exception as e:
             soft_fail(f"scores append failed for genid {child.genid}: {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -955,7 +964,8 @@ class GanLoop:
             # role's next self-improve sees its own heal.
             from gan.design.store import DesignStore
             from gan.framework.task_execution import heal_design_slots, heal_design_keys
-            store = DesignStore(paths.design_root(self.output_dir))
+            store = DesignStore(paths.design_root(self.output_dir),
+                                writer=self.ledger_writer)
             cfg = store.load(role)
             stripped = heal_design_keys(cfg, role, self.code_root)
             stripped += heal_design_slots(cfg, role, self.code_root)
@@ -1254,7 +1264,8 @@ class GanLoop:
         if not payload:
             return False
         ckpt.restore_trees(self.output_dir, payload.get("trees") or {})
-        ckpt.restore_designs(self.output_dir, payload.get("designs") or {})
+        ckpt.restore_designs(self.output_dir, payload.get("designs") or {},
+                             writer=self.ledger_writer)
         self.task_tree = TreeStore(self.output_dir, "task").load()
         self.planner_tree = TreeStore(self.output_dir, "planner").load()
         self.evaluator_tree = TreeStore(self.output_dir, "evaluator").load()

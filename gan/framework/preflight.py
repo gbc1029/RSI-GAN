@@ -214,11 +214,13 @@ def observed_capabilities(role: str, code_root: Optional[str] = None
         if prof.get("framework_owned"):
             return
         if (prof.get("observed_mutating") or prof.get("observed_subprocess")
-                or prof.get("observed_dynamic_exec") or prof.get("findings")):
+                or prof.get("observed_dynamic_exec")
+                or prof.get("observed_ledger_writer") or prof.get("findings")):
             out.append({"name": name, "path": path, "observed": {
                 "mutating": prof.get("observed_mutating", False),
                 "subprocess": prof.get("observed_subprocess", False),
                 "dynamic_exec": prof.get("observed_dynamic_exec", False),
+                "ledger_writer": prof.get("observed_ledger_writer", False),
             }, "findings": prof.get("findings", [])})
 
     for name, info in always_on_index(role, code_root=code_root).items():
@@ -310,7 +312,8 @@ def catalog_stale(role: str, code_root: Optional[str] = None,
 
 
 def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
-                            roles: Iterable[str] = ("planner", "evaluator")
+                            roles: Iterable[str] = ("planner", "evaluator"),
+                            writer: Optional[Any] = None,
                             ) -> Dict[str, Any]:
     """Strip unreachable ``tools`` names from role designs, keep forensics.
 
@@ -338,7 +341,7 @@ def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
     from gan.framework.task_execution import heal_design_slots, heal_design_keys
 
     out: Dict[str, Any] = {"checked": [], "stripped": [], "errors": []}
-    store = DesignStore(design_root)
+    store = DesignStore(design_root, writer=writer)
     for role in roles:
         path = store.path(role)
         if not os.path.exists(path):

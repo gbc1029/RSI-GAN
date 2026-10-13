@@ -145,6 +145,7 @@ class Role(AgentSystem):
         code_root: Optional[str] = None,
         attempt_id: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        ledger_writer: Optional[Any] = None,
     ):
         self.role = role
         # Thinking-intensity knob for this role's every LLM call (resolved from
@@ -173,7 +174,11 @@ class Role(AgentSystem):
             except (IndexError, ValueError):
                 self.outer = None
         self.prompt_text = prompt_text or ""
-        self.design_store = DesignStore(paths.design_root(self.output_dir))
+        # B46 step-1 gate: design saves go through the run's WriterToken
+        # (threaded from build_gan_loop; None keeps read-only stores working).
+        self.ledger_writer = ledger_writer
+        self.design_store = DesignStore(paths.design_root(self.output_dir),
+                                        writer=ledger_writer)
         self.registry = self._load_registry()
         chf = chat_history_file or self.default_chat_path(role)
         os.makedirs(os.path.dirname(chf), exist_ok=True)

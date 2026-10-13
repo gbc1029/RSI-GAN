@@ -104,11 +104,12 @@ python -m domains.report  --domain paper_review --dname ./outputs/demo
 
 Tests / verification scripts are kept locally under `scripts/local/` (gitignored).
 The tool-management regression suites (per-role registries, deep gate, P→E
-projections) live there too: run `venv_nat/bin/python
+projections, ledger write gate) live there too: run `venv_nat/bin/python
 scripts/local/run_tool_regression.py` before and after touching `gan/tools/`,
-`gan/registries/`, `gan/framework/{access,task_execution,receipt,loop}.py` or the
-design operators — three suites (deep gate S1–S4 / batch-6 unification /
-batch-8 isolation), one subprocess each.
+`gan/registries/`, `gan/framework/{access,task_execution,receipt,loop,
+scores,checkpoint,ledger}.py`, `gan/design/store.py` or the
+design operators — six suites (deep gate / batch-6 unification / batch-8
+isolation / c-dispatch / dynamic-keys / ledger-gate), one subprocess each.
 
 ## Offline run analysis (scripts/local/, gitignored)
 
@@ -254,6 +255,17 @@ with a GAN-native data layer.
   raw writes, subprocesses, and dynamic execution in agent-owned Python. Framework
   plumbing is explicitly exempt because it legitimately writes state; this AST
   check is defense in depth, not a replacement for a real sandbox.
+- **Ledger write gate (B46 step-1)**: the decision-grade artifacts
+  (`scores.jsonl`, design configs, checkpoints) are written only through guarded
+  framework entry points that require the per-run `WriterToken`
+  (`gan/framework/ledger.py`, minted once in `build_gan_loop` and threaded
+  explicitly — never env, never module-global). Unguarded writes raise
+  `LedgerAccessError`; agent-owned source importing a guarded writer module
+  (`gan.framework.scores` / `gan.design.store` / `gan.framework.checkpoint`) is
+  refused on the registry path and at the commit gate via the same AST issues
+  channel (`observed_ledger_writer`). The token is an identity, not a secret —
+  file-level tamper DETECTION is deferred step 2 (hash chain, unchanged
+  trigger); regression suite: `scripts/local/regress_ledger_gate.py`.
 - **Access boundary**: the frozen role allowlist also defines the read surface
   (read/write) — `task`: none; `planner`: read+write t-set ∪ p-set; `evaluator`:
   read t-set (read-only) + read/write e-set. Everything else is frozen by default;

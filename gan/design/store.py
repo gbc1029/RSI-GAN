@@ -6,11 +6,17 @@ import os
 from typing import Any, Dict, Optional
 
 from gan.design.schema import default_config, normalize_config
+from gan.framework.ledger import WriterToken, guard_writer
 
 
 class DesignStore:
-    def __init__(self, root: str | os.PathLike):
+    def __init__(self, root: str | os.PathLike, writer: Optional[WriterToken] = None):
         self.root = os.path.abspath(str(root))
+        # B46 step-1 gate: saves require the per-run ledger WriterToken (reads
+        # stay open -- every construction site may load). The token is minted
+        # once per run in build_gan_loop and threaded explicitly; None keeps
+        # read-only stores construction-only.
+        self._writer = writer
 
     def path(self, role: str, node_id: Any = None) -> str:
         if role == "task" and node_id is not None:
@@ -28,6 +34,7 @@ class DesignStore:
         return default_config(role)
 
     def save(self, config: Dict[str, Any], role: str, node_id: Any = None) -> str:
+        guard_writer(self._writer, f"design config ({role})")
         p = self.path(role, node_id)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         # Atomic write. The design file is authoritative and every role

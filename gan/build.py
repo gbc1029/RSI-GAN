@@ -20,7 +20,7 @@ from gan.roles.planner import Planner
 from gan.framework.task_runner import DomainTaskRunner
 
 
-def _seed_self_designs(output_dir: str) -> None:
+def _seed_self_designs(output_dir: str, ledger_writer=None) -> None:
     """First-time initialization of planner/evaluator self-designs.
 
     An existing design file is AUTHORITATIVE — including deliberately empty
@@ -30,7 +30,7 @@ def _seed_self_designs(output_dir: str) -> None:
     corrupt file cannot crash-loop the per-outer worker). Safe to call any number
     of times (``build_gan_loop`` runs once per outer worker).
     """
-    store = DesignStore(paths.design_root(output_dir))
+    store = DesignStore(paths.design_root(output_dir), writer=ledger_writer)
     for role in ("planner", "evaluator"):
         path = store.path(role)
         if os.path.exists(path):
@@ -136,7 +136,13 @@ def build_gan_loop(
     e_model, e_effort = e_entry["model"], e_entry.get("reasoning_effort")
 
     os.makedirs(output_dir, exist_ok=True)
-    _seed_self_designs(output_dir)
+    # B46 step-1 gate (docs/7 appendix 26): one WriterToken per run, minted at
+    # the single assembly point and threaded explicitly to every guarded
+    # writer (scores / design stores / checkpoints). Never exported via env,
+    # never stored module-global.
+    from gan.framework.ledger import open_run as _ledger_open_run
+    ledger_writer = _ledger_open_run(output_dir)
+    _seed_self_designs(output_dir, ledger_writer=ledger_writer)
 
     code_root = ensure_code_root(repo_root, output_dir) if code_repo else None
 
@@ -147,12 +153,12 @@ def build_gan_loop(
     def _planner_factory(outer: int, attempt: str):
         return Planner(p_model, output_dir, instance=f"outer_{outer}",
                        code_root=code_root, attempt_id=attempt,
-                       reasoning_effort=p_effort)
+                       reasoning_effort=p_effort, ledger_writer=ledger_writer)
 
     def _evaluator_factory(outer: int, attempt: str):
         return Evaluator(e_model, output_dir, instance=f"outer_{outer}",
                          code_root=code_root, attempt_id=attempt,
-                         reasoning_effort=e_effort)
+                         reasoning_effort=e_effort, ledger_writer=ledger_writer)
 
     runner = DomainTaskRunner(
         repo_root=repo_root,
@@ -173,6 +179,7 @@ def build_gan_loop(
         # per-question token budget (clamped into the design snapshot by
         # DomainTaskRunner before persist; cost.token_budget_per_gen).
         token_budget_per_gen=cfg.get("cost.token_budget_per_gen"),
+        ledger_writer=ledger_writer,
     )
     # Grants/diffs are against the per-run code baseline when code_repo is on;
     # only the parent harness receives repo_root for loading benchmark labels.
@@ -189,6 +196,7 @@ def build_gan_loop(
         planner_factory=_planner_factory,
         evaluator_factory=_evaluator_factory,
         code_root=code_root,
+        ledger_writer=ledger_writer,
     )
     # explicit runtime record of the model configuration actually used
     loop.log_event({"type": "model_config",
@@ -202,7 +210,8 @@ def build_gan_loop(
     # session (aborting would refuse service without undoing anything).
     from gan.framework import preflight as preflight_mod
     design_repair = preflight_mod.repair_dangling_designs(
-        paths.design_root(output_dir), code_root=code_root)
+        paths.design_root(output_dir), code_root=code_root,
+        writer=ledger_writer)
     if design_repair["stripped"] or design_repair["errors"]:
         loop.log_event({"type": "design_dangling_stripped", "stage": "preflight",
                         **design_repair})

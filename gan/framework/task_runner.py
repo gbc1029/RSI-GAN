@@ -79,6 +79,7 @@ class DomainTaskRunner:
         sample_seed_base: Optional[int] = None,
         anchor_ids: Optional[list] = None,
         token_budget_per_gen: Optional[int] = None,
+        ledger_writer: Optional[Any] = None,
     ):
         self.repo_root = os.path.abspath(repo_root)
         self.output_dir = os.path.abspath(output_dir)
@@ -110,7 +111,11 @@ class DomainTaskRunner:
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
 
-        self.design_store = DesignStore(paths.design_root(self.output_dir))
+        # B46 step-1 gate: the per-genid task design persist (persist_design)
+        # writes through the run's WriterToken threaded from build_gan_loop.
+        self.ledger_writer = ledger_writer
+        self.design_store = DesignStore(paths.design_root(self.output_dir),
+                                        writer=ledger_writer)
         self.log_path = paths.log_file(self.output_dir, "task_runner.log")
 
     # -- helpers -----------------------------------------------------------
