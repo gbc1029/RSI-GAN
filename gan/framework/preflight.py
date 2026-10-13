@@ -410,7 +410,8 @@ def cm_component_problems(role: str, code_root: Optional[str] = None
         return out
     from gan.framework.ast_checker import policy_reason
     from gan.framework.cm.failopen import policy_violations
-    from gan.framework.cm.assembly import _gan_import_problems
+    from gan.framework.cm.assembly import (_gan_import_problems,
+                                           static_methods_problems)
     for path in sorted(base.glob("*.py")):
         if path.name == "__init__.py":
             continue
@@ -418,6 +419,13 @@ def cm_component_problems(role: str, code_root: Optional[str] = None
         reason = policy_reason(str(path), rel)
         if reason:
             out.append({"file": rel, "check": "ast_policy", "reason": reason})
+        # P3 (docs/10 §11.10): a METHODS export makes this module's methods
+        # callable as same-level primitives — probe the name rules statically
+        # (advisory; the load-time harvest refuses the whole group for real).
+        mproblems = static_methods_problems(str(path))
+        if mproblems:
+            out.append({"file": rel, "check": "cm_methods_names",
+                        "reason": "; ".join(mproblems)[:200]})
         # P3 (docs/10 §11.9): ANY cm-pool file may be named as agent CM code
         # (cost.cm_policy / cost.cm_assembly) and then executed EVERY turn
         # in-process — so the frozen agent-code gate + the dual-posture

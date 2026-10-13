@@ -22,6 +22,9 @@ live in the PRIMITIVES below, each of which validates before it mutates
         outgoing dedup contract
     render / count_ops / emit_view / note_violation                   audit
         and no-fabrication primitives the post segment composes
+    call_method (P3)                       the assembly-face entry to the
+        session's registered custom methods — same-level, same-callee: the
+        method runs with a policy-face handle whose budget resets each turn
 
 This surface is FROZEN (P1): the baseline presets are named compositions
 over exactly these methods, and the P2 editable assembly resolves through
@@ -210,6 +213,20 @@ class ViewHandle:
             return err
         return ops.note_list(self._s.notes)
 
+    def call(self, name: str, **kwargs) -> Dict[str, Any]:
+        """P3 (docs/10 §11.10): invoke a registered custom method at the
+        CALLER's privilege — the method receives THIS handle (policy face:
+        the same op budget, continuous, with ``call`` itself costing one
+        unit; agent face: agent-level ops only). Never raises: unknown
+        name, crash, or a non-record return comes back as a refusal
+        record; a policy-face failure also counts a violation."""
+        if err := self._gate("call"):
+            return err
+        rec = self._s._invoke_method(name, kwargs, callee=self)
+        if not rec.get("ok"):
+            self._audit(rec)
+        return rec
+
 
 @dataclass
 class CMSession:
@@ -264,6 +281,15 @@ class CMSession:
                                               compare=False)
     # identity-keyed bookkeeping: rewritten shallow copies are not re-registered
     _by_fp: Dict[str, str] = field(default_factory=dict)  # content fp -> bid
+    # P3 custom methods (docs/10 §11.10): registered per session from the
+    # named modules' METHODS export — same-level, same-callee surface. The
+    # assembly's harvest registers first; the policy's merges at its first
+    # successful load (shadowed names refuse, assembly > policy).
+    methods_registry: Dict[str, Callable] = field(default_factory=dict)
+    _methods_policy_done: bool = field(default=False, repr=False,
+                                       compare=False)
+    _method_face: Optional["ViewHandle"] = field(default=None, repr=False,
+                                                 compare=False)
     # resolved assembly (cache: mode is clamped upstream and never mutates)
     _assembly_fn: Optional[Callable] = field(default=None, repr=False,
                                              compare=False)
@@ -422,6 +448,7 @@ class CMSession:
         every subsequent ``cm_view`` — a fallback is never silent."""
         self.turn += 1
         self._turn_degraded = False
+        self._method_face = None  # per-turn method-face budget reset (P3)
         fn = self._assembly_fn
         if fn is None:
             fn, fallback = assembly.resolve(self.mode)
@@ -480,13 +507,70 @@ class CMSession:
             return None
         if self._named_fn is None and not self._named_failed:
             try:
-                self._named_fn = assembly.load_assembly(self.assembly_path)
+                fn, methods, method_problems = \
+                    assembly.load_assembly(self.assembly_path)
+                self._named_fn = fn
+                self._merge_methods(methods, method_problems,
+                                    source="assembly")
             except Exception as e:  # noqa: BLE001 -- fail-open, loudly, once
                 self._named_failed = True
                 self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
                             "mode": self.mode, "to": self.mode,
                             "reason": str(e)[:160]})
         return self._named_fn
+
+    def _merge_methods(self, methods: Dict[str, Callable],
+                       problems: List[str], source: str) -> None:
+        """Register one named module's custom methods (P3). Refusals speak
+        exactly once per source (``cm_methods_refused``, reasons included);
+        a policy method whose name an assembly already registered refuses as
+        shadowed (assembly > policy, deterministic precedence). All-or-
+        nothing per module: the caller passes methods only when the whole
+        group validated."""
+        reasons = list(problems)
+        for name, fn in (methods or {}).items():
+            if name in self.methods_registry:
+                reasons.append(f"{name!r}: shadowed by an earlier "
+                               "registration (assembly > policy)")
+            else:
+                self.methods_registry[name] = fn
+        if reasons:
+            self._emit({"type": "cm_methods_refused", "source": source,
+                        "reasons": reasons[:12]})
+
+    def _invoke_method(self, name: str, kwargs: Dict[str, Any],
+                       callee: "ViewHandle") -> Dict[str, Any]:
+        """Run one custom method; NEVER raises. ``callee`` is the reach the
+        method receives — the caller's own handle (handle.call) or the
+        session's per-turn method-face handle (call_method): privilege =
+        the caller's privilege, no escalation. Unknown name, crash, or a
+        non-record return comes back as a refusal record."""
+        fn = self.methods_registry.get(str(name))
+        if fn is None:
+            return {"op": str(name), "ok": False, "error": "unknown method"}
+        try:
+            rec = fn(callee, **kwargs)
+        except Exception as e:  # noqa: BLE001 -- refusal, never a seam crash
+            return {"op": str(name), "ok": False, "error": str(e)[:160]}
+        if not isinstance(rec, dict) or "ok" not in rec:
+            return {"op": str(name), "ok": False,
+                    "error": "method returned a non-record"}
+        rec = dict(rec)
+        rec.setdefault("op", str(name))
+        return rec
+
+    def call_method(self, name: str, **kwargs) -> Dict[str, Any]:
+        """Assembly-face entry (P3): run a registered custom method with the
+        session's method-face handle (policy face; budget =
+        ``cm_max_ops_per_turn`` reset each turn, so an assembly looping
+        calls stays bounded — the call itself costs one unit, exactly like
+        ``handle.call``). Never raises — the refusal record is the
+        assembly's to embed in its records (and be counted) or drop."""
+        if self._method_face is None:
+            self._method_face = ViewHandle(self, "policy")
+        if err := self._method_face._gate("call"):
+            return err
+        return self._invoke_method(name, kwargs, callee=self._method_face)
 
     def _note_assembly_failure(self, error: str, phase: str = "run") -> None:
         """One assembly turn failure: count + emit + strike; 2 strikes
@@ -633,8 +717,9 @@ class CMSession:
         from .failopen import run_policy as _run_policy_module
         handle = ViewHandle(self, "policy")
         try:
-            records, over_ms = _run_policy_module(self.policy_path, handle,
-                                                  self.policy_exec_ms)
+            records, over_ms, methods, method_problems = \
+                _run_policy_module(self.policy_path, handle,
+                                   self.policy_exec_ms)
         except Exception as e:  # noqa: BLE001 -- fail-open, never break the session
             self._note_policy_failure(str(e)[:160])
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
@@ -657,6 +742,13 @@ class CMSession:
                 return [{"op": "policy", "ok": False,
                          "error": "policy returned a non-dict record"}]
         self._policy_strikes = 0
+        # P3: harvest the policy's METHODS once per session (a crashing
+        # first turn leaves the flag unset — the next successful load
+        # retries); assembly registrations take precedence (shadowed policy
+        # names refuse with a recorded reason).
+        if not self._methods_policy_done:
+            self._methods_policy_done = True
+            self._merge_methods(methods, method_problems, source="policy")
         return records
 
     def _note_policy_failure(self, error: str) -> None:

@@ -8,6 +8,10 @@ op, and the post-segment only counts + emits.
 FACES (双形态暴露): the agent face exposes index/fetch/budget_query/pin/
 unpin/note/view_state (``ctx_view`` is the agent's 知情权 tool, docs/10
 §5.2.3); the policy face may additionally drop/compact/substitute/order/peek.
+``call`` is on BOTH faces since P3 (docs/10 §11.10): the entry to the
+session's registered custom methods — it runs at the CALLER's privilege
+(the method receives the caller's own handle, so no capability is added),
+only the same-level extension surface.
 Agent-side ``drop`` is deliberately NOT a
 tool — eviction can only happen at the view layer (an agent "drop" call's
 output would itself enter the history).
@@ -20,9 +24,10 @@ from .blocks import (Block, Universe, View, cut, excerpt_saving, placeholder,
                        PLACEHOLDER_OVERHEAD, MIN_COMPACT_SAVE)
 
 AGENT_FACES = ("index", "fetch", "budget_query", "pin", "unpin", "note",
-               "view_state")
+               "view_state", "call")
 POLICY_FACES = ("index", "fetch", "peek", "pin", "unpin", "drop", "compact",
-                "substitute", "order", "budget_query", "view_state", "note")
+                "substitute", "order", "budget_query", "view_state", "note",
+                "call")
 
 _SHRINK_OPS = ("drop", "compact", "substitute")
 

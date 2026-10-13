@@ -63,7 +63,9 @@ def policy_violations(path: str) -> List[str]:
 
 def load_policy(path: str):
     """Import the policy module from an explicit file path (snapshot).
-    Returns the module or raises. The AST gate runs first (fail-closed).
+    Returns ``(module, methods, method_problems)``. The AST gate runs first
+    (fail-closed); the ``METHODS`` harvest (P3, docs/10 §11.10) is ADDITIVE
+    — its problems are returned, never raised.
 
     The sys.modules registration key is UNIQUE PER PATH (hash suffix): the
     in-process p/e seats run in PARALLEL threads and may load different
@@ -83,18 +85,22 @@ def load_policy(path: str):
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
-    return module
+    from .assembly import harvest_methods
+    methods, method_problems = harvest_methods(module)
+    return module, methods, method_problems
 
 
 def run_policy(path: Optional[str], handle: Any, exec_ms: int
-               ) -> Tuple[List[Dict[str, Any]], int]:
+               ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any], List[str]]:
     """Execute the policy's apply() under the execution budget.
 
-    Returns ``(records, over_ms)``. Raises on crash/timeout (the session's
-    wedge breaker counts the failure and fails open)."""
+    Returns ``(records, over_ms, methods, method_problems)`` — the P3
+    ``METHODS`` harvest rides the successful load (the caller merges it
+    once per session). Raises on crash/timeout (the session's wedge breaker
+    counts the failure and fails open)."""
     if not path:
         raise PolicyMissing("no policy path configured")
-    module = load_policy(path)
+    module, methods, method_problems = load_policy(path)
     apply_fn = getattr(module, "apply", None)
     if not callable(apply_fn):
         raise PolicyMissing("policy module exposes no apply(ctx)")
@@ -110,7 +116,7 @@ def run_policy(path: Optional[str], handle: Any, exec_ms: int
     over_ms = max(0, int((_time.monotonic() - t0) * 1000) - exec_ms)
     if records is None:
         records = []
-    return records, over_ms
+    return records, over_ms, methods, method_problems
 
 
 class PolicyMissing(Exception):

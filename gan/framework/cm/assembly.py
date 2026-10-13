@@ -37,6 +37,7 @@ import ast
 import concurrent.futures
 import importlib.util
 import os
+import re
 import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -176,6 +177,87 @@ class AssemblyTimeout(Exception):
     """The assembly exceeded its per-turn execution budget."""
 
 
+# ---------------------------------------------------------------------------
+# P3: custom methods (docs/10 §11.10) — same-level, same-callee surface
+# ---------------------------------------------------------------------------
+
+_METHOD_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# Reserved: the built-in op vocabulary (both faces, incl. ``call`` itself)
+# plus the handle-only note methods — a custom method must never shadow a
+# primitive or a handle attribute.
+_RESERVED_METHODS = {"note_write", "note_read", "note_list", "call"}
+
+
+def _reserved_names() -> "set[str]":
+    from . import ops
+    return set(ops.AGENT_FACES) | set(ops.POLICY_FACES) | _RESERVED_METHODS
+
+
+def method_problems(name: Any) -> Optional[str]:
+    """The registration rule for ONE custom-method name (docs/10 §11.10):
+    lowercase identifier, no leading underscore / dunder, no ``ctx_`` prefix
+    (the tool identity contract), never a reserved primitive/handle name."""
+    if not isinstance(name, str) or not _METHOD_NAME_RE.match(name):
+        return "invalid method name (must match [a-z][a-z0-9_]*)"
+    if name.startswith("ctx_"):
+        return "method name may not use the ctx_ tool prefix"
+    if name in _reserved_names():
+        return f"method name {name!r} is reserved"
+    return None
+
+
+def harvest_methods(module: Any) -> Tuple[Dict[str, Callable], List[str]]:
+    """Harvest ``METHODS`` from a loaded agent CM module (assembly or
+    policy). ALL-OR-NOTHING: one bad entry refuses the WHOLE group (a
+    half-registered surface would be ambiguous) — returns
+    ``(methods, problems)``; an absent/empty METHODS is a clean no-op. The
+    module itself stays fully usable either way (methods are additive)."""
+    declared = getattr(module, "METHODS", None)
+    if declared is None:
+        return {}, []
+    if not isinstance(declared, dict):
+        return {}, ["METHODS must be a dict of {name: callable}"]
+    problems: List[str] = []
+    for name, fn in declared.items():
+        problem = method_problems(name)
+        if problem:
+            problems.append(f"{name!r}: {problem}")
+        elif not callable(fn):
+            problems.append(f"{name!r}: value is not callable")
+    if problems:
+        return {}, problems
+    return dict(declared), []
+
+
+def static_methods_problems(path: str) -> List[str]:
+    """AST-only preflight probe: name-legality of a module-level
+    ``METHODS = {...}`` literal (no import, advisory early signal — the
+    load-time harvest remains the enforcement point)."""
+    problems: List[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+    except (OSError, SyntaxError):
+        return problems
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "METHODS"):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            problems.append("METHODS must be a dict of {name: callable}")
+            break
+        for key in node.value.keys:
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                problem = method_problems(key.value)
+                if problem:
+                    problems.append(f"{key.value!r}: {problem}")
+            else:
+                problems.append("METHODS keys must be string literals")
+        break
+    return problems
+
+
 # An assembly must be importable in BOTH postures (snapshot top-level ``cm``
 # and in-process ``gan.framework.cm``), so its top-level imports are
 # stdlib-only — plus the guarded dual-idiom import of the core itself. A
@@ -200,16 +282,19 @@ def _gan_import_problems(path: str) -> List[str]:
     return problems
 
 
-def load_assembly(path: str) -> AssembleFn:
+def load_assembly(path: str) -> Tuple[Callable, Dict[str, Callable], List[str]]:
     """Import a named assembly module from an explicit file path (snapshot
-    or component tree) and return its ``assemble`` function.
+    or component tree). Returns ``(assemble_fn, methods, method_problems)``.
 
     Fail-closed at load: the policy AST gate runs first (no LLM, no network,
     no subprocess, no dynamic exec, no filesystem writes), then the
     dual-posture import rule (stdlib + guarded ``cm`` imports only), then
     the contract check (a callable ``assemble``). Any refusal raises
     :class:`AssemblyError` — the session turns that into ONE loud
-    ``cm_assembly_fallback`` and runs the baseline preset for the session."""
+    ``cm_assembly_fallback`` and runs the baseline preset for the session.
+    ``METHODS`` harvest (P3) is ADDITIVE: its problems are returned, never
+    raised — a module with an illegal method group still runs as the
+    pipeline; the caller speaks the refusal (``cm_methods_refused``)."""
     from .failopen import policy_violations
     problems = policy_violations(path) + _gan_import_problems(path)
     if problems:
@@ -233,7 +318,8 @@ def load_assembly(path: str) -> AssembleFn:
         raise AssemblyError(
             "assembly exposes no callable assemble(session, msgs, outgoing, "
             "tokens_used, budget)")
-    return fn
+    methods, method_problems = harvest_methods(module)
+    return fn, methods, method_problems
 
 
 def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
