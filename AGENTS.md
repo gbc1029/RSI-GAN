@@ -197,9 +197,13 @@ batch-8 isolation), one subprocess each.
   committed **by the worker itself** (option B, v4.22: `loop._apply_self_patch` →
   `code_repo.apply_self_patch`, allowlist + compile, rolled back on failure; the
   durable record is the code commit, events `self_improve_commit` /
-  `self_improve_apply_failed`). Use `--in-process` for the legacy single-process
-  loop. Access grants/diffs are against `code_root`; benchmark labels still come
-  from `repo_root`, passed only as the CLI `--dataset_root` argument (never env).
+  `self_improve_apply_failed`). The legacy `--in-process` CLI option is disabled:
+  it bypasses the driver-managed role/task sandboxes. The supported security
+  boundary starts at `scripts/run_gan.py` or `gan.driver.run_gan_driver`; direct
+  calls to `build_gan_loop`, `gan.outer_worker`, or role classes are internal/test
+  interfaces, not sandboxed entry points. Access grants/diffs are against
+  `code_root`; benchmark labels still come from `repo_root`, passed only as the
+  CLI `--dataset_root` argument (never env).
 - **Code blood lineage (v5, branch-per-node)**: every task generation's code is
   a git commit in the per-run code tree whose git parent is its **selected
   parent's** code commit; each generation pins a persistent ref `task_<genid>`,

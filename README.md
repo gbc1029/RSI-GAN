@@ -40,7 +40,7 @@ gan/                     # the GAN framework (new)
   design/                #   shallow evolvable design (schema/store/seeds)
   roles/                 #   planner / evaluator (Role base in base_role.py)
   build.py driver.py outer_worker.py patch.py summary.py
-scripts/run_gan.py       # GAN dual-loop CLI entry (driver mode default; --in-process = legacy)
+scripts/run_gan.py       # GAN dual-loop CLI entry (sandboxed driver only)
 scripts/dgmh/            # DGM-H-only entry scripts (generate_loop/meta_agent/run_meta_agent/...)
 scripts/local/           # local-only verification scripts (gitignored)
 docs/                    # design / implementation / deployment docs
@@ -158,6 +158,12 @@ Large datasets are intentionally **not** committed (see `.gitignore`):
 > [!WARNING]
 > This repository executes untrusted, model-generated code. Review the original
 > HyperAgents safety notes before running self-improvement loops.
+
+The supported GAN security boundary starts at `scripts/run_gan.py` (or the
+programmatic `gan.driver.run_gan_driver` entry) and requires the driver-managed
+role/task sandboxes. The legacy `--in-process` option is disabled because it
+bypasses those sandboxes. Direct calls to `build_gan_loop`, `gan.outer_worker`,
+or role classes are internal/test interfaces and are not sandboxed entry points.
 
 ## Attribution
 
