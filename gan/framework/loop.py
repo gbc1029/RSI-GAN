@@ -663,6 +663,63 @@ class GanLoop:
                       event_type="cm_session_failed", role=role)
             return None
 
+    def _traj_materialization_files(self, genids: Any, outer: Any = None,
+                                    session_role: Optional[str] = None
+                                    ) -> List[Tuple[str, str]]:
+        """The seat's visible trajectory files as ``(label, path)`` pairs —
+        the SAME set the read tools serve. Task generations ride the seat's
+        ``trajectory_genids``; the self seat adds its OWN per-generation
+        session files for the current outer. Labels are genid-qualified so
+        one session's address space stays unique across all its files (files
+        from different generations share basenames). Advisory: missing files
+        are skipped by the materialization primitive."""
+        out: List[Tuple[str, str]] = []
+        seen = set()
+
+        def _add(path: str, genid: Any) -> None:
+            if not path or not os.path.isfile(path):
+                return
+            label = f"{genid}/{os.path.basename(path)}"
+            if label not in seen:
+                seen.add(label)
+                out.append((label, path))
+
+        for g in (genids or []):
+            _add(trajectory._session_file(self.output_dir, g, "task"), g)
+        if session_role and outer is not None:
+            d = paths.outer_traj_dir(self.output_dir, outer)
+            genids_outer = [str(e["genid"]) for e in
+                            trajectory.outer_session_index(self.output_dir,
+                                                           outer, session_role)]
+            genids_outer.sort(key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+            for g in genids_outer:
+                _add(os.path.join(d, g, f"{session_role}.jsonl"), g)
+        return out
+
+    def _materialize_traj(self, cm_session: Any, genids: Any, outer: Any = None,
+                          session_role: Optional[str] = None) -> None:
+        """Snapshot the seat's visible trajectories into its CM session (one
+        scan; the read tools' index face and the ctx faces then share the
+        same address space). Advisory: a failure leaves the session without
+        materialization (the tools self-build) and SPEAKS; ``passthrough``
+        sessions skip the scan entirely (identity view)."""
+        if cm_session is None:
+            return
+        try:
+            files = self._traj_materialization_files(genids, outer=outer,
+                                                     session_role=session_role)
+            if files:
+                cm_session.materialize_traj(files)
+        except Exception as e:  # noqa: BLE001 -- advisory, must speak
+            # the audit write itself must never turn an advisory failure
+            # fatal: if the event path is unreachable, the raise stops here
+            try:
+                soft_fail(f"traj materialization failed: {e}",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="cm_traj_materialize_failed")
+            except Exception:  # noqa: BLE001 -- audit sink unavailable
+                pass
+
     def _task_budget_keys(self, parent: Any) -> Optional[Dict[str, Any]]:
         """Effective TASK-side reserved keys of the design the child will
         inherit (the selected parent's config) — the plan statement's
@@ -1402,6 +1459,7 @@ class GanLoop:
                 # self-improve), like ``session_token_budget``.
                 self.planner.cm_session = self._build_cm_session("planner", plan_ck,
                                                                  outer=outer)
+                self._materialize_traj(self.planner.cm_session, parent_ref)
                 self._emit_cost_keys_applied("planner", "plan", genid,
                                              plan_ck, plan_clamps)
 
@@ -1563,6 +1621,7 @@ class GanLoop:
                 # Context-management session for THIS evaluate call (§11 D11).
                 self.evaluator.cm_session = self._build_cm_session("evaluator", eval_ck,
                                                                    outer=outer)
+                self._materialize_traj(self.evaluator.cm_session, [genid] + parent_ref)
                 cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair,
                                                            own_budget=eval_ck.get("evaluate_token_budget"))
                 eval_cost_kwargs: Dict[str, Any] = {}
@@ -1797,6 +1856,10 @@ class GanLoop:
                         # plan/evaluate stamps above).
                         role_obj.session_cm_mode = ck_si.get("cm_mode")
                         role_obj.cm_session = self._build_cm_session(role, ck_si, outer=outer)
+                        # self seat additionally materializes its OWN session
+                        # files (the read_session_trajectory face) for this outer
+                        self._materialize_traj(role_obj.cm_session, si_refs,
+                                               outer=outer, session_role=role)
                     except Exception as e:  # noqa: BLE001 -- advisory stamp
                         # A swallowed degradation must SPEAK (no-silent-fail
                         # rule, AGENTS.md): without this event the session's

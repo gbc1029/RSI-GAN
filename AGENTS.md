@@ -606,6 +606,38 @@ OpenAI-compatible gateway — each was invisible to the offline smokes:
   infrastructure failure — the lineage machinery records an auditable dead
   branch and the next outer plans from the parent's commit.
 
+## Field lessons for AI agents (tool-channel discipline)
+
+Lessons from a coding round that briefly concluded "the tool channel is
+untrustworthy" — the session log later proved every anomaly was
+self-inflicted. Recorded so the failure pattern is recognizable and
+non-repeatable:
+
+- **An unexpected tool result is a hypothesis to test, never a verdict.** The
+  correct reaction to output that contradicts expectations is a SECOND
+  INDEPENDENT CHANNEL (write command output to a log file and `read` it;
+  re-run; grep the session log), not escalating to "the environment
+  fabricates". A wrong verdict built on one channel then poisons every
+  downstream decision.
+- **Relative and absolute paths are the same file.** Edit results show
+  workspace-relative paths, reads show absolute ones (`gan/...` vs
+  `/root/HyperAgents/gan/...`). A path-display difference is not evidence of
+  "two different file states"; neither is seeing the same path twice.
+- **Do not cite your own memory as evidence about files.** Several
+  "contradictions" resolved the same way: the memory of what was just written
+  was wrong, the file was right. The previous turn's recollection is not
+  ground truth — re-read the file (or `git diff`) instead.
+- **Own your typos and hallucinated APIs.** A mistyped command name, a wrong
+  function signature, or an invented script path executed faithfully by the
+  tool is still your bug; blaming the channel doubles the error and blocks
+  the real diagnosis (which, in every checked case, was ordinary: an extra
+  brace, a miscounted fixture, an assertion reading the wrong channel).
+- **Before declaring an output "foreign", compare its fingerprint with what
+  you wrote** — suite prefixes, assertion names, diff stats (`git status
+  --short` + `git diff --stat` names exactly which files changed). The
+  confabulation risk peaks exactly when tired reasoning meets a long tool
+  transcript; the check costs one command.
+
 ## Do NOT
 
 - Do not commit `.env`, secrets, `venv_nat/`, `outputs/`, or large datasets

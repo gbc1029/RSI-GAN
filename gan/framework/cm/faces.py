@@ -70,7 +70,7 @@ _SPECS: dict = {
         "description": ("Enumerate the context blocks of this session (history turns, tool outputs, trajectory segments, your notes): id, kind, size, flags — metadata only, no content. Use it to see what can be fetched or pinned."),
         "input_schema": {
             "type": "object",
-            "properties": {"kind": {"type": "string", "description": "optional kind filter (turn_output|tool_output|traj_seg|kb_note|note|derived)"}},
+            "properties": {"kind": {"type": "string", "description": "optional kind filter (turn_output|tool_output|traj_seg|note|derived)"}},
             "required": [],
         },
         "params": ("kind=None",),

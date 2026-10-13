@@ -19,7 +19,9 @@ from .blocks import (Block, Universe, View, PLACEHOLDER_OVERHEAD,
 from .assembly import BASELINE_ASSEMBLY, resolve as resolve_assembly
 from .session import CMSession, ViewHandle, build_session, WINDOW_K_FLOOR
 from .state import activate, deactivate, current_session, current_handle
-from .traj_index import build_traj_index, render_index_text, segment_text
+from .traj_index import (build_traj_index, build_traj_materialization,
+                         parse_seg_id, render_index_text, segment_entry,
+                         segment_text, SEGMENT_KINDS, SEGMENT_FLAGS)
 from .faces import make_face_tool
 
 __all__ = [
@@ -29,6 +31,8 @@ __all__ = [
     "BASELINE_ASSEMBLY", "resolve_assembly",
     "CMSession", "ViewHandle", "build_session", "WINDOW_K_FLOOR",
     "activate", "deactivate", "current_session", "current_handle",
-    "build_traj_index", "render_index_text", "segment_text",
+    "build_traj_index", "build_traj_materialization", "parse_seg_id",
+    "render_index_text", "segment_entry", "segment_text",
+    "SEGMENT_KINDS", "SEGMENT_FLAGS",
     "make_face_tool",
 ]

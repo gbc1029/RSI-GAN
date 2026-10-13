@@ -10,6 +10,9 @@ live in the PRIMITIVES below, each of which validates before it mutates
     register_history / register_outgoing   block registration (fingerprint
         uniqueness, view-marker re-bind, first-user pin; the outgoing turn
         is registered but NEVER substituted except the dedup elision)
+    materialize_traj                       the seat's visible trajectory
+        files as pinned traj_seg blocks (one scan per session; the read
+        tools' index face and the ctx faces share the same address space)
     budget_checkpoint                      advisory >=80% warning (emit-only)
     conservative_compaction / window_defaults / dedup_prefix   the stage ops
         (validate via the ``cm.ops`` vocabulary; pre-check pinned / floor /
@@ -40,6 +43,7 @@ type-guards (the harness pass-through posture).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -289,6 +293,13 @@ class CMSession:
                                        compare=False)
     _method_face: Optional["ViewHandle"] = field(default=None, repr=False,
                                                  compare=False)
+    # Trajectory materialization: the seat's visible trajectory files,
+    # snapshotted at build time as pinned traj_seg blocks. ``traj_index`` is
+    # the metadata payload the read tools render; ``traj_segments`` maps each
+    # seg_id to its block so a fetch resolves through the SAME scan the index
+    # came from (one address space for both CM faces).
+    traj_index: Optional[Dict[str, Any]] = None
+    traj_segments: Dict[str, str] = field(default_factory=dict)
     # resolved assembly (cache: mode is clamped upstream and never mutates)
     _assembly_fn: Optional[Callable] = field(default=None, repr=False,
                                              compare=False)
@@ -337,6 +348,8 @@ class CMSession:
             out["assembly_active"] = self.assembly_active
             out["assembly_failures"] = self.assembly_failures
             out["assembly_disabled"] = self.assembly_disabled
+        if self.traj_index is not None:
+            out["traj_segments"] = len(self.traj_segments)
         return out
 
     # ------------------------------------------------------------------- events
@@ -415,6 +428,62 @@ class CMSession:
         self._seen_user = True
         self._by_fp[_fingerprint(outgoing)] = block.block_id
         return block
+
+    def materialize_traj(self, files: List[Tuple[str, str]]) -> int:
+        """Snapshot the seat's visible trajectory files into the universe.
+
+        ``files`` is a list of ``(label, path)`` pairs with genid-qualified
+        labels — VISIBILITY is the caller's decision (the same set the read
+        tools serve); this primitive only snapshots it, one scan per session.
+        Every segment becomes a pinned ``traj_seg`` block holding its full
+        text, with the seg_id as ``source``: the index the read tools render
+        and the blocks ``ctx_index``/``ctx_fetch`` address derive from the
+        SAME scan, so a fetch can never drift from the index the agent saw
+        (the material is invariant: trajectories are archived before they
+        become readable). Pinned so the window/compaction passes — which walk
+        the RENDERED history's turns — never produce phantom ops on blocks
+        that exist only as fetchable addressable content.
+
+        ``passthrough`` is an absolute no-op (identity view: nothing
+        materializes, nothing emits). Per-file scan failures skip that file
+        and SPEAK (``cm_traj_materialize_failed``); the read tools then fall
+        back to building their own index for uncovered genids. Returns the
+        number of segments registered."""
+        if self.mode == "passthrough" or not files:
+            return 0
+        from .traj_index import build_traj_materialization
+        clean: List[Tuple[str, str]] = []
+        seen: set = set()
+        for label, path in files:
+            if not label or not path or label in seen:
+                continue
+            if not os.path.isfile(path):
+                continue
+            seen.add(label)
+            clean.append((str(label), str(path)))
+        if not clean:
+            return 0
+        try:
+            payload, texts = build_traj_materialization(clean)
+        except Exception as e:  # noqa: BLE001 -- degrade, but speak
+            self._emit({"type": "cm_traj_materialize_failed",
+                        "error": str(e)[:200]})
+            return 0
+        registered = 0
+        for seg in payload.get("segments", []):
+            text = texts.get(seg["seg_id"])
+            if text is None:
+                continue
+            if seg["seg_id"] in self.traj_segments:
+                continue  # idempotent: a re-materialize never duplicates blocks
+            block = self.universe.register("traj_seg", text, 0,
+                                           source=seg["seg_id"], pinned=True)
+            self.traj_segments[seg["seg_id"]] = block.block_id
+            registered += 1
+        self.traj_index = payload
+        self._emit({"type": "cm_traj_materialized", "files": len(payload["files"]),
+                    "segments": registered})
+        return registered
 
     # -------------------------------------------------------------- the seam
     def assemble_turn(self, msgs: List[Dict[str, Any]],
