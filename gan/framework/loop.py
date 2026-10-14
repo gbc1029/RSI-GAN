@@ -534,10 +534,19 @@ class GanLoop:
         if not self.record_usage:
             return ""
         try:
+            # cost×score per-round alignment: map every generation already
+            # settled this outer to its measured score, so the statement can
+            # pair each round's spend with its result (n/a when unpublished).
+            scores_by_genid = {}
+            for node in self.task_tree.nodes.values():
+                score = getattr(node.value, "score", None)
+                if score is not None:
+                    scores_by_genid[str(node.genid)] = score
             return cost_ledger.render_self_statement(
                 role=role, outer=outer,
                 own_sessions=cost_ledger.self_session_costs(self.output_dir, outer, role),
-                own_last=cost_ledger.latest_session_cost(self.output_dir, role, "self_improve"))
+                own_last=cost_ledger.latest_session_cost(self.output_dir, role, "self_improve"),
+                scores_by_genid=scores_by_genid)
         except Exception as e:  # noqa: BLE001 -- advisory, never fatal
             soft_fail(f"self-improve cost statement build failed ({role}): {e}",
                       event_path=paths.events_path(self.output_dir),

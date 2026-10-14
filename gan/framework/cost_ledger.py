@@ -655,15 +655,23 @@ def render_evaluate_statement(*, genid: Any = None,
 def render_self_statement(*, role: str, outer: Any = None,
                           own_sessions: Optional[List[Dict[str, Any]]] = None,
                           own_last: Optional[Dict[str, Any]] = None,
+                          scores_by_genid: Optional[Dict[str, Any]] = None,
                           max_chars: int = _STATEMENT_MAX_CHARS) -> str:
     """Self-improvement statement: the role's OWN sessions this outer (the
-    cost×quality reflection material; the OTHER role's costs are not here)."""
+    cost×quality reflection material; the OTHER role's costs are not here).
+
+    When ``scores_by_genid`` is provided, each session line gains a
+    ``score`` column aligning that round's cost with its measured result
+    (per-round cost×score alignment; missing scores show as n/a)."""
     lines = [f"## Cost statement (framework-measured; your own sessions, outer {outer})"]
     for rec in (own_sessions or [])[-6:]:
         gid = rec.get("genid")
         seat = rec.get("seat") or "session"
         label = f"{seat}" + (f" gen {gid}" if gid is not None else "")
-        lines.append(_cost_line(label, rec))
+        line = _cost_line(label, rec)
+        if scores_by_genid and gid is not None and str(gid) in scores_by_genid:
+            line += f", score {scores_by_genid[str(gid)]}"
+        lines.append(line)
     if not own_sessions:
         lines.append("- (no sessions recorded this outer yet)")
     if own_last is not None:
