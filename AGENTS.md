@@ -219,7 +219,11 @@ with a GAN-native data layer.
   (`Role.run`). The visible set is explicit: `AccessContext.trajectory_genids`
   (evaluator = current + parent; planner = parent; self-improvement = this
   outer's generations + the direct parent). `read_trajectory` reads visible task
-  generations; `read_session_trajectory` reads the role's own sessions this outer.
+  generations; `read_session_trajectory` reads the role's own sessions over the
+  DECLARED `AccessContext.session_outers` (self seat: this outer + the previous
+  outer, batch 4; other seats never reach it — labels: genid-qualified for the
+  current outer, `outer_<O>/`-prefixed for extras, ONE rule shared by
+  materialization and the tool fallback).
   The current generation's task trajectory is archived **before** evaluation.
 - **Task runs are isolated from `repo_root`**: each generation runs in a
   **minimal allowlist copy** `work/<genid>/repo` (agent runtime + domain package,
@@ -265,13 +269,30 @@ with a GAN-native data layer.
   refused on the registry path and at the commit gate via the same AST issues
   channel (`observed_ledger_writer`). The token is an identity, not a secret —
   file-level tamper DETECTION is deferred step 2 (hash chain, unchanged
-  trigger); regression suite: `scripts/local/regress_ledger_gate.py`.
+  trigger); step 2's role (batch 4): the detection compensation for
+  application-step BYPASS — the write side's existence control (grants / AST
+  gate / WriterToken) is strong but heuristic, the read side's is absolute;
+  regression suite: `scripts/local/regress_ledger_gate.py`.
 - **Access boundary**: the frozen role allowlist also defines the read surface
   (read/write) — `task`: none; `planner`: read+write t-set ∪ p-set; `evaluator`:
   read t-set (read-only) + read/write e-set. Everything else is frozen by default;
   there is no persisted deny list. `AccessBroker` enforces it and refuses the repo
   root / self-containing / oversized grants. A local-only layout check lives at
   `scripts/local/test_frozen.py` (gitignored).
+- **Capability = existence (design axiom, batch 4)**: permissions are enforced by
+  what the framework MOVES, never by agent-side access checks. READ: without a
+  grant the content is not materialized into the workspace (source grants,
+  trajectory materialization over `trajectory_genids`/`session_outers`, toolset
+  assembly with `clear=True`) — a session faces existence, not an access check.
+  WRITE: without a grant/capability the workspace content is not applied (patch
+  visibility = `granted_paths`, seat write roots + AST capability gate at commit,
+  registry/schema_ext differentials, WriterToken-gated ledger writes). Every
+  absence must be ATTRIBUTABLE — authorized vs failure (the no-silent-fail
+  corollary; quarantined sessions are reported in BOTH presentation modes,
+  never served). Asymmetry to remember: the read side's containment is absolute
+  (physical absence); the write side's static gates are heuristic — B46 step 2
+  (hash chain) is the detection compensation for application-step bypass, not a
+  parallel half.
 - **Code repo / driver (default)**: `scripts/run_gan.py` materializes a per-run git
   tree `ckpt/code` (`gan/framework/code_repo.py`) and runs one `gan.outer_worker`
   subprocess per outer (`gan/driver.py`; cwd + `PYTHONPATH = code_root`), so role

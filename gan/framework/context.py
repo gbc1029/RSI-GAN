@@ -159,6 +159,13 @@ class AccessContext:
     # design; it never widens the visible set — trajectory_genids above and
     # redaction stay the sole permission surface (选择只能缩小).
     session_cm_mode: Optional[str] = None
+    # The set of outers whose OWN session files this seat may read (the
+    # read_session_trajectory face). Declared by the framework exactly like
+    # ``trajectory_genids`` above — never provided by the agent. ``None``
+    # keeps the legacy behavior (current outer only, derived from the node
+    # id); the self seat declares {O, O-1}. Presentation (``session_cm_mode``)
+    # never widens this set, and redaction stays the sole content filter.
+    session_outers: Optional[frozenset] = None
 
     def __post_init__(self) -> None:
         from gan.framework.frozen import assert_seat
@@ -166,11 +173,15 @@ class AccessContext:
 
 
 def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None, *,
-                       seat: str, session_cm_mode: Optional[str] = None):
+                       seat: str, session_cm_mode: Optional[str] = None,
+                       session_outers=None):
     return _ACCESS_CTX.set(AccessContext(broker, role, node_id,
                                           seat=seat,
                                           trajectory_genids=list(trajectory_genids or []),
-                                          session_cm_mode=session_cm_mode))
+                                          session_cm_mode=session_cm_mode,
+                                          session_outers=(frozenset(session_outers)
+                                                          if session_outers is not None
+                                                          else None)))
 
 
 def get_access_context() -> Optional[AccessContext]:

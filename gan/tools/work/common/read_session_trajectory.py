@@ -1,20 +1,27 @@
-"""Work tool: read YOUR OWN session trajectories for the current outer.
+"""Work tool: read YOUR OWN session trajectories over the DECLARED outers.
 
 Available to planner/evaluator during self-improvement. Sessions are the role's
-own ``plan``/``evaluate`` sessions for each inner generation of the current outer
-(``trajectory/outer_<O>/<genid>/<role>.jsonl``), redacted. Omit ``genid`` to read
-all of this outer's sessions (bounded).
+own ``plan``/``evaluate`` sessions per inner generation of the visible outers
+(``trajectory/outer_<O>/<genid>/<role>.jsonl``), redacted. The visible outer
+set is DECLARED by the framework (``AccessContext.session_outers`` — the self
+seat: this outer + the previous outer); omit ``genid`` to read all of them
+(bounded). ``genid`` accepts an optional ``outer_<O>/`` prefix (the same
+address space as the labels); a bare genid means the current outer.
 
 Slice mode: when the SESSION's own design ``cost.cm_mode`` is not
 ``passthrough``, the default response is the STRUCTURAL INDEX of the selected
 session file(s) — ids/sizes/flags, no content — and ``fetch`` materializes one
-segment by ``seg_id`` (a genid-qualified ``<genid>/<file>:<line>`` address;
-bare file names are refused when several visible files share one basename).
-Segment addresses are the SAME space the CM universe's ``traj_seg`` blocks
-use: a materialized session serves both faces from one scan; without one the
-tool scans the same visible files itself. ``kind=``/``tool=``/``flag=`` narrow
-the index, ``offset=`` pages it. Only metadata in the index; selection only
-shrinks the visible surface.
+segment by ``seg_id`` (a qualified ``[outer_<O>/]<genid>/<file>:<line>`
+address; bare file names are refused when several visible files share one
+basename). Segment addresses are the SAME space the CM universe's ``traj_seg``
+blocks use: a materialized session serves both faces from one scan; without
+one the tool scans the same declared files itself. ``kind=``/``tool=``/
+``flag=`` narrow the index, ``offset=`` pages it. Only metadata in the index;
+selection only shrinks the visible surface.
+
+Quarantined (unredactable) sessions are REPORTED in BOTH modes — a
+``[unavailable]`` refusal inline (passthrough) or a quarantine note on the
+index (slice) — never served: the absence stays attributable.
 """
 from __future__ import annotations
 
@@ -22,23 +29,26 @@ import glob
 import os
 
 from gan.framework.context import get_access_context
-from gan.framework.trajectory import outer_session_index, read_session
+from gan.framework.trajectory import outer_session_index, read_session, session_label
 
 
 def tool_info():
     return {
         "name": "read_session_trajectory",
         "description": (
-            "Read YOUR OWN session trajectories from the current outer generation "
-            "(redacted). Omit 'genid' to read all of this outer's sessions. In "
-            "slice mode (your design's cost.cm_mode) the default response is a "
-            "STRUCTURAL INDEX — narrow it with kind=/tool=/flag= and page with "
-            "offset= — and fetch=<seg_id> materializes one segment."
+            "Read YOUR OWN session trajectories over your visible outers "
+            "(redacted; the self seat: this outer and the previous outer). "
+            "Omit 'genid' to read all of them. In slice mode (your design's "
+            "cost.cm_mode) the default response is a STRUCTURAL INDEX — narrow "
+            "it with kind=/tool=/flag= and page with offset= — and "
+            "fetch=<seg_id> materializes one segment."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "genid": {"description": "Inner generation id. Omit for all of this outer."},
+                "genid": {"description": "Inner generation id; optional "
+                                         "'outer_<O>/' prefix for a previous "
+                                         "outer. Omit for all visible outers."},
                 "max_chars": {"type": "integer"},
                 "fetch": {"description": "Materialize one segment by seg_id "
                                         "(any mode: the slice index lists the "
@@ -91,26 +101,85 @@ def _session_cm_mode(actx) -> str | None:
     return None
 
 
-def _session_entries(output_dir, outer, role, genid):
+def _declared_outers(actx, outer):
+    """The declared own-session outer set (strings, current outer first).
+
+    Explicit ``AccessContext.session_outers`` when the framework declared one
+    (the self seat: {O, O-1}); ``None`` keeps the legacy single-current-outer
+    behavior for every other seat/path."""
+    declared = getattr(actx, "session_outers", None)
+    if not declared:
+        return [outer]
+    others = sorted((str(o) for o in declared if str(o) != str(outer)),
+                    key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+    return [str(outer)] + others
+
+
+def _parse_genid_ref(genid, current_outer):
+    """Split an optional ``outer_<O>/`` prefix off a genid reference (the same
+    address space as the materialized labels). Returns ``(outer, genid)``;
+    a bare genid means the CURRENT outer (backward compatible)."""
+    if genid is None:
+        return None, None
+    s = str(genid)
+    if s.startswith("outer_") and "/" in s:
+        head, _, tail = s.partition("/")
+        digits = head.split("_", 1)[1]
+        if not digits.isdigit() or not tail:
+            raise ValueError(f"malformed genid '{genid}' "
+                             "(expected 'outer_<O>/<genid>')")
+        return digits, tail
+    return current_outer, s
+
+
+def _quarantined_labels(output_dir, current_outer, outers, role):
+    """Labels of quarantined (unredactable) sessions across the declared
+    outers. Batch-4 ruling C: BOTH presentation modes report them — the
+    absence of a session must stay attributable (no-silent-fail corollary);
+    the content itself is NEVER served (read_session fail-closes)."""
+    return [session_label(current_outer, o, e["genid"], f"{role}.jsonl")
+            for o in outers
+            for e in outer_session_index(output_dir, o, role)
+            if e.get("quarantined")]
+
+
+def _quarantine_note(labels):
+    if not labels:
+        return ""
+    return ("\n# quarantined (unredactable; never served; audit trail: "
+            "events.jsonl session_redaction_failed): " + ", ".join(labels))
+
+
+def _session_entries(output_dir, current_outer, outers, role, genid):
     """The visible session files as ``(label, path)`` pairs.
 
-    Labels are genid-qualified (``<genid>/<file>``) so the index and every
-    seg_id stay unambiguous across generations — several generations' files
-    share basenames, and an address that cannot say WHICH generation it means
-    would fetch from the wrong one. Canonical + attempt siblings per genid,
-    newest first (mirrors trajectory.read_session)."""
-    d = os.path.join(output_dir, "trajectory", f"outer_{outer}")
-    if genid is not None:
-        genids = [str(genid)]
-    else:
-        genids = [str(e["genid"])
-                  for e in outer_session_index(output_dir, outer, role)]
+    Labels come from ``trajectory.session_label`` — the ONE label rule shared
+    with trajectory materialization (genid-qualified for the current outer,
+    outer-prefixed for other declared outers) so this fallback and the
+    session's materialized index address the same files identically.
+    ``genid`` may carry an ``outer_<O>/`` prefix; a bare genid narrows to the
+    CURRENT outer only. Canonical + attempt siblings per genid, newest first
+    (mirrors trajectory.read_session)."""
+    try:
+        req_outer, req_genid = _parse_genid_ref(genid, current_outer)
+    except ValueError:
+        raise
+    scan_outers = [str(req_outer)] if req_genid is not None \
+        else [str(o) for o in outers]
     out = []
-    for g in genids:
-        for p in sorted(glob.glob(os.path.join(d, g, f"{role}*.jsonl")),
-                        reverse=True):
-            if os.path.isfile(p):
-                out.append((f"{g}/{os.path.basename(p)}", p))
+    for o in scan_outers:
+        d = os.path.join(output_dir, "trajectory", f"outer_{o}")
+        if req_genid is not None:
+            genids = [req_genid]
+        else:
+            genids = [str(e["genid"])
+                      for e in outer_session_index(output_dir, o, role)]
+        for g in genids:
+            for p in sorted(glob.glob(os.path.join(d, g, f"{role}*.jsonl")),
+                            reverse=True):
+                if os.path.isfile(p):
+                    out.append((session_label(current_outer, o, g,
+                                              os.path.basename(p)), p))
     return out
 
 
@@ -171,6 +240,7 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
     outer = _outer_of(actx)
     if outer is None:
         return "Error: session trajectories are only available during self-improvement."
+    outers = _declared_outers(actx, outer)
     role = actx.role
     cap = int(max_chars or 6000)
 
@@ -187,14 +257,23 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         note = (f"# note: kind=/tool=/flag=/offset= apply in slice mode only "
                 f"(this session runs {mode or 'passthrough'})\n")
 
-    entries = _session_entries(output_dir, outer, role, genid)
+    try:
+        entries = _session_entries(output_dir, outer, outers, role, genid)
+    except ValueError as e:
+        return f"Error: {e}"
     labels = {label for label, _p in entries}
 
     if slice_mode and not fetch:
         paths = [p for _l, p in entries]
         paths = [p for p in paths if os.path.isfile(p)]
+        qnote = _quarantine_note(_quarantined_labels(output_dir, outer,
+                                                     outers, role))
         if not paths:
-            return "No session trajectories for this outer yet."
+            # Nothing servable — but if the void hides quarantined sessions,
+            # the absence must stay attributable (both modes report, batch 4
+            # ruling C).
+            msg = "No session trajectories in your visible outers yet."
+            return msg + ("\n" + qnote if qnote else "")
         sess = _active_traj_session()
         segs = _payload_segments(sess, entries) if sess is not None else None
         if segs is not None:
@@ -209,7 +288,7 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
                   "fetch=<seg_id> for content)")
         return header + "\n" + render_index_text(
             index, max_chars=cap, kinds=filt["kind"], tools=filt["tool"],
-            flags=filt["flag"], offset=filt["offset"])
+            flags=filt["flag"], offset=filt["offset"]) + qnote
 
     if fetch:
         from gan.framework.cm.traj_index import parse_seg_id, segment_entry
@@ -225,8 +304,8 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
             elif len(legacy) > 1:
                 return (f"Error: seg_id '{fetch}' is ambiguous across "
                         f"{len(legacy)} visible sessions sharing the basename "
-                        "'<file>'; use the genid-qualified "
-                        "'<genid>/<file>:<line>'.")
+                        "'<file>'; use the qualified "
+                        "'[outer_<O>/]<genid>/<file>:<line>'.")
             elif not addr:
                 if len(labels) == 1:
                     addr = next(iter(labels))
@@ -265,21 +344,31 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         return f"{meta}\n{entry['text'][:cap]}"
 
     if genid is not None:
-        blob = read_session(output_dir, outer, genid, role, cap)
+        try:
+            req_outer, req_genid = _parse_genid_ref(genid, outer)
+        except ValueError as e:
+            return f"Error: {e}"
+        blob = read_session(output_dir, req_outer, req_genid, role, cap)
         if not blob:
             return f"No session trajectory for genid {genid}."
         # The passthrough filter notice must ride the response (it was
         # computed but never prepended — the exact silent-ignore class this
         # tool's sibling read_trajectory fixed): empty by default, so the
         # unfiltered default call stays byte-identical.
-        return note + f"# your session genid={genid}\n{blob}"
-    idx = outer_session_index(output_dir, outer, role)
-    if not idx:
-        return "No session trajectories for this outer yet."
+        where = "" if str(req_outer) == str(outer) else f" (outer_{req_outer})"
+        return note + f"# your session genid={req_genid}{where}\n{blob}"
+    pairs = []
+    for o in outers:
+        for e in outer_session_index(output_dir, o, role):
+            pairs.append((session_label(outer, o, e["genid"], f"{role}.jsonl"),
+                          o, e["genid"]))
+    if not pairs:
+        return "No session trajectories in your visible outers yet."
     blob = "\n\n".join(
-        read_session(output_dir, outer, e["genid"], role, cap) for e in idx
+        read_session(output_dir, o, g, role, cap) for _l, o, g in pairs
     )
-    return note + f"# your sessions this outer: {[e['genid'] for e in idx]}\n{blob[:cap]}"
+    return note + (f"# your sessions (outers={outers}): "
+                   f"{[p[0] for p in pairs]}\n{blob[:cap]}")
 
 
 op_info = tool_info

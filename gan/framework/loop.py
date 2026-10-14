@@ -673,15 +673,19 @@ class GanLoop:
             return None
 
     def _traj_materialization_files(self, genids: Any, outer: Any = None,
-                                    session_role: Optional[str] = None
+                                    session_role: Optional[str] = None,
+                                    session_outers: Any = None
                                     ) -> List[Tuple[str, str]]:
         """The seat's visible trajectory files as ``(label, path)`` pairs —
         the SAME set the read tools serve. Task generations ride the seat's
         ``trajectory_genids``; the self seat adds its OWN per-generation
-        session files for the current outer. Labels are genid-qualified so
-        one session's address space stays unique across all its files (files
-        from different generations share basenames). Advisory: missing files
-        are skipped by the materialization primitive."""
+        session files over the DECLARED own-session universe
+        (``session_outers``: this outer + the previous outer, L65 ruling).
+        Labels come from ``trajectory.session_label`` — the one place the
+        label rule lives (genid-qualified for the current outer, outer-
+        prefixed for extras) so the materialized address space and the read
+        tool's fallback agree. Advisory: missing files are skipped by the
+        materialization primitive."""
         out: List[Tuple[str, str]] = []
         seen = set()
 
@@ -696,17 +700,17 @@ class GanLoop:
         for g in (genids or []):
             _add(trajectory._session_file(self.output_dir, g, "task"), g)
         if session_role and outer is not None:
-            d = paths.outer_traj_dir(self.output_dir, outer)
-            genids_outer = [str(e["genid"]) for e in
-                            trajectory.outer_session_index(self.output_dir,
-                                                           outer, session_role)]
-            genids_outer.sort(key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
-            for g in genids_outer:
-                _add(os.path.join(d, g, f"{session_role}.jsonl"), g)
+            for label, path in trajectory.session_universe(
+                    self.output_dir, session_role, outer,
+                    extra_outers=session_outers):
+                if label not in seen:
+                    seen.add(label)
+                    out.append((label, path))
         return out
 
     def _materialize_traj(self, cm_session: Any, genids: Any, outer: Any = None,
-                          session_role: Optional[str] = None) -> None:
+                          session_role: Optional[str] = None,
+                          session_outers: Any = None) -> None:
         """Snapshot the seat's visible trajectories into its CM session (one
         scan; the read tools' index face and the ctx faces then share the
         same address space). Advisory: a failure leaves the session without
@@ -716,7 +720,8 @@ class GanLoop:
             return
         try:
             files = self._traj_materialization_files(genids, outer=outer,
-                                                     session_role=session_role)
+                                                     session_role=session_role,
+                                                     session_outers=session_outers)
             if files:
                 cm_session.materialize_traj(files)
         except Exception as e:  # noqa: BLE001 -- advisory, must speak
@@ -1871,9 +1876,15 @@ class GanLoop:
                         role_obj.session_cm_mode = ck_si.get("cm_mode")
                         role_obj.cm_session = self._build_cm_session(role, ck_si, outer=outer)
                         # self seat additionally materializes its OWN session
-                        # files (the read_session_trajectory face) for this outer
+                        # files (the read_session_trajectory face) over the
+                        # declared universe: this outer + the previous outer
+                        # (L65 ruling — "self improve should read the previous
+                        # outer's trajectory").
                         self._materialize_traj(role_obj.cm_session, si_refs,
-                                               outer=outer, session_role=role)
+                                               outer=outer, session_role=role,
+                                               session_outers=([outer - 1]
+                                                               if isinstance(outer, int)
+                                                               and outer > 1 else []))
                     except Exception as e:  # noqa: BLE001 -- advisory stamp
                         # A swallowed degradation must SPEAK (no-silent-fail
                         # rule, AGENTS.md): without this event the session's

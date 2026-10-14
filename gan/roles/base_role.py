@@ -466,10 +466,21 @@ class Role(AgentSystem):
         cfg = self.load_self_config()
         dctx = DesignContext(role=self.role, config=cfg, node_id="self")
         tok = set_design_context(dctx)
+        # Own-session visibility (read_session_trajectory face): this outer +
+        # the previous outer (L65 ruling) — declared here like
+        # trajectory_genids, never derived inside the tool. None (no outer
+        # yet) keeps the tool's legacy current-outer derivation.
+        session_outers = None
+        if isinstance(self.outer, int):
+            session_outers = {self.outer}
+            if self.outer > 1:
+                session_outers.add(self.outer - 1)
         tok_access = (set_access_context(broker, self.role, self.access_key("self"),
                                          trajectory_genids=trajectory_genids,
                                          seat="self_improve",
-                                         session_cm_mode=getattr(self, "session_cm_mode", None))
+                                         session_cm_mode=getattr(self, "session_cm_mode", None),
+                                         session_outers=(frozenset(session_outers)
+                                                         if session_outers else None))
                       if broker is not None else None)
         traj = self.session_trajectory(None)
         attempts = 0
