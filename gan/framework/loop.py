@@ -1824,7 +1824,8 @@ class GanLoop:
                     # in the first increment (no assembly-time policy);
                     # cleared after the call (no leak across seats).
                     try:
-                        ck_si = self._effective_cost_keys(role)
+                        # _effective_cost_keys returns (keys, clamps) -- unpack.
+                        ck_si, _si_clamps = self._effective_cost_keys(role)
                         role_obj.cm_session = self._build_cm_session(role, ck_si)
                     except Exception:  # noqa: BLE001 -- advisory stamp
                         role_obj.cm_session = None

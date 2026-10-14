@@ -24,7 +24,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
+
+# paper_review 的 paper_text（论文全文）可超 csv 默认 128KB 字段上限
+csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 # Keep in sync with gan/framework/domains.yaml -> paper_review.task_brief.
 PAPER_REVIEW_TASK_BRIEF = (
