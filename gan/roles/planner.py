@@ -219,95 +219,32 @@ class Planner(Role):
     def self_improve(self, recent: Optional[Dict[str, Any]] = None, broker: Any = None,
                      max_tool_calls: int = 30, trajectory_genids: Optional[List[Any]] = None,
                      patch_retry_k: int = 2, tool_repeat_limit: Optional[int] = None):
-        cfg = self.load_self_config()
-        dctx = DesignContext(role="planner", config=cfg, node_id="self")
-        tok = set_design_context(dctx)
-        tok_access = (set_access_context(broker, "planner", self.access_key("self"),
-                                         trajectory_genids=trajectory_genids,
-                                         seat="self_improve",
-                                         session_cm_mode=getattr(self, "session_cm_mode", None))
-                      if broker is not None else None)
-        traj = self.session_trajectory(None)
-        attempts = 0
-        rejected = None
-        exhausted = False
-        patch_str = ""
-        # Receipt aggregation (§4.1): see plan() — OR the flags across the
-        # session's runs instead of reading only the last one.
-        tb_exhausted_any = False
-        truncated_any = False
-
-        def _absorb_run_flags() -> None:
-            nonlocal tb_exhausted_any, truncated_any
-            _info = getattr(self, "last_run_info", {}) or {}
-            tb_exhausted_any = tb_exhausted_any or bool(_info.get("token_budget_exhausted"))
-            truncated_any = truncated_any or bool(_info.get("truncated"))
-
-        try:
-            from gan.framework.trajectory import outer_session_index
-            sessions = outer_session_index(self.output_dir, self.outer, "planner")
-            sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
-            rr = render_receipt((recent or {}).get("receipt"))
-            cost_stmt = str((recent or {}).get("cost_statement") or "")
-            instruction = (
-                "Improve YOURSELF (the planner's own design) using only design operators "
-                "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
-                "deep changes need `request_source_access`). You may also extend your own "
-                "config's keys: `add_config_key` declares a new planner-config key (its "
-                "`consumer` must be a registered planner tool that reads it; declaration "
-                "and consumer land in the same patch) and `add_config_value` extends a "
-                "declared enum key. Goal: plan better task agents over "
-                "the long run. "
-                "Do not repeat the same tool call; when done, stop.\n"
-                f"\n## Your session trajectories this outer (use read_session_trajectory)\n{sess_line}\n"
-                + (("\n" + rr + "\n") if rr else "")
-                + ((f"\n{cost_stmt}\n") if cost_stmt else "")
-                + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k not in ('receipt', 'cost_statement')}, ensure_ascii=False)[:2000]}"
-            )
-            hist = self.run(instruction, max_tool_calls=max_tool_calls,
-                            tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
-            _absorb_run_flags()
-
-            def _build_patch() -> str:
-                if broker is None or not has_deep_write(dctx.records):
-                    return ""
-                # No catch — see the plan-session _build_patch comment.
-                return build_patch_from_workspace(broker, "planner", self.access_key("self"))
-
-            last_hash = None
-            for attempt in range(patch_retry_k + 1):
-                patch_str = _build_patch()
-                if not patch_str or not self.code_root:
-                    rejected = None
-                    break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str, role="planner", seat="self_improve")
-                if ok:
-                    rejected = None
-                    break
-                rejected = reason
-                h = hash(patch_str)
-                if h == last_hash or attempt >= patch_retry_k:
-                    exhausted = True
-                    break
-                last_hash = h
-                hist = self.run(
-                    "# Patch rejected\nYour previous patch was rejected by validation:\n"
-                    f"{reason}\nFix the problem, then stop. Do not repeat the same action.",
-                    msg_history=hist, max_tool_calls=max_tool_calls,
-                    tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
-                _absorb_run_flags()
-                attempts += 1
-        finally:
-            reset_design_context(tok)
-            if tok_access is not None:
-                reset_access_context(tok_access)
-        warn_dropped_workspace_edits(broker, "planner", self.access_key("self"),
-                                     dctx.records, self.output_dir, patch_str,
-                                     exhausted=exhausted, rejected=rejected)
-        self.save_self_config(cfg)
-        return {"records": dctx.records, "self_design": self.self_design_path(),
-                "patch": "" if rejected else patch_str, "patch_proposed": patch_str,
-                "patch_rejection": rejected,
-                "attempts": attempts, "truncated": truncated_any,
-                "budget_exhausted": exhausted,
-                "token_budget_exhausted": tb_exhausted_any}
+        from gan.framework.trajectory import outer_session_index
+        sessions = outer_session_index(self.output_dir, self.outer, "planner")
+        sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
+        rr = render_receipt((recent or {}).get("receipt"))
+        cost_stmt = str((recent or {}).get("cost_statement") or "")
+        instruction = (
+            "Improve YOURSELF (the planner's own design) using only design operators "
+            "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
+            "deep changes need `request_source_access`). You may also extend your own "
+            "config's keys: `add_config_key` declares a new planner-config key (its "
+            "`consumer` must be a registered planner tool that reads it; declaration "
+            "and consumer land in the same patch) and `add_config_value` extends a "
+            "declared enum key. Goal: plan better task agents over "
+            "the long run. "
+            "Do not repeat the same tool call; when done, stop.\n"
+            f"\n## Your session trajectories this outer (use read_session_trajectory)\n{sess_line}\n"
+            + (("\n" + rr + "\n") if rr else "")
+            + ((f"\n{cost_stmt}\n") if cost_stmt else "")
+            + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k not in ('receipt', 'cost_statement')}, ensure_ascii=False)[:2000]}"
+        )
+        # Scaffold (design context, self-seat access, session run, patch retry
+        # loop, result contract) is shared with the evaluator in
+        # Role._self_improve_session; only the instruction above is
+        # planner-specific (generic structured outcomes dump — costs ride
+        # inside ``recent``, docs/10 §11.5 B5).
+        return self._self_improve_session(
+            instruction, broker=broker, max_tool_calls=max_tool_calls,
+            trajectory_genids=trajectory_genids, patch_retry_k=patch_retry_k,
+            tool_repeat_limit=tool_repeat_limit)

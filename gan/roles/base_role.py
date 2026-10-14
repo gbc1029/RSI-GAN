@@ -430,3 +430,110 @@ class Role(AgentSystem):
 
     def save_self_config(self, cfg: dict) -> str:
         return self.design_store.save(cfg, self.role)
+
+    # -- self-improve scaffold (shared by planner/evaluator) ---------------
+    def _self_improve_session(
+        self,
+        instruction: str,
+        broker: Any = None,
+        max_tool_calls: int = 30,
+        trajectory_genids: Optional[List[Any]] = None,
+        patch_retry_k: int = 2,
+        tool_repeat_limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Shared self-improve scaffold for planner/evaluator (unified batch).
+
+        The ROLE-SPECIFIC part is the instruction, built by the caller: the
+        two payloads are deliberately different (the planner dumps its
+        structured ``recent`` outcomes; the evaluator gets the feedback-digest
+        stream plus a dedicated per-session costs section, docs/10 §11.5 B5).
+        Everything else — self design load, design context, self-seat access,
+        the session run, the patch retry loop (hash-dedup + ``patch_retry_k``),
+        the dropped-edit warning, the self-config save and the result
+        contract — is identical for both roles and lives here. Exceptions
+        propagate to the loop's ``self_improve_error`` classification exactly
+        as before the unification.
+        """
+        from gan.framework.access import reset_access_context, set_access_context
+        from gan.framework.context import (
+            DesignContext,
+            reset_design_context,
+            set_design_context,
+        )
+        from gan.framework import code_repo
+        from gan.patch import build_patch_from_workspace, has_deep_write
+
+        cfg = self.load_self_config()
+        dctx = DesignContext(role=self.role, config=cfg, node_id="self")
+        tok = set_design_context(dctx)
+        tok_access = (set_access_context(broker, self.role, self.access_key("self"),
+                                         trajectory_genids=trajectory_genids,
+                                         seat="self_improve",
+                                         session_cm_mode=getattr(self, "session_cm_mode", None))
+                      if broker is not None else None)
+        traj = self.session_trajectory(None)
+        attempts = 0
+        rejected = None
+        exhausted = False
+        patch_str = ""
+        # Receipt aggregation (§4.1): OR the flags across the session's runs
+        # (main + rejection retries) instead of reading only the last one.
+        tb_exhausted_any = False
+        truncated_any = False
+
+        def _absorb_run_flags() -> None:
+            nonlocal tb_exhausted_any, truncated_any
+            _info = getattr(self, "last_run_info", {}) or {}
+            tb_exhausted_any = tb_exhausted_any or bool(_info.get("token_budget_exhausted"))
+            truncated_any = truncated_any or bool(_info.get("truncated"))
+
+        try:
+            hist = self.run(instruction, max_tool_calls=max_tool_calls,
+                            tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
+            _absorb_run_flags()
+
+            def _build_patch() -> str:
+                if broker is None or not has_deep_write(dctx.records):
+                    return ""
+                # No catch — a patch build failure propagates (session ->
+                # <role>_failed), never masquerades as a legitimate empty patch.
+                return build_patch_from_workspace(broker, self.role, self.access_key("self"))
+
+            last_hash = None
+            for attempt in range(patch_retry_k + 1):
+                patch_str = _build_patch()
+                if not patch_str or not self.code_root:
+                    rejected = None
+                    break
+                ok, reason = code_repo.check_patch(self.code_root, patch_str,
+                                                   role=self.role, seat="self_improve")
+                if ok:
+                    rejected = None
+                    break
+                rejected = reason
+                h = hash(patch_str)
+                if h == last_hash or attempt >= patch_retry_k:
+                    exhausted = True
+                    break
+                last_hash = h
+                hist = self.run(
+                    "# Patch rejected\nYour previous patch was rejected by validation:\n"
+                    f"{reason}\nFix the problem, then stop. Do not repeat the same action.",
+                    msg_history=hist, max_tool_calls=max_tool_calls,
+                    tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
+                _absorb_run_flags()
+                attempts += 1
+        finally:
+            reset_design_context(tok)
+            if tok_access is not None:
+                reset_access_context(tok_access)
+        warn_dropped_workspace_edits(broker, self.role, self.access_key("self"),
+                                     dctx.records, self.output_dir, patch_str,
+                                     exhausted=exhausted, rejected=rejected)
+        self.save_self_config(cfg)
+        return {"records": dctx.records, "self_design": self.self_design_path(),
+                "patch": "" if rejected else patch_str, "patch_proposed": patch_str,
+                "patch_rejection": rejected,
+                "attempts": attempts, "truncated": truncated_any,
+                "budget_exhausted": exhausted,
+                "token_budget_exhausted": tb_exhausted_any}
