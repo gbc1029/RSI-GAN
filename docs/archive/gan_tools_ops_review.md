@@ -165,6 +165,7 @@
 **N9（新发现）— `prompt` 有两条写入路径，无唯一性与审计标签**
 - `set_prompt(text=...)`（`set_prompt.py:21`）与 `set_config(key="prompt", value=...)`（`set_config.py:29-35`，`prompt` 在三角色 schema 内，`gan/design/schema.py:15-30`）写**同一个 config key**。
 - 后果：审计/diff 无法区分"用哪个算子改的 prompt"；R4 白名单方案若只覆盖其中一个算子，另一条会漏。
+  > **【两半边均已治理·2026-10-14 核对】** 约束半边=P-a（共享校验器 `prompt_write_error`+`PROMPT_MAX_CHARS=20_000`，双路径于任何写入/record 前接入）；审计半边=B29（两路径 record 同一 `prompt_change_facts` 事实结构，record 的 `op` 字段天然区分 `set_prompt`/`set_config`）——"审计不可区分"不再成立；两条写入路径仍并存，但受约束+统一审计。见已办留档 §6.1 处置批（二）（五）。
 
 **自改写风险**：角色 prompt 完全由 agent 可写的 `config["prompt"]` 决定（`base_role.py:97-99,109`）。框架注入项（`task_brief`/`receipt`/`issues`…）是**追加**到 instruction 的（`planner.py:28-79`、`evaluator.py:20-54`），`set_prompt` **删不掉**它们，但可写入"忽略后续注入 / 停止调用工具 / 直接给分"等指令削弱约束。
 
@@ -289,7 +290,7 @@
 |---|---|---|---|
 | R-a | **扩展 `entry_reason` → 完整校验**：除现有 4 项外，增加 ①`name` 必须等于 `module` basename（N2 契约）②`module` 可 import 且暴露 `tool_info`/`tool_function` ③`input_schema` 结构合法 | `gan/registries/loader.py:50-63` | 中 |
 | R-b | **双向一致性检验**：`registry_report` 增加"孤儿组件"扫描（`gan/components/**` 有文件但无注册条目）→ N6 | `gan/framework/code_repo.py:283-301` | 中 |
-| R-c | **放宽校验触发条件**：不再要求 patch 触及 `gan/registries/`，只要 patch 触及 `gan/components/**` 或 `gan/tools/work/**` 也跑注册表一致性校验 | `code_repo.py:319-320` | 中 |
+| R-c | **放宽校验触发条件**：不再要求 patch 触及 `gan/registries/`，只要 patch 触及 `gan/components/**` 或 `gan/tools/work/**` 也跑注册表一致性校验 | `code_repo.py:319-320` | 中 |【消解·2026-10-14】被更强门取代：`_needs_registry_check` 自 4bc5318"validate collisions for every patch"起无条件 True，逐非空 code patch 跑全五类差分（unparseable/invalid/duplicate/orphan/collision），docstring 点名 `gan/tools/work/**` 场景——强于本行诉求（中间态：5112cb0 曾放宽为 registries∪components，即待办旧残余句记录的时点）。见已办留档 §6.1 处置批（五）。 |
 | R-d | **启动期 preflight 扩展**：`preflight()` 增加工具集/注册表校验（对每 role 跑 `load_registry_for_role` + `assemble_tools_dir` 到临时目录 + 校验无同名、无 invalid、无孤儿），失败即 abort | `gan/framework/preflight.py:15-38`；`gan/build.py:137-142` | 中 |
 | R-e | **自动注册（可选）**：新增组件时由 `edit_source`/patch 落点自动追加注册条目（或提供 `register_component` 算子），减少手工不一致 | 新增算子 + `frozen.py` 白名单 | 低 |
 
@@ -323,7 +324,7 @@
 | I-a | **F1 完整版**：`meta_view` 排除 `records`；`_source_access_log`/receipt 剥离 `reason`（通道 A、B）→ 并**补上本轮新发现的 C、D** | `loop.py:762-763`、`:346-355`、`receipt.py:92`、`evaluator_reward.py:197-200` | **高** |
 | I-b | **R4 落地**：删 `summary.py` 死分支 + 改"未知 op 透传 + 安全字段白名单"（`slot/name/key/paths/intent/chars/count`），并**统一 receipt 内两处字段策略**（N4） | `gan/summary.py:15-43`、`receipt.py:13-24,92` | 中 |
 | I-c | **G5 结构化加固**：evaluator 可见信息白名单**投影**（覆盖未来新算子的任意 record 字段），作为 A/B/C/D 的统一兜底 | 新增投影层；`loop.py:767-782` | 中 |
-| I-d | `set_param.value` 加 schema 约束（或从 records 中只记 key 不记 value）→ 通道 C | `set_param.py:9-12,27` | 中 |
+| I-d | `set_param.value` 加 schema 约束（或从 records 中只记 key 不记 value）→ 通道 C | `set_param.py:9-12,27` | 中 |【判定关闭·2026-10-14】两半边在现有架构下均无正收益——加 schema：`params` 槽按 schema 定义即自由 dict（异质自由参数无单一 schema），类型需求的既定通道=add_config_key+registered consumer 动态键机制（声明与消费同 patch），结构性冗余；只记 key：通道 C 的 evaluator 朝向已三面白名单全闭（`_EVALUATOR_META_KEYS` 不含 records / `build_diff_summary` 仅显式命名分支 / `_ops_summary` 无 value），value 现仅存 planner 自身审计面（会话轨迹/events，合法去处），剥除=纯审计损失零安全收益。见已办留档 §6.1 处置批（五）。 |
 | I-e | **T2 约定落地**：`AGENTS.md` + `seeds/*.md` 写入"新工具必须 `ctx.record(op, **结构化字段)`，不记录 rationale"，并与"检测-回退-回执"机制绑定 | `AGENTS.md`、`gan/design/seeds/*.md` | 中 |
 
 ### 9.6 继承
