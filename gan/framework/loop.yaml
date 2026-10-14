@@ -157,9 +157,9 @@ ablation:
   disable_shallow: false                # B4：禁所有 shallow（config 冻结），deep 照常
   # --- C 组：反馈信号轴 ---
   disable_blind: false                  # C1：关闭盲评，evaluator 一开始就看到 benchmark 分
-  feedback_numeric_only: false          # C2：planner 只拿 benchmark 分，无 issues/digest/diff
+  feedback_numeric_only: false          # C2：无文本反馈，只给两分数（predicted+benchmark）
   feedback_no_diff_summary: false       # C3：去掉 diff 差异摘要（planner/evaluator 两侧）
-  feedback_predicted_score_only: false  # C4：数值奖励(predicted_score)替代文本反馈
+  feedback_benchmark_score_only: false  # C4：仅给 benchmark 分数，无预测分，无文本
   # --- D 组：轨迹可见性轴 ---
   trajectory_visibility: parent         # parent(基线) | current | all
   # --- E 组：评估点增减轴 ---

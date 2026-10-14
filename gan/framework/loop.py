@@ -174,7 +174,7 @@ class GanLoop:
             "disable_blind": bool(cfg.get("ablation.disable_blind", False)),
             "feedback_numeric_only": bool(cfg.get("ablation.feedback_numeric_only", False)),
             "feedback_no_diff_summary": bool(cfg.get("ablation.feedback_no_diff_summary", False)),
-            "feedback_predicted_score_only": bool(cfg.get("ablation.feedback_predicted_score_only", False)),
+            "feedback_benchmark_score_only": bool(cfg.get("ablation.feedback_benchmark_score_only", False)),
             "trajectory_visibility": str(cfg.get("ablation.trajectory_visibility", "parent")),
             "freeze_evaluator": bool(cfg.get("ablation.freeze_evaluator", False)),
         }
@@ -1398,15 +1398,14 @@ class GanLoop:
                 plan_pred = parent_predicted_score
                 plan_bench = parent_benchmark_score
                 if self._ab("feedback_numeric_only"):
-                    # C2: only the objective benchmark score reaches the planner.
+                    # C2: both scores (predicted + benchmark), no text.
                     plan_feedback = None
                     plan_issues = None
-                if self._ab("feedback_predicted_score_only"):
-                    # C4: numeric reward (predicted_score) replaces text feedback;
-                    # the objective score is dropped too, isolating the signal.
+                if self._ab("feedback_benchmark_score_only"):
+                    # C4: benchmark score only -- no text, no predicted score.
                     plan_feedback = None
                     plan_issues = None
-                    plan_bench = None
+                    plan_pred = None
                 traj_plan = self._traj_vis([], parent_ref)
 
                 # Reserved cost keys for the PLAN seat (docs/10 §10, phase C):
