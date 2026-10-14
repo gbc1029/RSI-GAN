@@ -286,6 +286,7 @@ class _TaskBrokerState:
                 setfacl_path=str(self.config["setfacl"]),
                 bwrap_path=str(self.config["bwrap"]),
                 python_prefix=str(self.config["python_prefix"]),
+                sandbox_etc_dir=str(self.config["sandbox_etc_dir"]),
                 sandbox_profile=dict(self.config["sandbox_profile"]),
             )
         finally:

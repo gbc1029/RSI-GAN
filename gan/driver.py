@@ -12,6 +12,8 @@ failure; events ``self_improve_commit`` / ``self_improve_apply_failed``).
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from functools import wraps
 import json
 import multiprocessing
 import os
@@ -24,11 +26,55 @@ import time
 from typing import Any, Dict, List, Optional
 
 from gan.framework import paths
+from gan.framework.sandbox_etc import (
+    SANDBOX_HOSTNAME,
+    create_sandbox_etc,
+    validate_sandbox_etc,
+)
 
 
 _OUTPUT_SOURCE_MARKERS = frozenset({
     ".env", ".git", "agent", "baselines", "datasets", "domains", "gan",
 })
+
+
+def _private_driver_umask(func: Any) -> Any:
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        previous = os.umask(0o077)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            os.umask(previous)
+
+    return wrapped
+
+
+@contextmanager
+def _clean_broker_start_environment():
+    """Expose only non-secret process settings during spawn inheritance."""
+    previous = dict(os.environ)
+    allowed = {
+        "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+    clean = {
+        key: value for key, value in previous.items()
+        if key in allowed or key.startswith("LC_")
+    }
+    clean.update({
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "GAN_SECURE_MODE": "1",
+        "PYTHON_DOTENV_DISABLED": "1",
+    })
+    os.environ.clear()
+    os.environ.update(clean)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
 
 
 def _validate_run_paths(repo_root: str, output_dir: str) -> tuple[str, str]:
@@ -186,7 +232,8 @@ def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
                           proxy_socket: Optional[str] = None,
                           task_broker_socket: Optional[str] = None,
                           role_broker_socket: Optional[str] = None,
-                          env_mask_file: Optional[str] = None) -> List[str]:
+                          env_mask_file: Optional[str] = None,
+                          sandbox_etc_dir: Optional[str] = None) -> List[str]:
     """Run outer_worker in a no-network view with only its run inputs mounted."""
     del proxy_socket  # compatibility argument; role/task brokers mount it directly
     bwrap = shutil.which("bwrap")
@@ -194,15 +241,21 @@ def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
         raise RuntimeError(
             "GAN outer_worker network isolation requires bubblewrap ('bwrap'); "
             "refusing to run planner/evaluator with host networking")
+    if not sandbox_etc_dir:
+        raise RuntimeError("outer sandbox requires a sanitized /etc projection")
+    sandbox_etc_dir = validate_sandbox_etc(sandbox_etc_dir)
     command = [
         bwrap, "--die-with-parent", "--new-session",
         "--unshare-all", "--unshare-net", "--cap-drop", "ALL",
+        "--hostname", SANDBOX_HOSTNAME,
     ]
     created = {"/"}
-    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
         if os.path.exists(path):
             command.extend(["--ro-bind", path, path])
             created.add(path)
+    command.extend(["--ro-bind", sandbox_etc_dir, "/etc"])
+    created.add("/etc")
     prefix = os.path.realpath(sys.prefix)
     if not any(prefix == root or prefix.startswith(root + os.sep)
                for root in ("/usr", "/bin", "/sbin", "/lib", "/lib64")):
@@ -414,17 +467,16 @@ def _trusted_ipc_parent() -> str:
 
 
 def _start_task_broker(socket_path: str, config: Dict[str, Any]) -> _TaskBrokerController:
-    if "fork" not in multiprocessing.get_all_start_methods():
-        raise RuntimeError("secure TaskAgent launch requires POSIX fork support")
     from gan.framework.task_broker import broker_process_main
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     parent_control, child_control = context.Pipe()
     process = context.Process(
         target=broker_process_main,
         args=(child_control, socket_path, config),
         name="rsi-gan-privileged-task-broker",
     )
-    process.start()
+    with _clean_broker_start_environment():
+        process.start()
     child_control.close()
     if not parent_control.poll(10):
         process.terminate()
@@ -439,17 +491,16 @@ def _start_task_broker(socket_path: str, config: Dict[str, Any]) -> _TaskBrokerC
 
 
 def _start_role_broker(socket_path: str, config: Dict[str, Any]) -> _RoleBrokerController:
-    if "fork" not in multiprocessing.get_all_start_methods():
-        raise RuntimeError("secure role launch requires POSIX fork support")
     from gan.framework.role_broker import broker_process_main
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     parent_control, child_control = context.Pipe()
     process = context.Process(
         target=broker_process_main,
         args=(child_control, socket_path, config),
         name="rsi-gan-privileged-role-broker",
     )
-    process.start()
+    with _clean_broker_start_environment():
+        process.start()
     child_control.close()
     if not parent_control.poll(10):
         process.terminate()
@@ -463,6 +514,7 @@ def _start_role_broker(socket_path: str, config: Dict[str, Any]) -> _RoleBrokerC
     return _RoleBrokerController(process, parent_control)
 
 
+@_private_driver_umask
 def run_gan_driver(
     repo_root: str,
     output_dir: str,
@@ -573,6 +625,19 @@ def run_gan_driver(
     }
     proxy_dir = tempfile.mkdtemp(prefix="rsi-gan-proxy-", dir=_trusted_ipc_parent())
     os.chmod(proxy_dir, 0o711)
+    try:
+        sandbox_etc_dir = create_sandbox_etc(
+            proxy_dir,
+            owner=(owner_uid, owner_gid),
+            task=(int(sandbox_account.pw_uid), int(sandbox_account.pw_gid)),
+            planner=(int(role_accounts["planner"]["uid"]),
+                     int(role_accounts["planner"]["gid"])),
+            evaluator=(int(role_accounts["evaluator"]["uid"]),
+                       int(role_accounts["evaluator"]["gid"])),
+        )
+    except Exception:
+        shutil.rmtree(proxy_dir, ignore_errors=True)
+        raise
     proxy_socket = os.path.join(proxy_dir, "p.sock")
     task_broker_socket = os.path.join(proxy_dir, "task.sock")
     role_broker_socket = os.path.join(proxy_dir, "role.sock")
@@ -625,6 +690,7 @@ def run_gan_driver(
         "sandbox_uid": int(sandbox_account.pw_uid),
         "proxy_socket": proxy_socket,
         "proxy_control_token": proxy_control_token,
+        "sandbox_etc_dir": sandbox_etc_dir,
         "task_llm_max_calls": (
             max(1, int(num_samples)) *
             task_llm_calls_per_question
@@ -652,6 +718,7 @@ def run_gan_driver(
             "proxy_control_token": proxy_control_token,
             "llm_timeout_s": str(os.environ.get("GAN_LLM_TIMEOUT_S", "600")),
             "ipc_dir": proxy_dir,
+            "sandbox_etc_dir": sandbox_etc_dir,
         })
     except Exception:
         task_broker.close()
@@ -664,6 +731,18 @@ def run_gan_driver(
         proxy.bind()
         _drop_driver_privileges(owner_uid, owner_gid, owner_username)
         os.makedirs(output_dir, exist_ok=True)
+        output_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        output_fd = os.open(output_dir, output_flags)
+        try:
+            output_info = os.fstat(output_fd)
+            if (not stat.S_ISDIR(output_info.st_mode)
+                    or output_info.st_uid != owner_uid):
+                raise RuntimeError(
+                    "output_dir has an unexpected owner or type after privilege drop"
+                )
+            os.fchmod(output_fd, 0o700)
+        finally:
+            os.close(output_fd)
         if not os.access(output_dir, os.R_OK | os.W_OK | os.X_OK):
             raise RuntimeError(
                 f"sudo invoking user cannot read/write/traverse output_dir: {output_dir}"
@@ -761,6 +840,7 @@ def run_gan_driver(
                         task_broker_socket=task_broker_socket,
                         role_broker_socket=role_broker_socket,
                         env_mask_file=env_mask_file,
+                        sandbox_etc_dir=sandbox_etc_dir,
                     ),
                     cwd=code_root, env=env,
                 )

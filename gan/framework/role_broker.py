@@ -18,6 +18,8 @@ import tempfile
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List, Tuple
 
+from gan.framework.sandbox_etc import SANDBOX_HOSTNAME, validate_sandbox_etc
+
 _INSTANCE_RE = re.compile(r"outer_(0|[1-9][0-9]{0,11})\Z")
 _MAX_AUTH_BYTES = 16 * 1024
 _ROLE_SEATS = {
@@ -693,15 +695,19 @@ class _RoleBrokerState:
                 traverse_entries.extend(
                     self._acquire_traverse(parent_fds, str(cfg["setfacl"]), role_uid)
                 )
+            sandbox_etc_dir = validate_sandbox_etc(str(cfg["sandbox_etc_dir"]))
             command = [
                 str(cfg["bwrap"]), "--die-with-parent", "--new-session",
                 "--unshare-all", "--unshare-net", "--cap-drop", "ALL",
+                "--hostname", SANDBOX_HOSTNAME,
             ]
             created = {"/"}
-            for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
+            for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
                 if os.path.exists(path):
                     command.extend(["--ro-bind", path, path])
                     created.add(path)
+            command.extend(["--ro-bind", sandbox_etc_dir, "/etc"])
+            created.add("/etc")
             prefix = str(cfg["python_prefix"])
             if not any(prefix == root or prefix.startswith(root + os.sep)
                        for root in ("/usr", "/bin", "/sbin", "/lib", "/lib64")):

@@ -33,6 +33,88 @@ _TASK_ENV_NAMES = {
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
     "GAN_SECURE_MODE", "PYTHON_DOTENV_DISABLED",
 }
+_SANDBOX_ETC_MARKER = "/etc/.rsi-gan-sandbox"
+_SANDBOX_ETC_MARKER_CONTENT = b"RSI_GAN_SANDBOX_ETC_V1\n"
+_SANDBOX_HOSTNAME = "rsi-gan-sandbox"
+_SANDBOX_ETC_REQUIRED_FILES = {
+    ".rsi-gan-sandbox",
+    "group",
+    "hostname",
+    "hosts",
+    "localtime",
+    "nsswitch.conf",
+    "passwd",
+    "timezone",
+}
+_SANDBOX_ETC_OPTIONAL_FILES = {
+    "ld.so.cache",
+    "ssl/openssl.cnf",
+    "ssl/certs/ca-certificates.crt",
+}
+_SANDBOX_ETC_ALLOWED_DIRS = {"ssl", "ssl/certs"}
+
+
+def _etc_mount_is_read_only(device):
+    expected_device = f"{os.major(device)}:{os.minor(device)}"
+    with open("/proc/self/mountinfo", "r", encoding="ascii") as handle:
+        for line in handle:
+            fields = line.split()
+            if (len(fields) >= 6 and fields[2] == expected_device
+                    and fields[4] == "/etc"
+                    and "ro" in fields[5].split(",")):
+                return True
+    return False
+
+
+def _require_projected_etc():
+    """Refuse nested sandboxing unless the parent supplied the trusted /etc."""
+    root_info = os.lstat("/etc")
+    if (not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_IMODE(root_info.st_mode) != 0o555
+            or not _etc_mount_is_read_only(root_info.st_dev)):
+        raise RuntimeError("TaskAgent sandbox requires the sanitized /etc projection")
+
+    observed_files = set()
+    for current, directories, files in os.walk("/etc", followlinks=False):
+        relative_root = os.path.relpath(current, "/etc")
+        relative_root = "" if relative_root == "." else relative_root
+        for name in directories:
+            relative = "/".join(part for part in (relative_root, name) if part)
+            info = os.lstat(os.path.join(current, name))
+            if (relative not in _SANDBOX_ETC_ALLOWED_DIRS
+                    or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != root_info.st_uid
+                    or stat.S_IMODE(info.st_mode) != 0o555):
+                raise RuntimeError(
+                    f"TaskAgent sandbox /etc contains an unsafe directory: {relative}"
+                )
+        for name in files:
+            relative = "/".join(part for part in (relative_root, name) if part)
+            info = os.lstat(os.path.join(current, name))
+            if (relative not in (_SANDBOX_ETC_REQUIRED_FILES
+                                | _SANDBOX_ETC_OPTIONAL_FILES)
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != root_info.st_uid
+                    or stat.S_IMODE(info.st_mode) != 0o444
+                    or info.st_nlink != 1):
+                raise RuntimeError(
+                    f"TaskAgent sandbox /etc contains an unsafe file: {relative}"
+                )
+            observed_files.add(relative)
+    if not _SANDBOX_ETC_REQUIRED_FILES <= observed_files:
+        raise RuntimeError("TaskAgent sandbox /etc projection is incomplete")
+
+    fd = os.open(_SANDBOX_ETC_MARKER,
+                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        content = os.read(fd, len(_SANDBOX_ETC_MARKER_CONTENT) + 1)
+    finally:
+        os.close(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != root_info.st_uid
+            or stat.S_IMODE(info.st_mode) != 0o444 or info.st_nlink != 1
+            or content != _SANDBOX_ETC_MARKER_CONTENT):
+        raise RuntimeError("TaskAgent sandbox /etc projection marker is invalid")
 
 def _task_child_env(base_env):
     """Return a non-secret allowlist for the trusted worker and agent child."""
@@ -89,6 +171,7 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
             "TaskAgent sandbox is required, but 'bwrap' is not installed. "
             "Refusing to run TaskAgent without benchmark isolation."
         )
+    _require_projected_etc()
 
     agent_host = os.path.realpath(os.path.join(run_root, agent_path))
     _sandbox_path(run_root, agent_host)  # validates containment
@@ -127,14 +210,17 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
         "--unshare-all",
         "--unshare-net",
         "--cap-drop", "ALL",
+        "--hostname", _SANDBOX_HOSTNAME,
     ]
 
     # System runtime is read-only. No repository/data parent is mounted.
     created = {"/"}
-    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
         if os.path.exists(path):
             command.extend(["--ro-bind", path, path])
             created.add(path)
+    command.extend(["--ro-bind", "/etc", "/etc"])
+    created.add("/etc")
 
     # Support an interpreter installed in a venv/conda prefix outside /usr
     # without exposing its parent directories.

@@ -277,6 +277,7 @@ def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str
 
     Quarantined (unredactable) sessions are reported explicitly with
     ``quarantined: True`` instead of silently vanishing from the list."""
+    out: List[Dict[str, Any]] = []
     seat = "plan" if role == "planner" else "evaluate"
     seat_dir = paths.role_traj_dir(output_dir, outer, role, seat)
     if os.path.isdir(seat_dir):
@@ -289,7 +290,6 @@ def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str
                 out.append({"genid": name[4:], "quarantined": True})
         return out
     d = paths.outer_traj_dir(output_dir, outer)
-    out: List[Dict[str, Any]] = []
     if os.path.isdir(d):
         for name in sorted(os.listdir(d)):
             sub = os.path.join(d, name)
