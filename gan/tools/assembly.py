@@ -134,9 +134,13 @@ def load_failures(report: Optional[Dict[str, Any]], role: str,
     ``task_runner`` and ``base_role._load_failures``: ``"not selected by the
     design"`` is NOT a failure (expected state of every non-selected file); the
     fixable/reportable classes are ``import failed``, ``missing tool_info``,
-    ``tool_info failed`` and ``name mismatch`` (the runtime identity gate),
-    each classified via :func:`classify_tool_file` so a consumer can route
-    agent-fixable items vs frozen-framework bugs.
+    ``tool_info failed``, ``name mismatch`` (the runtime identity gate) and
+    ``input_schema mismatch`` (the R-a③ load-time schema gate: a well-formed
+    ``required`` naming keys ``properties`` does not declare would brick the
+    tool at dispatch), each classified via :func:`classify_tool_file` so a
+    consumer can route agent-fixable items vs frozen-framework bugs.
+    Precheck-degrading schema malformations are NOT here: they load with an
+    advisory entry in the report's ``schema_issues`` instead.
     """
     out: List[Dict[str, Any]] = []
     for item in ((report or {}).get("skipped") or []):
@@ -144,7 +148,8 @@ def load_failures(report: Optional[Dict[str, Any]], role: str,
         if not (reason.startswith("import failed")
                 or reason.startswith("missing tool_info")
                 or reason.startswith("tool_info failed")
-                or reason.startswith("name mismatch")):
+                or reason.startswith("name mismatch")
+                or reason.startswith("input_schema mismatch")):
             continue
         cls = classify_tool_file(role, str(item.get("file") or ""),
                                  code_root=code_root)

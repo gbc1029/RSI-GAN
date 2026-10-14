@@ -500,6 +500,7 @@ class DomainTaskRunner:
                     "failed": load_failed,
                     "framework_failed": [f for f in load_failed
                                          if f.get("kind") == "always_on_frozen"],
+                    "schema_issues": load_report.get("schema_issues") or [],
                 })
             except Exception as e:  # noqa: BLE001 -- audit write failure
                 print(f"[WARN] task_tools_loaded event write failed: {e}")

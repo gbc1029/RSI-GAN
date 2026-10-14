@@ -465,11 +465,22 @@ with a GAN-native data layer.
   import-checks the module and fail-closes a `name != stem` file with a
   skip-with-reason report entry (erratum vs batch 18: a STATIC gate can never
   check the name VALUE without an import, so the load-time runtime gate is
-  the settled K2 form). `gan/registries/loader.py:entry_reason` enforces this at selection
+  the settled K2 form). The same load layer also gates the structural health
+  of `tool_info()["input_schema"]` (R-a③, two tiers): a well-formed
+  `required` naming keys `properties` does not declare fail-closes with a
+  skip-with-reason report entry (it would brick the tool at dispatch:
+  dispatch_rejected on every call, then an unexpected kwarg), while
+  precheck-degrading malformations (non-dict schema, `required` not a string
+  list) still load with an advisory `schema_issues` entry in the load report
+  (the P-b precheck tolerates them; absent schema stays legal).
+  `gan/registries/loader.py:entry_reason` enforces this at selection
   time (plus the **role-directory binding**: a registry entry may only reference
   its own role's component tree — one single-writer file per role since batch 6);
-  `gan/framework/code_repo.py` (differential gate on commits touching
-  `gan/registries/**` or `gan/components/**`) and
+  `gan/framework/code_repo.py` (the five-class differential gate —
+  unparseable/invalid/duplicate/orphan/collision — run for EVERY non-empty
+  code patch since 4bc5318: registry health and toolset-basename collisions
+  are properties of the resulting tree, not of which directory a patch
+  touched) and
   `gan/framework/preflight.py:preflight_tools` (startup, fail-fast) enforce it too.
   Adding a tool file without a registry entry is reported as an **orphan**
   instead of failing silently; `list_components` lists such files as candidates and

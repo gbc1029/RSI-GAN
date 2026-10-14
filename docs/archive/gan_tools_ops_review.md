@@ -288,7 +288,7 @@
 
 | # | 建议 | 落点 | 优先级 |
 |---|---|---|---|
-| R-a | **扩展 `entry_reason` → 完整校验**：除现有 4 项外，增加 ①`name` 必须等于 `module` basename（N2 契约）②`module` 可 import 且暴露 `tool_info`/`tool_function` ③`input_schema` 结构合法 | `gan/registries/loader.py:50-63` | 中 |
+| R-a | **扩展 `entry_reason` → 完整校验**：除现有 4 项外，增加 ①`name` 必须等于 `module` basename（N2 契约）②`module` 可 import 且暴露 `tool_info`/`tool_function` ③`input_schema` 结构合法 | `gan/registries/loader.py:50-63` | 中 |【✅ 兑现·2026-10-14】①②=identity 线（name==stem、AST 暴露检查+角色目录绑定+safe_module_rel）；③ 经改形兑现于**加载层**（静态层取不到 `tool_info()` 返回值，同 batch-22 K2 勘误原理）：required/properties 失配 fail-close（`input_schema mismatch:` 进 load report+owner 分类链），仅降级预检的畸形以 `schema_issues` advisory 装载——两级语义经用户裁决。见已办留档 §6.1 处置批（六）。 |
 | R-b | **双向一致性检验**：`registry_report` 增加"孤儿组件"扫描（`gan/components/**` 有文件但无注册条目）→ N6 | `gan/framework/code_repo.py:283-301` | 中 |
 | R-c | **放宽校验触发条件**：不再要求 patch 触及 `gan/registries/`，只要 patch 触及 `gan/components/**` 或 `gan/tools/work/**` 也跑注册表一致性校验 | `code_repo.py:319-320` | 中 |【消解·2026-10-14】被更强门取代：`_needs_registry_check` 自 4bc5318"validate collisions for every patch"起无条件 True，逐非空 code patch 跑全五类差分（unparseable/invalid/duplicate/orphan/collision），docstring 点名 `gan/tools/work/**` 场景——强于本行诉求（中间态：5112cb0 曾放宽为 registries∪components，即待办旧残余句记录的时点）。见已办留档 §6.1 处置批（五）。 |
 | R-d | **启动期 preflight 扩展**：`preflight()` 增加工具集/注册表校验（对每 role 跑 `load_registry_for_role` + `assemble_tools_dir` 到临时目录 + 校验无同名、无 invalid、无孤儿），失败即 abort | `gan/framework/preflight.py:15-38`；`gan/build.py:137-142` | 中 |
