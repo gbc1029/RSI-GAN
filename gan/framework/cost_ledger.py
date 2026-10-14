@@ -345,6 +345,19 @@ def compact(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 # -- cost_sessions.jsonl (the loop's append-only per-session record) ---------
 def append_session_cost(output_dir: str, record: Dict[str, Any]) -> None:
+    """Append one session's cost record, refusing duplicate keys.
+
+    The ledger is append-only; a second write for the same
+    (role, seat, outer, genid, attempt) would silently double-count the
+    session in aggregates (reconcile / cost statements). Fail loud instead.
+    """
+    key = (record.get("role"), record.get("seat"),
+           str(record.get("outer")), str(record.get("genid")), record.get("attempt"))
+    for old in read_session_costs(output_dir):
+        old_key = (old.get("role"), old.get("seat"),
+                   str(old.get("outer")), str(old.get("genid")), old.get("attempt"))
+        if old_key == key:
+            raise ValueError(f"duplicate session-cost record {key!r} refused")
     trajectory_log.append(paths.cost_sessions_path(output_dir), record)
 
 

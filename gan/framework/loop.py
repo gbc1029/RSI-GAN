@@ -410,7 +410,19 @@ class GanLoop:
                                      if k in cm_sum}
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass
-            cost_ledger.append_session_cost(self.output_dir, rec)
+            # 幂等：同 key 记录已存在时不重复写入文件（防止 reconcile 重复
+            # 结算产生重复行）。复用已有记录并保留会话级记账与事件暴露。
+            key = (rec.get("role"), rec.get("seat"),
+                   str(rec.get("outer")), str(rec.get("genid")), rec.get("attempt"))
+            existing = [
+                old for old in cost_ledger.read_session_costs(self.output_dir)
+                if (old.get("role"), old.get("seat"),
+                    str(old.get("outer")), str(old.get("genid")), old.get("attempt")) == key
+            ]
+            if existing:
+                rec = existing[-1]
+            else:
+                cost_ledger.append_session_cost(self.output_dir, rec)
             self._session_costs.append(rec)
             self.log_event({"type": "cost_session",
                             **{k: rec.get(k) for k in
