@@ -1,7 +1,10 @@
 """Design operator: set an EXISTING config key (shallow).
 
-Only keys already defined in the role schema may be set. Adding a NEW key is a
-source-level (deep) change, not a shallow operator.
+Settable: keys already defined in the role schema (the static slots, incl. the
+reserved ``cost`` slot) plus keys DECLARED dynamic via ``add_config_key`` (the
+operator's own text says so and refuses undeclared names). Adding a genuinely
+NEW key is therefore a source-level (deep) change, not a shallow operator: it
+must first be declared (declaration + consumer in the same patch).
 
 The ``tools`` slot (one component slot per role; legacy ``skills``/
 ``eval_points`` names are aliases) goes through the SAME tool validation as
@@ -90,10 +93,13 @@ def tool_function(key, value, **kwargs):
         # Frozen framework setting: role model is not an evolvable design value.
         value = {k: v for k, v in value.items() if k != "model"}
     if key == "prompt":
-        # ``set_config(key="prompt")`` is the same act as set_prompt. Capture the
-        # replaced value BEFORE the assignment and record the same structural
-        # facts.
-        from gan.tools.design.set_prompt import _seed_prompt
+        # ``set_config(key="prompt")`` is the same act as set_prompt: the SAME
+        # P-a validation (shared chokepoint, cannot drift), then the same
+        # structural facts. Capture the replaced value BEFORE the assignment.
+        from gan.tools.design.set_prompt import _seed_prompt, prompt_write_error
+        err = prompt_write_error(value)
+        if err:
+            return err
         prev = (ctx.config or {}).get("prompt") or ""
         extra.update(prompt_change_facts(prev, value, seed=_seed_prompt(ctx.role)))
     ctx.config[key] = value

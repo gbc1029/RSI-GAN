@@ -79,6 +79,7 @@ class DomainTaskRunner:
         sample_seed_base: Optional[int] = None,
         anchor_ids: Optional[list] = None,
         token_budget_per_gen: Optional[int] = None,
+        ledger_writer: Optional[Any] = None,
     ):
         self.repo_root = os.path.abspath(repo_root)
         self.output_dir = os.path.abspath(output_dir)
@@ -93,7 +94,8 @@ class DomainTaskRunner:
         self.sample_seed_base = sample_seed_base
         self.anchor_ids = list(anchor_ids or [])
         # Thinking-intensity knob for the task child's every LLM call; rides
-        # the task env (GAN_LLM_REASONING_EFFORT) like GAN_LLM_TIMEOUT_S.
+        # the stdin payload (explicit transport, never an env — same chain as
+        # the budget fields; the CLI --reasoning_effort argument feeds it).
         # Validated upstream by models.resolve_entry(); None -> gateway default.
         self.reasoning_effort = reasoning_effort
         # Reserved cost-key ceiling (docs/10 §10): loop.yaml
@@ -109,7 +111,11 @@ class DomainTaskRunner:
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
 
-        self.design_store = DesignStore(paths.design_root(self.output_dir))
+        # B46 step-1 gate: the per-genid task design persist (persist_design)
+        # writes through the run's WriterToken threaded from build_gan_loop.
+        self.ledger_writer = ledger_writer
+        self.design_store = DesignStore(paths.design_root(self.output_dir),
+                                        writer=ledger_writer)
         self.log_path = paths.log_file(self.output_dir, "task_runner.log")
 
     # -- helpers -----------------------------------------------------------
@@ -125,6 +131,56 @@ class DomainTaskRunner:
                          {"type": event_type, "domain": self.domain, **fields})
         except Exception as e:  # noqa: BLE001 -- audit write failure: stderr covers
             print(f"[WARN] {event_type} event write failed: {e}")
+
+    def _ingest_cm_events(self, run_dir: str, genid: Any) -> None:
+        """Fold the child's CM seam-event sidecar into events.jsonl (docs/10
+        §11.5): each line is re-emitted with role=task attribution so the
+        per-generation cost record and the offline reconcilers see the seam
+        activity in the ONE audit stream. Advisory end to end: never a run
+        failure -- but NEVER silent (no-silent-fail rule, AGENTS.md): a
+        MISSING or EMPTY sidecar is itself a finding (the runner pre-creates
+        the file, so absence/emptiness means the child had no seam at all)
+        and gets its own event. The sidecar dies with the pruned work dir
+        either way."""
+        sidecar = paths.cm_events_path(run_dir)
+        if not os.path.isfile(sidecar):
+            self._event("cm_events_ingest_empty", genid=str(genid),
+                        reason="sidecar file missing (child never created "
+                               "or never bound it)")
+            return
+        try:
+            with open(sidecar, "r", encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+        except OSError as e:
+            from utils.soft_fail import soft_fail
+            soft_fail(f"cm events sidecar unreadable (genid {genid}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="cm_events_ingest_failed", genid=str(genid))
+            return
+        emitted = 0
+        for ln in lines:
+            try:
+                e = json.loads(ln)
+            except json.JSONDecodeError:
+                continue  # a torn last line must not sink the rest
+            if not isinstance(e, dict):
+                continue
+            etype = str(e.pop("type", "cm_event"))
+            self._event(etype, role="task", genid=str(genid), **e)
+            emitted += 1
+        try:
+            os.remove(sidecar)
+        except OSError:
+            pass  # the work-dir prune is the backstop
+        if emitted:
+            self._event("cm_events_ingested", genid=str(genid), events=emitted)
+        else:
+            # A zero-event sidecar after a real harness run means the child
+            # had no seam session (or its emit never reached the file):
+            # exactly the failure mode that used to be invisible.
+            self._event("cm_events_ingest_empty", genid=str(genid),
+                        reason="sidecar present but no seam events (child "
+                               "ran without a cm session)")
 
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,
@@ -391,6 +447,10 @@ class DomainTaskRunner:
                 soft_fail(f"existing-domain report failed for genid {genid}: {e}",
                           event_path=paths.events_path(self.output_dir),
                           event_type="existing_domain_report_failed", genid=str(genid))
+        # Context-management audit exit (docs/10 §11.5): fold the child's
+        # seam events into events.jsonl on EVERY post-harness path (the child
+        # may have run a seam session even when scoring later failed).
+        self._ingest_cm_events(run_dir, genid)
         # Persist per-question failure diagnostics into runs/<genid>/: the work
         # dir is pruned at generation end, so anything left only under
         # run_dir/outputs/<run_id>/agent_evals dies before it can be read
@@ -440,6 +500,7 @@ class DomainTaskRunner:
                     "failed": load_failed,
                     "framework_failed": [f for f in load_failed
                                          if f.get("kind") == "always_on_frozen"],
+                    "schema_issues": load_report.get("schema_issues") or [],
                 })
             except Exception as e:  # noqa: BLE001 -- audit write failure
                 print(f"[WARN] task_tools_loaded event write failed: {e}")

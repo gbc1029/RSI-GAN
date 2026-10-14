@@ -28,8 +28,29 @@ live under `scripts/dgmh/`.
   + harness glue + minimal run-dir copy), `task_runner.py`, `checkpoint.py`,
   `scores.py`, `trajectory.py`, `preflight.py`, `context.py`, `access.py`,
   `loop.py`, `tree/`, `reward/`, `cm/` (context-management frozen core —
-  block model, primitives, the per-turn seam pipeline, fail-open policy
-  runner, trajectory index; STDLIB-ONLY import contract because it is
+  block model, primitives, the per-turn seam (``assemble_turn`` DISPATCHES
+  only; the pipeline itself is the baseline assembly ``assembly.py`` — one
+  named preset per ``cm_mode``, composed over the session's frozen primitive
+  methods; invariants live in the primitives, never in the pipeline source,
+  and ``resolve()`` also loads the P2 NAMED agent-owned assembly (``cost.cm_assembly``
+  design key → ``gan/components/<role>/cm/<stem>.py``, delivered as
+  ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the
+  child env pins are static; load-once per session, per-turn exec budget,
+  2-strike wedge breaker, fail-open to the preset — every fallback leaves
+  durable events + ``degraded``/``assembly_disabled`` cm_view stats; the P3
+  in-process p/e seats resolve the SAME named slots workspace-first at
+  session build (``loop._resolve_cm_module``, no sort-order discovery — an
+  unresolved claim is a loud ``cm_module_unresolved`` and custom degrades to
+  the slice preset with its keys rewritten), with per-path sys.modules keys
+  for the parallel self-improve threads and a preflight pool gate; named
+  modules may export a ``METHODS`` dict of custom methods (harvested
+  all-or-nothing with ``cm_methods_refused``, assembly > policy shadowing,
+  invoked same-level/same-callee via ``handle.call``/``session.call_method``
+  — the caller's own privilege, never an escalation), fail-open policy
+  runner, trajectory index (``materialize_traj`` snapshots the seat's visible
+  trajectories as pinned ``traj_seg`` blocks — one scan per session; the
+  read tools and the ``ctx_`` faces share that single genid-qualified
+  address space); STDLIB-ONLY import contract because it is
   snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
@@ -83,11 +104,12 @@ python -m domains.report  --domain paper_review --dname ./outputs/demo
 
 Tests / verification scripts are kept locally under `scripts/local/` (gitignored).
 The tool-management regression suites (per-role registries, deep gate, P→E
-projections) live there too: run `venv_nat/bin/python
+projections, ledger write gate) live there too: run `venv_nat/bin/python
 scripts/local/run_tool_regression.py` before and after touching `gan/tools/`,
-`gan/registries/`, `gan/framework/{access,task_execution,receipt,loop}.py` or the
-design operators — three suites (deep gate S1–S4 / batch-6 unification /
-batch-8 isolation), one subprocess each.
+`gan/registries/`, `gan/framework/{access,task_execution,receipt,loop,
+scores,checkpoint,ledger}.py`, `gan/design/store.py` or the
+design operators — six suites (deep gate / batch-6 unification / batch-8
+isolation / c-dispatch / dynamic-keys / ledger-gate), one subprocess each.
 
 ## Offline run analysis (scripts/local/, gitignored)
 
@@ -197,7 +219,11 @@ with a GAN-native data layer.
   (`Role.run`). The visible set is explicit: `AccessContext.trajectory_genids`
   (evaluator = current + parent; planner = parent; self-improvement = this
   outer's generations + the direct parent). `read_trajectory` reads visible task
-  generations; `read_session_trajectory` reads the role's own sessions this outer.
+  generations; `read_session_trajectory` reads the role's own sessions over the
+  DECLARED `AccessContext.session_outers` (self seat: this outer + the previous
+  outer, batch 4; other seats never reach it — labels: genid-qualified for the
+  current outer, `outer_<O>/`-prefixed for extras, ONE rule shared by
+  materialization and the tool fallback).
   The current generation's task trajectory is archived **before** evaluation.
 - **Task runs are isolated from `repo_root`**: each generation runs in a
   **minimal allowlist copy** `work/<genid>/repo` (agent runtime + domain package,
@@ -233,12 +259,40 @@ with a GAN-native data layer.
   raw writes, subprocesses, and dynamic execution in agent-owned Python. Framework
   plumbing is explicitly exempt because it legitimately writes state; this AST
   check is defense in depth, not a replacement for a real sandbox.
+- **Ledger write gate (B46 step-1)**: the decision-grade artifacts
+  (`scores.jsonl`, design configs, checkpoints) are written only through guarded
+  framework entry points that require the per-run `WriterToken`
+  (`gan/framework/ledger.py`, minted once in `build_gan_loop` and threaded
+  explicitly — never env, never module-global). Unguarded writes raise
+  `LedgerAccessError`; agent-owned source importing a guarded writer module
+  (`gan.framework.scores` / `gan.design.store` / `gan.framework.checkpoint`) is
+  refused on the registry path and at the commit gate via the same AST issues
+  channel (`observed_ledger_writer`). The token is an identity, not a secret —
+  file-level tamper DETECTION is deferred step 2 (hash chain, unchanged
+  trigger); step 2's role (batch 4): the detection compensation for
+  application-step BYPASS — the write side's existence control (grants / AST
+  gate / WriterToken) is strong but heuristic, the read side's is absolute;
+  regression suite: `scripts/local/regress_ledger_gate.py`.
 - **Access boundary**: the frozen role allowlist also defines the read surface
   (read/write) — `task`: none; `planner`: read+write t-set ∪ p-set; `evaluator`:
   read t-set (read-only) + read/write e-set. Everything else is frozen by default;
   there is no persisted deny list. `AccessBroker` enforces it and refuses the repo
   root / self-containing / oversized grants. A local-only layout check lives at
   `scripts/local/test_frozen.py` (gitignored).
+- **Capability = existence (design axiom, batch 4)**: permissions are enforced by
+  what the framework MOVES, never by agent-side access checks. READ: without a
+  grant the content is not materialized into the workspace (source grants,
+  trajectory materialization over `trajectory_genids`/`session_outers`, toolset
+  assembly with `clear=True`) — a session faces existence, not an access check.
+  WRITE: without a grant/capability the workspace content is not applied (patch
+  visibility = `granted_paths`, seat write roots + AST capability gate at commit,
+  registry/schema_ext differentials, WriterToken-gated ledger writes). Every
+  absence must be ATTRIBUTABLE — authorized vs failure (the no-silent-fail
+  corollary; quarantined sessions are reported in BOTH presentation modes,
+  never served). Asymmetry to remember: the read side's containment is absolute
+  (physical absence); the write side's static gates are heuristic — B46 step 2
+  (hash chain) is the detection compensation for application-step bypass, not a
+  parallel half.
 - **Code repo / driver (default)**: `scripts/run_gan.py` materializes a per-run git
   tree `ckpt/code` (`gan/framework/code_repo.py`) and runs one `gan.outer_worker`
   subprocess per outer (`gan/driver.py`; cwd + `PYTHONPATH = code_root`), so role
@@ -282,7 +336,13 @@ with a GAN-native data layer.
   self-written code or adversarial leakage must be ruled out (see v4.14).
 - **Tool dispatch net (batch 27)**: the tool loop's single execution chokepoint
   `agent/llm_withtools.py:process_tool_call` packages every call with three
-  dispatch-level guarantees — **C1** a per-call timeout (`loop.tool_call_timeout_s`,
+  dispatch-level guarantees — **P-b required pre-check**: a call missing its
+  declared `input_schema.required` params is refused BEFORE tool code runs with
+  a uniform `dispatch_rejected` error (presence-only, no type checks — an
+  unvalidated schema must not false-reject; a missing/malformed `required`
+  skips the check and the TypeError fallback in `_run_captured` stays as the
+  schema/signature-drift backstop; edit_source additionally has its own
+  hand-rolled declared-input precheck); **C1** a per-call timeout (`loop.tool_call_timeout_s`,
   roles via `Role.run` → instance attribute; task child 240s under the harness
   QUESTION_TIMEOUT) with a per-tool wedge breaker (2 wedges → disabled for the
   session, events `tool_wedged`/`tool_disabled`; wedged threads are non-daemon, so
@@ -332,15 +392,51 @@ with a GAN-native data layer.
   the `CMSession` (`cm=` arg, built by the loop per seat / by `task_worker` from the
   `.gan_runtime/cm` SNAPSHOT — the run dir has no `gan/`, so the frozen core is copied
   per generation and imports as top-level `cm`; STDLIB-ONLY by contract) rewrites only
-  what is SENT (shallow copies; sticky view forms; the canonical history and the raw
-  trajectory rows stay untouched — 双记). Modes: `passthrough` (identity, pre-D behavior)
+  what is SENT (per-ENTRY copies — the client's text->content conversion pops keys from
+  the dicts it is handed, so the canonical history and the raw trajectory rows stay
+  untouched — 双记; sticky view forms). Binding reads BOTH `content`- and `text`-keyed
+  entries (`_msg_text`); the session's FIRST user turn (the instruction + cost
+  statement) is pinned by default, whose only exemption is the `dedup` prefix-elision.
+  Modes: `passthrough` (identity, pre-D behavior — an absolute kill switch:
+  a named `cm_assembly` is never executed under it, spoken once)
   / `slice` / `compact_conservative` / `custom` (agent policy module, AST-gated no-LLM/
-  no-network, exec budget + 2-strike wedge breaker, fail-open always). Invariants:
+  no-network, exec budget + 2-strike wedge breaker, fail-open always; since P2
+  the design NAMES the policy (`cost.cm_policy`) and may name a whole
+  agent-owned assembly (`cost.cm_assembly`) replacing the preset composition —
+  delivered under fixed names, loaded once per session, wedge-broken, and a
+  degraded session marks receipt `budget.kind` = `cm` (policy OR assembly
+  degradation); compact_conservative
+  excerpts big old USER turns — tool outputs ride inside user turns in this protocol,
+  so a separate tool_output kind never materializes). Invariants:
   pinned blocks survive, `cm_drop_floor_chars` guards tiny blocks, the view cannot
-  fabricate content. Agent face = the `ctx_*` opt-in tools; `read_trajectory`/
-  `read_session_trajectory` gain a slice front-end (structural index first, `fetch=`
-  materializes one segment). Audit: per-turn `cm_view` + `cm_violation`/
-  `cm_policy_failed`/`cm_policy_disabled` events; the session cost record carries a `cm`
+  fabricate content (face-enforced; the handle's `ctx._s` private reference is NOT a
+  security boundary). Agent face = the `ctx_*` opt-in tools (`ctx_view` included —
+  `view_state` is on the agent face; `ctx_budget` is a LIVE meter: `chat_with_agent`
+  attaches a reader over the run's authoritative usage totals, 实付口径, completed
+  tool calls only); `read_trajectory`/`read_session_trajectory` gain a slice front-end
+  (structural index first, `fetch=` materializes one segment — real params
+  `genid/max_chars/fetch/kind/tool/flag/offset`; segment addresses are
+  genid-qualified `<genid>/<file>:<line>`, ambiguous or stale addresses are
+  refused loudly) whose mode rides
+  `AccessContext.session_cm_mode` — stamped per session from the session OWNER's own
+  design, presentation-only (trajectory_genids/redaction stay the sole permission
+  surface); non-passthrough sessions additionally materialize their visible
+  trajectories as pinned `traj_seg` blocks (`materialize_traj`, one scan per
+  session) so the read tools and the `ctx_` faces share one address space.
+  Audit: per-turn `cm_view` (aggregate stats + per-op brief with block
+  refs/rules, no content) + `cm_violation`/`cm_policy_failed`/`cm_policy_disabled`
+  events plus the assembly/policy-surface events (`cm_assembly_fallback`/
+  `cm_assembly_failed`/`cm_assembly_disabled`/`cm_assembly_overrun`/
+  `cm_assembly_ignored`, `cm_module_unresolved`, `cm_methods_refused`,
+  `cm_budget_checkpoint`, `cm_traj_materialized`/`cm_traj_materialize_failed`);
+  a session whose event sink dropped lines carries `emit_failures` in its `cm`
+  summary (absence = a healthy sink); the task child's seam events land in a
+  `cm_events.jsonl` sidecar (rw-bound
+  as `/workspace/cm_events.jsonl`) that `DomainTaskRunner._ingest_cm_events` folds
+  into events.jsonl with role=task attribution (`cost.json` carries the `task_cm`
+  summary) — every child-side degradation writes a `cm_session_degraded`
+  sidecar line (prints are not durable), and a failed sidecar append falls
+  back to `cm_events_failed.jsonl` + stderr; the session cost record carries a `cm`
   summary (estimated savings are a DERIVED indicator, never billing — the ledger keeps
   实付); receipt `budget.kind` gains `cm` when a session's policy degraded.
 - `gan/framework/loop.yaml` is framework hyperparameters — **not** evolvable. Task
@@ -369,11 +465,22 @@ with a GAN-native data layer.
   import-checks the module and fail-closes a `name != stem` file with a
   skip-with-reason report entry (erratum vs batch 18: a STATIC gate can never
   check the name VALUE without an import, so the load-time runtime gate is
-  the settled K2 form). `gan/registries/loader.py:entry_reason` enforces this at selection
+  the settled K2 form). The same load layer also gates the structural health
+  of `tool_info()["input_schema"]` (R-a③, two tiers): a well-formed
+  `required` naming keys `properties` does not declare fail-closes with a
+  skip-with-reason report entry (it would brick the tool at dispatch:
+  dispatch_rejected on every call, then an unexpected kwarg), while
+  precheck-degrading malformations (non-dict schema, `required` not a string
+  list) still load with an advisory `schema_issues` entry in the load report
+  (the P-b precheck tolerates them; absent schema stays legal).
+  `gan/registries/loader.py:entry_reason` enforces this at selection
   time (plus the **role-directory binding**: a registry entry may only reference
   its own role's component tree — one single-writer file per role since batch 6);
-  `gan/framework/code_repo.py` (differential gate on commits touching
-  `gan/registries/**` or `gan/components/**`) and
+  `gan/framework/code_repo.py` (the five-class differential gate —
+  unparseable/invalid/duplicate/orphan/collision — run for EVERY non-empty
+  code patch since 4bc5318: registry health and toolset-basename collisions
+  are properties of the resulting tree, not of which directory a patch
+  touched) and
   `gan/framework/preflight.py:preflight_tools` (startup, fail-fast) enforce it too.
   Adding a tool file without a registry entry is reported as an **orphan**
   instead of failing silently; `list_components` lists such files as candidates and
@@ -484,6 +591,24 @@ with a GAN-native data layer.
    these implement: **abort only when nobody can
   repair the state OR continuing would produce a silently wrong result; otherwise
   strip/repair, record, and feed the owner.**
+- **No silent failures/degradations (fail-open must SPEAK; 拒绝所有静默失败/降级).**
+  Fail-open is the availability contract; audit persistence is the truth contract.
+  BOTH are required — fail-open is NEVER fail-silent. Every advisory path that
+  changes behavior — a swallowed exception, a degraded mode, a missing audit
+  artifact, a `None` that means "absent" — must leave a DURABLE trace in the
+  audit stream (events.jsonl / the cm sidecar / a `soft_fail` event), at the
+  point where the degradation happens. A bare `print` is NOT durable: child
+  stdout is PIPE-captured and log windows truncate, so prints vanish exactly
+  when needed. Rule of thumb: **an `except` that restores a default without a
+  same-path audit write is a bug**; `except: pass` needs a comment naming the
+  auditor that observes the case, and an optional subsystem's ABSENCE must be
+  as visible as its activity (e.g. emit the ingest event even at zero events).
+  Rationale (2026-10-12 real-API round): the driver-mode task child ran EVERY
+  generation with no CM seam at all while three fail-open layers stacked into
+  total silence (broker env omission + cwd fallback miss + a swallowed
+  tuple-unpack AttributeError at the self seat) — only the offline record
+  cross-check caught it. When introducing or editing such a path, add the
+  degradation event in the SAME patch.
 - Session state travels via contextvars (`gan/framework/context.py`), not function arguments.
 - **Planner→evaluator isolation (batch 8): facts flow, rhetoric does not.** Every
   evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) —
@@ -551,6 +676,38 @@ OpenAI-compatible gateway — each was invisible to the offline smokes:
 - **`score: null` with an invalid prediction is a task-quality outcome**, not an
   infrastructure failure — the lineage machinery records an auditable dead
   branch and the next outer plans from the parent's commit.
+
+## Field lessons for AI agents (tool-channel discipline)
+
+Lessons from a coding round that briefly concluded "the tool channel is
+untrustworthy" — the session log later proved every anomaly was
+self-inflicted. Recorded so the failure pattern is recognizable and
+non-repeatable:
+
+- **An unexpected tool result is a hypothesis to test, never a verdict.** The
+  correct reaction to output that contradicts expectations is a SECOND
+  INDEPENDENT CHANNEL (write command output to a log file and `read` it;
+  re-run; grep the session log), not escalating to "the environment
+  fabricates". A wrong verdict built on one channel then poisons every
+  downstream decision.
+- **Relative and absolute paths are the same file.** Edit results show
+  workspace-relative paths, reads show absolute ones (`gan/...` vs
+  `/root/HyperAgents/gan/...`). A path-display difference is not evidence of
+  "two different file states"; neither is seeing the same path twice.
+- **Do not cite your own memory as evidence about files.** Several
+  "contradictions" resolved the same way: the memory of what was just written
+  was wrong, the file was right. The previous turn's recollection is not
+  ground truth — re-read the file (or `git diff`) instead.
+- **Own your typos and hallucinated APIs.** A mistyped command name, a wrong
+  function signature, or an invented script path executed faithfully by the
+  tool is still your bug; blaming the channel doubles the error and blocks
+  the real diagnosis (which, in every checked case, was ordinary: an extra
+  brace, a miscounted fixture, an assertion reading the wrong channel).
+- **Before declaring an output "foreign", compare its fingerprint with what
+  you wrote** — suite prefixes, assertion names, diff stats (`git status
+  --short` + `git diff --stat` names exactly which files changed). The
+  confabulation risk peaks exactly when tired reasoning meets a long tool
+  transcript; the check costs one command.
 
 ## Do NOT
 

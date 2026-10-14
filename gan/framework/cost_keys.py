@@ -43,6 +43,9 @@ COST_SLOT = "cost"
 _SPECS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "task": {
         # Soft per-question token budget (chat-level stop; docs/10 §10.2 C8).
+        # SOFT semantics: the call that crosses it completes and the forced
+        # final summary turn spends MORE on top — actual spend > budget is the
+        # designed outcome, never a mid-call cut (docs/10 §10.2).
         "per_question_token_budget": {
             "type": "int", "min": 2_000, "max": 5_000_000, "default": None,
             "consumer": "harness payload -> agent.llm_withtools max_total_tokens",
@@ -129,6 +132,24 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
         "type": "int", "min": 10, "max": 10_000, "default": 200,
         "consumer": "cm seam (policy execution budget; overruns count toward the wedge breaker)",
     },
+    "cm_assembly_exec_ms": {
+        "type": "int", "min": 10, "max": 10_000, "default": 200,
+        "consumer": "cm seam (agent assembly execution budget per turn; overruns count toward its wedge breaker)",
+    },
+    "cm_policy": {
+        "type": "str", "max_len": 64, "default": None,
+        "consumer": ("cm seam (custom mode: stems the policy module in "
+                     "gan/components/<role>/cm/; named slot, delivered as "
+                     "cm_policy.py — the sort-first legacy scan is only the "
+                     "unnamed fallback)"),
+    },
+    "cm_assembly": {
+        "type": "str", "max_len": 64, "default": None,
+        "consumer": ("cm seam (non-passthrough modes: stems the agent-owned "
+                     "assembly module in gan/components/<role>/cm/; named "
+                     "slot, delivered as cm_assembly.py; replaces the "
+                     "cm_mode preset composition, fail-open to it)"),
+    },
     "cm_note_cap_chars": {
         "type": "int", "min": 200, "max": 100_000, "default": 8_000,
         "consumer": "cm note primitive (scratchpad per-note cap)",
@@ -196,6 +217,9 @@ def _validate_value(spec: Dict[str, Any], value: Any) -> Optional[str]:
         enum = spec.get("enum")
         if enum is not None and value not in enum:
             return f"must be one of {list(enum)}"
+        max_len = spec.get("max_len")
+        if max_len is not None and len(value) > max_len:
+            return f"exceeds max length {max_len}"
         return None
     return "unsupported spec type"
 
@@ -313,8 +337,12 @@ def clamp_cost_config(role: str, config: Any,
     for key in list(new_slot):
         if new_slot[key] is None and slot.get(key) is None:
             del new_slot[key]
-    if new_slot:
-        config[COST_SLOT] = new_slot
-    else:
-        config.pop(COST_SLOT, None)
+    # The slot is ALWAYS materialized (even as {}): a design whose reserved
+    # cost slot silently vanishes looks like "this design never carried cost
+    # keys" in later audits, indistinguishable from a lossy serialization
+    # (observed: gen-0 task designs lost the schema-guaranteed slot, so
+    # ``ckpt/design/task/<g>/config.json`` had three keys where the schema
+    # promises four). An explicit empty slot means the same thing to
+    # ``effective_all`` (all defaults) but stays auditable.
+    config[COST_SLOT] = new_slot
     return records

@@ -1,27 +1,57 @@
-"""CM session: per-chat-run Universe/View + per-turn assembly pipeline.
+"""CM session: per-chat-run Universe/View + the frozen primitive surface.
 
-The seam (docs/10 §5.2 分一): every LLM call passes the session's message
-history through :meth:`CMSession.assemble` — fixed pre-segment (window
-defaults + conservative compaction) -> optional custom policy -> post-segment
-apply (count + emit ``cm_view``) -> render. View forms PERSIST across turns
-(a block compacted last turn stays compacted; ``fetch`` restores it).
-``passthrough`` mode is the identity view (pre-D behaviour, byte identical).
+The seam: every LLM call passes the session's message history through
+:meth:`CMSession.assemble_turn` — a DISPATCHER that resolves the session's
+assembly (``cm/assembly.py``: the baseline presets, one per ``cm_mode``)
+and hands the turn to it. The assembly is pure orchestration; the rules
+live in the PRIMITIVES below, each of which validates before it mutates
+(拒绝即不动) and owns its own invariant:
+
+    register_history / register_outgoing   block registration (fingerprint
+        uniqueness, view-marker re-bind, first-user pin; the outgoing turn
+        is registered but NEVER substituted except the dedup elision)
+    materialize_traj                       the seat's visible trajectory
+        files as pinned traj_seg blocks (one scan per session; the read
+        tools' index face and the ctx faces share the same address space)
+    budget_checkpoint                      advisory >=80% warning (emit-only)
+    conservative_compaction / window_defaults / dedup_prefix   the stage ops
+        (validate via the ``cm.ops`` vocabulary; pre-check pinned / floor /
+        sticky so a stage's predictable refusal never becomes violation noise)
+    run_policy                             the custom policy hook (fail-open,
+        execution budget, 2-strike wedge breaker)
+    finalize_turn                          the post segment: count_ops +
+        emit_view (audit completeness) + render (no-fabrication) + the
+        outgoing dedup contract
+    render / count_ops / emit_view / note_violation                   audit
+        and no-fabrication primitives the post segment composes
+    call_method                            the assembly-face entry to the
+        session's registered custom methods — same-level, same-callee: the
+        method runs with a policy-face handle whose budget resets each turn
+
+This surface is FROZEN: the baseline presets are named compositions
+over exactly these methods, and the named agent assemblies resolve
+through the same contract — an assembly can reorder or extend stages, but every
+mutation still passes a validating primitive, so pipeline freedom cannot
+buy rule evasion. View forms PERSIST across turns (a block compacted last
+turn stays compacted; ``fetch`` restores it).
 
 The canonical history is never mutated: substitutions are applied to shallow
 copies, so the raw trajectory rows stay the untouched audit face (双记).
 Effective key values are injected ALREADY CLAMPED by the frozen
 ``gan.framework.cost_keys`` authority — this module never clamps, it only
-type-guards (the harness pass-through posture). The ``cm.ops`` primitives
-validate BEFORE mutating (拒绝即不动); the seam only counts and emits.
+type-guards (the harness pass-through posture).
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import assembly
 from . import ops
 from .blocks import (Block, Universe, View, cut, placeholder, estimate_tokens,
-                       EXCERPT_KEEP, HEAD_TAIL_KEEP)
+                       excerpt_saving, EXCERPT_KEEP, HEAD_TAIL_KEEP,
+                       MIN_COMPACT_SAVE)
 
 # Framework floor (docs/10 §5.2.3: K 是带框架下限的键) — the clamping
 # authority owns the ranges; this is the hard invariant this layer adds.
@@ -54,6 +84,26 @@ def _parse_view_marker(content: str) -> Optional[str]:
 def _fingerprint(content: str) -> str:
     import hashlib
     return hashlib.sha1(content.encode("utf-8", "replace")).hexdigest()
+
+
+def _msg_text(m: Any) -> Optional[str]:
+    """The text of one history entry, in EITHER key convention.
+
+    This repo's canonical history is ``text``-keyed (``agent/llm.py`` converts
+    content->text on return; ``task_agent`` reads ``['text']``) while the
+    seam's user-turn rebuild in the chat loop writes ``content`` — the binding
+    must not depend on which form a given entry happens to carry (docs/10
+    §11.5 erratum: the seam previously read ``content`` only and silently
+    failed to bind the canonical history)."""
+    if not isinstance(m, dict):
+        return None
+    v = m.get("content")
+    if isinstance(v, str) and v:
+        return v
+    v = m.get("text")
+    if isinstance(v, str) and v:
+        return v
+    return None
 
 
 class ViewHandle:
@@ -104,7 +154,7 @@ class ViewHandle:
             return err
         return ops.view_state(self._s.universe, self._s.view)
 
-    def budget_query(self, tokens_used: int = 0,
+    def budget_query(self, tokens_used: Optional[int] = None,
                      budget: Optional[int] = None) -> Dict[str, Any]:
         if err := self._gate("budget_query"):
             return err
@@ -166,10 +216,31 @@ class ViewHandle:
             return err
         return ops.note_list(self._s.notes)
 
+    def call(self, name: str, **kwargs) -> Dict[str, Any]:
+        """Invoke a registered custom method at the
+        CALLER's privilege — the method receives THIS handle (policy face:
+        the same op budget, continuous, with ``call`` itself costing one
+        unit; agent face: agent-level ops only). Never raises: unknown
+        name, crash, or a non-record return comes back as a refusal
+        record; a policy-face failure also counts a violation."""
+        if err := self._gate("call"):
+            return err
+        rec = self._s._invoke_method(name, kwargs, callee=self)
+        if not rec.get("ok"):
+            self._audit(rec)
+        return rec
+
 
 @dataclass
 class CMSession:
-    """One chat run's CM state (universe + view + config + audit counters)."""
+    """One chat run's CM state (universe + view + config + audit counters).
+
+    The per-turn pipeline lives in the ASSEMBLY (``cm/assembly.py``), not
+    here: :meth:`assemble_turn` dispatches to the resolved assembly, which
+    composes the frozen primitive methods above. The dispatch itself owns
+    exactly two invariants — the turn counter advances once per call, and
+    the resolution is cached (an unknown mode fails open to the slice
+    preset with a loud ``cm_assembly_fallback`` event, never silently)."""
     mode: str = "passthrough"
     window_k: int = 4
     drop_floor_chars: int = 400
@@ -179,6 +250,8 @@ class CMSession:
     emit: Optional[Callable[[Dict[str, Any]], None]] = None
     budget_reader: Optional[Callable[[], Dict[str, Any]]] = None
     policy_path: Optional[str] = None  # custom mode: agent policy module path
+    assembly_path: Optional[str] = None  # named agent-owned assembly module
+    assembly_exec_ms: int = 200          # per-turn budget for that assembly
     system_prefix: str = ""  # per-turn tool-use header (dedup op target)
     turn: int = 0
     universe: Universe = field(default_factory=Universe)
@@ -193,9 +266,44 @@ class CMSession:
     policy_disabled: bool = False
     violations: int = 0
     est_chars_saved: int = 0
+    emit_failures: int = 0
     _policy_strikes: int = 0
+    _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
+    # Named-assembly bookkeeping (audit fields materialize WITH the
+    # subsystem they describe: a session without an assembly configured has
+    # no claim to expose; one with a claim shows activity AND absence)
+    assembly_active: bool = False    # the named assembly produced >= 1 turn
+    assembly_failures: int = 0
+    assembly_disabled: bool = False  # wedge-broken for the session
+    _assembly_strikes: int = 0
+    _named_fn: Optional[Callable] = field(default=None, repr=False,
+                                          compare=False)
+    _named_failed: bool = field(default=False, repr=False, compare=False)
+    _assembly_ignored: bool = field(default=False, repr=False, compare=False)
+    _turn_degraded: bool = field(default=False, repr=False, compare=False)
+    _view_emitted_turn: Optional[int] = field(default=None, repr=False,
+                                              compare=False)
     # identity-keyed bookkeeping: rewritten shallow copies are not re-registered
     _by_fp: Dict[str, str] = field(default_factory=dict)  # content fp -> bid
+    # Custom methods: registered per session from the
+    # named modules' METHODS export — same-level, same-callee surface. The
+    # assembly's harvest registers first; the policy's merges at its first
+    # successful load (shadowed names refuse, assembly > policy).
+    methods_registry: Dict[str, Callable] = field(default_factory=dict)
+    _methods_policy_done: bool = field(default=False, repr=False,
+                                       compare=False)
+    _method_face: Optional["ViewHandle"] = field(default=None, repr=False,
+                                                 compare=False)
+    # Trajectory materialization: the seat's visible trajectory files,
+    # snapshotted at build time as pinned traj_seg blocks. ``traj_index`` is
+    # the metadata payload the read tools render; ``traj_segments`` maps each
+    # seg_id to its block so a fetch resolves through the SAME scan the index
+    # came from (one address space for both CM faces).
+    traj_index: Optional[Dict[str, Any]] = None
+    traj_segments: Dict[str, str] = field(default_factory=dict)
+    # resolved assembly (cache: mode is clamped upstream and never mutates)
+    _assembly_fn: Optional[Callable] = field(default=None, repr=False,
+                                             compare=False)
 
     # ------------------------------------------------------------------- config
     def apply_keys(self, keys: Dict[str, Any]) -> None:
@@ -216,20 +324,38 @@ class CMSession:
         v = keys.get("cm_policy_exec_ms")
         if type(v) is int and v >= 1:
             self.policy_exec_ms = v
+        v = keys.get("cm_assembly_exec_ms")
+        if type(v) is int and v >= 1:
+            self.assembly_exec_ms = v
         v = keys.get("cm_note_cap_chars")
         if type(v) is int and v >= 1:
             self.note_cap_chars = v
 
     def summary(self) -> Dict[str, Any]:
-        """Session-level CM summary (cost record / receipt ``cm`` node)."""
-        return {"mode": self.mode, "turns": self.turn,
-                "blocks": len(self.universe.blocks),
-                "ops_total": self.ops_total, "ops_applied": self.ops_applied,
-                "ops_refused": self.ops_refused,
-                "policy_failures": self.policy_failures,
-                "policy_disabled": self.policy_disabled,
-                "violations": self.violations,
-                "est_chars_saved": self.est_chars_saved}
+        """Session-level CM summary (cost record / receipt ``cm`` node).
+
+        The assembly fields materialize only when an assembly was CONFIGURED
+        (the design claim creates the observability duty: a configured-but-
+        never-active assembly must read as exactly that, None ≠ 0 style)."""
+        out = {"mode": self.mode, "turns": self.turn,
+               "blocks": len(self.universe.blocks),
+               "ops_total": self.ops_total, "ops_applied": self.ops_applied,
+               "ops_refused": self.ops_refused,
+               "policy_failures": self.policy_failures,
+               "policy_disabled": self.policy_disabled,
+               "violations": self.violations,
+               "est_chars_saved": self.est_chars_saved}
+        if self.emit_failures:
+            # Conditional audit field (absence = a healthy sink): a session
+            # whose event sink dropped lines must not read as fully audited.
+            out["emit_failures"] = self.emit_failures
+        if self.assembly_path:
+            out["assembly_active"] = self.assembly_active
+            out["assembly_failures"] = self.assembly_failures
+            out["assembly_disabled"] = self.assembly_disabled
+        if self.traj_index is not None:
+            out["traj_segments"] = len(self.traj_segments)
+        return out
 
     # ------------------------------------------------------------------- events
     def _emit(self, event: Dict[str, Any]) -> None:
@@ -238,7 +364,13 @@ class CMSession:
         try:
             self.emit(event)
         except Exception:
-            pass  # the audit sink must never break the session
+            # The audit sink must never break the session — but a sink that
+            # FAILS is a degradation the session must carry, not hide: the
+            # counter surfaces in summary() (the cost record ``cm`` node and
+            # the receipt), which is this module's durable channel exactly
+            # when the event sink itself is the broken part. Recursing into
+            # the broken sink to report the breakage is not an option.
+            self.emit_failures += 1
 
     # ---------------------------------------------------- block registration
     def register_history(self, msgs: List[Dict[str, Any]]) -> None:
@@ -252,8 +384,8 @@ class CMSession:
         rendered copy must not grow a second block or the view would fight
         its own output. Blocks carry their latest msg_index for rendering."""
         for i, m in enumerate(msgs):
-            content = m.get("content") if isinstance(m, dict) else None
-            if not isinstance(content, str) or not content:
+            content = _msg_text(m)
+            if not content:
                 continue  # tool-call carriers etc. — no text to manage
             bid = _parse_view_marker(content)
             if bid is not None and bid in self.universe.blocks:
@@ -266,7 +398,14 @@ class CMSession:
                 continue
             role = str(m.get("role", "user"))
             kind = _KIND_FOR_ROLE.get(role, "turn_output")
-            block = self.universe.register(kind, content, self.turn, source=role)
+            # The session's FIRST user turn (the instruction, carrying the cost
+            # statement) is pinned by default (docs/10 §5.2.3: 当前问题默认
+            # pin) — whichever way it arrives (history entry or outgoing).
+            first_user = role == "user" and not self._seen_user
+            block = self.universe.register(kind, content, self.turn,
+                                           source=role, pinned=first_user)
+            if role == "user":
+                self._seen_user = True
             block.msg_index = i
             self._by_fp[fp] = block.block_id
 
@@ -283,18 +422,79 @@ class CMSession:
             source=f"note:{note_id}", pinned=True)
         return block.block_id, note_id
 
-    def register_note(self, text: str) -> Tuple[Optional[str], str]:
-        """Scratchpad note write: the note block is auto-pinned (never dropped)."""
-        self.note_seq += 1
-        note_id = f"n{self.note_seq}"
-        text = str(text or "")
-        if len(text) > self.note_cap_chars:
-            return None, f"note exceeds cap ({self.note_cap_chars})"
-        self.notes[note_id] = text
-        block = self.universe.register(
-            "note", f"{_NOTE_PREFIX} {note_id}\n{text}", self.turn,
-            source=f"note:{note_id}", pinned=True)
-        return block.block_id, note_id
+    def register_outgoing(self, outgoing: str) -> Optional["Block"]:
+        """Register the outgoing user text as the current turn's block.
+
+        The outgoing text is registered NOW and re-bound to its canonical
+        history entry next turn (fingerprint below; without it the same
+        content was registered TWICE — an orphan that inflated savings).
+        Invariant: the ACTIVE instruction is registered for the audit face
+        but is never substituted by the assembly — its only form change is
+        the dedup prefix-elision, applied by ``finalize_turn``."""
+        if not isinstance(outgoing, str) or not outgoing:
+            return None
+        first_user = not self._seen_user
+        block = self.universe.register("turn_output", outgoing, self.turn,
+                                       source="user", pinned=first_user)
+        self._seen_user = True
+        self._by_fp[_fingerprint(outgoing)] = block.block_id
+        return block
+
+    def materialize_traj(self, files: List[Tuple[str, str]]) -> int:
+        """Snapshot the seat's visible trajectory files into the universe.
+
+        ``files`` is a list of ``(label, path)`` pairs with genid-qualified
+        labels — VISIBILITY is the caller's decision (the same set the read
+        tools serve); this primitive only snapshots it, one scan per session.
+        Every segment becomes a pinned ``traj_seg`` block holding its full
+        text, with the seg_id as ``source``: the index the read tools render
+        and the blocks ``ctx_index``/``ctx_fetch`` address derive from the
+        SAME scan, so a fetch can never drift from the index the agent saw
+        (the material is invariant: trajectories are archived before they
+        become readable). Pinned so the window/compaction passes — which walk
+        the RENDERED history's turns — never produce phantom ops on blocks
+        that exist only as fetchable addressable content.
+
+        ``passthrough`` is an absolute no-op (identity view: nothing
+        materializes, nothing emits). Per-file scan failures skip that file
+        and SPEAK (``cm_traj_materialize_failed``); the read tools then fall
+        back to building their own index for uncovered genids. Returns the
+        number of segments registered."""
+        if self.mode == "passthrough" or not files:
+            return 0
+        from .traj_index import build_traj_materialization
+        clean: List[Tuple[str, str]] = []
+        seen: set = set()
+        for label, path in files:
+            if not label or not path or label in seen:
+                continue
+            if not os.path.isfile(path):
+                continue
+            seen.add(label)
+            clean.append((str(label), str(path)))
+        if not clean:
+            return 0
+        try:
+            payload, texts = build_traj_materialization(clean)
+        except Exception as e:  # noqa: BLE001 -- degrade, but speak
+            self._emit({"type": "cm_traj_materialize_failed",
+                        "error": str(e)[:200]})
+            return 0
+        registered = 0
+        for seg in payload.get("segments", []):
+            text = texts.get(seg["seg_id"])
+            if text is None:
+                continue
+            if seg["seg_id"] in self.traj_segments:
+                continue  # idempotent: a re-materialize never duplicates blocks
+            block = self.universe.register("traj_seg", text, 0,
+                                           source=seg["seg_id"], pinned=True)
+            self.traj_segments[seg["seg_id"]] = block.block_id
+            registered += 1
+        self.traj_index = payload
+        self._emit({"type": "cm_traj_materialized", "files": len(payload["files"]),
+                    "segments": registered})
+        return registered
 
     # -------------------------------------------------------------- the seam
     def assemble_turn(self, msgs: List[Dict[str, Any]],
@@ -302,50 +502,184 @@ class CMSession:
                       tokens_used: int = 0,
                       budget: Optional[int] = None
                       ) -> Tuple[List[Dict[str, Any]], str]:
-        """The chat-loop contract: assemble ONE LLM call.
+        """The chat-loop contract: assemble ONE LLM call (dispatch only).
 
         ``msgs`` is the canonical history (raw dicts), ``outgoing`` the raw
         user text for this call. Returns ``(history_to_send, msg_to_send)``.
-        The outgoing text is registered as a block (the current turn) but is
-        NEVER substituted (the active instruction must not be mangled) except
-        the dedup form, which elides the repeated per-turn header.
-        ``passthrough`` returns ``(msgs, outgoing)`` unchanged."""
+        The PIPELINE itself is the resolved assembly (``cm/assembly.py``):
+        a named preset composition over this session's primitive methods —
+        ``passthrough`` being the identity view. Resolution is cached; an unknown mode fails open to the
+        slice preset with a loud ``cm_assembly_fallback`` event (the clamp
+        authority makes that unreachable in production; a direct
+        construction must not degrade silently).
+
+        When the design names an assembly (``assembly_path``), it
+        REPLACES the preset composition for every non-passthrough turn —
+        loaded once per session, executed under ``cm_assembly_exec_ms``,
+        wedge-broken after 2 failures. ``passthrough`` is the ABSOLUTE
+        identity posture: a named assembly is never executed under it (the
+        kill switch must stay absolute; the mismatch is spoken once). ANY
+        assembly failure re-runs the baseline preset on the current state
+        for that turn (sticky forms make the replay safe) and leaves a
+        durable trace: ``cm_assembly_failed`` per failing turn,
+        ``degraded`` on that turn's ``cm_view``, ``assembly_disabled`` in
+        every subsequent ``cm_view`` — a fallback is never silent."""
         self.turn += 1
-        self.register_history(msgs)
-        out_block = self._register_outgoing(outgoing)
-        if self.mode == "passthrough":
-            self._emit_view(0)
-            return msgs, outgoing
+        self._turn_degraded = False
+        self._method_face = None  # per-turn method-face budget reset
+        fn = self._assembly_fn
+        if fn is None:
+            fn, fallback = assembly.resolve(self.mode)
+            self._assembly_fn = fn
+            if fallback is not None:
+                self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                            "mode": self.mode, "to": fallback})
+        if self.assembly_path and self.mode == "passthrough":
+            if not self._assembly_ignored:
+                self._assembly_ignored = True
+                self._emit({"type": "cm_assembly_ignored", "turn": self.turn,
+                            "reason": "passthrough is the identity posture; "
+                                      "the named assembly is never executed "
+                                      "under it"})
+            return fn(self, msgs, outgoing, tokens_used, budget)
+        # after the wedge breaker disables the assembly, the preset runs
+        # directly: no more per-turn attempts, failures, or disabled events —
+        # the standing degradation stays visible via cm_view stats alone
+        named = None if self.assembly_disabled else self._load_named()
+        if named is not None:
+            self._view_emitted_turn = None
+            try:
+                result = assembly.run_assembly(named, self, msgs, outgoing,
+                                               tokens_used, budget,
+                                               self.assembly_exec_ms)
+                if not (isinstance(result, tuple) and len(result) == 2
+                        and isinstance(result[0], list)
+                        and isinstance(result[1], str)):
+                    raise assembly.AssemblyError(
+                        "assembly returned a non-(history, msg) result")
+                self.assembly_active = True
+                if self._view_emitted_turn != self.turn:
+                    # audit completeness is framework-owned: an assembly
+                    # that skips the finalize_turn post segment still gets
+                    # its per-turn cm_view (minimal honest brief)
+                    self._emit_synthetic_view()
+                return result
+            except Exception as e:  # noqa: BLE001 -- fail-open, never break the seam
+                phase = ("contract" if isinstance(e, assembly.AssemblyError)
+                         else "run")
+                self._note_assembly_failure(str(e)[:160], phase=phase)
+                self._turn_degraded = True
+                # fall through: the preset re-runs on the current state
+                # (sticky forms make the replay safe); this turn's cm_view
+                # carries degraded=true
+        return fn(self, msgs, outgoing, tokens_used, budget)
 
-        records: List[Dict[str, Any]] = []
-        bc = self._budget_checkpoint(tokens_used, budget)
-        if bc is not None:
-            records.append(bc)
-        records += self._window_defaults()
-        if self.system_prefix:
-            records += self._dedup_prefix(msgs)
-        if self.mode == "compact_conservative":
-            records += self._conservative_compaction()
-        if self.mode == "custom":
-            records += self._run_policy()
-
-        saved = self._count(records)
-        self._emit_view(saved)
-        send_history = self._render(msgs)
-        send_msg = outgoing
-        if out_block is not None \
-                and self.view.form_of(out_block.block_id) == "dedup":
-            # the outgoing turn carries the per-turn header; elide it exactly
-            # like an old turn (same frozen form, anchored at the head)
-            if self.system_prefix and outgoing.startswith(self.system_prefix):
-                send_msg = _DEDUP_MARKER + outgoing[len(self.system_prefix):]
-        return send_history, send_msg
-
-    def _register_outgoing(self, outgoing: str) -> Optional["Block"]:
-        if not isinstance(outgoing, str) or not outgoing:
+    def _load_named(self) -> Optional[Callable]:
+        """Load the named assembly ONCE per session; the result is cached
+        INCLUDING failure (no mid-session hot reload — a self_improve
+        session editing its own assembly must not change its own seam
+        mid-flight). A load failure speaks exactly once
+        (``cm_assembly_fallback``) and the baseline preset runs for the
+        whole session; ``summary()`` shows ``assembly_active: false``."""
+        if self.assembly_path is None:
             return None
-        return self.universe.register("turn_output", outgoing, self.turn,
-                                      source="user")
+        if self._named_fn is None and not self._named_failed:
+            try:
+                fn, methods, method_problems = \
+                    assembly.load_assembly(self.assembly_path)
+                self._named_fn = fn
+                self._merge_methods(methods, method_problems,
+                                    source="assembly")
+            except Exception as e:  # noqa: BLE001 -- fail-open, loudly, once
+                self._named_failed = True
+                self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                            "mode": self.mode, "to": self.mode,
+                            "reason": str(e)[:160]})
+        return self._named_fn
+
+    def _merge_methods(self, methods: Dict[str, Callable],
+                       problems: List[str], source: str) -> None:
+        """Register one named module's custom methods. Refusals speak
+        exactly once per source (``cm_methods_refused``, reasons included);
+        a policy method whose name an assembly already registered refuses as
+        shadowed (assembly > policy, deterministic precedence). All-or-
+        nothing per module: the caller passes methods only when the whole
+        group validated."""
+        reasons = list(problems)
+        for name, fn in (methods or {}).items():
+            if name in self.methods_registry:
+                reasons.append(f"{name!r}: shadowed by an earlier "
+                               "registration (assembly > policy)")
+            else:
+                self.methods_registry[name] = fn
+        if reasons:
+            self._emit({"type": "cm_methods_refused", "source": source,
+                        "reasons": reasons[:12]})
+
+    def _invoke_method(self, name: str, kwargs: Dict[str, Any],
+                       callee: "ViewHandle") -> Dict[str, Any]:
+        """Run one custom method; NEVER raises. ``callee`` is the reach the
+        method receives — the caller's own handle (handle.call) or the
+        session's per-turn method-face handle (call_method): privilege =
+        the caller's privilege, no escalation. Unknown name, crash, or a
+        non-record return comes back as a refusal record."""
+        fn = self.methods_registry.get(str(name))
+        if fn is None:
+            return {"op": str(name), "ok": False, "error": "unknown method"}
+        try:
+            rec = fn(callee, **kwargs)
+        except Exception as e:  # noqa: BLE001 -- refusal, never a seam crash
+            return {"op": str(name), "ok": False, "error": str(e)[:160]}
+        if not isinstance(rec, dict) or "ok" not in rec:
+            return {"op": str(name), "ok": False,
+                    "error": "method returned a non-record"}
+        rec = dict(rec)
+        rec.setdefault("op", str(name))
+        return rec
+
+    def call_method(self, name: str, **kwargs) -> Dict[str, Any]:
+        """Assembly-face entry: run a registered custom method with the
+        session's method-face handle (policy face; budget =
+        ``cm_max_ops_per_turn`` reset each turn, so an assembly looping
+        calls stays bounded — the call itself costs one unit, exactly like
+        ``handle.call``). Never raises — the refusal record is the
+        assembly's to embed in its records (and be counted) or drop."""
+        if self._method_face is None:
+            self._method_face = ViewHandle(self, "policy")
+        if err := self._method_face._gate("call"):
+            return err
+        return self._invoke_method(name, kwargs, callee=self._method_face)
+
+    def _note_assembly_failure(self, error: str, phase: str = "run") -> None:
+        """One assembly turn failure: count + emit + strike; 2 strikes
+        disable the named assembly for the session (C1-class wedge breaker)
+        — the preset then runs directly and every subsequent ``cm_view``
+        carries ``assembly_disabled: true`` until the session ends."""
+        self.assembly_failures += 1
+        self._assembly_strikes += 1
+        self._emit({"type": "cm_assembly_failed", "turn": self.turn,
+                    "phase": phase, "error": error,
+                    "struck": self._assembly_strikes,
+                    "fallback": self.mode})
+        if self._assembly_strikes >= _POLICY_STRIKES:
+            self.assembly_disabled = True
+            self._emit({"type": "cm_assembly_disabled", "turn": self.turn,
+                        "strikes": self._assembly_strikes})
+
+    def _emit_synthetic_view(self) -> None:
+        """Per-turn audit completion for an assembly that returned without
+        closing through ``finalize_turn``: one ``cm_view`` brief per
+        assembled turn is the framework's contract, so the seam emits the
+        minimal honest brief itself (ops empty; stats marked)."""
+        self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
+                    "ops": [],
+                    "stats": {"blocks": len(self.universe.blocks),
+                              "substituted": len(self.view.forms),
+                              "saved_chars": 0,
+                              "est_saved_session": self.est_chars_saved,
+                              "policy_disabled": self.policy_disabled,
+                              "assembled_by": "agent_assembly"}})
+        self._view_emitted_turn = self.turn
 
     def assemble(self, msgs: List[Dict[str, Any]],
                  tokens_used: int = 0,
@@ -355,7 +689,7 @@ class CMSession:
         if self.mode == "passthrough":
             self.turn += 1
             self.register_history(msgs)
-            self._emit_view(0)
+            self.emit_view(0)
             return msgs
         send_history, _msg = self.assemble_turn(msgs, "", tokens_used=tokens_used,
                                                 budget=budget)
@@ -376,9 +710,9 @@ class CMSession:
         from .state import deactivate
         deactivate(token)
 
-    # -- fixed pre-segment -------------------------------------------------------
-    def _budget_checkpoint(self, tokens_used: int,
-                           budget: Optional[int]) -> Optional[Dict[str, Any]]:
+    # -- stage primitives (the frozen composition surface; see assembly.py) --
+    def budget_checkpoint(self, tokens_used: int,
+                          budget: Optional[int]) -> Optional[Dict[str, Any]]:
         """Advisory warning at >=80% of an active token budget (the C8 soft
         stop stays the enforcement point; this only informs)."""
         used = tokens_used
@@ -393,10 +727,10 @@ class CMSession:
                     "used": used, "budget": budget})
         return {"op": "budget_checkpoint", "ok": True, "source": "pre"}
 
-    def _window_defaults(self) -> List[Dict[str, Any]]:
-        """slice/compact modes: keep the newest ``window_k`` assistant turns
-        FULL (plus pinned blocks + notes — pin/note protection lives in the
-        primitives), older turn/tool blocks -> placeholder. Drop-floor
+    def window_defaults(self) -> List[Dict[str, Any]]:
+        """slice/compact/custom modes: keep the newest ``window_k`` assistant
+        turns FULL (plus pinned blocks + notes — pin/note protection lives in
+        the primitives), older turn/tool blocks -> placeholder. Drop-floor
         guarded: small blocks stay (a placeholder would cost more)."""
         out: List[Dict[str, Any]] = []
         blocks = [b for b in self.universe.ordered()
@@ -409,6 +743,9 @@ class CMSession:
                 continue
             if self.view.form_of(block.block_id) != "full":
                 continue  # already substituted in an earlier turn (sticky)
+            if block.pinned:
+                continue  # pre-checked so the primitive's refusal (a pinned
+                # block must never drop) does not become violation noise
             if block.chars < self.drop_floor_chars:
                 continue
             out.append(ops.drop(self.universe, self.view, block.block_id,
@@ -416,59 +753,96 @@ class CMSession:
                                 self.drop_floor_chars))
         return out
 
-    def _conservative_compaction(self) -> List[Dict[str, Any]]:
-        """compact_conservative adds: tool_outputs older than the pin window
-        whose excerpt actually saves >= MIN_COMPACT_SAVE chars."""
+    def conservative_compaction(self) -> List[Dict[str, Any]]:
+        """compact_conservative adds: history turns older than the pin window
+        whose mechanical excerpt actually saves >= MIN_COMPACT_SAVE chars
+        become EXCERPTS (head+tail kept) instead of the slice mode's
+        whole-turn placeholder.
+
+        Erratum (docs/10 §11.5): the compaction target is the old USER turn —
+        this chat protocol embeds tool outputs in the next user message, so a
+        separate ``tool_output`` kind never materializes and the original
+        tool_output-only targeting made this tier identical to ``slice``."""
         out: List[Dict[str, Any]] = []
         rounds = 0
         for block in reversed([b for b in self.universe.ordered()
                                if b.kind in ("turn_output", "tool_output")]):
             if block.kind == "turn_output":
                 rounds += 1
-                continue
             if rounds <= max(self.window_k, WINDOW_K_FLOOR):
                 continue
-            if self.view.form_of(block.block_id) != "full":
+            if block.pinned:
                 continue
+            if self.view.form_of(block.block_id) != "full":
+                continue  # already substituted in an earlier turn (sticky)
+            if excerpt_saving(block) < MIN_COMPACT_SAVE:
+                continue  # the excerpt would save nothing: leave to the window
             out.append(ops.compact(self.universe, self.view,
                                    [block.block_id], "first_last",
                                    self.drop_floor_chars))
         return out
 
-    def budget_snapshot(self, tokens_used: int = 0,
+    def budget_snapshot(self, tokens_used: Optional[int] = None,
                         budget: Optional[int] = None) -> Dict[str, Any]:
         return ops.budget_query(self.budget_reader, tokens_used, budget)
 
     # -- policy segment -----------------------------------------------------------
-    def _run_policy(self) -> List[Dict[str, Any]]:
+    def run_policy(self) -> List[Dict[str, Any]]:
         """Run the custom policy module (fail-open; wedge breaker)."""
         if self.policy_disabled:
             return [{"op": "policy", "ok": False,
                      "error": "policy disabled for this session"}]
-        from .failopen import run_policy
+        from .failopen import run_policy as _run_policy_module
         handle = ViewHandle(self, "policy")
         try:
-            records, over_ms = run_policy(self.policy_path, handle,
-                                          self.policy_exec_ms)
-        except Exception:  # noqa: BLE001 -- fail-open, never break the session
-            self.policy_failures += 1
-            self._policy_strikes += 1
-            if self._policy_strikes >= _POLICY_STRIKES:
-                self.policy_disabled = True
-                self._emit({"type": "cm_policy_disabled", "turn": self.turn,
-                            "strikes": self._policy_strikes})
+            records, over_ms, methods, method_problems = \
+                _run_policy_module(self.policy_path, handle,
+                                   self.policy_exec_ms)
+        except Exception as e:  # noqa: BLE001 -- fail-open, never break the session
+            self._note_policy_failure(str(e)[:160])
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         if over_ms:
             self._emit({"type": "cm_policy_overrun", "turn": self.turn,
                         "over_ms": over_ms})
         if not isinstance(records, list):
+            # A non-list return is a policy failure like any other (failopen
+            # contract): strike-counted, emitted, fail-open.
+            self._note_policy_failure("policy returned a non-list")
             return [{"op": "policy", "ok": False,
                      "error": "policy returned a non-list"}]
+        for rec in records:
+            if not isinstance(rec, dict):
+                # A non-dict record would crash the post-segment count PAST
+                # the wedge breaker: one policy failure, strike-counted,
+                # emitted, fail-open — never a seam crash with only a log
+                # line.
+                self._note_policy_failure("policy returned a non-dict record")
+                return [{"op": "policy", "ok": False,
+                         "error": "policy returned a non-dict record"}]
         self._policy_strikes = 0
+        # Harvest the policy's METHODS once per session (a crashing first
+        # turn leaves the flag unset — the next successful load retries);
+        # assembly registrations take precedence (shadowed policy names
+        # refuse with a recorded reason).
+        if not self._methods_policy_done:
+            self._methods_policy_done = True
+            self._merge_methods(methods, method_problems, source="policy")
         return records
 
-    # -- post segment: audit the applied records -----------------------------------
-    def _count(self, records: List[Dict[str, Any]]) -> int:
+    def _note_policy_failure(self, error: str) -> None:
+        """One policy failure: count + emit, and disable after 2 strikes
+        (C1-class wedge breaker; docs/10 §5.2 分三)."""
+        self.policy_failures += 1
+        self._policy_strikes += 1
+        self._emit({"type": "cm_policy_failed", "turn": self.turn,
+                    "error": error})
+        if self._policy_strikes >= _POLICY_STRIKES:
+            self.policy_disabled = True
+            self._emit({"type": "cm_policy_disabled", "turn": self.turn,
+                        "strikes": self._policy_strikes})
+
+    # -- post segment: the audit + render + outgoing contract ----------------------
+    def count_ops(self, records: List[Dict[str, Any]]) -> int:
         """The primitives already validated + mutated the view; this counts,
         emits violations, and sums the estimated savings (audit only — the
         ledger keeps 实付; savings are a derived indicator, never billing)."""
@@ -495,7 +869,32 @@ class CMSession:
         self.ops_refused += max(0, len(records) - len(capped))
         return saved_total
 
-    def _dedup_prefix(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def finalize_turn(self, msgs: List[Dict[str, Any]],
+                      outgoing: str,
+                      out_block: Optional["Block"],
+                      records: List[Dict[str, Any]]
+                      ) -> Tuple[List[Dict[str, Any]], str]:
+        """The post segment every non-passthrough turn closes with.
+
+        Invariants owned here (so an assembly cannot route around them):
+        the applied records are counted + emitted exactly once per turn
+        (``cm_view`` brief, no content); the sent history is materialized
+        from the persistent view by the no-fabrication render (copies only
+        — 双记); the outgoing instruction is never substituted except the
+        dedup prefix-elision (same frozen form, anchored at the head)."""
+        saved = self.count_ops(records)
+        self.emit_view(saved, records)
+        send_history = self.render(msgs)
+        send_msg = outgoing
+        if out_block is not None \
+                and self.view.form_of(out_block.block_id) == "dedup":
+            # the outgoing turn carries the per-turn header; elide it exactly
+            # like an old turn (same frozen form, anchored at the head)
+            if self.system_prefix and outgoing.startswith(self.system_prefix):
+                send_msg = _DEDUP_MARKER + outgoing[len(self.system_prefix):]
+        return send_history, send_msg
+
+    def dedup_prefix(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fixed pre-segment: fixed-overhead governance. The tool-use header
         is re-sent in EVERY user message; for messages older than the pin
         window it is elided (one in-band marker replaces it) — the newest
@@ -524,7 +923,7 @@ class CMSession:
                         "saved": len(self.system_prefix)})
         return out
 
-    def _render(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def render(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Materialize the CURRENT persistent view into shallow copies.
 
         A block's text is only ever replaced by its own excerpt/head_tail cut
@@ -538,14 +937,16 @@ class CMSession:
                 continue
             by_msg.setdefault(block.msg_index, []).append(block)
         if not by_msg:
-            return msgs
-        out = list(msgs)
+            # still copy every entry: the client pops keys from what it gets
+            # (see the passthrough preset) — canonical must stay raw
+            return [dict(m) if isinstance(m, dict) else m for m in msgs]
+        out = [dict(m) if isinstance(m, dict) else m for m in msgs]
         for idx, blocks in by_msg.items():
             if idx < 0 or idx >= len(out):
                 continue
             m = out[idx]
-            content = m.get("content") if isinstance(m, dict) else None
-            if not isinstance(content, str):
+            content = _msg_text(m)
+            if content is None:
                 continue
             new_content = content
             for block in blocks:
@@ -581,13 +982,17 @@ class CMSession:
                     break
             if new_content != content:
                 shallow = dict(m)
-                shallow["content"] = new_content
+                # write back under the entry's OWN key: the canonical history
+                # mixes ``text``-form and ``content``-form entries, and the
+                # client's text->content conversion keys off exactly these
+                shallow["content" if isinstance(m.get("content"), str)
+                        else "text"] = new_content
                 out[idx] = shallow
         return out
 
     def note_violation(self, rec: Dict[str, Any]) -> None:
         """Count + emit one op refusal (idempotent with the seam path: the
-        seam's ``_count`` only emits for records that did NOT come from a
+        seam's ``count_ops`` only emits for records that did NOT come from a
         handle audit — tracked via the record marker below)."""
         if rec.get("_audited"):
             return
@@ -598,22 +1003,47 @@ class CMSession:
                     "op": rec.get("op"), "refs": rec.get("refs"),
                     "error": rec.get("error")})
 
-    def _emit_view(self, saved: int) -> None:
+    def emit_view(self, saved: int,
+                  records: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Per-turn assembly event. ``ops`` is the applied-mutation brief
+        (op name + block refs + rule, NO content) — the 对账 half of the 双记
+        audit: what was kept/dropped, by which rule, addressable by block id
+        (docs/10 §5.2.3; the aggregate ``stats`` stay alongside)."""
+        ops_brief: List[Dict[str, Any]] = []
+        for rec in (records or [])[:max(1, self.max_ops_per_turn)]:
+            if not rec.get("ok") or rec.get("op") == "policy":
+                continue  # refusals ride cm_violation; the run itself is not a view op
+            ops_brief.append({"op": rec.get("op"),
+                              "refs": list(rec.get("refs") or []),
+                              "rule": str(rec.get("rule")
+                                          or rec.get("form") or "")[:60]})
+        stats: Dict[str, Any] = {"blocks": len(self.universe.blocks),
+                                 "substituted": len(self.view.forms),
+                                 "saved_chars": saved,
+                                 "est_saved_session": self.est_chars_saved,
+                                 "policy_disabled": self.policy_disabled}
+        # conditional audit fields: they materialize only in the states they
+        # describe, so the baseline event shape stays byte-identical while a
+        # degraded turn / a wedge-broken assembly stays visible EVERY turn
+        if self._turn_degraded:
+            stats["degraded"] = True
+        if self.assembly_disabled:
+            stats["assembly_disabled"] = True
         self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
-                    "stats": {"blocks": len(self.universe.blocks),
-                              "substituted": len(self.view.forms),
-                              "saved_chars": saved,
-                              "est_saved_session": self.est_chars_saved,
-                              "policy_disabled": self.policy_disabled}})
+                    "ops": ops_brief, "stats": stats})
+        self._view_emitted_turn = self.turn
 
 
 def build_session(keys: Dict[str, Any], *, emit: Optional[Callable] = None,
                   budget_reader: Optional[Callable] = None,
-                  policy_path: Optional[str] = None) -> CMSession:
+                  policy_path: Optional[str] = None,
+                  assembly_path: Optional[str] = None) -> CMSession:
     """Factory: already-clamped effective keys -> a ready session. Unknown or
     out-of-range values are IGNORED here (the clamp authority reported them
-    parent-side); the safe defaults are the passthrough posture."""
+    parent-side); the safe defaults are the passthrough posture. The named
+    assembly path is FRAMEWORK-RESOLVED (the snapshot/component tree), never
+    a design value: keys carry only the name."""
     session = CMSession(emit=emit, budget_reader=budget_reader,
-                        policy_path=policy_path)
+                        policy_path=policy_path, assembly_path=assembly_path)
     session.apply_keys(keys or {})
     return session

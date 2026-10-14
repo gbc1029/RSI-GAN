@@ -5,6 +5,7 @@ import io
 import re
 import sys
 import json
+import time
 from functools import partial
 
 from agent.llm import get_response_from_llm
@@ -141,6 +142,31 @@ def _dispatch_precheck(tool_name, tool_input):
     return None
 
 
+def _required_missing(entry, tool_input):
+    """Generic ``input_schema.required`` presence check (P-b, dispatch level).
+
+    Refuses a call whose REQUIRED parameters are absent BEFORE tool code runs,
+    replacing the bare ``TypeError`` fallback with a uniform, fixable message.
+    Deliberately minimal:
+    - the schema is trusted only STRUCTURALLY -- a missing or malformed
+      ``required`` (schemas are not structure-validated; ops_review R-a③)
+      skips the check entirely and falls back to the TypeError backstop;
+    - presence only, NO type checks: an unvalidated schema must not be able
+      to reject calls the tool itself would accept;
+    - a non-dict ``tool_input`` counts as missing everything declared;
+    - the TypeError fallback in ``_run_captured`` stays as the backstop for
+      schema/signature drift (a C1/C2 concern never arises here: the call
+      fails before any tool work starts).
+    """
+    info = entry.get("info") if isinstance(entry, dict) else None
+    schema = info.get("input_schema") if isinstance(info, dict) else None
+    req = schema.get("required") if isinstance(schema, dict) else None
+    if not isinstance(req, list):
+        return []
+    given = tool_input if isinstance(tool_input, dict) else {}
+    return [k for k in req if isinstance(k, str) and k not in given]
+
+
 def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
     """Execute one tool call with the dispatch-level safety net.
 
@@ -149,6 +175,8 @@ def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
 
     - ``wedged`` / ``wedge_limit`` / ``tool_disabled`` -- C1 timeouts and the
       per-tool breaker;
+    - ``dispatch_rejected``                        -- input refused BEFORE tool
+      code (edit_source declared-input checks / missing required params, P-b);
     - ``truncated`` / ``original_chars``             -- C2 central cap;
     - ``tool_stdout`` / ``tool_stderr``              -- C3 captured output
       (stderr means the tool escaped its own error handling; audit-only).
@@ -169,6 +197,13 @@ def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
         return (f"Error: tool '{tool_name}' is DISABLED for this session: it wedged "
                 f"{meta['wedges']} time(s). Fix the tool's hang cause before retrying "
                 f"(or use another tool to make progress).", {"tool_disabled": True})
+
+    # P-b: refuse calls missing their declared REQUIRED params before any tool
+    # code runs (uniform message instead of the raw TypeError fallback).
+    missing = _required_missing(entry, tool_input)
+    if missing:
+        return (f"Error: tool '{tool_name}' is missing required parameter(s): "
+                f"{', '.join(missing)}", {"dispatch_rejected": True})
 
     fn = entry["function"]
     ctx = contextvars.copy_context()
@@ -377,7 +412,9 @@ def chat_with_agent(
                           # credentials; None -> ambient env (legacy callers).
     load_report_path=None,  # Explicit sink for the toolset LOAD outcome; None
     cm=None,  # Reserved cost keys (docs/10 §11): an optional CM session object
-              # (duck-typed: assemble(msgs, tokens_used, budget) -> msgs).
+              # (duck-typed: assemble_turn(msgs, outgoing, tokens_used, budget)
+              # -> (history_to_send, msg_to_send); `assemble()` is the
+              # direct-form variant for tests/non-chat callers).
               # Wired ONLY by framework callers that built it (loop / task
               # worker); None = pre-D behaviour (no seam at all).
                           # -> $GAN_TOOLS_LOAD_REPORT env fallback (legacy).
@@ -395,6 +432,27 @@ def chat_with_agent(
     # mechanism, no GAN semantics: None (default) keeps today's behaviour.
     tokens_used = 0
     token_budget_exhausted = False
+
+    # Live meter source for the CM session (docs/10 §11.5): the chat loop owns
+    # the authoritative running totals, so it hands the session a reader
+    # closure over them instead of letting the meter keep a second counter.
+    # Reader contract (gan/framework/cm/session.py): keys tokens_used / budget
+    # / tool_calls / wallclock_s, all optional, 实付口径 (proxy usage sums).
+    cm_started = time.time()
+    cm_token = None
+
+    def _cm_usage_reader():
+        out = {"tokens_used": tokens_used,
+               "tool_calls": num_tool_calls,
+               "wallclock_s": round(time.time() - cm_started, 1)}
+        # budget_armed must be EXPLICIT in both states (no-silent-fail rule):
+        # a missing "budget" key alone reads as "a budget exists somewhere
+        # else" — it does not; unset means NO token soft stop for this run
+        # (only tool-call caps and the time walls constrain it).
+        out["budget_armed"] = isinstance(max_total_tokens, int) and max_total_tokens > 0
+        if out["budget_armed"]:
+            out["budget"] = max_total_tokens
+        return out
 
     def _counting_llm(**kwargs):
         nonlocal tokens_used
@@ -427,12 +485,14 @@ def chat_with_agent(
         if cm is not None and n_viewed and isinstance(hist, list):
             # keep the CANONICAL (raw) history: the seam's copies were only
             # for sending; the user turn is rebuilt RAW, the assistant reply
-            # is raw by construction (LLM output).
+            # is raw by construction (LLM output). Text-key form — the
+            # canonical convention (agent/llm.py returns text-form entries;
+            # get_response's entry conversion text->content handles the send).
             try:
                 new_entries = list(hist[n_viewed:])
                 if new_entries and isinstance(new_entries[0], dict) \
                         and new_entries[0].get("role") == "user":
-                    new_entries[0] = {"role": "user", "content": raw_msg}
+                    new_entries[0] = {"role": "user", "text": raw_msg}
                 hist = list(raw_history or []) + new_entries
             except Exception:  # noqa: BLE001 -- history shapes vary
                 pass
@@ -454,10 +514,14 @@ def chat_with_agent(
         if cm is not None:
             # The seam learns the per-turn header (dedup target) and binds
             # itself for ctx_* tools (contextvar; process_tool_call copies it
-            # into the dispatch threads).
+            # into the dispatch threads). The live meter reader rides the same
+            # wiring: ctx_budget reads THIS chat run's authoritative totals
+            # instead of an empty snapshot (docs/10 §11.5).
             try:
                 cm.set_system_prefix(system_msg)
-                cm.activate()
+                if hasattr(cm, "budget_reader"):
+                    cm.budget_reader = _cm_usage_reader
+                cm_token = cm.activate()
             except Exception as e:  # noqa: BLE001 -- advisory wiring
                 logging(f"[cm] session wiring degraded: {e}")
 
@@ -659,6 +723,15 @@ def chat_with_agent(
     except Exception as e:
         logging(f"Error: {str(e)}")
         raise e
+    finally:
+        # Reset the contextvar binding: the session object must not leak into
+        # whatever runs later on this thread (parallel role sessions reuse
+        # threads through the dispatch executor).
+        if cm_token is not None:
+            try:
+                cm.deactivate(cm_token)
+            except Exception:  # noqa: BLE001 -- contextvar reset must not fail the session
+                pass
 
     if return_info:
         return new_msg_history, {"truncated": truncated, "tool_calls": num_tool_calls,

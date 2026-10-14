@@ -6,6 +6,48 @@ import os
 import sys
 
 
+def _schema_issue(info):
+    """Structural health of ``tool_info()["input_schema"]`` (R-a③, load layer).
+
+    The registry layer cannot run this check: ``entry_reason`` is static (no
+    import), while ``input_schema`` is a RETURN VALUE of ``tool_info()`` -- the
+    same principle as the runtime identity gate (a static gate can never check
+    a value without importing the module). An absent schema is legal: the P-b
+    dispatch precheck skips by design. Returns ``(hard, advisory)``:
+
+    - ``hard``: ``required`` is a well-formed string list but names keys that
+      ``properties`` does not declare. Every call would be dispatch-rejected
+      for the ghost name; passing it feeds an unexpected kwarg to the tool
+      (silently swallowed by ``**kwargs`` or a TypeError) -- the tool is
+      effectively bricked at call time. Fail-closed with a fixable report
+      entry, mirroring the identity gate.
+    - ``advisory``: malformations that merely degrade the P-b precheck, which
+      already tolerates them (non-dict schema; ``required`` not a list of
+      strings). The tool itself still works, so it LOADS; the issue rides the
+      load report's ``schema_issues`` (record + feed the owner -- never a
+      silent degradation, never an availability loss).
+    """
+    schema = info.get("input_schema") if isinstance(info, dict) else None
+    if schema is None:
+        return None, None
+    if not isinstance(schema, dict):
+        return None, (f"input_schema is {type(schema).__name__}, not dict "
+                      f"(P-b precheck inactive)")
+    req = schema.get("required")
+    if req is None:
+        return None, None
+    if not isinstance(req, list) or any(not isinstance(k, str) for k in req):
+        return None, ("input_schema.required is not a list of strings "
+                      "(P-b precheck inactive)")
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        ghost = [k for k in req if k not in props]
+        if ghost:
+            return (f"required names not declared in properties: {ghost} "
+                    f"(every call would be dispatch-rejected)", None)
+    return None, None
+
+
 def load_tools(logging=print, names=[], tools_dir=None, report_path=None):
     """Discover tool modules exposing ``tool_info()`` and ``tool_function``.
 
@@ -20,7 +62,10 @@ def load_tools(logging=print, names=[], tools_dir=None, report_path=None):
             tool API) is skipped right here with a log line nobody reads, so the
             framework could not tell "assembled" from "actually available". The
             report closes that gap and rides the existing toolset report into the
-            node meta / role assembly report.
+            node meta / role assembly report. Since the R-a③ schema gate the
+            report also carries ``schema_issues`` (advisory entries for modules
+            that load but whose malformed ``input_schema`` degrades the P-b
+            precheck).
     """
     report_path = report_path or os.environ.get("GAN_TOOLS_LOAD_REPORT") or None
     base_dir = Path(__file__).parent
@@ -29,6 +74,7 @@ def load_tools(logging=print, names=[], tools_dir=None, report_path=None):
 
     tools = []
     loaded, skipped = [], []
+    schema_issues = []
 
     # Get all Python files in the tools directory (excluding __init__.py)
     tool_files = sorted(f for f in tools_dir.glob("*.py") if f.stem != "__init__")
@@ -83,6 +129,19 @@ def load_tools(logging=print, names=[], tools_dir=None, report_path=None):
                                 "reason": f"name mismatch: tool_info name '{info_name}' "
                                           f"!= file stem '{tool_file.stem}' (runtime identity gate)"})
                 continue
+            # R-a③ (load-time schema gate): structural health of the schema
+            # VALUE (see _schema_issue). A required/properties mismatch
+            # fail-closes like the identity gate above; a precheck-degrading
+            # malformation loads with a schema_issues advisory entry.
+            hard, advisory = _schema_issue(info)
+            if hard:
+                logging(f"Skipping tool {tool_file}: input_schema mismatch: {hard}")
+                skipped.append({"file": tool_file.name,
+                                "reason": f"input_schema mismatch: {hard}"})
+                continue
+            if advisory:
+                logging(f"Tool {tool_file}: {advisory}")
+                schema_issues.append({"file": tool_file.name, "issue": advisory})
             tool_name = tool_file.stem
             if names and (names == 'all' or tool_name in names):
                 tools.append({
@@ -108,7 +167,8 @@ def load_tools(logging=print, names=[], tools_dir=None, report_path=None):
                 os.makedirs(_dir, exist_ok=True)
             with open(str(report_path), "w", encoding="utf-8") as f:
                 json.dump({"tools_dir": str(tools_dir), "names": names,
-                           "loaded": loaded, "skipped": skipped},
+                           "loaded": loaded, "skipped": skipped,
+                           "schema_issues": schema_issues},
                           f, ensure_ascii=False, indent=2)
         except Exception:  # noqa: BLE001 -- advisory sink
             pass

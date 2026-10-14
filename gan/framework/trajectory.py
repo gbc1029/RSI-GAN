@@ -19,7 +19,7 @@ import glob
 import json
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from gan.framework import paths
 from utils import trajectory_log
@@ -299,6 +299,50 @@ def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str
                     out.append({"genid": name, "bytes": os.path.getsize(p)})
                 elif glob.glob(p + ".unredacted-*"):
                     out.append({"genid": name, "quarantined": True})
+    return out
+
+
+def session_label(current_outer: Any, outer: Any, genid: Any, filename: str) -> str:
+    """The OWN-session address label for one file — the ONE place the label
+    rule lives, shared by trajectory materialization and the
+    read_session_trajectory fallback so both sides' address spaces agree.
+
+    The current outer keeps the established genid-qualified form
+    (``<genid>/<file>`` — zero regression for existing addresses); any OTHER
+    outer gets an outer-prefixed form (``outer_<O>/<genid>/<file>``) so one
+    session's address space stays unique across outers."""
+    prefix = "" if str(outer) == str(current_outer) else f"outer_{outer}/"
+    return f"{prefix}{genid}/{filename}"
+
+
+def session_universe(output_dir: str, role: str, current_outer: Any,
+                     extra_outers: Any = None) -> List[Tuple[str, str]]:
+    """The seat's OWN-session visible universe as ``(label, path)`` pairs —
+    the single definition served to BOTH consumers: trajectory materialization
+    (``loop._traj_materialization_files``) and the read_session_trajectory
+    fallback, so what a session can read is exactly what was declared.
+
+    ``extra_outers`` (e.g. the previous outer for the self seat) widen the
+    universe beyond the current outer; their entries carry outer-prefixed
+    labels (see ``session_label``). Canonical files only (attempt siblings
+    stay a fallback-side refinement, as before); quarantined (unredactable)
+    sessions are EXCLUDED from the universe. Everything is advisory: missing
+    files/dirs are skipped — the universe is what exists."""
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for o in [current_outer] + list(extra_outers or []):
+        if o is None:
+            continue
+        d = paths.outer_traj_dir(output_dir, o)
+        genids = [str(e["genid"]) for e in outer_session_index(output_dir, o, role)
+                  if not e.get("quarantined")]
+        genids.sort(key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+        for g in genids:
+            p = os.path.join(d, g, f"{role}.jsonl")
+            label = session_label(current_outer, o, g, f"{role}.jsonl")
+            if os.path.isfile(p) and label not in seen:
+                seen.add(label)
+                out.append((label, p))
     return out
 
 

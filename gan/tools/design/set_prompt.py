@@ -4,6 +4,34 @@ from typing import Optional
 from gan.framework.context import get_design_context, shallow_op_error
 from gan.framework.receipt import prompt_change_facts
 
+# P-a (ops_review): prompt writes get a floor (non-empty) and a ceiling (length
+# cap) at ONE shared chokepoint used by both prompt paths (``set_prompt`` and
+# ``set_config(key="prompt")``). Seeds are <= ~6k chars; 20k leaves ~3.5x
+# evolution headroom. An EMPTY prompt is not a legal state (the seed fallback
+# rule treats blank as "use the default", i.e. no agent instructions), so a
+# blank write is refused, never stored.
+PROMPT_MAX_CHARS = 20_000
+
+
+def prompt_write_error(text) -> Optional[str]:
+    """Return an error string for an illegal prompt write, else ``None``.
+
+    Shared by ``set_prompt`` and ``set_config(key="prompt")`` so the two
+    entries cannot drift. Shape checks only -- the text is never inspected
+    beyond shape, and the design is untouched on refusal (no record either:
+    a refused write must not look like a change).
+    """
+    if not isinstance(text, str):
+        return f"Error: prompt must be a string (got {type(text).__name__})"
+    if not text.strip():
+        return ("Error: prompt must be a non-empty string (a blank prompt "
+                "leaves the agent without instructions; the seed fallback "
+                "applies only to fresh runs)")
+    if len(text) > PROMPT_MAX_CHARS:
+        return (f"Error: prompt exceeds the {PROMPT_MAX_CHARS}-char limit "
+                f"(got {len(text)})")
+    return None
+
 
 def _seed_prompt(role: str) -> Optional[str]:
     """The generation-0 prompt for ``role`` (``equals_seed``), or None.
@@ -23,7 +51,9 @@ def _seed_prompt(role: str) -> Optional[str]:
 def tool_info():
     return {
         "name": "set_prompt",
-        "description": "Replace the agent's prompt (design config key 'prompt').",
+        "description": ("Replace the agent's prompt (design config key 'prompt'). "
+                        "Refuses empty/whitespace text and text over "
+                        f"{PROMPT_MAX_CHARS} chars."),
         "input_schema": {
             "type": "object",
             "properties": {"text": {"type": "string"}},
@@ -37,6 +67,11 @@ def tool_function(text="", **kwargs):
     if ctx is None:
         return "Error: no design context"
     err = shallow_op_error("set_prompt")
+    if err:
+        return err
+    # P-a: floor (non-empty) + ceiling (length cap) BEFORE any mutation or
+    # record -- a refused write must leave the design and the records clean.
+    err = prompt_write_error(text)
     if err:
         return err
     # Capture the value being replaced BEFORE the overwrite -- this is the

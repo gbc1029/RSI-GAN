@@ -214,11 +214,13 @@ def observed_capabilities(role: str, code_root: Optional[str] = None
         if prof.get("framework_owned"):
             return
         if (prof.get("observed_mutating") or prof.get("observed_subprocess")
-                or prof.get("observed_dynamic_exec") or prof.get("findings")):
+                or prof.get("observed_dynamic_exec")
+                or prof.get("observed_ledger_writer") or prof.get("findings")):
             out.append({"name": name, "path": path, "observed": {
                 "mutating": prof.get("observed_mutating", False),
                 "subprocess": prof.get("observed_subprocess", False),
                 "dynamic_exec": prof.get("observed_dynamic_exec", False),
+                "ledger_writer": prof.get("observed_ledger_writer", False),
             }, "findings": prof.get("findings", [])})
 
     for name, info in always_on_index(role, code_root=code_root).items():
@@ -310,7 +312,8 @@ def catalog_stale(role: str, code_root: Optional[str] = None,
 
 
 def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
-                            roles: Iterable[str] = ("planner", "evaluator")
+                            roles: Iterable[str] = ("planner", "evaluator"),
+                            writer: Optional[Any] = None,
                             ) -> Dict[str, Any]:
     """Strip unreachable ``tools`` names from role designs, keep forensics.
 
@@ -338,7 +341,7 @@ def repair_dangling_designs(design_root: str, code_root: Optional[str] = None,
     from gan.framework.task_execution import heal_design_slots, heal_design_keys
 
     out: Dict[str, Any] = {"checked": [], "stripped": [], "errors": []}
-    store = DesignStore(design_root)
+    store = DesignStore(design_root, writer=writer)
     for role in roles:
         path = store.path(role)
         if not os.path.exists(path):
@@ -395,9 +398,13 @@ def cm_component_problems(role: str, code_root: Optional[str] = None
       any agent-owned tool (raw writes / subprocess / dynamic exec) — a
       capability-flagged wrapper cannot ride the registry, so a violation is
       reported as a problem;
-    - a ``policy*.py`` file additionally must pass the frozen no-LLM /
-      no-network gate (``cm.failopen.policy_violations``): the snapshot
-      materialization refuses it otherwise, so report the reason up front.
+    - EVERY pool file (wrapper included) additionally passes the frozen
+      no-LLM / no-network gate (``cm.failopen.policy_violations``) plus the
+      dual-posture import ban (``gan.*`` banned): any pool file can be NAMED
+      as per-turn-executed agent code (``cost.cm_policy`` /
+      ``cost.cm_assembly``, docs/10 §11.8/§11.9), so the gate is pool-wide —
+      the snapshot materialization / session load refuses on it, and this
+      reports the reason before the run starts.
 
     Non-fatal (advisory): the snapshot is the enforcement point; preflight
     only makes the outcome visible before the run starts.
@@ -410,6 +417,8 @@ def cm_component_problems(role: str, code_root: Optional[str] = None
         return out
     from gan.framework.ast_checker import policy_reason
     from gan.framework.cm.failopen import policy_violations
+    from gan.framework.cm.assembly import (_gan_import_problems,
+                                           static_methods_problems)
     for path in sorted(base.glob("*.py")):
         if path.name == "__init__.py":
             continue
@@ -417,10 +426,23 @@ def cm_component_problems(role: str, code_root: Optional[str] = None
         reason = policy_reason(str(path), rel)
         if reason:
             out.append({"file": rel, "check": "ast_policy", "reason": reason})
-        if path.name.startswith("policy"):
-            problems = policy_violations(str(path))
-            if problems:
-                out.append({"file": rel, "check": "cm_policy_gate",
-                            "reason": "; ".join(problems)[:200]})
+        # A METHODS export makes this module's methods
+        # callable as same-level primitives — probe the name rules statically
+        # (advisory; the load-time harvest refuses the whole group for real).
+        mproblems = static_methods_problems(str(path))
+        if mproblems:
+            out.append({"file": rel, "check": "cm_methods_names",
+                        "reason": "; ".join(mproblems)[:200]})
+        # ANY cm-pool file may be named as agent CM code
+        # (cost.cm_policy / cost.cm_assembly) and then executed EVERY turn
+        # in-process — so the frozen agent-code gate + the dual-posture
+        # import rule run over the whole pool here, before the run starts.
+        # Advisory early signal; the load-time gate remains the enforcement
+        # point (and the snapshot refuses at materialization).
+        problems = (policy_violations(str(path))
+                    + _gan_import_problems(str(path)))
+        if problems:
+            out.append({"file": rel, "check": "cm_agent_gate",
+                        "reason": "; ".join(problems)[:200]})
     return out
 

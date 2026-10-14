@@ -110,8 +110,13 @@ source_access:
 #                            custom）；窗口/下限/op 预算/policy 执行预算/
 #                            笔记上限随 cost 槽继承，消费点在 seam
 #                            （agent/llm_withtools，task 子代经 .gan_runtime/cm
-#                            快照投递）与 read_*_trajectory 的 slice 前端。
-#                            本文件不设 cm 键——档位是 design 键，不是框架超参。
+#                            快照投递）与 read_*_trajectory 的 slice 前端
+#                            （§11.5 档位归座：AccessContext.session_cm_mode，
+#                            各会话读自己角色的设计）。task 子代的 seam 事件经
+#                            cm_events.jsonl sidecar 由 task_runner 并入
+#                            events.jsonl（role=task）；meter（ctx_budget）读
+#                            chat 循环挂的实付累计 reader。本文件不设 cm 键
+#                            ——档位是 design 键，不是框架超参。
 # ---------------------------------------------------------------------------
 cost:
   token_budget_per_gen: 200000

@@ -19,8 +19,10 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
-    # context-management snapshot (docs/10 §11 D2/D7)
-    "GAN_CM_CORE", "GAN_CM_POLICY",
+    # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
+    # audit sidecar (§11.5: rw bind in the sandbox; cwd fallback locally)
+    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
+                      "GAN_CM_EVENTS",
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -186,22 +188,81 @@ def _write_json_fd(fd: int, payload) -> None:
         os.close(fd)
 
 
+def _cm_events_path():
+    """Where this child appends its seam events (docs/10 §11.5).
+
+    Sandbox: GAN_CM_EVENTS is the rw-bound sidecar host file
+    (/workspace/cm_events.jsonl <-> <run_dir>/cm_events.jsonl). Local
+    (non-sandbox) runs: the env points at the sandbox view, which does
+    not exist — fall back to the cwd (the run dir). Module-level so BOTH
+    the seam session and the payload-forwarding degradations below can
+    leave a durable trace (no-silent-fail rule)."""
+    path = os.environ.get("GAN_CM_EVENTS") or ""
+    if path and os.path.isdir(os.path.dirname(path) or "."):
+        return path
+    return os.path.join(os.getcwd(), "cm_events.jsonl")
+
+
+def _cm_emit(event):
+    """Audit sink for the child's seam events (cm_view/cm_violation/...):
+    appended to the sidecar and folded into events.jsonl by task_runner.
+    The sink must never break the session — but a failed append is not
+    silent either: the line is preserved in a sibling fallback file and
+    echoed to stderr (when the durable channel itself fails, these two are
+    the only channels left in-process; the fallback file shares the work
+    dir's lifetime, so it is best-effort by design)."""
+    line = json.dumps(dict(event), ensure_ascii=False, default=str)
+    try:
+        with open(_cm_events_path(), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return
+    except OSError as e:
+        fallback = os.path.join(os.getcwd(), "cm_events_failed.jsonl")
+        landed = False
+        try:
+            with open(fallback, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            landed = True
+        except OSError:
+            pass
+        print(f"[cm] sidecar append failed ({e}); event line "
+              + (f"preserved at {fallback}" if landed else "follows")
+              + f": {line[:300]}", flush=True)
+
+
+def _degrade(reason: str, consequence: str = "; running without seam") -> None:
+    """Fail-open LOUDLY: sidecar line + stderr print (the print alone is
+    not durable — harness captures child stdout and the log keeps only a
+    window; the sidecar line is what the audit fold sees)."""
+    _cm_emit({"type": "cm_session_degraded", "reason": reason})
+    print(f"[cm] {reason}{consequence}", flush=True)
+
+
 def _build_cm_session():
     """Reserved cost keys (docs/10 §11 D7): build the context-management
     session for this child from the per-generation snapshot.
 
-    ``GAN_CM_CORE`` (set by assemble_task_env) points at the frozen core the
-    parent materialized under ``.gan_runtime/cm``; ``GAN_CM_POLICY`` carries
-    the AST-gated policy component (custom mode only). The ``cm_*`` keys come
-    from the ALREADY-CLAMPED design snapshot — a type-guarded pass-through,
-    never a second clamp authority. Any failure returns None: the chat runs
-    with no seam at all (pre-D behaviour, fail-open by absence)."""
+    ``GAN_CM_CORE`` (set by assemble_task_env / the task broker) points at
+    the frozen core the parent materialized under ``.gan_runtime/cm``;
+    ``GAN_CM_POLICY`` carries the AST-gated policy component (custom mode
+    only). The ``cm_*`` keys come from the ALREADY-CLAMPED design snapshot —
+    a type-guarded pass-through, never a second clamp authority. Any failure
+    returns None: the chat runs with no seam at all (pre-D behaviour,
+    fail-open) — but NEVER silently: every degradation writes a
+    ``cm_session_degraded`` line into the audit sidecar (folded into
+    events.jsonl by task_runner) AND keeps its stderr print. The one
+    legit-abstain path (no GAN_CM_CORE anywhere) is a LOCAL/manual run, not
+    a GAN generation — recorded for exactly that reason."""
+
     core = os.environ.get("GAN_CM_CORE") or ""
     if not os.path.isdir(core):
         alt = os.path.join(os.getcwd(), ".gan_runtime", "cm")
         if os.path.isdir(alt):
             core = alt
         else:
+            _degrade(f"no CM core snapshot (GAN_CM_CORE={core!r} and no "
+                     f".gan_runtime/cm under cwd); local/manual run or a "
+                     f"broker env without the CM keys")
             return None
     parent = os.path.dirname(os.path.abspath(core))
     if parent not in sys.path:
@@ -209,8 +270,7 @@ def _build_cm_session():
     try:
         import cm as cmcore  # the snapshot package (stdlib-only by contract)
     except Exception as e:  # noqa: BLE001 -- fail-open by absence
-        print(f"[cm] snapshot import failed ({e}); running without seam",
-              flush=True)
+        _degrade(f"snapshot import failed ({e})")
         return None
     keys: dict = {}
     try:
@@ -222,16 +282,64 @@ def _build_cm_session():
             if isinstance(cost, dict):
                 keys = {k: v for k, v in cost.items()
                         if isinstance(k, str) and k.startswith("cm_")}
-    except Exception as e:  # noqa: BLE001 -- advisory
-        print(f"[cm] design cm keys unavailable ({e}); using defaults",
-              flush=True)
+    except Exception as e:  # noqa: BLE001 -- fail-open, must SPEAK
+        # The keys degrade to the snapshot defaults: an audible degrade with
+        # a durable sidecar line (no-silent-fail rule; the print alone is
+        # not durable). The seam still RUNS — only its configuration is
+        # downgraded — so the consequence differs from a lost seam.
+        _degrade(f"design cm keys unavailable ({e}); snapshot defaults apply",
+                 consequence="; using default cm keys")
     mode = keys.get("cm_mode") if isinstance(keys.get("cm_mode"), str) else "passthrough"
-    policy_path = os.environ.get("GAN_CM_POLICY") if mode == "custom" else None
+    # Fixed-name delivery (cm_policy.py / cm_assembly.py in the snapshot):
+    # the env pins are static (assemble_task_env and the broker pin the same
+    # values), so resolution is deterministic — no sort-order scan. An env
+    # value whose file is absent means THIS generation delivered nothing;
+    # a design claim without delivery degrades LOUDLY (claim-vs-snapshot
+    # gap), never silently.
+    policy_path = None
+    if mode == "custom":
+        env_policy = os.environ.get("GAN_CM_POLICY") or ""
+        if env_policy and os.path.isfile(env_policy):
+            policy_path = env_policy
+        else:
+            fixed = os.path.join(core, "cm_policy.py")
+            if os.path.isfile(fixed):
+                # legacy/local-run recovery (no env pin): the snapshot's
+                # fixed-name policy IS the only candidate — deterministic.
+                policy_path = fixed
+                if env_policy:
+                    _degrade(f"GAN_CM_POLICY={env_policy!r} does not exist; "
+                             "recovered the snapshot's cm_policy.py",
+                             consequence="; seam runs on the recovered "
+                                         "fixed-name policy")
+            else:
+                named = keys.get("cm_policy")
+                _degrade("design requests cm_mode=custom but no policy is "
+                         f"deliverable (env={env_policy!r}, snapshot has no "
+                         f"cm_policy.py"
+                         + (f", design names {named!r}" if named else "")
+                         + "); running PASSTHROUGH instead")
+                # The degrade CLAIMS passthrough — the keys must say it too,
+                # or apply_keys would still build a custom session whose
+                # every turn fails on the missing policy.
+                mode = "passthrough"
+                keys = dict(keys)
+                keys["cm_mode"] = "passthrough"
+    assembly_path = None
+    env_asm = os.environ.get("GAN_CM_ASSEMBLY") or ""
+    if env_asm and os.path.isfile(env_asm):
+        assembly_path = env_asm
+    elif keys.get("cm_assembly"):
+        _degrade(f"design names cm_assembly={keys['cm_assembly']!r} but the "
+                 f"snapshot has no cm_assembly.py (env={env_asm!r}); the "
+                 f"baseline preset runs instead")
+
     try:
-        return cmcore.build_session(keys, policy_path=policy_path)
+        return cmcore.build_session(keys, policy_path=policy_path,
+                                    assembly_path=assembly_path,
+                                    emit=_cm_emit)
     except Exception as e:  # noqa: BLE001 -- fail-open
-        print(f"[cm] session build failed ({e}); running without seam",
-              flush=True)
+        _degrade(f"session build failed ({e})")
         return None
 
 
@@ -256,10 +364,19 @@ def _run_agent_child(result_fd: int) -> None:
             if dropped:
                 print(f"[cost] TaskAgent does not accept {dropped}; "
                       f"budget fields dropped", flush=True)
+                # Print is not durable (PIPE-captured child stdout): the
+                # sidecar line is what the audit fold sees (no-silent-fail).
+                _cm_emit({"type": "cm_session_degraded",
+                          "reason": f"TaskAgent does not accept {dropped}; "
+                                    "budget fields dropped"})
                 for k in dropped:
                     budget_kwargs.pop(k)
-    except (TypeError, ValueError):
-        budget_kwargs = {}
+    except (TypeError, ValueError) as e:
+        # Signature unreadable -> EVERY budget field is dropped: the largest
+        # silent-budget regression this file can produce. Degrade loudly
+        # (sidecar + stderr), never bare.
+        _degrade(f"TaskAgent.__init__ signature unreadable ({e}); ALL payload "
+                 "budget fields dropped", consequence="")
     # Context-management session (docs/10 §11 D7): forwarded like the budget
     # kwargs -- only when the artifact's __init__ accepts it; a modified
     # artifact dropping the seam degrades to the pre-D behaviour (the design
@@ -274,8 +391,17 @@ def _run_agent_child(result_fd: int) -> None:
             else:
                 print("[cost] TaskAgent does not accept ['cm']; "
                       "running without the context-management seam", flush=True)
-        except (TypeError, ValueError):
-            pass
+                # Durable trace: the session was built but is not forwarded,
+                # so its own emit sink (the sidecar) never fires — without
+                # this line the lost seam is indistinguishable from a
+                # passthrough design (no-silent-fail rule).
+                _cm_emit({"type": "cm_session_degraded",
+                          "reason": "TaskAgent does not accept ['cm']; "
+                                    "running without the context-management "
+                                    "seam"})
+        except (TypeError, ValueError) as e:
+            _degrade(f"TaskAgent.__init__ signature unreadable ({e}); the "
+                     "built cm session is NOT forwarded")
     agent = TaskAgent(
         model=payload["model"],
         chat_history_file=payload["trajectory_path"],

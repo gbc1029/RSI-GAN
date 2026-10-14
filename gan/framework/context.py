@@ -153,6 +153,19 @@ class AccessContext:
     # Explicit set of task generations whose trajectory this session may read
     # (resolved by the loop; avoids relying on the node already being in the tree).
     trajectory_genids: List[Any] = field(default_factory=list)
+    # The session's effective ``cost.cm_mode`` (docs/10 §11.5): governs ONLY
+    # the presentation of read_trajectory/read_session_trajectory (structural
+    # index vs full blob). Stamped by the loop from the session owner's OWN
+    # design; it never widens the visible set — trajectory_genids above and
+    # redaction stay the sole permission surface (选择只能缩小).
+    session_cm_mode: Optional[str] = None
+    # The set of outers whose OWN session files this seat may read (the
+    # read_session_trajectory face). Declared by the framework exactly like
+    # ``trajectory_genids`` above — never provided by the agent. ``None``
+    # keeps the legacy behavior (current outer only, derived from the node
+    # id); the self seat declares {O, O-1}. Presentation (``session_cm_mode``)
+    # never widens this set, and redaction stays the sole content filter.
+    session_outers: Optional[frozenset] = None
 
     def __post_init__(self) -> None:
         from gan.framework.frozen import assert_seat
@@ -160,10 +173,15 @@ class AccessContext:
 
 
 def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None, *,
-                       seat: str):
+                       seat: str, session_cm_mode: Optional[str] = None,
+                       session_outers=None):
     return _ACCESS_CTX.set(AccessContext(broker, role, node_id,
                                           seat=seat,
-                                          trajectory_genids=list(trajectory_genids or [])))
+                                          trajectory_genids=list(trajectory_genids or []),
+                                          session_cm_mode=session_cm_mode,
+                                          session_outers=(frozenset(session_outers)
+                                                          if session_outers is not None
+                                                          else None)))
 
 
 def get_access_context() -> Optional[AccessContext]:

@@ -31,8 +31,10 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
-    # context-management snapshot (docs/10 §11 D2/D7)
-    "GAN_CM_CORE", "GAN_CM_POLICY",
+    # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
+    # audit sidecar (§11.5: rw-bound host file, folded back by task_runner)
+    "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
+                      "GAN_CM_EVENTS",
     # timeout plumbing (consumers: QUESTION_TIMEOUT above, agent/llm.py
     # per-call client budget). The thinking-intensity knob does NOT ride the
     # env: it is threaded explicitly (CLI --reasoning_effort -> payload).
@@ -234,6 +236,14 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
     # agent/ is bound unconditionally for every domain. The context-management
     # snapshot lives under .gan_runtime/cm (GAN_CM_CORE) — delivered by the
     # same ro-bind above, still no gan/ (docs/10 §11.0.1).
+    # Task-child CM audit sidecar (docs/10 §11.5): a rw BIND (the tmpfs
+    # /workspace dies with the sandbox, so the sidecar must be a host file)
+    # so task_runner can ingest the seam events after the child exits. The
+    # host file is pre-created by assemble_task_env (a --bind source must
+    # exist before the namespace is built).
+    cm_events_host = os.path.join(run_root, "cm_events.jsonl")
+    if os.path.isfile(cm_events_host):
+        command.extend(["--bind", cm_events_host, "/workspace/cm_events.jsonl"])
     command.extend([
         # Expose only this question's trajectory file, never outputs/ or other
         # questions' trajectories, which may themselves contain benchmark data.
@@ -723,8 +733,9 @@ if __name__ == "__main__":
         "--reasoning_effort", type=str, default=None,
         help="Thinking-intensity knob for reasoning models, forwarded as the "
              "reasoning_effort body field (gateway contract: low|high|max). "
-             "Validated against agent.llm.REASONING_EFFORTS; default = gateway "
-             "default. Resolved from gan/framework/models.yaml by the GAN driver.",
+             "Validated against agent.llm_params.REASONING_EFFORTS; default = "
+             "gateway default. Resolved from gan/framework/models.yaml by the "
+             "GAN driver.",
     )
     args = parser.parse_args()
     if args.reasoning_effort is not None:

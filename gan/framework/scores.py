@@ -13,6 +13,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from gan.framework import paths
+from gan.framework.ledger import WriterToken, guard_writer
 
 
 def _path(output_dir: str) -> str:
@@ -29,7 +30,18 @@ def sha256_file(path: Optional[str]) -> Optional[str]:
     return h.hexdigest()
 
 
-def append_score(output_dir: str, record: Dict[str, Any]) -> None:
+def append_score(output_dir: str, record: Dict[str, Any],
+                 *, writer: WriterToken) -> None:
+    """Append one score row; requires the per-run ledger WriterToken.
+
+    B46 step-1 gate (docs/7 appendix 26): the public no-token signature is the
+    documented one-line forgery face -- ``import gan.framework.scores`` +
+    ``append_score`` from agent-owned tool code. The run token travels only
+    through framework call arguments (loop -> here), so the agent-facing write
+    surface is closed; the static ``observed_ledger_writer`` flag refuses the
+    import itself on the registry/commit paths.
+    """
+    guard_writer(writer, "scores.jsonl")
     p = _path(output_dir)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     row = dict(record)

@@ -50,6 +50,7 @@ from gan.framework import checkpoint as ckpt
 from gan.framework import cost_ledger
 from gan.framework import cost_keys
 from gan.framework import paths, scores, trajectory
+from gan.framework import ledger as ledger_mod
 from gan.framework.loader import load_registry, resolve_domain
 from gan.framework.reward.evaluator_reward import build_feedback_digest
 from gan.framework.reward.packet import RewardPacket
@@ -126,8 +127,15 @@ class GanLoop:
         planner_factory: Optional[Callable[[int], Any]] = None,
         evaluator_factory: Optional[Callable[[int], Any]] = None,
         code_root: Optional[str] = None,
+        ledger_writer: Optional[Any] = None,
     ):
         self.output_dir = os.path.abspath(output_dir)
+        # B46 step-1 gate: the per-run WriterToken guards every decision-grade
+        # artifact write (scores / design configs / checkpoints). build_gan_loop
+        # mints one and threads it everywhere; a directly-constructed loop
+        # auto-mints so legacy constructions keep working (the token gates the
+        # WRITE API surface, it is not a secret).
+        self.ledger_writer = ledger_writer or ledger_mod.open_run(self.output_dir)
         self.domains = list(domains)
         self.cfg = cfg
         self.planner = planner
@@ -509,7 +517,8 @@ class GanLoop:
                                      ("mode", "turns", "blocks", "ops_total",
                                       "ops_applied", "ops_refused",
                                       "policy_failures", "policy_disabled",
-                                      "violations", "est_chars_saved")
+                                      "violations", "est_chars_saved",
+                                      "emit_failures")
                                      if k in cm_sum}
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass
@@ -540,10 +549,21 @@ class GanLoop:
             task = cost_ledger.task_cost_for_gen(self.output_dir, genid)
             sess = cost_ledger.gen_session_costs(self.output_dir, outer, genid)
             task_traj = cost_ledger.task_trajectory_cost(self.output_dir, outer, genid)
+            task_cm = cost_ledger.task_cm_summary(self.output_dir, genid)
             payload: Dict[str, Any] = {
                 "genid": str(genid), "outer": outer,
                 "task": ({"cost_tokens": task[0], "cost_wallclock_s": task[1],
                           "source": "proxy_audit"} if task is not None else None),
+                # Task child's seam audit (docs/10 §11.5): ingested sidecar
+                # events. None is now ALWAYS explained: the runner emits
+                # cm_events_ingest_empty / the child emits
+                # cm_session_degraded, so a bare null here would mean the
+                # cost record was written before the ingest ran (a bug).
+                "task_cm": (task_cm if task_cm is not None else
+                            {"absent": True,
+                             "reason": "no role=task cm events ingested for "
+                                       "this generation (see cm_events_ingest_empty "
+                                       "/ cm_session_degraded events)"}),
                 "task_trajectory": ({"total_tokens": task_traj.get("total_tokens"),
                                      "wallclock_s": task_traj.get("wallclock_s"),
                                      "llm_calls": task_traj.get("llm_calls"),
@@ -602,7 +622,8 @@ class GanLoop:
                 genid=genid, task_cost=task_cost,
                 own_last=cost_ledger.latest_session_cost(
                     self.output_dir, "evaluator", "evaluate", exclude_genid=genid),
-                own_budget=own_budget)
+                own_budget=own_budget,
+                token_budget=self.token_budget_per_gen)
         except Exception as e:  # noqa: BLE001 -- advisory, never fatal
             soft_fail(f"evaluate cost statement build failed: {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -664,18 +685,96 @@ class GanLoop:
                         "genid": str(genid), "keys": dict(keys or {}),
                         "clamped": list(clamps or [])})
 
-    def _build_cm_session(self, role: str, keys: Optional[Dict[str, Any]]) -> Any:
+    def _resolve_cm_module(self, role: str, stem: Any,
+                           outer: Any = None) -> Optional[str]:
+        """Resolve a design-named CM module
+        (``cost.cm_policy`` / ``cost.cm_assembly``) to a loadable path —
+        WORKSPACE-FIRST (the role's live self-edit surface for this outer),
+        committed tree second, the same rule ``list_components`` and the deep
+        tools scan with. Resolved ONCE at session build; the session runs
+        that version all session long (no mid-session hot reload). No
+        sort-order discovery: the named slot is the only form for in-process
+        roles — an unnamed or unresolvable claim degrades LOUDLY (the caller
+        emits ``cm_module_unresolved``)."""
+        if not isinstance(stem, str) or not stem.strip():
+            return None
+        stem = stem.strip()
+        rel = os.path.join("gan", "components", role, "cm", stem + ".py")
+        if outer is not None and self.broker is not None:
+            try:
+                cand = os.path.join(self.broker.src_dir(role, f"outer_{outer}"),
+                                    rel)
+                if os.path.isfile(cand):
+                    return cand
+            except Exception:  # noqa: BLE001 -- advisory resolution; the
+                # committed-tree fallback below still applies
+                pass
+        if self.code_root:
+            cand = os.path.join(self.code_root, rel)
+            if os.path.isfile(cand):
+                return cand
+        return None
+
+    def _build_cm_session(self, role: str, keys: Optional[Dict[str, Any]],
+                          outer: Any = None) -> Any:
         """Per-session context-management session (docs/10 §11 D11): built from
         this role's ALREADY-CLAMPED effective ``cm_*`` keys; events ride the
         framework event stream (role-attributed). Advisory: any failure
-        degrades to no seam (pre-D behaviour), never fatal."""
+        degrades to no seam (pre-D behaviour), never fatal.
+
+        The design may NAME agent-owned CM modules —
+        resolved workspace-first at build time and handed to the session, so
+        the execution contract (load gate, per-turn budget, wedge breaker,
+        loud fallback) applies unchanged in-process. A named module that
+        cannot be resolved is a LOUD claim-vs-tree gap
+        (``cm_module_unresolved``): an assembly claim degrades to the
+        baseline preset; ``cm_mode=custom`` without a resolvable policy
+        degrades to the slice preset — the keys' ``cm_mode`` is rewritten
+        too, so the degrade says what it actually runs (rewriting only a
+        local variable would leave the session building ``custom`` and
+        failing on the missing policy every turn)."""
         if keys is None:
             return None
         try:
             from gan.framework.cm import build_session
             cm_keys = {k: v for k, v in keys.items()
                        if isinstance(k, str) and k.startswith("cm_")}
-            session = build_session(cm_keys)
+            # Named slots: resolve claims against the role's OWN tree.
+            assembly_path = None
+            named_asm = cm_keys.get("cm_assembly")
+            if isinstance(named_asm, str) and named_asm.strip():
+                assembly_path = self._resolve_cm_module(role, named_asm, outer)
+                if assembly_path is None:
+                    soft_fail(
+                        f"cm_assembly={named_asm.strip()!r} unresolved for "
+                        f"{role} (no workspace/committed module); the "
+                        "baseline preset runs instead",
+                        event_path=paths.events_path(self.output_dir),
+                        event_type="cm_module_unresolved", role=role,
+                        kind="assembly", stem=named_asm.strip())
+            policy_path = None
+            if cm_keys.get("cm_mode") == "custom":
+                named_pol = cm_keys.get("cm_policy")
+                if isinstance(named_pol, str) and named_pol.strip():
+                    policy_path = self._resolve_cm_module(role, named_pol, outer)
+                if policy_path is None:
+                    stem = (named_pol.strip()
+                            if isinstance(named_pol, str) and named_pol.strip()
+                            else None)
+                    soft_fail(
+                        f"cm_mode=custom without a resolvable policy for "
+                        f"{role} (stem={stem!r}); degrading to the slice "
+                        "preset for this session",
+                        event_path=paths.events_path(self.output_dir),
+                        event_type="cm_module_unresolved", role=role,
+                        kind="policy", stem=stem)
+                    # The degrade CLAIMS the slice preset — the keys must say
+                    # it too, or apply_keys would still build a custom
+                    # session whose every turn fails on the missing policy.
+                    cm_keys = dict(cm_keys)
+                    cm_keys["cm_mode"] = "slice"
+            session = build_session(cm_keys, policy_path=policy_path,
+                                    assembly_path=assembly_path)
             session.emit = (lambda r: (lambda e: self.log_event(
                 {**e, "role": r})))(role)
             return session
@@ -684,6 +783,68 @@ class GanLoop:
                       event_path=paths.events_path(self.output_dir),
                       event_type="cm_session_failed", role=role)
             return None
+
+    def _traj_materialization_files(self, genids: Any, outer: Any = None,
+                                    session_role: Optional[str] = None,
+                                    session_outers: Any = None
+                                    ) -> List[Tuple[str, str]]:
+        """The seat's visible trajectory files as ``(label, path)`` pairs —
+        the SAME set the read tools serve. Task generations ride the seat's
+        ``trajectory_genids``; the self seat adds its OWN per-generation
+        session files over the DECLARED own-session universe
+        (``session_outers``: this outer + the previous outer, L65 ruling).
+        Labels come from ``trajectory.session_label`` — the one place the
+        label rule lives (genid-qualified for the current outer, outer-
+        prefixed for extras) so the materialized address space and the read
+        tool's fallback agree. Advisory: missing files are skipped by the
+        materialization primitive."""
+        out: List[Tuple[str, str]] = []
+        seen = set()
+
+        def _add(path: str, genid: Any) -> None:
+            if not path or not os.path.isfile(path):
+                return
+            label = f"{genid}/{os.path.basename(path)}"
+            if label not in seen:
+                seen.add(label)
+                out.append((label, path))
+
+        for g in (genids or []):
+            _add(trajectory._session_file(self.output_dir, g, "task"), g)
+        if session_role and outer is not None:
+            for label, path in trajectory.session_universe(
+                    self.output_dir, session_role, outer,
+                    extra_outers=session_outers):
+                if label not in seen:
+                    seen.add(label)
+                    out.append((label, path))
+        return out
+
+    def _materialize_traj(self, cm_session: Any, genids: Any, outer: Any = None,
+                          session_role: Optional[str] = None,
+                          session_outers: Any = None) -> None:
+        """Snapshot the seat's visible trajectories into its CM session (one
+        scan; the read tools' index face and the ctx faces then share the
+        same address space). Advisory: a failure leaves the session without
+        materialization (the tools self-build) and SPEAKS; ``passthrough``
+        sessions skip the scan entirely (identity view)."""
+        if cm_session is None:
+            return
+        try:
+            files = self._traj_materialization_files(genids, outer=outer,
+                                                     session_role=session_role,
+                                                     session_outers=session_outers)
+            if files:
+                cm_session.materialize_traj(files)
+        except Exception as e:  # noqa: BLE001 -- advisory, must speak
+            # the audit write itself must never turn an advisory failure
+            # fatal: if the event path is unreachable, the raise stops here
+            try:
+                soft_fail(f"traj materialization failed: {e}",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="cm_traj_materialize_failed")
+            except Exception:  # noqa: BLE001 -- audit sink unavailable
+                pass
 
     def _task_budget_keys(self, parent: Any) -> Optional[Dict[str, Any]]:
         """Effective TASK-side reserved keys of the design the child will
@@ -797,6 +958,7 @@ class GanLoop:
             designs=ckpt.snapshot_designs(self.output_dir, ["planner", "evaluator"]),
             index=(outer if boundary == "outer" else None),
             code=code,
+            writer=self.ledger_writer,
         )
 
     def _refresh_roles(self, outer: int) -> None:
@@ -880,7 +1042,7 @@ class GanLoop:
                 "coverage": child.value.coverage,
                 "report_sha": child.meta.get("report_sha"),
                 "valid_parent": child.valid_parent,
-            })
+            }, writer=self.ledger_writer)
         except Exception as e:
             soft_fail(f"scores append failed for genid {child.genid}: {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -919,7 +1081,8 @@ class GanLoop:
             # role's next self-improve sees its own heal.
             from gan.design.store import DesignStore
             from gan.framework.task_execution import heal_design_slots, heal_design_keys
-            store = DesignStore(paths.design_root(self.output_dir))
+            store = DesignStore(paths.design_root(self.output_dir),
+                                writer=self.ledger_writer)
             cfg = store.load(role)
             stripped = heal_design_keys(cfg, role, self.code_root)
             stripped += heal_design_slots(cfg, role, self.code_root)
@@ -1036,10 +1199,17 @@ class GanLoop:
         exhausted = bool(plan_result.get("budget_exhausted"))
         truncated = bool(plan_result.get("truncated"))
         tb_exhausted = bool(plan_result.get("token_budget_exhausted"))
-        # Context management (docs/10 §11 D12): a degraded CM session (policy
-        # disabled / failures) is a budget-state fact of its own kind.
-        cm_degraded = bool(cm_summary and (cm_summary.get("policy_disabled")
-                                           or cm_summary.get("policy_failures")))
+        # Context management: a degraded CM session (policy disabled /
+        # failures) is a budget-state fact of its own kind. Assembly
+        # degradation degrades the seam the same way — the receipt must say
+        # so too (the summary only carries the
+        # assembly fields when an assembly was configured, so a baseline
+        # session is unaffected).
+        cm_degraded = bool(cm_summary and (
+            cm_summary.get("policy_disabled")
+            or cm_summary.get("policy_failures")
+            or cm_summary.get("assembly_disabled")
+            or cm_summary.get("assembly_failures")))
         budget = {
             "exhausted": exhausted or truncated or tb_exhausted,
             # Reserved cost keys (docs/10 §10): a token soft stop is a budget
@@ -1131,8 +1301,11 @@ class GanLoop:
         rejected = r.get("patch_rejection")
         tb_exhausted = bool(r.get("token_budget_exhausted"))
         cm_summary = r.get("cm_summary") if isinstance(r, dict) else None
-        cm_degraded = bool(cm_summary and (cm_summary.get("policy_disabled")
-                                           or cm_summary.get("policy_failures")))
+        cm_degraded = bool(cm_summary and (
+            cm_summary.get("policy_disabled")
+            or cm_summary.get("policy_failures")
+            or cm_summary.get("assembly_disabled")
+            or cm_summary.get("assembly_failures")))
         budget = {
             "exhausted": bool(r.get("budget_exhausted")) or bool(r.get("truncated")) or tb_exhausted,
             "kind": ("retries" if r.get("budget_exhausted")
@@ -1208,7 +1381,8 @@ class GanLoop:
         if not payload:
             return False
         ckpt.restore_trees(self.output_dir, payload.get("trees") or {})
-        ckpt.restore_designs(self.output_dir, payload.get("designs") or {})
+        ckpt.restore_designs(self.output_dir, payload.get("designs") or {},
+                             writer=self.ledger_writer)
         self.task_tree = TreeStore(self.output_dir, "task").load()
         self.planner_tree = TreeStore(self.output_dir, "planner").load()
         self.evaluator_tree = TreeStore(self.output_dir, "evaluator").load()
@@ -1422,12 +1596,20 @@ class GanLoop:
                 # by a session that has no design key of its own).
                 try:
                     self.planner.session_token_budget = plan_ck.get("plan_token_budget")
+                    # slice 前端档位归座 (docs/10 §11.5): the PLAN session's
+                    # read_trajectory presentation follows the PLANNER's own
+                    # design cm_mode (stamped onto the AccessContext by the
+                    # role) — visible sets are untouched.
+                    self.planner.session_cm_mode = plan_ck.get("cm_mode")
                 except Exception as e:  # noqa: BLE001 -- advisory stamp
-                    soft_fail(f"session_token_budget stamp failed (planner): {e}")
+                    soft_fail(f"session cost stamp failed (planner: token "
+                              f"budget / cm_mode): {e}")
                 # Context-management session for THIS plan call (docs/10 §11
                 # D11); cleared right after the call (no stamp leak into
                 # self-improve), like ``session_token_budget``.
-                self.planner.cm_session = self._build_cm_session("planner", plan_ck)
+                self.planner.cm_session = self._build_cm_session("planner", plan_ck,
+                                                                 outer=outer)
+                self._materialize_traj(self.planner.cm_session, parent_ref)
                 self._emit_cost_keys_applied("planner", "plan", genid,
                                              plan_ck, plan_clamps)
 
@@ -1587,12 +1769,20 @@ class GanLoop:
                 })
                 try:
                     self.evaluator.session_token_budget = eval_ck.get("evaluate_token_budget")
+                    # slice 前端档位归座 (docs/10 §11.5): the evaluator's OWN
+                    # design governs its read_trajectory presentation (the
+                    # evaluate seat previously had no DesignContext and was
+                    # stuck on passthrough).
+                    self.evaluator.session_cm_mode = eval_ck.get("cm_mode")
                 except Exception as e:  # noqa: BLE001 -- advisory stamp
-                    soft_fail(f"session_token_budget stamp failed (evaluator): {e}")
+                    soft_fail(f"session cost stamp failed (evaluator: token "
+                              f"budget / cm_mode): {e}")
                 self._emit_cost_keys_applied("evaluator", "evaluate", genid,
                                              eval_ck, eval_clamps)
                 # Context-management session for THIS evaluate call (§11 D11).
-                self.evaluator.cm_session = self._build_cm_session("evaluator", eval_ck)
+                self.evaluator.cm_session = self._build_cm_session("evaluator", eval_ck,
+                                                                   outer=outer)
+                self._materialize_traj(self.evaluator.cm_session, [genid] + parent_ref)
                 cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair,
                                                            own_budget=eval_ck.get("evaluate_token_budget"))
                 eval_cost_kwargs: Dict[str, Any] = {}
@@ -1782,6 +1972,12 @@ class GanLoop:
                                for r in cost_ledger.self_session_costs(self.output_dir, outer, role)]
                         payload["costs"] = {"own_sessions": [r for r in own if r]}
                         payload["cost_statement"] = self._cost_statement_self(role, outer)
+                        # Injection fact (B2, self seat): same bytes audit the
+                        # plan/evaluate statements get (docs/10 §11.5 gap fix).
+                        if payload["cost_statement"]:
+                            self.log_event({"type": "cost_statement",
+                                            "seat": "self_improve", "role": role,
+                                            "bytes": len(payload["cost_statement"])})
                     except Exception as e:  # noqa: BLE001 -- advisory, never fatal
                         soft_fail(f"self cost payload failed ({role}): {e}",
                                   event_path=paths.events_path(self.output_dir),
@@ -1811,8 +2007,10 @@ class GanLoop:
                               role_obj: Any, prev_receipt: Any) -> None:
                 try:
                     # Clear the plan/evaluate seat's token-budget stamp: the
-                    # self-improve session has no design token key of its own
-                    # in phase C (its budget stays loop.yaml) and must not
+                    # self-improve session has NO design token key of its own
+                    # in phase C (phase C defines no self-seat budget key at
+                    # all — the session runs UNLIMITED token-wise; its only
+                    # cap is self_improve_max_tool_calls) and must not
                     # inherit the stamp by accident (docs/10 §10.2 C11).
                     try:
                         role_obj.session_token_budget = None
@@ -1823,10 +2021,38 @@ class GanLoop:
                     # in the first increment (no assembly-time policy);
                     # cleared after the call (no leak across seats).
                     try:
-                        # _effective_cost_keys returns (keys, clamps) -- unpack.
+                        # Returns (values, clamps) -- UNPACK the tuple (the
+                        # plan/evaluate seats do; the bare assignment made
+                        # ``ck_si`` the tuple itself, and ``.get`` raised
+                        # AttributeError that the except below swallowed:
+                        # every self-improve session ran with NO cm session
+                        # and NO cm_mode stamp, silently -- observed in the
+                        # 2026-10-12 real round: self rows in
+                        # cost_sessions.jsonl carried ``cm: null``).
                         ck_si, _si_clamps = self._effective_cost_keys(role)
-                        role_obj.cm_session = self._build_cm_session(role, ck_si)
-                    except Exception:  # noqa: BLE001 -- advisory stamp
+                        # slice 前端档位归座 (docs/10 §11.5): the self seat
+                        # follows the role's OWN self-design (no leak from the
+                        # plan/evaluate stamps above).
+                        role_obj.session_cm_mode = ck_si.get("cm_mode")
+                        role_obj.cm_session = self._build_cm_session(role, ck_si, outer=outer)
+                        # self seat additionally materializes its OWN session
+                        # files (the read_session_trajectory face) over the
+                        # declared universe: this outer + the previous outer
+                        # (L65 ruling — "self improve should read the previous
+                        # outer's trajectory").
+                        self._materialize_traj(role_obj.cm_session, si_refs,
+                                               outer=outer, session_role=role,
+                                               session_outers=([outer - 1]
+                                                               if isinstance(outer, int)
+                                                               and outer > 1 else []))
+                    except Exception as e:  # noqa: BLE001 -- advisory stamp
+                        # A swallowed degradation must SPEAK (no-silent-fail
+                        # rule, AGENTS.md): without this event the session's
+                        # cm: null row is indistinguishable from "no keys".
+                        soft_fail(f"self-seat cm session build failed ({role}): {e}",
+                                  event_path=paths.events_path(self.output_dir),
+                                  event_type="cm_session_failed", role=role,
+                                  seat="self_improve")
                         role_obj.cm_session = None
                     _si_res = role_obj.self_improve(
                         recent={**recent_payload, "receipt": prev_receipt},

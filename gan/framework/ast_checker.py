@@ -15,6 +15,18 @@ from typing import List, Optional
 
 _WRITE_MODES = {"w", "wb", "wt", "a", "ab", "at", "x", "xb", "xt", "w+", "w+b", "wb+", "a+", "a+b", "ab+", "x+", "x+b", "xb+", "r+", "r+b", "rb+"}
 
+# B46 step-1 gate: modules whose import in AGENT-OWNED source is the ledger
+# forgery face (their write entry points already require a per-run WriterToken,
+# see gan/framework/ledger.py). An import alone is refused on the registry path
+# (loader unsafe-capability family) and at the commit gate -- there is currently
+# NO legitimate use in any agent-writable surface; the legitimate importers
+# (gan/build.py, gan/roles/base_role.py, gan/registries/loader.py,
+# gan/driver.py) sit outside every seat's write roots and are never checked.
+# Heuristic by construction: ``from gan.design import store``-style package
+# attribute access and importlib indirection are invisible here.
+_GUARDED_WRITER_MODULES = ("gan.framework.scores", "gan.design.store",
+                           "gan.framework.checkpoint")
+
 
 def framework_owned(relpath: str) -> bool:
     """Whether *relpath* is frozen framework plumbing rather than agent code."""
@@ -37,7 +49,14 @@ class _Checker(ast.NodeVisitor):
         self.issues: List[str] = []
         # The per-category flags below come from the SAME visit as ``issues``,
         # so the advisory report and the reject gate cannot drift apart.
-        self.observed = {"mutating": False, "subprocess": False, "dynamic_exec": False}
+        self.observed = {"mutating": False, "subprocess": False, "dynamic_exec": False,
+                         "ledger_writer": False}
+
+    def _guarded_writer_import(self, module: Optional[str]) -> bool:
+        if not module:
+            return False
+        return any(module == m or module.startswith(m + ".")
+                   for m in _GUARDED_WRITER_MODULES)
 
     def _issue(self, node: ast.AST, text: str, category: Optional[str] = None) -> None:
         self.issues.append(f"line {getattr(node, 'lineno', '?')}: {text}")
@@ -48,11 +67,19 @@ class _Checker(ast.NodeVisitor):
         for alias in node.names:
             if alias.name == "subprocess" or alias.name.startswith("subprocess."):
                 self._issue(node, "subprocess import", "subprocess")
+            elif self._guarded_writer_import(alias.name):
+                self._issue(node, f"guarded ledger writer import: {alias.name} "
+                                  f"(write via the framework run token only)",
+                            "ledger_writer")
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module == "subprocess" or (node.module or "").startswith("subprocess."):
             self._issue(node, "subprocess import", "subprocess")
+        elif self._guarded_writer_import(node.module):
+            self._issue(node, f"guarded ledger writer import: {node.module} "
+                              f"(write via the framework run token only)",
+                        "ledger_writer")
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -122,7 +149,8 @@ def check_source_report(text: str, relpath: str = "") -> dict:
     already fail-fasts on them).
     """
     out = {"observed_mutating": False, "observed_subprocess": False,
-           "observed_dynamic_exec": False, "findings": [], "framework_owned": False}
+           "observed_dynamic_exec": False, "observed_ledger_writer": False,
+           "findings": [], "framework_owned": False}
     if framework_owned(relpath):
         out["framework_owned"] = True
         return out
@@ -137,6 +165,7 @@ def check_source_report(text: str, relpath: str = "") -> dict:
     out["observed_mutating"] = checker.observed["mutating"]
     out["observed_subprocess"] = checker.observed["subprocess"]
     out["observed_dynamic_exec"] = checker.observed["dynamic_exec"]
+    out["observed_ledger_writer"] = checker.observed["ledger_writer"]
     return out
 
 
@@ -146,7 +175,8 @@ def check_file_report(path: str, relpath: str = "") -> dict:
             return check_source_report(fh.read(), relpath or path)
     except OSError as exc:
         return {"observed_mutating": False, "observed_subprocess": False,
-                "observed_dynamic_exec": False, "findings": [f"unreadable: {exc}"],
+                "observed_dynamic_exec": False, "observed_ledger_writer": False,
+                "findings": [f"unreadable: {exc}"],
                 "framework_owned": False}
 
 

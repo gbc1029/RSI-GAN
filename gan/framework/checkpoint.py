@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from gan.design.store import DesignStore
 from gan.framework import paths
+from gan.framework.ledger import WriterToken, guard_writer
 
 _TREE_NAMES = ("task", "planner", "evaluator")
 _OUTER_RE = re.compile(r"^outer_(\d+)\.json$")            # canonical (first write)
@@ -134,10 +135,13 @@ def snapshot_designs(output_dir: str, roles: List[str]) -> Dict[str, Any]:
     return out
 
 
-def restore_designs(output_dir: str, designs: Dict[str, Any]) -> None:
+def restore_designs(output_dir: str, designs: Dict[str, Any],
+                    writer: Optional[WriterToken] = None) -> None:
+    """Re-write role designs from a checkpoint payload (B46 step-1 gate)."""
     if not designs:
         return
-    store = DesignStore(paths.design_root(output_dir))
+    guard_writer(writer, "design configs (checkpoint restore)")
+    store = DesignStore(paths.design_root(output_dir), writer=writer)
     for role, cfg in designs.items():
         store.save(cfg, role)
 
@@ -151,6 +155,7 @@ def save_checkpoint(
     designs: Dict[str, Any],
     index: Optional[int] = None,
     code: Optional[Dict[str, Any]] = None,
+    writer: Optional[WriterToken] = None,
 ) -> str:
     """Persist a checkpoint.
 
@@ -165,6 +170,7 @@ def save_checkpoint(
     produced against — ``{"commit": <code_root HEAD>}`` — so a resume can
     verify/restore the code tree to the checkpointed state.
     """
+    guard_writer(writer, "checkpoint.json / outer_<N>.json")
     payload = {"boundary": boundary, "state": state, "trees": trees, "designs": designs}
     if code:
         payload["code"] = dict(code)

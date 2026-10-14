@@ -20,7 +20,7 @@ from gan.roles.planner import Planner
 from gan.framework.task_runner import DomainTaskRunner
 
 
-def _seed_self_designs(output_dir: str, drop_eval_points: Optional[List[str]] = None) -> None:
+def _seed_self_designs(output_dir: str, drop_eval_points: Optional[List[str]] = None, ledger_writer=None) -> None:
     """First-time initialization of planner/evaluator self-designs.
 
     An existing design file is AUTHORITATIVE — including deliberately empty
@@ -30,7 +30,7 @@ def _seed_self_designs(output_dir: str, drop_eval_points: Optional[List[str]] = 
     corrupt file cannot crash-loop the per-outer worker). Safe to call any number
     of times (``build_gan_loop`` runs once per outer worker).
     """
-    store = DesignStore(paths.design_root(output_dir))
+    store = DesignStore(paths.design_root(output_dir), writer=ledger_writer)
     for role in ("planner", "evaluator"):
         path = store.path(role)
         if os.path.exists(path):
@@ -58,17 +58,23 @@ def _seed_self_designs(output_dir: str, drop_eval_points: Optional[List[str]] = 
         # schema defaults + seed prompt; initial_config applies the non-empty
         # guard, so a missing/blank seed can no longer blank the prompt.
         cfg = initial_config(role)
-        # capability tools are optional but selected by default (evolvable later);
-        # The single ``tools`` slot, name-keyed registry
-        if role == "evaluator":
+        # Capability tools are optional but selected by default (evolvable
+        # later); the single ``tools`` slot, name-keyed registry. BOTH roles
+        # preselect their full registry at gen-0 (unification): the planner's
+        # seed prompt promises the ctx_* faces, but an empty tools slot meant
+        # the promise was false at gen-0 while the evaluator's was true.
+        if role in ("planner", "evaluator"):
             from gan.registries.loader import load_registry_for_role
-            reg = load_registry_for_role("evaluator")
-            drop = set(drop_eval_points or [])
-            # E-group ablation (docs/11): seed WITHOUT the dropped eval_points.
-            # Only affects a MISSING design file; an existing design file is
-            # authoritative and is never rewritten (change the drop list by
-            # deleting the design file or deselecting manually).
-            cfg["tools"] = [n for n in reg.names() if n not in drop]
+            reg = load_registry_for_role(role)
+            if role == "evaluator":
+                drop = set(drop_eval_points or [])
+                # E-group ablation (docs/11): seed WITHOUT the dropped eval_points.
+                # Only affects a MISSING design file; an existing design file is
+                # authoritative and is never rewritten (change the drop list by
+                # deleting the design file or deselecting manually).
+                cfg["tools"] = [n for n in reg.names() if n not in drop]
+            else:
+                cfg["tools"] = reg.names()
         store.save(cfg, role)
 
 
@@ -138,8 +144,15 @@ def build_gan_loop(
     e_model, e_effort = e_entry["model"], e_entry.get("reasoning_effort")
 
     os.makedirs(output_dir, exist_ok=True)
+    # B46 step-1 gate (docs/7 appendix 26): one WriterToken per run, minted at
+    # the single assembly point and threaded explicitly to every guarded
+    # writer (scores / design stores / checkpoints). Never exported via env,
+    # never stored module-global.
+    from gan.framework.ledger import open_run as _ledger_open_run
+    ledger_writer = _ledger_open_run(output_dir)
     _seed_self_designs(output_dir, drop_eval_points=list(
-        cfg.get("ablation.evaluator_drop_eval_points") or []))
+        cfg.get("ablation.evaluator_drop_eval_points") or []),
+        ledger_writer=ledger_writer)
 
     code_root = ensure_code_root(repo_root, output_dir) if code_repo else None
 
@@ -150,12 +163,12 @@ def build_gan_loop(
     def _planner_factory(outer: int, attempt: str):
         return Planner(p_model, output_dir, instance=f"outer_{outer}",
                        code_root=code_root, attempt_id=attempt,
-                       reasoning_effort=p_effort)
+                       reasoning_effort=p_effort, ledger_writer=ledger_writer)
 
     def _evaluator_factory(outer: int, attempt: str):
         return Evaluator(e_model, output_dir, instance=f"outer_{outer}",
                          code_root=code_root, attempt_id=attempt,
-                         reasoning_effort=e_effort)
+                         reasoning_effort=e_effort, ledger_writer=ledger_writer)
 
     runner = DomainTaskRunner(
         repo_root=repo_root,
@@ -176,6 +189,7 @@ def build_gan_loop(
         # per-question token budget (clamped into the design snapshot by
         # DomainTaskRunner before persist; cost.token_budget_per_gen).
         token_budget_per_gen=cfg.get("cost.token_budget_per_gen"),
+        ledger_writer=ledger_writer,
     )
     # Grants/diffs are against the per-run code baseline when code_repo is on;
     # only the parent harness receives repo_root for loading benchmark labels.
@@ -196,6 +210,7 @@ def build_gan_loop(
         planner_factory=_planner_factory,
         evaluator_factory=_evaluator_factory,
         code_root=code_root,
+        ledger_writer=ledger_writer,
     )
     # explicit runtime record of the model configuration actually used
     loop.log_event({"type": "model_config",
@@ -209,7 +224,8 @@ def build_gan_loop(
     # session (aborting would refuse service without undoing anything).
     from gan.framework import preflight as preflight_mod
     design_repair = preflight_mod.repair_dangling_designs(
-        paths.design_root(output_dir), code_root=code_root)
+        paths.design_root(output_dir), code_root=code_root,
+        writer=ledger_writer)
     if design_repair["stripped"] or design_repair["errors"]:
         loop.log_event({"type": "design_dangling_stripped", "stage": "preflight",
                         **design_repair})

@@ -147,6 +147,25 @@ class _TaskBrokerState:
             "GAN_TASK_TOOLS_DIR": "/workspace/.gan_runtime/tools",
             "GAN_TOOLS_LOAD_REPORT": ".gan_runtime/tools_load_report.json",
             "GAN_TASK_KNOWLEDGE_DIR": "/workspace/.gan_runtime/knowledge",
+            # Context-management snapshot + the child's audit sidecar
+            # (docs/10 §11 D2 / §11.5). The broker builds the child env
+            # ITSELF, so these must be pinned HERE: the runner's env dict
+            # (assembled by ``assemble_task_env``) never crosses the broker
+            # boundary -- ``request_task_run`` passes only scope/model/token/
+            # timeout (observed: every driver-mode round ran the task child
+            # with NO seam at all; the worker's cwd fallback pointed at the
+            # scratch tmpfs, where ``.gan_runtime`` does not exist). Paths
+            # mirror assemble_task_env; the sidecar is pre-created
+            # parent-side BEFORE this launch, so the rw-bind source exists.
+            "GAN_CM_CORE": "/workspace/.gan_runtime/cm",
+            "GAN_CM_EVENTS": "/workspace/cm_events.jsonl",
+            # Agent-owned CM modules are delivered under FIXED names, so the
+            # env pins are static and pinnable here (the runner's env never
+            # crosses this boundary). A generation whose design names no
+            # module leaves the file absent; the child degrades loudly on
+            # that claim-vs-snapshot gap instead of guessing at candidates.
+            "GAN_CM_POLICY": "/workspace/.gan_runtime/cm/cm_policy.py",
+            "GAN_CM_ASSEMBLY": "/workspace/.gan_runtime/cm/cm_assembly.py",
             # Per-question wall + per-call client budget, pinned at root-side
             # registration (the outer worker cannot influence them). Without
             # these the harness silently used its 300s default regardless of

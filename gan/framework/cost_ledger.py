@@ -99,10 +99,64 @@ def _cm_summary(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "cm_policy_failures": (_count(rows, "cm_policy_failed")
                                + _count(rows, "cm_policy_disabled")
                                + _count(rows, "cm_policy_overrun")),
+        "cm_assembly_failures": (_count(rows, "cm_assembly_failed")
+                                 + _count(rows, "cm_assembly_disabled")
+                                 + _count(rows, "cm_assembly_overrun")),
         "cm_budget_warnings": _count(rows, "cm_budget_checkpoint"),
         "est_chars_saved": sum(int(r.get("stats", {}).get("saved_chars") or 0)
                                for r in rows if r.get("kind") == "cm_view"),
     }
+
+
+def cm_summary_from_events(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Aggregate CM events (the sidecar/ingested form) into a cost-record
+    ``cm`` summary — same shape as :func:`_cm_summary` but keyed on the event
+    ``type`` field: the task child's seam events arrive via events.jsonl
+    (role-attributed by task_runner's ingest), not the trajectory. Returns
+    None when there are no cm events (None ≠ 0)."""
+    if not events:
+        return None
+
+    def _count(kind: str) -> int:
+        return sum(1 for e in events if e.get("type") == kind)
+
+    return {
+        "cm_view_turns": _count("cm_view"),
+        "cm_violations": _count("cm_violation"),
+        "cm_policy_failures": (_count("cm_policy_failed")
+                               + _count("cm_policy_disabled")
+                               + _count("cm_policy_overrun")),
+        "cm_assembly_failures": (_count("cm_assembly_failed")
+                                 + _count("cm_assembly_disabled")
+                                 + _count("cm_assembly_overrun")),
+        "cm_budget_warnings": _count("cm_budget_checkpoint"),
+        "est_chars_saved": sum(int((e.get("stats") or {}).get("saved_chars") or 0)
+                               for e in events if e.get("type") == "cm_view"),
+    }
+
+
+def task_cm_summary(output_dir: str, genid: Any) -> Optional[Dict[str, Any]]:
+    """The task child's CM summary for one generation, from its INGESTED
+    events (task_runner folds the sidecar into events.jsonl with role=task
+    before the cost record is written — docs/10 §11.5)."""
+    ev_path = paths.events_path(output_dir)
+    if not os.path.exists(ev_path):
+        return None
+    events: List[Dict[str, Any]] = []
+    for line in trajectory_log.read_all(ev_path).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(e, dict) or not str(e.get("type", "")).startswith("cm_"):
+            continue
+        if e.get("role") != "task" or str(e.get("genid")) != str(genid):
+            continue
+        events.append(e)
+    return cm_summary_from_events(events)
 
 
 def _wallclock(rows: List[Dict[str, Any]]) -> Optional[float]:
@@ -450,7 +504,13 @@ def _cost_line(label: str, rec: Optional[Dict[str, Any]], *, with_calls: bool = 
         tok = "n/a (no usage recorded)"
     else:
         tok = _fmt_tokens(tokens)
-    line = f"- {label}: {tok} tokens, {_fmt_secs(rec.get('wallclock_s'))} wall"
+    line = f"- {label}: {tok} tokens"
+    # Reasoning split (docs/10 §4: 注入面必须保留这一列 — reasoning is the
+    # cost majority on reasoning models; shown only when recorded, None≠0).
+    rt = rec.get("reasoning_tokens")
+    if isinstance(rt, (int, float)):
+        line += f" (reasoning {_fmt_tokens(rt)})"
+    line += f", {_fmt_secs(rec.get('wallclock_s'))} wall"
     if with_calls:
         line += f", {_fmt_calls(rec.get('tool_calls'))} tool calls"
     return line
@@ -486,7 +546,7 @@ def render_plan_statement(*, parent_genid: Any = None,
             try:
                 pct = float(tokens) / float(token_budget) * 100.0
                 lines.append(f"- budget reference: {_fmt_tokens(token_budget)} tokens/gen "
-                             f"(parent used {pct:.1f}% of it)")
+                             f"(parent used {pct:.1f}% of it; reference only, not enforced)")
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
     if task_budgets:
@@ -511,6 +571,12 @@ def render_plan_statement(*, parent_genid: Any = None,
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
         lines.append(line)
+    else:
+        # Unset must SPEAK (no-silent-fail rule): a silently-absent budget
+        # line reads as "a budget exists somewhere" — it does not; only
+        # tool-call caps and the time walls constrain this session.
+        lines.append("- your plan session token budget: unset (no token soft "
+                     "stop armed; tool-call caps and time walls still apply)")
     hist = [h for h in (history_costs or []) if h]
     if hist:
         parts = []
@@ -530,17 +596,28 @@ def render_evaluate_statement(*, genid: Any = None,
                               task_cost: Optional[Tuple[float, float]] = None,
                               own_last: Optional[Dict[str, Any]] = None,
                               own_budget: Any = None,
+                              token_budget: Any = None,
                               max_chars: int = _STATEMENT_MAX_CHARS) -> str:
     """Evaluator evaluate-session statement: THIS generation's task cost as a
     PROCESS fact (no scores — blind discipline holds) + your own last session.
 
     Phase C: ``own_budget`` = the evaluator design's
-    ``cost.evaluate_token_budget`` (effective, clamped by the frozen table)."""
+    ``cost.evaluate_token_budget`` (effective, clamped by the frozen table).
+    ``token_budget`` = loop.yaml ``cost.token_budget_per_gen`` — the reference
+    line the task cost is shown against (docs/10 §4: the evaluate statement's
+    task-cost line gains its budget anchor)."""
     lines = ["## Cost statement (framework-measured; process facts, no scores)"]
     if task_cost is not None:
         tokens, wall = task_cost
         lines.append(f"- task child, gen {genid}: "
                      f"{_fmt_tokens(tokens)} tokens, {_fmt_secs(wall)} wall")
+        if isinstance(token_budget, (int, float)) and token_budget > 0:
+            try:
+                pct = float(tokens) / float(token_budget) * 100.0
+                lines.append(f"- budget reference: {_fmt_tokens(token_budget)} tokens/gen "
+                             f"(task used {pct:.1f}% of it; reference only, not enforced)")
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
     else:
         lines.append(f"- task child, gen {genid}: no cost recorded (proxy-less run?)")
     if isinstance(own_budget, (int, float)):
@@ -552,6 +629,9 @@ def render_evaluate_statement(*, genid: Any = None,
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
         lines.append(line)
+    else:
+        lines.append("- your evaluate session token budget: unset (no token soft "
+                     "stop armed; tool-call caps and time walls still apply)")
     if own_last is not None:
         gid = own_last.get("genid")
         label = "your last evaluate session" + (f" (gen {gid})" if gid is not None else "")
