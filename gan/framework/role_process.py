@@ -230,8 +230,10 @@ class RoleProcess:
 
     def _start_worker(self, seat: str) -> None:
         self._stop_worker()
-        self._prepare_paths(seat)
         broker_socket = os.environ.get("GAN_ROLE_BROKER_UNIX", "").strip()
+        if not broker_socket:
+            raise RoleProcessError("role broker launch capability is required")
+        self._prepare_paths(seat)
         if broker_socket:
             if not self.instance:
                 raise RoleProcessError("role broker launch capability is missing")
@@ -271,24 +273,6 @@ class RoleProcess:
             self._socket = channel
             self._reader = auth_reader
             self._writer = channel.makefile("w", encoding="utf-8", errors="strict")
-        else:
-            env = os.environ.copy()
-            env.update({
-                "PYTHONUNBUFFERED": "1",
-                "GAN_ROLE_NAME": self.role,
-                "GAN_ROLE_SEAT": seat,
-                "GAN_ROLE_INSTANCE": self.instance or "",
-            })
-            process = subprocess.Popen(
-                [sys.executable, "-m", "gan.framework.role_process", "--worker"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None, text=True,
-                encoding="utf-8", errors="strict", bufsize=1, close_fds=True, env=env,
-            )
-            if process.stdin is None or process.stdout is None:
-                process.terminate()
-                raise RoleProcessError("failed to create role IPC pipes")
-            self._process = process
-            self._reader, self._writer = process.stdout, process.stdin
         self._seat = seat
         _write_message(self._writer, {
             "v": _PROTOCOL_VERSION, "type": "init", "role": self.role,
@@ -315,7 +299,7 @@ class RoleProcess:
                 raise RoleProcessError("role runtime report must be an object")
             expected_uid = os.environ.get(f"GAN_ROLE_{self.role.upper()}_UID")
             expected_gid = os.environ.get(f"GAN_ROLE_{self.role.upper()}_GID")
-            if broker_socket and (
+            if (
                 not expected_uid or not expected_gid
                 or runtime.get("euid") != int(expected_uid)
                 or runtime.get("egid") != int(expected_gid)

@@ -804,7 +804,8 @@ class _RoleBrokerState:
             self._traverse_by_pid[process.pid] = traverse_entries
             traverse_entries = []
             return process, [output_fd, runtime_fd, *writable_fds]
-        except Exception:
+        except Exception as launch_error:
+            reclaim_errors = []
             if process is not None and process.poll() is None:
                 process.terminate()
                 try:
@@ -815,21 +816,29 @@ class _RoleBrokerState:
             for fd in writable_fds:
                 try:
                     _reclaim_tree(fd, str(cfg["setfacl"]), owner_uid, owner_gid, role_uid)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    reclaim_errors.append(str(exc))
             if output_acl:
                 try:
                     self._release_output_acl(role, output_fd, role_uid)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    reclaim_errors.append(str(exc))
             for fd in [output_fd, runtime_fd, *writable_fds,
                        *readonly_file_fds, *secret_fds]:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-            self._release_traverse(traverse_entries, str(cfg["setfacl"]), role_uid)
+            reclaim_errors.extend(
+                self._release_traverse(traverse_entries, str(cfg["setfacl"]), role_uid)
+            )
             shutil.rmtree(runtime_root, ignore_errors=True)
+            if reclaim_errors:
+                raise RuntimeError(
+                    "role sandbox launch failed and ACL reclaim also failed: "
+                    f"{type(launch_error).__name__}: {launch_error}; "
+                    + "; ".join(reclaim_errors[:5])
+                ) from launch_error
             raise
 
     def reclaim(self, role: str, fds: List[int], pid: int | None = None) -> None:

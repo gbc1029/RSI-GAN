@@ -154,11 +154,20 @@ class _TaskBrokerState:
         self._lock = threading.Lock()
         self._outers: Dict[int, Dict[str, int]] = {}
         self._used_scopes = set()
+        self._acl_reconciled = False
 
     def register_outer(self, outer: int, budget: int) -> None:
         if outer < 1 or budget < 1:
             raise ValueError("task broker budget must be positive")
         with self._lock:
+            if not self._acl_reconciled:
+                from gan.framework import task_execution as tx
+                tx.reconcile_stale_task_acl(
+                    str(self.config["setfacl"]), str(self.config["output_dir"]),
+                    int(self.config["owner_uid"]), int(self.config["owner_gid"]),
+                    int(self.config["sandbox_uid"]),
+                )
+                self._acl_reconciled = True
             if outer in self._outers:
                 raise ValueError("task broker outer was already registered")
             self._outers[outer] = {"remaining": int(budget)}
@@ -260,6 +269,8 @@ class _TaskBrokerState:
         env.update({
             "HOME": "/tmp",
             "PYTHONPATH": run_dir,
+            "GAN_SECURE_MODE": "1",
+            "PYTHON_DOTENV_DISABLED": "1",
             "GAN_TASK_DESIGN": "/workspace/.gan_runtime/design.json",
             "GAN_TASK_TOOLS_DIR": "/workspace/.gan_runtime/tools",
             "GAN_TOOLS_LOAD_REPORT": ".gan_runtime/tools_load_report.json",

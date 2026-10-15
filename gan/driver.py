@@ -95,6 +95,9 @@ def _validate_run_paths(repo_root: str, output_dir: str) -> tuple[str, str]:
     if output == os.path.abspath(os.path.sep):
         raise RuntimeError("output_dir must not be filesystem root")
     if os.name == "posix":
+        tmp_root = os.path.realpath("/tmp")
+        if os.path.commonpath([output, tmp_root]) == tmp_root:
+            raise RuntimeError("output_dir must not be /tmp or below /tmp")
         repo_info = os.stat(repo, follow_symlinks=False)
         repo_identity = (repo_info.st_dev, repo_info.st_ino)
         current = output_input

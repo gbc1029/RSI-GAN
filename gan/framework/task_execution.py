@@ -810,6 +810,62 @@ def _task_walk_tree(root_fd: int, visit: Any, *, reclaim: bool = False) -> None:
         raise RuntimeError("; ".join(errors[:5]))
 
 
+def reconcile_stale_task_acl(setfacl: str, output_dir: str,
+                             owner_uid: int, owner_gid: int,
+                             sandbox_uid: int) -> None:
+    """Revoke task identity access left by a previously killed broker."""
+    if os.geteuid() != 0:
+        raise RuntimeError("task ACL recovery must run in the root broker")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    output_fd = os.open(output_dir, flags)
+    errors: List[str] = []
+
+    def revoke(fd: int, info: os.stat_result) -> None:
+        if info.st_uid not in {owner_uid, sandbox_uid}:
+            raise RuntimeError("task work tree contains an unexpected owner")
+        access = f"u:{sandbox_uid}:---"
+        remove = f"u:{sandbox_uid}"
+        if stat.S_ISDIR(info.st_mode):
+            access += f",d:u:{sandbox_uid}:---"
+            remove += f",d:u:{sandbox_uid}"
+        _task_setfacl(setfacl, fd, "-m", access)
+        if info.st_uid == sandbox_uid:
+            os.fchown(fd, owner_uid, owner_gid)
+        _task_setfacl(setfacl, fd, "-x", remove)
+
+    try:
+        output_info = os.fstat(output_fd)
+        if (not stat.S_ISDIR(output_info.st_mode)
+                or output_info.st_uid != owner_uid):
+            raise RuntimeError("task ACL recovery found an unexpected output root")
+        try:
+            _task_setfacl(setfacl, output_fd, "-m", f"u:{sandbox_uid}:---")
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
+            work_fd = os.open("work", flags, dir_fd=output_fd)
+        except FileNotFoundError:
+            work_fd = -1
+        except Exception as exc:
+            errors.append(str(exc))
+            work_fd = -1
+        if work_fd >= 0:
+            try:
+                _task_walk_tree(work_fd, revoke, reclaim=True)
+            except Exception as exc:
+                errors.append(str(exc))
+            finally:
+                os.close(work_fd)
+        try:
+            _task_setfacl(setfacl, output_fd, "-x", f"u:{sandbox_uid}")
+        except Exception as exc:
+            errors.append(str(exc))
+    finally:
+        os.close(output_fd)
+    if errors:
+        raise RuntimeError("stale task ACL recovery failed: " + "; ".join(errors[:5]))
+
+
 def _task_open_beneath(root_fd: int, relative: str, owner_uid: int) -> int:
     parts = [part for part in relative.split(os.sep) if part not in ("", ".")]
     if not parts or any(part == ".." for part in parts):
@@ -1255,6 +1311,7 @@ def _run_harness_and_report_local(
     secure_launch = questions_path is not None or broker_launch
     child_env = _task_safe_env(env)
     lease = None
+    primary_error: Optional[BaseException] = None
     try:
         if secure_launch:
             if (os.name == "posix" and hasattr(os, "geteuid") and
@@ -1331,9 +1388,20 @@ def _run_harness_and_report_local(
                     f"\n$ {' '.join(harness_cmd)} (cwd={run_dir})\n{out[-4000:]}\n"
                 )
         return proc.returncode, out
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
         if lease is not None:
-            lease.close()
+            try:
+                lease.close()
+            except Exception as reclaim_error:
+                if primary_error is None:
+                    raise
+                raise RuntimeError(
+                    "domain harness failed and task ACL reclaim also failed: "
+                    f"{type(primary_error).__name__}: {primary_error}; {reclaim_error}"
+                ) from primary_error
 
 
 def write_parent_report(
