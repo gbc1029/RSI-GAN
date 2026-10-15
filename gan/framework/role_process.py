@@ -115,7 +115,8 @@ def _validated_result(method: str, value: Any) -> Any:
     if method == "evaluate":
         fields = {
             "predicted_score", "issues", "fix_verdicts", "penalties",
-            "eval_point_results", "weaknesses",
+            "eval_point_results", "weaknesses", "token_budget_exhausted",
+            "truncated",
         }
         _exact_keys(value, fields, "evaluate result")
         score = value["predicted_score"]
@@ -136,6 +137,7 @@ def _validated_result(method: str, value: Any) -> Any:
         fields = {
             "records", "responses", "config", "patch", "patch_proposed",
             "patch_rejection", "attempts", "truncated", "budget_exhausted",
+            "token_budget_exhausted",
         }
         _exact_keys(value, fields, "plan result")
         _dict_list(value["records"], "plan records")
@@ -146,6 +148,7 @@ def _validated_result(method: str, value: Any) -> Any:
         fields = {
             "records", "self_design", "patch", "patch_proposed",
             "patch_rejection", "attempts", "truncated", "budget_exhausted",
+            "token_budget_exhausted",
         }
         _exact_keys(value, fields, "self_improve result")
         _dict_list(value["records"], "self_improve records")
@@ -159,7 +162,7 @@ def _validated_result(method: str, value: Any) -> Any:
         raise RoleProcessError(f"{method} patch_rejection must be a string or null")
     if type(value["attempts"]) is not int:
         raise RoleProcessError(f"{method} attempts must be an integer")
-    for field in ("truncated", "budget_exhausted"):
+    for field in ("truncated", "budget_exhausted", "token_budget_exhausted"):
         if type(value[field]) is not bool:
             raise RoleProcessError(f"{method} {field} must be a boolean")
     return value
