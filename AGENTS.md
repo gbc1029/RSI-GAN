@@ -92,9 +92,15 @@ OPENAI_API_KEY=<key>
 ## Run
 
 ```bash
-# GAN dual-loop (paper_review minimal)
-python scripts/run_gan.py --domains paper_review --subset _filtered_100_train \
-  --num_samples 2 --outer 1 --inner 2 --output_dir ../runs/gan_paper_review
+# GAN dual-loop (paper_review minimal) -- sandboxed driver ONLY: launch as a
+# normal user via `sudo` with the three *_SANDBOX_USER env vars (see README
+# "Environment deployment"); `--in-process` is disabled; one --domains per run.
+sudo GAN_TASK_SANDBOX_USER=rsi_gan_task \
+  GAN_PLANNER_SANDBOX_USER=rsi_gan_planner \
+  GAN_EVALUATOR_SANDBOX_USER=rsi_gan_evaluator \
+  venv_nat/bin/python scripts/run_gan.py --repo_root "$PWD" \
+  --domains paper_review --subset _filtered_100_train \
+  --num_samples 2 --outer 1 --inner 2 --output_dir /opt/rsi-gan/runs/gan_paper_review
 
 # original HyperAgents domain eval (model is explicit; resolved from models.yaml)
 python -m domains.harness --domain paper_review --model openai/gpt-4o \
@@ -198,6 +204,7 @@ with a GAN-native data layer.
 ### Sandboxing & activation
 
 - Each generation runs in a **minimal allowlist copy** `work/<genid>/repo` (agent runtime + domain package, datasets excluded; patched inside the copy when a deep patch exists). Benchmark labels are read by the harness from `repo_root`, passed only via the CLI `--dataset_root` argument to the parent harness — never written into the task child's env/payload; `GAN_DATASET_ROOT` is scrubbed from every child env.
+- **Secure sandbox boundary (fix3-main-sync)**: the GAN loop runs ONLY through the sandboxed driver (`scripts/run_gan.py` / `gan.driver.run_gan_driver`, launched via `sudo` as a normal user with the three `*_SANDBOX_USER` env vars — see README "Environment deployment"); the legacy `--in-process` option is hard-disabled and only ONE `--domains` value is accepted. Every worker is dropped to a dedicated UID (`setpriv --bounding-set=-all --no-new-privs`) inside a bubblewrap namespace (`--unshare-all --unshare-net --cap-drop ALL`, a synthetic credential-free `/etc` from `gan/framework/sandbox_etc.py`), with role/seat-scoped write roots granted and reclaimed via POSIX ACL (root-side brokers reconcile stale ACLs after a crash). Provider credentials never leave the root-side `ParentLLMProxy`: children get scoped `sk-gan-` tokens delivered as sealed memfds (never argv/env), planner/evaluator run as separate seat processes hosted by `gan/framework/role_process.py` (the one sanctioned framework→roles import). Per-domain sandbox profiles in `domains.yaml` are fail-closed (missing/disabled profile or `gpu != none` refuses the run). Resource budgets (cgroup/CPU/mem/pid/disk, #7) remain deferred.
 - **Activation**: always-on → `gan/tools/`; opt-in → `gan/components/` (registered, selected by design config). Plumbing (`deep/`, `design/`, `work/common/`) is frozen; only `work/<role>/` and the task components/registry are evolvable.
 
 ### Model config

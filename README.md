@@ -97,6 +97,42 @@ The domain task agent receives its model via an explicit
 `domains.harness --model ...` argument, never via env. To change a model, edit
 `gan/framework/models.yaml`.
 
+### 3b) Secure sandbox dependencies (GAN driver)
+
+The GAN security boundary (fix3-main-sync) additionally requires — the driver
+fails fast without them:
+
+```bash
+sudo apt-get install -y bubblewrap acl util-linux tzdata ca-certificates
+```
+
+`bwrap` / `setpriv` / `setfacl` must be root-owned regular executables that are
+NOT group/other-writable:
+
+```bash
+stat -Lc '%U %G %a %n' \
+  "$(command -v bwrap)" "$(command -v setpriv)" "$(command -v setfacl)"
+```
+
+### 3c) Dedicated sandbox accounts (GAN driver)
+
+The driver runs as root but drops every worker to a dedicated unprivileged
+UID. Four UIDs must be pairwise distinct: the `sudo` caller, the task agent,
+the planner and the evaluator. Create three no-login system accounts:
+
+```bash
+for u in rsi_gan_task rsi_gan_planner rsi_gan_evaluator; do
+  getent passwd "$u" >/dev/null || \
+    sudo useradd --system --user-group --no-create-home \
+      --home-dir /nonexistent --shell /usr/sbin/nologin "$u"
+done
+```
+
+Env vars: `GAN_TASK_SANDBOX_USER` has NO default and must be set explicitly;
+`GAN_PLANNER_SANDBOX_USER` / `GAN_EVALUATOR_SANDBOX_USER` default to
+`rsi_gan_planner` / `rsi_gan_evaluator` — pass all three explicitly to avoid
+deployment ambiguity.
+
 ### 4) Docker (only needed for the original HyperAgents container flow)
 
 ```bash
@@ -108,14 +144,37 @@ docker build --network=host -t hyperagents .
 
 ### GAN dual-loop (new)
 
+The GAN loop runs ONLY through the sandboxed driver: launch it as a normal
+user via `sudo` (so the driver gets both root start privileges and the correct
+`SUDO_UID`/`SUDO_GID`), with the three sandbox-account env vars. `--in-process`
+is hard-disabled (it bypasses the sandboxes), and only ONE `--domains` value is
+accepted per run:
+
 ```bash
-python scripts/run_gan.py \
+sudo \
+  GAN_TASK_SANDBOX_USER=rsi_gan_task \
+  GAN_PLANNER_SANDBOX_USER=rsi_gan_planner \
+  GAN_EVALUATOR_SANDBOX_USER=rsi_gan_evaluator \
+  venv_nat/bin/python scripts/run_gan.py \
+  --repo_root "$PWD" \
   --domains paper_review \
   --subset _filtered_100_train \
   --num_samples 2 \
   --outer 1 --inner 2 \
-  --output_dir ../runs/gan_paper_review
+  --output_dir /opt/rsi-gan/runs/gan_paper_review
 ```
+
+`output_dir` rules (validated fail-fast): NOT inside `repo_root`, not a parent
+of it, not `/`, not your home (or a parent of it), not under `/tmp`, no symlink
+component, no bind-mount alias of the repo/home, and an already-existing
+`output_dir` must not contain source/credential markers (`.env`, `.git`,
+`agent/`, `domains/`, `gan/`, ...). It must be owned by the `sudo` caller and
+sit on a native Linux filesystem with POSIX ACL support (avoid `/mnt/c`
+DrvFS); e.g. `sudo install -d -o "$USER" -g "$(id -gn)" -m 700
+/opt/rsi-gan/runs`. Credentials come from `<repo_root>/.env`, loaded only in
+the trusted parent; sandboxed workers receive no provider credential (scoped
+short-lived tokens via a sealed memfd instead). GPU runs are rejected
+(`sandbox.gpu` must be `none`); only the CPU path is verified.
 
 Outputs (under `--output_dir`): `logs/events.jsonl`,
 `logs/{task,planner,evaluator}_tree.jsonl`, `scores/scores.jsonl`,
