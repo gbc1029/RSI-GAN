@@ -234,9 +234,12 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
     actx = get_access_context()
     if actx is None:
         return "Error: no access context"
-    output_dir = getattr(actx.broker, "output_dir", None) if actx.broker is not None else None
-    if not output_dir:
-        return "Error: no output directory available"
+    broker = actx.broker
+    # Sandboxed seat workers carry the RPC broker (method present);
+    # in-process sessions carry the plain AccessBroker and read files
+    # directly. Both are valid -- only a missing broker is fatal.
+    if broker is None:
+        return "Error: parent session reader is unavailable"
     outer = _outer_of(actx)
     if outer is None:
         return "Error: session trajectories are only available during self-improvement."
@@ -257,6 +260,45 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         note = (f"# note: kind=/tool=/flag=/offset= apply in slice mode only "
                 f"(this session runs {mode or 'passthrough'})\n")
 
+    output_dir = getattr(actx.broker, "output_dir", None) if actx.broker is not None else None
+
+    if hasattr(broker, "session_trajectory_index"):
+        # Sandboxed seat worker: every byte crosses the parent-side RPC
+        # (redaction stays parent-side; this seat cannot see other outers'
+        # files). The CM slice index / seg-fetch faces are in-process faces
+        # and do not apply here; filters are noted, never silently ignored.
+        extra = ("# note: kind=/tool=/flag=/offset=/fetch= are in-process "
+                 "slice-mode faces; a sandboxed seat worker reads the full "
+                 "redacted blob\n") if (slice_mode or has_filter) else ""
+        if genid is not None:
+            try:
+                req_outer, req_genid = _parse_genid_ref(genid, outer)
+            except ValueError as e:
+                return f"Error: {e}"
+            blob = broker.read_session_trajectory(role, actx.node_id, req_outer,
+                                                  req_genid, cap, seat=actx.seat)
+            if not blob:
+                return f"No session trajectory for genid {genid}."
+            where = "" if str(req_outer) == str(outer) else f" (outer_{req_outer})"
+            return extra + note + f"# your session genid={req_genid}{where}\n{blob}"
+        pairs = []
+        for o in outers:
+            idx = broker.session_trajectory_index(role, actx.node_id, o,
+                                                  seat=actx.seat)
+            for e in (idx or []):
+                pairs.append((session_label(outer, o, e["genid"], f"{role}.jsonl"),
+                              o, e["genid"]))
+        if not pairs:
+            return "No session trajectories in your visible outers yet."
+        blob = "\n\n".join(
+            broker.read_session_trajectory(role, actx.node_id, o, g, cap,
+                                           seat=actx.seat) for _l, o, g in pairs
+        )
+        return extra + note + (f"# your sessions (outers={outers}): "
+                               f"{[p[0] for p in pairs]}\n{blob[:cap]}")
+
+    if not output_dir:
+        return "Error: parent trajectory root is unavailable"
     try:
         entries = _session_entries(output_dir, outer, outers, role, genid)
     except ValueError as e:

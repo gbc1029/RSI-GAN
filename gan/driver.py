@@ -12,10 +12,13 @@ failure; events ``self_improve_commit`` / ``self_improve_apply_failed``).
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from functools import wraps
 import json
 import multiprocessing
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +26,157 @@ import time
 from typing import Any, Dict, List, Optional
 
 from gan.framework import paths
+from gan.framework.sandbox_etc import (
+    SANDBOX_HOSTNAME,
+    create_sandbox_etc,
+    validate_sandbox_etc,
+)
+
+
+_OUTPUT_SOURCE_MARKERS = frozenset({
+    ".env", ".git", "agent", "baselines", "datasets", "domains", "gan",
+})
+
+
+def _private_driver_umask(func: Any) -> Any:
+    @wraps(func)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        previous = os.umask(0o077)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            os.umask(previous)
+
+    return wrapped
+
+
+@contextmanager
+def _clean_broker_start_environment():
+    """Expose only non-secret process settings during spawn inheritance."""
+    previous = dict(os.environ)
+    allowed = {
+        "PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ",
+        "PYTHONDONTWRITEBYTECODE",
+    }
+    clean = {
+        key: value for key, value in previous.items()
+        if key in allowed or key.startswith("LC_")
+    }
+    clean.update({
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "GAN_SECURE_MODE": "1",
+        "PYTHON_DOTENV_DISABLED": "1",
+    })
+    os.environ.clear()
+    os.environ.update(clean)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
+
+
+def _validate_run_paths(repo_root: str, output_dir: str) -> tuple[str, str]:
+    """Reject output trees that overlap the source or expose sensitive roots."""
+    repo = os.path.realpath(os.path.abspath(os.path.expanduser(repo_root)))
+    output_input = os.path.abspath(os.path.expanduser(output_dir))
+    current = output_input
+    while True:
+        if os.path.lexists(current) and os.path.islink(current):
+            raise RuntimeError(f"output_dir path must not contain a symlink: {current}")
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    output = os.path.realpath(output_input)
+    if not os.path.isdir(repo):
+        raise RuntimeError(f"repo_root is not an existing directory: {repo}")
+    if output == os.path.abspath(os.path.sep):
+        raise RuntimeError("output_dir must not be filesystem root")
+    if os.name == "posix":
+        tmp_root = os.path.realpath("/tmp")
+        if os.path.commonpath([output, tmp_root]) == tmp_root:
+            raise RuntimeError("output_dir must not be /tmp or below /tmp")
+        repo_info = os.stat(repo, follow_symlinks=False)
+        repo_identity = (repo_info.st_dev, repo_info.st_ino)
+        current = output_input
+        while not os.path.lexists(current):
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        while True:
+            info = os.stat(current, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) == repo_identity:
+                raise RuntimeError("output_dir is inside a bind-mounted repo_root alias")
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+        if os.path.exists(output):
+            output_info = os.stat(output, follow_symlinks=False)
+            output_identity = (output_info.st_dev, output_info.st_ino)
+            current = repo
+            while True:
+                info = os.stat(current, follow_symlinks=False)
+                if (info.st_dev, info.st_ino) == output_identity:
+                    raise RuntimeError(
+                        "output_dir is a bind-mounted alias of a repo_root ancestor"
+                    )
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+    homes = {os.path.realpath(os.path.expanduser("~"))}
+    raw_uid = os.environ.get("SUDO_UID", "")
+    if os.name == "posix" and raw_uid.isdigit():
+        import pwd
+        homes.add(os.path.realpath(pwd.getpwuid(int(raw_uid)).pw_dir))
+    for home in homes:
+        try:
+            contains_home = os.path.commonpath([output, home]) == output
+        except ValueError:
+            contains_home = False
+        if contains_home:
+            raise RuntimeError(
+                "output_dir must not be a home directory or contain one: "
+                f"{output}"
+            )
+        if os.name == "posix" and os.path.exists(output):
+            output_info = os.stat(output, follow_symlinks=False)
+            output_identity = (output_info.st_dev, output_info.st_ino)
+            current = home
+            while True:
+                info = os.stat(current, follow_symlinks=False)
+                if (info.st_dev, info.st_ino) == output_identity:
+                    raise RuntimeError(
+                        "output_dir is a bind-mounted alias of a home ancestor"
+                    )
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+    try:
+        overlap = os.path.commonpath([repo, output]) in {repo, output}
+    except ValueError:
+        overlap = False
+    if overlap:
+        raise RuntimeError(
+            "output_dir must be a separate tree from repo_root "
+            f"(repo_root={repo}, output_dir={output})"
+        )
+    if os.path.exists(output):
+        if not os.path.isdir(output):
+            raise RuntimeError("output_dir exists but is not a directory")
+        present = sorted(name for name in _OUTPUT_SOURCE_MARKERS
+                         if os.path.lexists(os.path.join(output, name)))
+        if present:
+            raise RuntimeError(
+                "output_dir contains source/credential markers: "
+                + ", ".join(present)
+            )
+    return repo, output
 
 
 def _log_event(output_dir: str, event: Dict[str, Any]) -> None:
@@ -87,11 +241,13 @@ def _cost_rollup(output_dir: str, *, label: str, since_ts: float = 0.0) -> float
     return max((e.get("timestamp") or 0.0 for e in calls), default=since_ts)
 
 
-def _outer_env(base: Dict[str, str], *, proxy_socket: str,
-               planner_token: str, evaluator_token: str,
-               task_broker_socket: str, task_broker_token: str,
-               code_root: str) -> Dict[str, str]:
+def _outer_env(base: Dict[str, str], *, task_broker_socket: str, outer: int,
+               role_broker_socket: str,
+               role_accounts: Dict[str, Dict[str, Any]],
+               code_root: str,
+               proxy_socket: Optional[str] = None) -> Dict[str, str]:
     """Return the small non-secret environment inherited by outer_worker."""
+    del proxy_socket  # compatibility argument; the outer must not receive this endpoint
     allowed = {
         "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
         "PYTHONPATH", "PYTHONDONTWRITEBYTECODE",
@@ -103,16 +259,19 @@ def _outer_env(base: Dict[str, str], *, proxy_socket: str,
            if k in allowed or k.startswith("LC_")}
     env["PYTHONPATH"] = code_root + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["GAN_SECURE_MODE"] = "1"
+    env["PYTHON_DOTENV_DISABLED"] = "1"
     # Per-LLM-call client budget consumed by agent/llm.py (roles +, via the
     # task env allowlist, the task child). Must stay <= the proxy upstream
     # timeout so the proxy is never the first to cut a healthy call.
     env["GAN_LLM_TIMEOUT_S"] = str(
         os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
-    env["GAN_LLM_PROXY_UNIX"] = proxy_socket
-    env["GAN_PROXY_PLANNER_TOKEN"] = planner_token
-    env["GAN_PROXY_EVALUATOR_TOKEN"] = evaluator_token
     env["GAN_TASK_BROKER_UNIX"] = task_broker_socket
-    env["GAN_TASK_BROKER_TOKEN"] = task_broker_token
+    env["GAN_TASK_BROKER_OUTER"] = str(int(outer))
+    env["GAN_ROLE_BROKER_UNIX"] = role_broker_socket
+    for role in ("planner", "evaluator"):
+        env[f"GAN_ROLE_{role.upper()}_UID"] = str(role_accounts[role]["uid"])
+        env[f"GAN_ROLE_{role.upper()}_GID"] = str(role_accounts[role]["gid"])
     return env
 
 
@@ -131,24 +290,34 @@ def _add_empty_parents(command: List[str], path: str, created: set) -> None:
 
 
 def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
-                          code_root: str, proxy_socket: str,
+                          code_root: str,
+                          proxy_socket: Optional[str] = None,
                           task_broker_socket: Optional[str] = None,
-                          env_mask_file: Optional[str] = None) -> List[str]:
+                          role_broker_socket: Optional[str] = None,
+                          env_mask_file: Optional[str] = None,
+                          sandbox_etc_dir: Optional[str] = None) -> List[str]:
     """Run outer_worker in a no-network view with only its run inputs mounted."""
+    del proxy_socket  # compatibility argument; role/task brokers mount it directly
     bwrap = shutil.which("bwrap")
     if not bwrap:
         raise RuntimeError(
             "GAN outer_worker network isolation requires bubblewrap ('bwrap'); "
             "refusing to run planner/evaluator with host networking")
+    if not sandbox_etc_dir:
+        raise RuntimeError("outer sandbox requires a sanitized /etc projection")
+    sandbox_etc_dir = validate_sandbox_etc(sandbox_etc_dir)
     command = [
         bwrap, "--die-with-parent", "--new-session",
         "--unshare-all", "--unshare-net", "--cap-drop", "ALL",
+        "--hostname", SANDBOX_HOSTNAME,
     ]
     created = {"/"}
-    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
         if os.path.exists(path):
             command.extend(["--ro-bind", path, path])
             created.add(path)
+    command.extend(["--ro-bind", sandbox_etc_dir, "/etc"])
+    created.add("/etc")
     prefix = os.path.realpath(sys.prefix)
     if not any(prefix == root or prefix.startswith(root + os.sep)
                for root in ("/usr", "/bin", "/sbin", "/lib", "/lib64")):
@@ -164,9 +333,11 @@ def _outer_worker_command(cmd: List[str], repo_root: str, output_dir: str,
             raise RuntimeError(f"outer sandbox bind source is missing: {source}")
         _add_empty_parents(command, target, created)
         command.extend([mode, source, target])
-    sockets = [proxy_socket]
+    sockets = []
     if task_broker_socket:
         sockets.append(task_broker_socket)
+    if role_broker_socket:
+        sockets.append(role_broker_socket)
     for socket_path in sockets:
         if not os.path.exists(socket_path):
             raise RuntimeError(f"outer sandbox bind source is missing: {socket_path}")
@@ -197,15 +368,34 @@ class _TaskBrokerController:
         self.process = process
         self.control = control
 
-    def register_outer(self, budget: int) -> str:
-        self.control.send({"op": "register", "budget": int(budget)})
+    def register_outer(self, outer: int, budget: int) -> None:
+        self.control.send({"op": "register", "outer": int(outer),
+                           "budget": int(budget)})
         if not self.control.poll(10):
             raise RuntimeError("privileged task broker did not register the outer budget")
         response = self.control.recv()
-        if not response.get("ok") or not response.get("token"):
+        if not response.get("ok"):
             raise RuntimeError(f"privileged task broker registration failed: "
                                f"{response.get('error', 'invalid response')}")
-        return str(response["token"])
+
+    def activate_outer(self, outer: int, supervisor_pid: int) -> None:
+        self.control.send({"op": "activate", "outer": int(outer),
+                           "supervisor_pid": int(supervisor_pid)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged task broker did not activate the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged task broker activation failed: "
+                               f"{response.get('error', 'invalid response')}")
+
+    def release_outer(self, outer: int) -> None:
+        self.control.send({"op": "release", "outer": int(outer)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged task broker did not release the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged task broker release failed: "
+                               f"{response.get('error', 'invalid response')}")
 
     def close(self) -> None:
         try:
@@ -220,6 +410,55 @@ class _TaskBrokerController:
         if self.process.is_alive():
             print("[WARN] privileged task broker did not exit; it will receive "
                   "the configured parent-death signal when this driver exits")
+
+
+class _RoleBrokerController:
+    def __init__(self, process: Any, control: Any) -> None:
+        self.process = process
+        self.control = control
+
+    def register_outer(self, outer: int,
+                       proxy_tokens: Dict[str, Dict[str, str]]) -> None:
+        self.control.send({"op": "register", "outer": int(outer),
+                           "proxy_tokens": dict(proxy_tokens)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged role broker did not register the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged role broker registration failed: "
+                               f"{response.get('error', 'invalid response')}")
+
+    def activate_outer(self, outer: int, supervisor_pid: int) -> None:
+        self.control.send({"op": "activate", "outer": int(outer),
+                           "supervisor_pid": int(supervisor_pid)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged role broker did not activate the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged role broker activation failed: "
+                               f"{response.get('error', 'invalid response')}")
+
+    def release_outer(self, outer: int) -> None:
+        self.control.send({"op": "release", "outer": int(outer)})
+        if not self.control.poll(10):
+            raise RuntimeError("privileged role broker did not release the outer")
+        response = self.control.recv()
+        if not response.get("ok"):
+            raise RuntimeError(f"privileged role broker release failed: "
+                               f"{response.get('error', 'invalid response')}")
+
+    def close(self) -> None:
+        try:
+            self.control.send({"op": "shutdown"})
+            if self.control.poll(10):
+                self.control.recv()
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        finally:
+            self.control.close()
+        self.process.join(timeout=10)
+        if self.process.is_alive():
+            print("[WARN] privileged role broker did not exit cleanly")
 
 
 def _sudo_invoking_identity() -> tuple[int, int, str]:
@@ -256,18 +495,50 @@ def _drop_driver_privileges(uid: int, gid: int, username: str) -> None:
     os.environ.update({"HOME": home, "USER": username, "LOGNAME": username})
 
 
+def _trusted_root_tool(name: str) -> str:
+    """Resolve a root-owned, non-writable privilege-boundary executable."""
+    candidate = shutil.which(name)
+    if not candidate:
+        raise RuntimeError(f"secure TaskAgent launch requires {name}")
+    path = os.path.realpath(candidate)
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise RuntimeError(f"cannot stat trusted executable {path}: {exc}") from exc
+    if (not os.path.isabs(path) or not stat.S_ISREG(info.st_mode) or
+            info.st_uid != 0 or info.st_mode & 0o022 or
+            not os.access(path, os.X_OK)):
+        raise RuntimeError(
+            f"secure TaskAgent launch rejects untrusted {name} executable: {path}"
+        )
+    return path
+
+
+def _trusted_ipc_parent() -> str:
+    """Choose a root-controlled parent that cannot rename the IPC directory."""
+    for path in ("/run", "/tmp"):
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if (stat.S_ISDIR(info.st_mode) and info.st_uid == 0
+                and ((info.st_mode & 0o022) == 0
+                     or (info.st_mode & stat.S_ISVTX) != 0)):
+            return path
+    raise RuntimeError("secure IPC requires a root-owned /run or sticky /tmp")
+
+
 def _start_task_broker(socket_path: str, config: Dict[str, Any]) -> _TaskBrokerController:
-    if "fork" not in multiprocessing.get_all_start_methods():
-        raise RuntimeError("secure TaskAgent launch requires POSIX fork support")
     from gan.framework.task_broker import broker_process_main
-    context = multiprocessing.get_context("fork")
+    context = multiprocessing.get_context("spawn")
     parent_control, child_control = context.Pipe()
     process = context.Process(
         target=broker_process_main,
         args=(child_control, socket_path, config),
         name="rsi-gan-privileged-task-broker",
     )
-    process.start()
+    with _clean_broker_start_environment():
+        process.start()
     child_control.close()
     if not parent_control.poll(10):
         process.terminate()
@@ -281,6 +552,31 @@ def _start_task_broker(socket_path: str, config: Dict[str, Any]) -> _TaskBrokerC
     return _TaskBrokerController(process, parent_control)
 
 
+def _start_role_broker(socket_path: str, config: Dict[str, Any]) -> _RoleBrokerController:
+    from gan.framework.role_broker import broker_process_main
+    context = multiprocessing.get_context("spawn")
+    parent_control, child_control = context.Pipe()
+    process = context.Process(
+        target=broker_process_main,
+        args=(child_control, socket_path, config),
+        name="rsi-gan-privileged-role-broker",
+    )
+    with _clean_broker_start_environment():
+        process.start()
+    child_control.close()
+    if not parent_control.poll(10):
+        process.terminate()
+        process.join(timeout=5)
+        raise RuntimeError("privileged role broker did not start")
+    response = parent_control.recv()
+    if not response.get("ok"):
+        process.join(timeout=5)
+        raise RuntimeError(f"privileged role broker failed to start: "
+                           f"{response.get('error', 'invalid response')}")
+    return _RoleBrokerController(process, parent_control)
+
+
+@_private_driver_umask
 def run_gan_driver(
     repo_root: str,
     output_dir: str,
@@ -306,8 +602,16 @@ def run_gan_driver(
     cfg = load_gan_loop_config(cfg_overrides)
     G = int(cfg.get("loop.outer_generations", 2))
     I_max = int(cfg.get("loop.inner_max", 3))
-    repo_root = os.path.realpath(os.path.abspath(repo_root))
-    output_dir = os.path.realpath(os.path.abspath(output_dir))
+    task_llm_calls_per_question = int(
+        cfg.get("loop.task_llm_max_calls_per_question", 64))
+    if task_llm_calls_per_question < 1:
+        raise ValueError("loop.task_llm_max_calls_per_question must be positive")
+    repo_root, output_dir = _validate_run_paths(repo_root, output_dir)
+    env_file = os.path.join(repo_root, ".env")
+    if os.path.isfile(env_file):
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=env_file, override=False)
+    os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 
     # Domain shape checks (the ONLY default lives in scripts/run_gan.py; here the
     # value is required input). Empty/None and multi-value both fail fast before
@@ -328,6 +632,14 @@ def run_gan_driver(
     unregistered = domain not in registered and not any(
         domain.startswith(family) for family in families
     )
+    if unregistered:
+        raise ValueError(
+            f"domain {domain!r} has no registered sandbox profile; refusing secure launch"
+        )
+    domain_config = resolve_domain(reg, domain)
+    sandbox_profile = task_execution.validate_domain_sandbox_profile(
+        domain, domain_config.get("sandbox"), repo_root,
+    )
 
     owner_uid, owner_gid, owner_username = _sudo_invoking_identity()
     sandbox_username = os.environ.get("GAN_TASK_SANDBOX_USER", "").strip()
@@ -340,6 +652,26 @@ def run_gan_driver(
         raise RuntimeError(f"sandbox user {sandbox_username!r} does not exist") from exc
     if int(sandbox_account.pw_uid) == 0:
         raise RuntimeError("TaskAgent sandbox user must not be root")
+    role_accounts = {}
+    for role, default_user in (("planner", "rsi_gan_planner"),
+                               ("evaluator", "rsi_gan_evaluator")):
+        env_name = f"GAN_{role.upper()}_SANDBOX_USER"
+        username = os.environ.get(env_name, default_user).strip()
+        try:
+            account = pwd.getpwnam(username)
+        except KeyError as exc:
+            raise RuntimeError(f"role sandbox user {username!r} does not exist") from exc
+        if int(account.pw_uid) == 0:
+            raise RuntimeError(f"{role} sandbox user must not be root")
+        role_accounts[role] = {"username": username, "uid": int(account.pw_uid),
+                               "gid": int(account.pw_gid)}
+    role_uids = {entry["uid"] for entry in role_accounts.values()}
+    if len(role_uids) != 2 or int(sandbox_account.pw_uid) in role_uids or owner_uid in role_uids:
+        raise RuntimeError("planner/evaluator/task/owner identities must be distinct")
+
+    setpriv_path = _trusted_root_tool("setpriv")
+    setfacl_path = _trusted_root_tool("setfacl")
+    bwrap_path = _trusted_root_tool("bwrap")
 
     python_executable = os.path.realpath(sys.executable)
     python_prefix = os.path.realpath(sys.prefix)
@@ -353,11 +685,24 @@ def run_gan_driver(
         "planner": model_registry.resolve("gan.planner"),
         "evaluator": model_registry.resolve("gan.evaluator"),
     }
-    proxy_dir = tempfile.mkdtemp(prefix="rsi-gan-proxy-")
-    os.chmod(proxy_dir, 0o755)
-    os.chown(proxy_dir, owner_uid, owner_gid)
+    proxy_dir = tempfile.mkdtemp(prefix="rsi-gan-proxy-", dir=_trusted_ipc_parent())
+    os.chmod(proxy_dir, 0o711)
+    try:
+        sandbox_etc_dir = create_sandbox_etc(
+            proxy_dir,
+            owner=(owner_uid, owner_gid),
+            task=(int(sandbox_account.pw_uid), int(sandbox_account.pw_gid)),
+            planner=(int(role_accounts["planner"]["uid"]),
+                     int(role_accounts["planner"]["gid"])),
+            evaluator=(int(role_accounts["evaluator"]["uid"]),
+                       int(role_accounts["evaluator"]["gid"])),
+        )
+    except Exception:
+        shutil.rmtree(proxy_dir, ignore_errors=True)
+        raise
     proxy_socket = os.path.join(proxy_dir, "p.sock")
     task_broker_socket = os.path.join(proxy_dir, "task.sock")
+    role_broker_socket = os.path.join(proxy_dir, "role.sock")
     env_mask_file = os.path.join(proxy_dir, "empty.env")
     proxy = ParentLLMProxy(
         output_dir, proxy_socket,
@@ -367,14 +712,24 @@ def run_gan_driver(
         # (observed: default 120s cut thinking calls at 121s -> 502 -> the
         # question budget burned on doomed retries).
         timeout=float(cfg.get("loop.llm_proxy_timeout_s", 700)),
+        socket_uids=[
+            int(sandbox_account.pw_uid),
+            int(role_accounts["planner"]["uid"]),
+            int(role_accounts["evaluator"]["uid"]),
+        ],
+        setfacl_path=setfacl_path,
     )
-    proxy_control_token = proxy.issue_framework_scope(0)
+    proxy_control_token = proxy.issue_framework_scope(0, peer_uid=0)
     safe_broker_env = {
         key: value for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
                    "PYTHONDONTWRITEBYTECODE"} or key.startswith("LC_")
     }
     domain_cfg = resolve_domain(reg, domain)
+    safe_broker_env["GAN_SECURE_MODE"] = "1"
+    safe_broker_env["PYTHON_DOTENV_DISABLED"] = "1"
+    question_timeout_s = int(domain_config.get("question_timeout_s") or 300)
+    harness_timeout = int(num_samples) * question_timeout_s + 900
     broker_config = {
         "output_dir": output_dir,
         "repo_root": repo_root,
@@ -395,25 +750,76 @@ def run_gan_driver(
         "llm_client_timeout_s": float(cfg.get("loop.llm_client_timeout_s", 600)),
         "python": python_executable,
         "python_prefix": python_prefix,
-        "timeout": 1800,
+        "timeout": harness_timeout,
         "task_brief": (domain_cfg.get("task_brief") or ""),
         "parent_scored": task_execution.uses_parent_scoring(domain),
         # Question-sampling scheme (loop.yaml sampling.*). The broker reads the
         # run-persistent seed file at launch time (per generation) so a resume
         # reuses the same base seed without restart-order constraints.
         "sampling_mode": str((cfg.get("sampling") or {}).get("mode", "seeded")),
+        "sandbox_profile": sandbox_profile,
         "owner_uid": owner_uid,
         "owner_gid": owner_gid,
+        "setpriv": setpriv_path,
+        "setfacl": setfacl_path,
+        "bwrap": bwrap_path,
         "sandbox_username": sandbox_username,
+        "sandbox_uid": int(sandbox_account.pw_uid),
         "proxy_socket": proxy_socket,
         "proxy_control_token": proxy_control_token,
+        "sandbox_etc_dir": sandbox_etc_dir,
+        "task_llm_max_calls": (
+            max(1, int(num_samples)) *
+            task_llm_calls_per_question
+        ),
         "base_env": safe_broker_env,
     }
-    task_broker = _start_task_broker(task_broker_socket, broker_config)
-    proxy_started = False
     try:
+        task_broker = _start_task_broker(task_broker_socket, broker_config)
+    except Exception:
+        shutil.rmtree(proxy_dir, ignore_errors=True)
+        raise
+    try:
+        role_broker = _start_role_broker(role_broker_socket, {
+            "output_dir": output_dir,
+            "code_root": paths.code_root(output_dir),
+            "owner_uid": owner_uid,
+            "owner_gid": owner_gid,
+            "accounts": role_accounts,
+            "python": python_executable,
+            "python_prefix": python_prefix,
+            "setpriv": setpriv_path,
+            "setfacl": setfacl_path,
+            "bwrap": bwrap_path,
+            "proxy_socket": proxy_socket,
+            "proxy_control_token": proxy_control_token,
+            "llm_timeout_s": str(os.environ.get("GAN_LLM_TIMEOUT_S", "600")),
+            "ipc_dir": proxy_dir,
+            "sandbox_etc_dir": sandbox_etc_dir,
+        })
+    except Exception:
+        task_broker.close()
+        shutil.rmtree(proxy_dir, ignore_errors=True)
+        raise
+    try:
+        with open(env_mask_file, "w", encoding="utf-8"):
+            pass
+        os.chmod(env_mask_file, 0o444)
+        proxy.bind()
         _drop_driver_privileges(owner_uid, owner_gid, owner_username)
         os.makedirs(output_dir, exist_ok=True)
+        output_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        output_fd = os.open(output_dir, output_flags)
+        try:
+            output_info = os.fstat(output_fd)
+            if (not stat.S_ISDIR(output_info.st_mode)
+                    or output_info.st_uid != owner_uid):
+                raise RuntimeError(
+                    "output_dir has an unexpected owner or type after privilege drop"
+                )
+            os.fchmod(output_fd, 0o700)
+        finally:
+            os.close(output_fd)
         if not os.access(output_dir, os.R_OK | os.W_OK | os.X_OK):
             raise RuntimeError(
                 f"sudo invoking user cannot read/write/traverse output_dir: {output_dir}"
@@ -428,11 +834,6 @@ def run_gan_driver(
                 f"the tree/UCB. Use --resume to continue at outer {newest['index'] + 1}, "
                 f"or --force to re-run from outer 1 (legacy duplicate-prone behaviour, "
                 f"explicit escape hatch).")
-
-        if unregistered:
-            _log_event(output_dir, {"type": "domain_unregistered", "domain": domain,
-                                    "hint": "not in domains.yaml domains/families; "
-                                            "task_brief/output_contract fall back to default"})
 
         code_root = ensure_code_root(repo_root, output_dir)
 
@@ -495,56 +896,92 @@ def run_gan_driver(
             if not preflight_mod.all_ok(results):
                 raise RuntimeError(f"model preflight failed: {results}")
 
-        with open(env_mask_file, "w", encoding="utf-8"):
-            pass
-        os.chmod(env_mask_file, 0o400)
         proxy.start()
-        proxy_started = True
         cost_since = 0.0  # llm_call timestamp watermark for per-outer deltas
         for outer in range(start, G + 1):
-            tokens = {
-                "planner": proxy.issue_scope(
-                    "planner", str(outer), models["planner"]),
-                "evaluator": proxy.issue_scope(
-                    "evaluator", str(outer), models["evaluator"]),
+            role_proxy_tokens = {
+                "planner": {
+                    seat: proxy.issue_scope(
+                        "planner", str(outer), models["planner"], seat=seat,
+                        peer_uid=int(role_accounts["planner"]["uid"]))
+                    for seat in ("plan", "self_improve")
+                },
+                "evaluator": {
+                    seat: proxy.issue_scope(
+                        "evaluator", str(outer), models["evaluator"], seat=seat,
+                        peer_uid=int(role_accounts["evaluator"]["uid"]))
+                    for seat in ("evaluate", "self_improve")
+                },
             }
-            task_broker_token = task_broker.register_outer(I_max)
-            cmd = [
-                python_executable, "-m", "gan.outer_worker",
-                "--repo_root", repo_root, "--output_dir", output_dir,
-                "--outer", str(outer), "--domains", domain,
-                "--subset", subset, "--num_samples", str(num_samples),
-            ]
-            if sample_seed_base is not None:
-                cmd.extend(["--sample-seed-base", str(sample_seed_base)])
-                if anchor_ids:
-                    cmd.extend(["--anchor-ids", ",".join(anchor_ids)])
-            if inner is not None:
-                cmd.extend(["--inner", str(inner)])
-            if resume:
-                cmd += ["--resume-boundary", "outer"]
-            env = _outer_env(
-                os.environ, proxy_socket=proxy_socket,
-                planner_token=tokens["planner"],
-                evaluator_token=tokens["evaluator"],
-                task_broker_socket=task_broker_socket,
-                task_broker_token=task_broker_token,
-                code_root=code_root,
-            )
-            proc = subprocess.run(
-                _outer_worker_command(
-                    cmd, repo_root, output_dir, code_root, proxy_socket,
-                    task_broker_socket=task_broker_socket,
-                    env_mask_file=env_mask_file,
-                ),
-                cwd=code_root, env=env,
-            )
-            if proc.returncode != 0:
+            role_broker.register_outer(outer, role_proxy_tokens)
+            proc = None
+            try:
+                task_broker.register_outer(outer, I_max)
+                cmd = [
+                    python_executable, "-m", "gan.outer_worker",
+                    "--repo_root", repo_root, "--output_dir", output_dir,
+                    "--outer", str(outer), "--domains", domain,
+                    "--subset", subset, "--num_samples", str(num_samples),
+                ]
+                if sample_seed_base is not None:
+                    cmd.extend(["--sample-seed-base", str(sample_seed_base)])
+                    if anchor_ids:
+                        cmd.extend(["--anchor-ids", ",".join(anchor_ids)])
+                if inner is not None:
+                    cmd.extend(["--inner", str(inner)])
+                if resume:
+                    cmd += ["--resume-boundary", "outer"]
+                env = _outer_env(
+                    os.environ, task_broker_socket=task_broker_socket,
+                    outer=outer,
+                    role_broker_socket=role_broker_socket,
+                    role_accounts=role_accounts,
+                    code_root=code_root,
+                )
+                proc = subprocess.Popen(
+                    _outer_worker_command(
+                        cmd, repo_root, output_dir, code_root,
+                        task_broker_socket=task_broker_socket,
+                        role_broker_socket=role_broker_socket,
+                        env_mask_file=env_mask_file,
+                        sandbox_etc_dir=sandbox_etc_dir,
+                    ),
+                    cwd=code_root, env=env,
+                )
+                task_broker.activate_outer(outer, proc.pid)
+                role_broker.activate_outer(outer, proc.pid)
+                returncode = proc.wait()
+            except BaseException:
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                raise
+            finally:
+                failed = sys.exc_info()[0] is not None
+                release_errors = []
+                try:
+                    task_broker.release_outer(outer)
+                except Exception as exc:
+                    release_errors.append(f"task broker: {exc}")
+                try:
+                    role_broker.release_outer(outer)
+                except Exception as exc:
+                    release_errors.append(f"role broker: {exc}")
+                if release_errors:
+                    if not failed:
+                        raise RuntimeError("; ".join(release_errors))
+                    print(f"[WARN] privileged broker release failed: "
+                          f"{'; '.join(release_errors)}")
+            if returncode != 0:
                 _log_event(output_dir, {"type": "outer_worker_failed", "outer": outer,
-                                        "rc": proc.returncode})
+                                        "rc": returncode})
                 _cost_rollup(output_dir, label=f"outer_{outer}_failed",
                              since_ts=cost_since)
-                raise RuntimeError(f"outer worker failed at outer {outer} (rc={proc.returncode})")
+                raise RuntimeError(f"outer worker failed at outer {outer} (rc={returncode})")
             # Role self-edits are applied+committed by the worker itself.
             cost_since = _cost_rollup(output_dir, label=f"outer_{outer}",
                                       since_ts=cost_since)
@@ -553,7 +990,11 @@ def run_gan_driver(
         _cost_rollup(output_dir, label="run", since_ts=0.0)  # full-run cumulative
         return code_root
     finally:
-        if proxy_started:
+        try:
             proxy.close()
-        task_broker.close()
-        shutil.rmtree(proxy_dir, ignore_errors=True)
+        finally:
+            try:
+                task_broker.close()
+            finally:
+                role_broker.close()
+                shutil.rmtree(proxy_dir, ignore_errors=True)

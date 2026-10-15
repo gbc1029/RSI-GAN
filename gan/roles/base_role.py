@@ -166,6 +166,7 @@ class Role(AgentSystem):
         # post-construction stamp in _refresh_roles stays as an idempotent
         # safety net for factories that ignored the argument.
         self.attempt_id = attempt_id
+        self.seat = os.environ.get("GAN_ROLE_SEAT", "").strip() or None
         self.assembly_report: Optional[dict] = None  # last assembly report
         self.outer = None
         if instance and str(instance).startswith("outer_"):
@@ -211,11 +212,14 @@ class Role(AgentSystem):
     def session_trajectory(self, genid: Any = None) -> str:
         """JSONL trajectory file for one session (outer-level if genid is None)."""
         return paths.session_traj_file(self.output_dir, self.outer, genid, self.role,
-                                       attempt=getattr(self, "attempt_id", None))
+                                       attempt=getattr(self, "attempt_id", None),
+                                       seat=self.seat)
 
     def tools_dir_for(self) -> str:
         base = os.path.join(self.output_dir, "toolsets", self.role)
-        return os.path.join(base, self.instance) if self.instance else base
+        if self.instance:
+            base = os.path.join(base, self.instance)
+        return os.path.join(base, self.seat) if self.seat else base
 
     def refresh_tools(self) -> str:
         """(Re)assemble this instance's toolset from the current design.
@@ -317,9 +321,16 @@ class Role(AgentSystem):
         # arguments -- Role sessions may now run in parallel threads, and any
         # process-global os.environ swap would let one session steal the other's
         # proxy token or redirect its load report (observed failure class).
-        load_report_path = os.path.join(
-            paths.logs_dir(self.output_dir),
-            f"tools_load_{self.role}_{self.instance or 'default'}.json")
+        # Seat-aware sink: sandboxed seat workers write under their own
+        # role+seat logs dir (per-seat write roots); legacy layout otherwise.
+        if getattr(self, "seat", None) and self.instance:
+            load_report_path = os.path.join(
+                paths.role_logs_dir(self.output_dir, self.role, self.instance, self.seat),
+                "tools_load.json")
+        else:
+            load_report_path = os.path.join(
+                paths.logs_dir(self.output_dir),
+                f"tools_load_{self.role}_{self.instance or 'default'}.json")
         # Scoped proxy credential for THIS role (framework-injected via env at
         # worker start; read-only here). Sent per call as an explicit api_key.
         proxy_token = os.environ.get(f"GAN_PROXY_{self.role.upper()}_TOKEN")

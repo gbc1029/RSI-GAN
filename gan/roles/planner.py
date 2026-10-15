@@ -163,6 +163,8 @@ class Planner(Role):
                 # repo file, a builder defect) propagates and fails the session;
                 # the loop then marks the generation planner_failed (B-level)
                 # instead of applying a semantically wrong diff.
+                if hasattr(broker, "build_patch"):
+                    return broker.build_patch("planner", akey, seat="plan")
                 return build_patch_from_workspace(broker, "planner", akey)
 
             patch_str = _build_patch()
@@ -172,7 +174,11 @@ class Planner(Role):
                 if not patch_str or not self.code_root:
                     rejected = None
                     break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str, role="planner", seat="plan")
+                if broker is not None and hasattr(broker, "check_patch"):
+                    ok, reason = broker.check_patch(patch_str, role="planner", seat="plan")
+                else:
+                    ok, reason = code_repo.check_patch(
+                        self.code_root, patch_str, role="planner", seat="plan")
                 if ok:
                     rejected = None
                     break

@@ -7,7 +7,9 @@ import requests
 import litellm
 from dotenv import load_dotenv
 
-load_dotenv()
+if (os.environ.get("GAN_SECURE_MODE") != "1" and
+        os.environ.get("PYTHON_DOTENV_DISABLED") != "1"):
+    load_dotenv()
 
 # Output budget for agent calls. Reasoning models (glm-5.3-flash observed:
 # 16377 reasoning tokens on an imo_grading question, finish_reason=length,

@@ -39,7 +39,7 @@ gan/                     # the GAN framework (new)
   design/                #   shallow evolvable design (schema/store/seeds)
   roles/                 #   planner / evaluator (Role base in base_role.py)
   build.py driver.py outer_worker.py patch.py summary.py
-scripts/run_gan.py       # GAN dual-loop CLI entry (driver mode default; --in-process = legacy)
+scripts/run_gan.py       # GAN dual-loop CLI entry (sandboxed driver only)
 scripts/dgmh/            # DGM-H-only entry scripts (generate_loop/meta_agent/run_meta_agent/...)
 scripts/local/           # local-only verification scripts (gitignored)
 docs/                    # integrated docs (current) + archive/ (historical records)
@@ -79,8 +79,10 @@ pip install -r requirements_dev.txt
 
 ### 3) LLM credentials (create `.env`, NOT committed)
 
-The repo loads `.env` automatically (`agent/llm.py`), and `litellm` reads
-`OPENAI_API_BASE` / `OPENAI_API_KEY`. Any OpenAI-compatible endpoint works:
+The secure GAN entry loads only `<repo_root>/.env` in the trusted parent;
+sandboxed role/task processes disable dotenv discovery and receive no provider
+credential. `litellm` reads `OPENAI_API_BASE` / `OPENAI_API_KEY` in the parent.
+Any OpenAI-compatible endpoint works:
 
 ```ini
 # .env  (never commit this file)
@@ -112,7 +114,7 @@ python scripts/run_gan.py \
   --subset _filtered_100_train \
   --num_samples 2 \
   --outer 1 --inner 2 \
-  --output_dir outputs/gan_paper_review
+  --output_dir ../runs/gan_paper_review
 ```
 
 Outputs (under `--output_dir`): `logs/events.jsonl`,
@@ -155,6 +157,12 @@ Large datasets are intentionally **not** committed (see `.gitignore`):
 > [!WARNING]
 > This repository executes untrusted, model-generated code. Review the original
 > HyperAgents safety notes before running self-improvement loops.
+
+The supported GAN security boundary starts at `scripts/run_gan.py` (or the
+programmatic `gan.driver.run_gan_driver` entry) and requires the driver-managed
+role/task sandboxes. The legacy `--in-process` option is disabled because it
+bypasses those sandboxes. Direct calls to `build_gan_loop`, `gan.outer_worker`,
+or role classes are internal/test interfaces and are not sandboxed entry points.
 
 ## Attribution
 

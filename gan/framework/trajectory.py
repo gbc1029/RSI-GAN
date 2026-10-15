@@ -125,6 +125,13 @@ def collect(run_dir: str, run_id: str, output_dir: str, outer: Any, genid: Any) 
 
 
 def _session_file(output_dir: str, genid: Any, role: str) -> str:
+    if role in ("planner", "evaluator"):
+        seat = "plan" if role == "planner" else "evaluate"
+        pat = os.path.join(paths.trajectory_root(output_dir), "outer_*", "roles",
+                           role, seat, f"gen_{genid}.jsonl")
+        hits = sorted(glob.glob(pat))
+        if hits:
+            return hits[-1]
     pat = os.path.join(paths.trajectory_root(output_dir), "outer_*", str(genid), f"{role}.jsonl")
     hits = sorted(glob.glob(pat))
     return hits[-1] if hits else ""
@@ -228,13 +235,23 @@ def _read_gen_session(output_dir: str, outer: Any, genid: Any, role: str,
 
     Reasoning is PINNED OFF for role sessions regardless of the loop.yaml
     flag: planner/evaluator never read their own (or each other's) CoT."""
-    path = paths.session_traj_file(output_dir, outer, genid, role)
+    seat = ("plan" if role == "planner" else
+            "evaluate" if role == "evaluator" else None)
+    path = paths.session_traj_file(output_dir, outer, genid, role, seat=seat)
     if not os.path.isfile(path):
+        # Legacy layout (pre-seat runs): the genid-keyed file may sit directly
+        # under the outer dir. Quarantine detection must cover BOTH layouts --
+        # a legacy .unredacted-* sibling is just as unservable.
+        legacy = paths.session_traj_file(output_dir, outer, genid, role)
         quarantined = sorted(glob.glob(path + ".unredacted-*"))
+        quarantined += sorted(glob.glob(legacy + ".unredacted-*"))
         if quarantined:
             return ("[unavailable] this session trajectory could not be redacted and was "
                     "quarantined; the audit trail is in events.jsonl "
                     "(session_redaction_failed).")
+        if os.path.isfile(legacy):
+            return _render(trajectory_log.read_all(legacy), max_chars,
+                           expose_reasoning=False)
         # legacy fallback: a missing gen-session file falls back to the
         # generational archive. That may be a ROLE session file (role != task),
         # so the reasoning gate stays pinned off here too — only the
@@ -251,6 +268,14 @@ def _outer_session_files(output_dir: str, outer: Any, role: str) -> List[str]:
     offline smoke) use ``<role>.jsonl``. Readers accept every shape so an
     attempt-keyed file can never become invisible behind the canonical name;
     rotated parts (``.N``) and quarantine names are excluded by the glob."""
+    seat_dir = paths.role_traj_dir(output_dir, outer, role, "self_improve")
+    if os.path.isdir(seat_dir):
+        cands = [os.path.join(seat_dir, "outer.jsonl")]
+        cands += sorted(glob.glob(os.path.join(seat_dir, "outer__*.jsonl")))
+        existing = [p for p in cands if os.path.isfile(p)]
+        if existing:
+            existing.sort(key=os.path.getmtime, reverse=True)
+            return existing
     d = paths.outer_traj_dir(output_dir, outer)
     if not os.path.isdir(d):
         return []
@@ -269,6 +294,9 @@ def _read_outer_sessions(output_dir: str, outer: Any, role: str,
     files = _outer_session_files(output_dir, outer, role)
     d = paths.outer_traj_dir(output_dir, outer)
     quarantined = sorted(glob.glob(os.path.join(d, f"{role}*.jsonl.unredacted-*")))
+    quarantined += sorted(glob.glob(os.path.join(
+        paths.role_traj_dir(output_dir, outer, role, "self_improve"),
+        "outer*.jsonl.unredacted-*")))
     if not files:
         if quarantined:
             return ("[unavailable] this session trajectory could not be redacted and was "
@@ -288,17 +316,38 @@ def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str
 
     Quarantined (unredactable) sessions are reported explicitly with
     ``quarantined: True`` instead of silently vanishing from the list."""
-    d = paths.outer_traj_dir(output_dir, outer)
     out: List[Dict[str, Any]] = []
+    seat = "plan" if role == "planner" else "evaluate"
+    # BOTH layouts are enumerated and merged: the sandboxed seat layout
+    # (``roles/<role>/<seat>/gen_<genid>.jsonl``) and the legacy layout
+    # (``outer_<O>/<genid>/<role>.jsonl``). A run writes ONE of them, but an
+    # empty seat dir (created by a path probe) must never shadow the populated
+    # legacy one -- hence merge + dedup instead of an early return.
+    seat_dir = paths.role_traj_dir(output_dir, outer, role, seat)
+
+    def _seen(genid: Any) -> bool:
+        return any(str(row.get("genid")) == str(genid) for row in out)
+
+    if os.path.isdir(seat_dir):
+        for path in sorted(glob.glob(os.path.join(seat_dir, "gen_*.jsonl"))):
+            name = os.path.basename(path)
+            out.append({"genid": name[4:-6], "bytes": os.path.getsize(path)})
+        for path in sorted(glob.glob(os.path.join(seat_dir, "gen_*.jsonl.unredacted-*"))):
+            name = os.path.basename(path).split(".jsonl", 1)[0]
+            if not _seen(name[4:]):
+                out.append({"genid": name[4:], "quarantined": True})
+    d = paths.outer_traj_dir(output_dir, outer)
     if os.path.isdir(d):
         for name in sorted(os.listdir(d)):
             sub = os.path.join(d, name)
-            if os.path.isdir(sub):
+            if os.path.isdir(sub) and name != "roles":
                 p = os.path.join(sub, f"{role}.jsonl")
                 if os.path.isfile(p):
-                    out.append({"genid": name, "bytes": os.path.getsize(p)})
+                    if not _seen(name):
+                        out.append({"genid": name, "bytes": os.path.getsize(p)})
                 elif glob.glob(p + ".unredacted-*"):
-                    out.append({"genid": name, "quarantined": True})
+                    if not _seen(name):
+                        out.append({"genid": name, "quarantined": True})
     return out
 
 
