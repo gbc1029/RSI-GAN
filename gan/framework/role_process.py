@@ -15,6 +15,8 @@ import time
 import traceback
 from typing import Any, Dict, Optional, TextIO
 
+from gan.framework.access import SourceAccessDisabled
+
 
 _PROTOCOL_VERSION = 1
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024
@@ -415,7 +417,11 @@ class RoleProcess:
                     "kwargs": call_kwargs,
                     "has_broker": broker is not None,
                     "broker_info": ({"repo_root": broker.repo_root,
-                                     "output_dir": broker.output_dir}
+                                     "output_dir": broker.output_dir,
+                                     "deny_deep": bool(getattr(broker, "deny_deep", False)),
+                                     "deep_view_only": bool(getattr(broker, "deep_view_only", False)),
+                                     "shallow_prompt_only": bool(getattr(broker, "shallow_prompt_only", False)),
+                                     "disable_shallow": bool(getattr(broker, "disable_shallow", False))}
                                     if broker is not None else None),
                     "role_state": {
                         "attempt_id": self.attempt_id,
@@ -596,13 +602,19 @@ class _RemoteGrants:
 
 class _RemoteBroker:
     def __init__(self, reader: TextIO, writer: TextIO, call_id: int,
-                 repo_root: str, output_dir: str):
+                 repo_root: str, output_dir: str,
+                 deny_deep: bool = False, deep_view_only: bool = False,
+                 shallow_prompt_only: bool = False, disable_shallow: bool = False):
         self._reader = reader
         self._writer = writer
         self._call_id = call_id
         self._request_id = 0
         self.repo_root = repo_root
         self.output_dir = output_dir
+        self.deny_deep = deny_deep
+        self.deep_view_only = deep_view_only
+        self.shallow_prompt_only = shallow_prompt_only
+        self.disable_shallow = disable_shallow
         self.last_result: Dict[str, Any] = {}
         self.grants = _RemoteGrants(self)
 
@@ -634,6 +646,7 @@ class _RemoteBroker:
                 "PermissionError": PermissionError,
                 "ValueError": ValueError,
                 "TypeError": TypeError,
+                "SourceAccessDisabled": SourceAccessDisabled,
             }.get(name, RuntimeError)
             raise exc_type(message)
         return reply["result"]
@@ -847,10 +860,17 @@ def _worker_main() -> None:
             kwargs = dict(request["kwargs"])
             if request["has_broker"]:
                 info = request["broker_info"]
-                if not isinstance(info, dict) or set(info) != {"repo_root", "output_dir"}:
+                if not isinstance(info, dict) or set(info) != {
+                        "repo_root", "output_dir", "deny_deep", "deep_view_only",
+                        "shallow_prompt_only", "disable_shallow"}:
                     raise RoleProcessError("invalid broker info")
                 remote = _RemoteBroker(
-                    reader, protocol_writer, call_id, info["repo_root"], info["output_dir"])
+                    reader, protocol_writer, call_id,
+                    info["repo_root"], info["output_dir"],
+                    deny_deep=bool(info.get("deny_deep", False)),
+                    deep_view_only=bool(info.get("deep_view_only", False)),
+                    shallow_prompt_only=bool(info.get("shallow_prompt_only", False)),
+                    disable_shallow=bool(info.get("disable_shallow", False)))
                 index = _BROKER_POSITION[method]
                 if len(args) > index:
                     args[index] = remote
