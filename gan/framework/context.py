@@ -69,6 +69,10 @@ class EvalContext:
     # `weaknesses` is the structured comment carrier of the `trajectory_quality`
     # eval point (an audit surface).
     weaknesses: List[str] = field(default_factory=list)
+    # cost-budget state of this session, aggregated across all of its runs
+    # (blind + reveal). Mirrors the plan/self receipts' budget flags.
+    token_budget_exhausted: bool = False
+    truncated: bool = False
 
     def add_issue(self, issue: Dict[str, Any]) -> None:
         self.issues.append(issue)
