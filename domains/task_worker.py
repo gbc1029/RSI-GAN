@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import socket
+import time
 
 
 _TASK_ENV_NAMES = {
@@ -26,6 +27,8 @@ _TASK_ENV_NAMES = {
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
+    "GAN_SECURE_CAPABILITY_HOLDER",
+    "GAN_SECURE_MODE", "PYTHON_DOTENV_DISABLED",
 }
 
 
@@ -35,39 +38,84 @@ def _task_child_env(base_env):
 
 
 class _LocalRelay:
-    def __init__(self, unix_path):
+    def __init__(self, unix_path, proxy_token, max_connections=32,
+                 header_timeout_s=10.0):
         self.unix_path = unix_path
+        self.proxy_token = proxy_token
+        self.max_connections = int(max_connections)
+        self.header_timeout_s = float(header_timeout_s)
         self.listener = None
         self.port = 0
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(self.max_connections)
+        self._serve_thread = None
+        self._bridge_threads = set()
+        self._connections = set()
 
     def start(self):
+        if self.listener is not None or self._stop.is_set():
+            raise RuntimeError("LLM relay cannot be started twice")
         self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.bind(("127.0.0.1", 0))
-        self.listener.listen(32)
+        self.listener.listen(self.max_connections)
         self.port = int(self.listener.getsockname()[1])
-        threading.Thread(target=self._serve, daemon=True).start()
+        self._serve_thread = threading.Thread(target=self._serve, daemon=True)
+        self._serve_thread.start()
         return self.port
 
     def _serve(self):
-        while self.listener is not None:
+        while not self._stop.is_set():
+            listener = self.listener
+            if listener is None:
+                return
             try:
-                client, _ = self.listener.accept()
+                client, _ = listener.accept()
             except OSError:
                 return
-            threading.Thread(target=self._bridge, args=(client,), daemon=True).start()
+            if not self._slots.acquire(blocking=False):
+                client.close()
+                continue
+            thread = threading.Thread(target=self._bridge, args=(client,), daemon=True)
+            with self._lock:
+                self._connections.add(client)
+                self._bridge_threads.add(thread)
+            thread.start()
 
     def _bridge(self, client):
+        upstream = None
         try:
             upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            # The timeout is for the CONNECT phase only (fail fast on a dead
-            # socket path). It MUST be lifted before pumping: a real gateway
-            # call routinely takes >10s, and a socket.timeout in the unix->
-            # client pump silently strands the client's in-flight request
-            # while the parent proxy still completes and audits it
-            # (reproduced: audit 200 / 51s, child hung until the question
-            # wall). Mirrors the fix in gan/framework/llm_relay.py.
-            upstream.settimeout(10)
+            with self._lock:
+                self._connections.add(upstream)
+            upstream.settimeout(self.header_timeout_s)
             upstream.connect(self.unix_path)
+            deadline = time.monotonic() + self.header_timeout_s
+            header = b""
+            while b"\r\n\r\n" not in header:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("relay request header deadline exceeded")
+                client.settimeout(remaining)
+                chunk = client.recv(65536)
+                if not chunk or len(header) + len(chunk) > 128 * 1024:
+                    raise OSError("invalid relay request header")
+                header += chunk
+            raw_head, pending = header.split(b"\r\n\r\n", 1)
+            lines = raw_head.split(b"\r\n")
+            if not lines or not lines[0]:
+                raise OSError("invalid relay request line")
+            filtered = []
+            for line in lines[1:]:
+                if not line or line[:1] in b" \t" or b":" not in line:
+                    raise OSError("invalid relay request header")
+                name, _value = line.split(b":", 1)
+                if name.strip().lower() != b"authorization":
+                    filtered.append(line)
+            auth = f"Authorization: Bearer {self.proxy_token}".encode("ascii")
+            upstream.sendall(b"\r\n".join([lines[0], *filtered, auth])
+                             + b"\r\n\r\n" + pending)
+            client.settimeout(None)
             upstream.settimeout(None)
             threads = []
             for source, target in ((client, upstream), (upstream, client)):
@@ -77,10 +125,21 @@ class _LocalRelay:
                 threads.append(thread)
             for thread in threads:
                 thread.join()
-        except OSError:
+        except (OSError, TimeoutError):
             pass
         finally:
-            client.close()
+            for connection in (client, upstream):
+                if connection is None:
+                    continue
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+                with self._lock:
+                    self._connections.discard(connection)
+            with self._lock:
+                self._bridge_threads.discard(threading.current_thread())
+            self._slots.release()
 
     @staticmethod
     def _copy(source, target):
@@ -103,9 +162,36 @@ class _LocalRelay:
             return
 
     def close(self):
+        self._stop.set()
         listener, self.listener = self.listener, None
         if listener is not None:
-            listener.close()
+            try:
+                listener.close()
+            except OSError:
+                pass
+        with self._lock:
+            connections = list(self._connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+        deadline = time.monotonic() + 5.0
+        threads = ([self._serve_thread] if self._serve_thread is not None else [])
+        with self._lock:
+            threads.extend(self._bridge_threads)
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is current:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
 
 
 def _polyglot_prepare(inputs: dict) -> None:
@@ -434,14 +520,14 @@ def _run_trusted_worker() -> None:
     try:
         child_env = _task_child_env(os.environ)
         proxy_socket = payload.get("proxy_socket")
-        proxy_token = payload.get("proxy_token")
+        proxy_token = payload.pop("proxy_token", None)
         if proxy_socket:
             if not proxy_token:
                 raise RuntimeError("Task proxy socket requires a scoped token")
-            relay = _LocalRelay(proxy_socket)
+            relay = _LocalRelay(proxy_socket, proxy_token)
             port = relay.start()
             child_env["OPENAI_API_BASE"] = f"http://127.0.0.1:{port}/v1"
-            child_env["OPENAI_API_KEY"] = str(proxy_token)
+            child_env["OPENAI_API_KEY"] = "rsi-gan-local-relay"
         with tempfile.TemporaryFile(mode="w+b") as child_result_file:
             child_result_fd = child_result_file.fileno()
             child = subprocess.Popen(

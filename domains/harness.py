@@ -39,7 +39,91 @@ _TASK_ENV_NAMES = {
     # per-call client budget). The thinking-intensity knob does NOT ride the
     # env: it is threaded explicitly (CLI --reasoning_effort -> payload).
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
+    "GAN_SECURE_CAPABILITY_HOLDER",
+    "GAN_SECURE_MODE", "PYTHON_DOTENV_DISABLED",
 }
+_SANDBOX_ETC_MARKER = "/etc/.rsi-gan-sandbox"
+_SANDBOX_ETC_MARKER_CONTENT = b"RSI_GAN_SANDBOX_ETC_V1\n"
+_SANDBOX_HOSTNAME = "rsi-gan-sandbox"
+_SANDBOX_ETC_REQUIRED_FILES = {
+    ".rsi-gan-sandbox",
+    "group",
+    "hostname",
+    "hosts",
+    "localtime",
+    "nsswitch.conf",
+    "passwd",
+    "timezone",
+}
+_SANDBOX_ETC_OPTIONAL_FILES = {
+    "ld.so.cache",
+    "ssl/openssl.cnf",
+    "ssl/certs/ca-certificates.crt",
+}
+_SANDBOX_ETC_ALLOWED_DIRS = {"ssl", "ssl/certs"}
+
+
+def _etc_mount_is_read_only(device):
+    expected_device = f"{os.major(device)}:{os.minor(device)}"
+    with open("/proc/self/mountinfo", "r", encoding="ascii") as handle:
+        for line in handle:
+            fields = line.split()
+            if (len(fields) >= 6 and fields[2] == expected_device
+                    and fields[4] == "/etc"
+                    and "ro" in fields[5].split(",")):
+                return True
+    return False
+
+
+def _require_projected_etc():
+    """Refuse nested sandboxing unless the parent supplied the trusted /etc."""
+    root_info = os.lstat("/etc")
+    if (not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_IMODE(root_info.st_mode) != 0o555
+            or not _etc_mount_is_read_only(root_info.st_dev)):
+        raise RuntimeError("TaskAgent sandbox requires the sanitized /etc projection")
+
+    observed_files = set()
+    for current, directories, files in os.walk("/etc", followlinks=False):
+        relative_root = os.path.relpath(current, "/etc")
+        relative_root = "" if relative_root == "." else relative_root
+        for name in directories:
+            relative = "/".join(part for part in (relative_root, name) if part)
+            info = os.lstat(os.path.join(current, name))
+            if (relative not in _SANDBOX_ETC_ALLOWED_DIRS
+                    or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != root_info.st_uid
+                    or stat.S_IMODE(info.st_mode) != 0o555):
+                raise RuntimeError(
+                    f"TaskAgent sandbox /etc contains an unsafe directory: {relative}"
+                )
+        for name in files:
+            relative = "/".join(part for part in (relative_root, name) if part)
+            info = os.lstat(os.path.join(current, name))
+            if (relative not in (_SANDBOX_ETC_REQUIRED_FILES
+                                | _SANDBOX_ETC_OPTIONAL_FILES)
+                    or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != root_info.st_uid
+                    or stat.S_IMODE(info.st_mode) != 0o444
+                    or info.st_nlink != 1):
+                raise RuntimeError(
+                    f"TaskAgent sandbox /etc contains an unsafe file: {relative}"
+                )
+            observed_files.add(relative)
+    if not _SANDBOX_ETC_REQUIRED_FILES <= observed_files:
+        raise RuntimeError("TaskAgent sandbox /etc projection is incomplete")
+
+    fd = os.open(_SANDBOX_ETC_MARKER,
+                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        content = os.read(fd, len(_SANDBOX_ETC_MARKER_CONTENT) + 1)
+    finally:
+        os.close(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != root_info.st_uid
+            or stat.S_IMODE(info.st_mode) != 0o444 or info.st_nlink != 1
+            or content != _SANDBOX_ETC_MARKER_CONTENT):
+        raise RuntimeError("TaskAgent sandbox /etc projection marker is invalid")
 
 def _task_child_env(base_env):
     """Return a non-secret allowlist for the trusted worker and agent child."""
@@ -148,6 +232,7 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
             "TaskAgent sandbox is required, but 'bwrap' is not installed. "
             "Refusing to run TaskAgent without benchmark isolation."
         )
+    _require_projected_etc()
 
     agent_host = os.path.realpath(os.path.join(run_root, agent_path))
     _sandbox_path(run_root, agent_host)  # validates containment
@@ -186,14 +271,17 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
         "--unshare-all",
         "--unshare-net",
         "--cap-drop", "ALL",
+        "--hostname", _SANDBOX_HOSTNAME,
     ]
 
     # System runtime is read-only. No repository/data parent is mounted.
     created = {"/"}
-    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"):
+    for path in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
         if os.path.exists(path):
             command.extend(["--ro-bind", path, path])
             created.add(path)
+    command.extend(["--ro-bind", "/etc", "/etc"])
+    created.add("/etc")
 
     # Support an interpreter installed in a venv/conda prefix outside /usr
     # without exposing its parent directories.
@@ -254,6 +342,9 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
         "--setenv", "TMPDIR", "/tmp",
         "--setenv", "PWD", "/workspace/scratch",
         "--setenv", "PYTHONPATH", "/workspace",
+        "--setenv", "GAN_SECURE_CAPABILITY_HOLDER", "1",
+        "--setenv", "GAN_SECURE_MODE", "1",
+        "--setenv", "PYTHON_DOTENV_DISABLED", "1",
         sys.executable,
         "-m", "domains.task_worker",
     ])
@@ -728,7 +819,9 @@ if __name__ == "__main__":
         help="Questions-only CSV prepared by the GAN parent process.",
     )
     parser.add_argument("--proxy_socket", type=str, default=None)
-    parser.add_argument("--proxy_token", type=str, default=None)
+    parser.add_argument("--proxy_token", type=str, default=None,
+                        help="Legacy LOCAL transport (non-broker dev runs only); "
+                             "secure launches pass --proxy_token_file instead.")
     parser.add_argument(
         "--reasoning_effort", type=str, default=None,
         help="Thinking-intensity knob for reasoning models, forwarded as the "
@@ -737,6 +830,7 @@ if __name__ == "__main__":
              "gateway default. Resolved from gan/framework/models.yaml by the "
              "GAN driver.",
     )
+    parser.add_argument("--proxy_token_file", type=str, default=None)
     args = parser.parse_args()
     if args.reasoning_effort is not None:
         # Contract lives in the STDLIB-ONLY module (agent/llm_params): importing
@@ -746,6 +840,25 @@ if __name__ == "__main__":
         from agent.llm_params import REASONING_EFFORTS
         if str(args.reasoning_effort).strip().lower() not in REASONING_EFFORTS:
             parser.error(f"--reasoning_effort must be one of {list(REASONING_EFFORTS)}")
+
+    proxy_token = None
+    if args.proxy_token_file:
+        with open(args.proxy_token_file, "rb") as handle:
+            raw_token = handle.read(4097)
+        if (not raw_token or len(raw_token) > 4096 or b"\x00" in raw_token):
+            parser.error("proxy token file is invalid")
+        try:
+            proxy_token = raw_token.decode("utf-8")
+        except UnicodeDecodeError:
+            parser.error("proxy token file is invalid")
+        if not proxy_token.startswith("sk-gan-"):
+            parser.error("proxy token file is invalid")
+
+    if proxy_token is None and args.proxy_token:
+        # Legacy LOCAL transport (non-broker dev runs); never combined with a
+        # --proxy_token_file launch. The value rides argv only outside the
+        # sandboxed broker path.
+        proxy_token = args.proxy_token
 
     domain = args.domain
    # Make proofs_dname required for imo_proof_grading
@@ -769,7 +882,7 @@ if __name__ == "__main__":
             dataset_root=args.dataset_root,
             questions_path=args.questions_path,
             proxy_socket=args.proxy_socket,
-            proxy_token=args.proxy_token,
+            proxy_token=proxy_token,
             reasoning_effort=args.reasoning_effort,
             sample_seed=args.sample_seed,
             anchor_ids=([a for a in (args.anchor_ids or "").split(",") if a.strip()]
@@ -795,7 +908,7 @@ if __name__ == "__main__":
             dataset_root=args.dataset_root,
             questions_path=args.questions_path,
             proxy_socket=args.proxy_socket,
-            proxy_token=args.proxy_token,
+            proxy_token=proxy_token,
             reasoning_effort=args.reasoning_effort,
         )
 

@@ -7,6 +7,8 @@ import os
 import secrets
 import socket
 import socketserver
+import struct
+import subprocess
 import threading
 import time
 import urllib.error
@@ -22,15 +24,59 @@ def _normalize_model_name(model: Any) -> Optional[str]:
     return model[len(prefix):] if model.startswith(prefix) else model
 
 
-class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
 class _UnixHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     address_family = socket.AF_UNIX
     daemon_threads = True
-    allow_reuse_address = True
+    allow_reuse_address = False
+    max_connection_threads = 64
+    request_queue_size = 64
+
+    def server_activate(self) -> None:
+        self._connection_slots = threading.BoundedSemaphore(
+            self.max_connection_threads)
+        self._active_lock = threading.Lock()
+        self._active_requests = set()
+        super().server_activate()
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(10.0)
+        return request, address
+
+    def process_request(self, request, client_address) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        with self._active_lock:
+            self._active_requests.add(request)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            with self._active_lock:
+                self._active_requests.discard(request)
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._active_lock:
+                self._active_requests.discard(request)
+            self._connection_slots.release()
+
+    def close_active_requests(self) -> None:
+        with self._active_lock:
+            requests = list(self._active_requests)
+        for request in requests:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):
@@ -39,13 +85,44 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, *_args: Any) -> None:
         return
 
+    def setup(self) -> None:
+        super().setup()
+        self._deadline = threading.Timer(10.0, self._expire_deadline)
+        self._deadline.daemon = True
+        self._deadline.start()
+
+    def finish(self) -> None:
+        self._clear_deadline()
+        super().finish()
+
+    def _expire_deadline(self) -> None:
+        try:
+            self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _clear_deadline(self) -> None:
+        deadline = getattr(self, "_deadline", None)
+        if deadline is not None:
+            deadline.cancel()
+            self._deadline = None
+
     @property
     def proxy(self) -> "ParentLLMProxy":
         return self.server.proxy  # type: ignore[attr-defined]
 
     @property
     def is_unix(self) -> bool:
-        return bool(getattr(self.server, "is_unix", False))
+        return True
+
+    @property
+    def peer_uid(self) -> int:
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise PermissionError("LLM proxy peer credentials are unavailable")
+        credentials = self.request.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
+        return int(peer_uid)
 
     def _reply(self, status: int, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -59,6 +136,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/__gan__/issue-task":
             self._issue_task()
+            return
+        if self.path == "/__gan__/revoke":
+            self._revoke()
             return
         if self.path != "/v1/chat/completions":
             self.proxy.audit_denied(None, "unknown endpoint", self.path)
@@ -74,8 +154,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if size < 0 or size > self.proxy.max_request_bytes:
             return None
         try:
-            value = json.loads(self.rfile.read(size).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, OSError):
+            raw = self.rfile.read(size)
+        except OSError:
+            return None
+        self._clear_deadline()
+        self.request.settimeout(None)
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
             return None
         return value if isinstance(value, dict) else None
 
@@ -85,41 +171,78 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             return
         token = self.proxy._bearer(self.headers.get("Authorization"))
         scope = self.proxy.scope_for(token)
-        if not scope or scope.get("role") != "framework":
+        if (not scope or scope.get("role") != "framework"
+                or int(scope.get("peer_uid", -1)) != self.peer_uid):
             self.proxy.audit_denied(scope, "task scope registration denied", self.path)
             self._reply(403, {"error": {"message": "registration capability denied"}})
             return
         body = self._read_json()
-        if not body or not body.get("scope_id") or not body.get("model"):
-            self._reply(400, {"error": {"message": "scope_id and model are required"}})
+        if (not body or not body.get("scope_id") or not body.get("model")
+                or type(body.get("ttl_s")) not in {int, float}
+                or type(body.get("max_calls")) is not int
+                or type(body.get("peer_uid")) is not int
+                or int(body["peer_uid"]) < 1):
+            self._reply(400, {"error": {"message":
+                "scope_id, model, ttl_s, max_calls and peer_uid are required"}})
             return
-        self._reply(200, {"token": self.proxy.issue_scope(
-            "task", str(body["scope_id"]), str(body["model"]))})
+        try:
+            issued = self.proxy.issue_scope(
+                "task", str(body["scope_id"]), str(body["model"]),
+                ttl_s=float(body["ttl_s"]), max_calls=int(body["max_calls"]),
+                peer_uid=int(body["peer_uid"]),
+            )
+        except ValueError as exc:
+            self._reply(400, {"error": {"message": str(exc)}})
+            return
+        self._reply(200, {"token": issued})
+
+    def _revoke(self) -> None:
+        if not self.is_unix:
+            self._reply(403, {"error": {"message": "framework revoke requires Unix transport"}})
+            return
+        control = self.proxy._bearer(self.headers.get("Authorization"))
+        scope = self.proxy.scope_for(control)
+        if (not scope or scope.get("role") != "framework"
+                or int(scope.get("peer_uid", -1)) != self.peer_uid):
+            self.proxy.audit_denied(scope, "scope revoke denied", self.path)
+            self._reply(403, {"error": {"message": "revoke capability denied"}})
+            return
+        body = self._read_json()
+        token = body.get("token") if body else None
+        if not isinstance(token, str) or not token:
+            self._reply(400, {"error": {"message": "token is required"}})
+            return
+        self.proxy.revoke_scope(token)
+        self._reply(200, {"revoked": True})
 
 
 class ParentLLMProxy:
-    """Per-run proxy serving TCP and Unix-socket transports."""
+    """Per-run proxy serving only an ACL-restricted Unix socket."""
 
     def __init__(self, output_dir: str, socket_path: str, *,
                  upstream_base: Optional[str] = None,
                  upstream_key: Optional[str] = None,
                  models: Optional[Dict[str, str]] = None,
-                 timeout: float = 120.0) -> None:
+                 timeout: float = 120.0,
+                 socket_uids: Optional[list[int]] = None,
+                 setfacl_path: Optional[str] = None) -> None:
         self.output_dir = os.path.abspath(output_dir)
         self.socket_path = os.path.abspath(socket_path)
         self.upstream_base = (upstream_base or os.environ.get("OPENAI_API_BASE") or "").rstrip("/")
         self.upstream_key = upstream_key or os.environ.get("OPENAI_API_KEY") or ""
         self.models = dict(models or {})
         self.timeout = float(timeout)
+        self.socket_uids = sorted(set(int(uid) for uid in (socket_uids or [])))
+        self.setfacl_path = setfacl_path
         self.max_request_bytes = 8 * 1024 * 1024
         self._tokens: Dict[str, Dict[str, Any]] = {}
         self._token_lock = threading.Lock()
         self._audit_lock = threading.Lock()
-        self._servers = []
-        self._threads = []
+        self._server: Optional[_UnixHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
         self._inflight: Dict[str, int] = {}
         self._max_inflight = 32
-        self.tcp_port = 0
 
     @property
     def audit_path(self) -> str:
@@ -138,19 +261,49 @@ class ParentLLMProxy:
     def audit_denied(self, scope: Optional[Dict[str, Any]], reason: str, path: str) -> None:
         scope = scope or {}
         self._audit({"role": scope.get("role"), "scope_type": scope.get("scope_type"),
-                     "scope_id": scope.get("scope_id"), "model": scope.get("model"),
+                     "scope_id": scope.get("scope_id"), "seat": scope.get("seat"),
+                     "model": scope.get("model"),
                      "status": 403, "allow": False, "reason": reason, "path": path})
 
-    def issue_scope(self, role: str, scope_id: str, model: str) -> str:
+    def issue_scope(self, role: str, scope_id: str, model: str, *,
+                    seat: Optional[str] = None,
+                    ttl_s: Optional[float] = None,
+                    max_calls: Optional[int] = None,
+                    peer_uid: Optional[int] = None) -> str:
+        role_seats = {
+            "planner": {"plan", "self_improve"},
+            "evaluator": {"evaluate", "self_improve"},
+        }
+        if role in role_seats:
+            if seat not in role_seats[role]:
+                raise ValueError(f"invalid LLM proxy seat for {role}: {seat!r}")
+        elif seat is not None:
+            raise ValueError(f"LLM proxy seat is not valid for role {role!r}")
+        if role == "task":
+            if ttl_s is None or ttl_s <= 0:
+                raise ValueError("task LLM scope TTL must be positive")
+            if max_calls is None or max_calls < 1:
+                raise ValueError("task LLM scope call budget must be positive")
+        elif ttl_s is not None or max_calls is not None:
+            raise ValueError("TTL and call budget are valid only for task scopes")
+        expected_uid = os.geteuid() if peer_uid is None else int(peer_uid)
+        if expected_uid < 0:
+            raise ValueError("LLM proxy peer uid must be non-negative")
         token = "sk-gan-" + secrets.token_urlsafe(32)
         with self._token_lock:
             self._tokens[token] = {"role": str(role),
                                    "scope_type": "genid" if role == "task" else "outer",
-                                   "scope_id": str(scope_id), "model": str(model)}
+                                   "scope_id": str(scope_id), "seat": seat,
+                                   "model": str(model),
+                                   "peer_uid": expected_uid,
+                                   "expires_at": (time.monotonic() + float(ttl_s)
+                                                  if ttl_s is not None else None),
+                                   "remaining_calls": max_calls,
+                                   "revoked": False}
         return token
 
-    def issue_framework_scope(self, outer: int) -> str:
-        return self.issue_scope("framework", str(outer), "")
+    def issue_framework_scope(self, outer: int, *, peer_uid: Optional[int] = None) -> str:
+        return self.issue_scope("framework", str(outer), "", peer_uid=peer_uid)
 
     def scope_for(self, token: Optional[str]) -> Optional[Dict[str, Any]]:
         if not token:
@@ -159,6 +312,37 @@ class ParentLLMProxy:
             scope = self._tokens.get(token)
             return dict(scope) if scope else None
 
+    def revoke_scope(self, token: str) -> None:
+        with self._token_lock:
+            scope = self._tokens.get(token)
+            if scope is not None:
+                scope["revoked"] = True
+
+    def _authorize_completion(self, token: Optional[str], peer_uid: int
+                              ) -> tuple[Optional[Dict[str, Any]], str]:
+        if not token:
+            return None, "invalid or non-agent capability token"
+        with self._token_lock:
+            scope = self._tokens.get(token)
+            if scope is None or scope.get("role") not in {"task", "planner", "evaluator"}:
+                return (dict(scope) if scope else None,
+                        "invalid or non-agent capability token")
+            if int(scope.get("peer_uid", -1)) != int(peer_uid):
+                return dict(scope), "proxy capability peer uid mismatch"
+            if scope.get("revoked"):
+                return dict(scope), "revoked proxy capability"
+            expires_at = scope.get("expires_at")
+            if expires_at is not None and time.monotonic() >= float(expires_at):
+                scope["revoked"] = True
+                return dict(scope), "expired proxy capability"
+            remaining = scope.get("remaining_calls")
+            if remaining is not None:
+                if int(remaining) < 1:
+                    scope["revoked"] = True
+                    return dict(scope), "proxy call budget exhausted"
+                scope["remaining_calls"] = int(remaining) - 1
+            return dict(scope), ""
+
     @staticmethod
     def _bearer(value: Optional[str]) -> Optional[str]:
         if not value or not value.startswith("Bearer "):
@@ -166,32 +350,57 @@ class ParentLLMProxy:
         token = value[7:].strip()
         return token or None
 
-    def start(self) -> None:
+    def bind(self) -> None:
+        if self._server is not None:
+            raise RuntimeError("LLM proxy socket is already bound")
         os.makedirs(os.path.dirname(self.socket_path), exist_ok=True)
-        if os.path.exists(self.socket_path):
-            if not stat_is_socket(self.socket_path):
-                raise RuntimeError(f"LLM proxy socket path is not a socket: {self.socket_path}")
-            os.unlink(self.socket_path)
-        tcp = _ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
-        tcp.proxy = self
-        tcp.is_unix = False
+        if os.path.lexists(self.socket_path):
+            raise RuntimeError(f"LLM proxy socket path already exists: {self.socket_path}")
         unix = _UnixHTTPServer(self.socket_path, _ProxyHandler)
         unix.proxy = self
-        unix.is_unix = True
-        os.chmod(self.socket_path, 0o666)
-        self._servers = [tcp, unix]
-        self.tcp_port = int(tcp.server_address[1])
-        for server in self._servers:
-            thread = threading.Thread(target=server.serve_forever,
-                                      name="rsi-gan-llm-proxy", daemon=True)
-            thread.start()
-            self._threads.append(thread)
+        try:
+            os.chmod(self.socket_path, 0o600)
+            if self.socket_uids:
+                if not self.setfacl_path:
+                    raise RuntimeError("LLM proxy socket ACL tool is missing")
+                for uid in self.socket_uids:
+                    subprocess.run(
+                        [self.setfacl_path, "-m", f"u:{uid}:rw", self.socket_path],
+                        check=True, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+        except Exception:
+            unix.server_close()
+            try:
+                os.unlink(self.socket_path)
+            except OSError:
+                pass
+            raise
+        self._server = unix
+
+    def start(self) -> None:
+        if self._server is None:
+            self.bind()
+        if self._started:
+            raise RuntimeError("LLM proxy is already running")
+        assert self._server is not None
+        thread = threading.Thread(target=self._server.serve_forever,
+                                  name="rsi-gan-llm-proxy", daemon=True)
+        thread.start()
+        self._thread = thread
+        self._started = True
 
     def close(self) -> None:
-        for server in self._servers:
-            server.shutdown()
+        server, self._server = self._server, None
+        if server is not None:
+            if self._started:
+                server.shutdown()
+            server.close_active_requests()
             server.server_close()
-        self._servers = []
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=5)
+        self._started = False
         try:
             if os.path.exists(self.socket_path):
                 os.unlink(self.socket_path)
@@ -200,9 +409,9 @@ class ParentLLMProxy:
 
     def handle_completion(self, handler: _ProxyHandler) -> None:
         token = self._bearer(handler.headers.get("Authorization"))
-        scope = self.scope_for(token)
-        if not scope or scope.get("role") not in {"task", "planner", "evaluator"}:
-            self.audit_denied(scope, "invalid or non-agent capability token", handler.path)
+        scope, denied = self._authorize_completion(token, handler.peer_uid)
+        if denied:
+            self.audit_denied(scope, denied, handler.path)
             handler._reply(403, {"error": {"message": "invalid proxy capability"}})
             return
         body = handler._read_json()
@@ -277,40 +486,48 @@ class ParentLLMProxy:
                          "reasoning_effort": body.get("reasoning_effort"),
                          "latency_ms": round((time.monotonic() - started) * 1000, 2)})
 
-
-
-
-
-def stat_is_socket(path: str) -> bool:
-    try:
-        return (os.stat(path).st_mode & 0o170000) == 0o140000
-    except OSError:
-        return False
-
-
-def request_task_token(socket_path: str, control_token: str, scope_id: str, model: str) -> str:
-    """Ask the parent proxy for one generation-bound task capability."""
-    body = json.dumps({"scope_id": str(scope_id), "model": str(model)}).encode("utf-8")
+def _control_request(socket_path: str, control_token: str, path: str,
+                     body: Dict[str, Any]) -> Dict[str, Any]:
+    encoded = json.dumps(body).encode("utf-8")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         sock.settimeout(10)
         sock.connect(socket_path)
-        request = (b"POST /__gan__/issue-task HTTP/1.1\r\n"
-                   b"Host: localhost\r\n"
+        request = (f"POST {path} HTTP/1.1\r\n".encode("ascii")
+                   + b"Host: localhost\r\n"
                    + f"Authorization: Bearer {control_token}\r\n".encode("ascii")
                    + b"Content-Type: application/json\r\n"
-                   + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
-                   + body)
+                   + f"Content-Length: {len(encoded)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                   + encoded)
         sock.sendall(request)
         response = http.client.HTTPResponse(sock)
         response.begin()
         raw = response.read(1024 * 1024)
         if response.status != 200:
-            raise RuntimeError(f"proxy task scope registration denied (HTTP {response.status})")
+            raise RuntimeError(f"proxy control request denied (HTTP {response.status})")
         payload = json.loads(raw.decode("utf-8"))
-        token = payload.get("token") if isinstance(payload, dict) else None
-        if not isinstance(token, str) or not token:
-            raise RuntimeError("proxy task scope registration returned no token")
-        return token
+        if not isinstance(payload, dict):
+            raise RuntimeError("proxy control request returned an invalid response")
+        return payload
     finally:
         sock.close()
+
+
+def request_task_token(socket_path: str, control_token: str, scope_id: str,
+                       model: str, *, ttl_s: float, max_calls: int,
+                       peer_uid: int) -> str:
+    """Ask the parent proxy for one generation-bound task capability."""
+    payload = _control_request(socket_path, control_token, "/__gan__/issue-task", {
+        "scope_id": str(scope_id), "model": str(model),
+        "ttl_s": float(ttl_s), "max_calls": int(max_calls),
+        "peer_uid": int(peer_uid),
+    })
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("proxy task scope registration returned no token")
+    return token
+
+
+def revoke_token(socket_path: str, control_token: str, token: str) -> None:
+    """Revoke an issued agent capability through the framework-only channel."""
+    _control_request(socket_path, control_token, "/__gan__/revoke", {"token": token})

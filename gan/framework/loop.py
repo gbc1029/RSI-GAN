@@ -522,7 +522,19 @@ class GanLoop:
                                      if k in cm_sum}
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass
-            cost_ledger.append_session_cost(self.output_dir, rec)
+            # 幂等：同 key 记录已存在时不重复写入文件（防止 reconcile 重复
+            # 结算产生重复行）。复用已有记录并保留会话级记账与事件暴露。
+            key = (rec.get("role"), rec.get("seat"),
+                   str(rec.get("outer")), str(rec.get("genid")), rec.get("attempt"))
+            existing = [
+                old for old in cost_ledger.read_session_costs(self.output_dir)
+                if (old.get("role"), old.get("seat"),
+                    str(old.get("outer")), str(old.get("genid")), old.get("attempt")) == key
+            ]
+            if existing:
+                rec = existing[-1]
+            else:
+                cost_ledger.append_session_cost(self.output_dir, rec)
             self._session_costs.append(rec)
             self.log_event({"type": "cost_session",
                             **{k: rec.get(k) for k in
@@ -634,10 +646,19 @@ class GanLoop:
         if not self.record_usage:
             return ""
         try:
+            # cost×score per-round alignment: map every generation already
+            # settled this outer to its measured score, so the statement can
+            # pair each round's spend with its result (n/a when unpublished).
+            scores_by_genid = {}
+            for node in self.task_tree.nodes.values():
+                score = getattr(node.value, "score", None)
+                if score is not None:
+                    scores_by_genid[str(node.genid)] = score
             return cost_ledger.render_self_statement(
                 role=role, outer=outer,
                 own_sessions=cost_ledger.self_session_costs(self.output_dir, outer, role),
-                own_last=cost_ledger.latest_session_cost(self.output_dir, role, "self_improve"))
+                own_last=cost_ledger.latest_session_cost(self.output_dir, role, "self_improve"),
+                scores_by_genid=scores_by_genid)
         except Exception as e:  # noqa: BLE001 -- advisory, never fatal
             soft_fail(f"self-improve cost statement build failed ({role}): {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -975,6 +996,9 @@ class GanLoop:
         # resolves the OUTER-level file exactly once), otherwise session content
         # and stop records can land on different names. Signature probing keeps
         # legacy single-arg factories (tests, injected instances) working.
+        if self.broker is not None:
+            for role in ("planner", "evaluator"):
+                self.broker.clear_workspace(role)
         for name, factory in (("planner", self.planner_factory),
                               ("evaluator", self.evaluator_factory)):
             if factory is None:
@@ -987,9 +1011,13 @@ class GanLoop:
                 ) or any(p.kind == p.VAR_POSITIONAL for p in params.values())
             except (TypeError, ValueError):
                 accepts_attempt = False
-            setattr(self, name,
-                    factory(outer, self._attempt) if accepts_attempt
-                    else factory(outer))
+            previous = getattr(self, name, None)
+            replacement = (factory(outer, self._attempt) if accepts_attempt
+                           else factory(outer))
+            setattr(self, name, replacement)
+            close = getattr(previous, "close", None)
+            if previous is not replacement and callable(close):
+                close()
         for inst in (self.planner, self.evaluator):
             try:
                 inst.attempt_id = self._attempt
@@ -1003,20 +1031,6 @@ class GanLoop:
             except Exception as e:
                 soft_fail(f"tool_timeout_s stamp failed for "
                           f"{getattr(inst, 'role', '?')}: {e}")
-        if self.broker is not None:
-            for role in ("planner", "evaluator"):
-                try:
-                    self.broker.clear_workspace(role)
-                except Exception as e:
-                    # The broker dropped this role's grants, so stale copies
-                    # cannot enter a patch -- but their bytes stay on disk, and a
-                    # later default grant keeps them (if_absent). Do not continue
-                    # this outer unattended.
-                    soft_fail(f"clear_workspace failed for {role}: {e} — stale "
-                              f"copies may linger on disk; the role's grants were "
-                              f"dropped so they cannot enter a patch, but a "
-                              f"default (if_absent) re-grant keeps them — do not "
-                              f"continue this outer unattended")
         self.log_event({"type": "role_refresh", "outer": outer})
 
     def _source_access_log(self, outer: Any) -> List[Dict[str, Any]]:
@@ -1025,9 +1039,10 @@ class GanLoop:
             return []
         akey = f"outer_{outer}"
         out: List[Dict[str, Any]] = []
-        for role in ("planner", "evaluator"):
-            out.extend(self.broker.grants.get((role, akey), []))
-            out.extend(self.broker.grants.get((role, str(akey)), []))
+        for role, seats in (("planner", ("plan", "self_improve")),
+                            ("evaluator", ("evaluate", "self_improve"))):
+            for seat in seats:
+                out.extend(self.broker.grants.get((role, f"{akey}__{seat}"), []))
         return out
 
     def _append_score(self, child: Node) -> None:
@@ -1118,9 +1133,10 @@ class GanLoop:
             return
         akey = f"outer_{outer}"
         sync_failures: List[str] = []
-        for role in ("planner", "evaluator"):
+        for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
+            seat_key = f"{akey}__{seat}"
             try:
-                src = self.broker.src_dir(role, akey)
+                src = self.broker.src_dir(role, seat_key)
             except Exception as e:
                 sync_failures.append(f"src_dir({role}): {e}")
                 continue
@@ -1245,9 +1261,10 @@ class GanLoop:
             cost = dict(cost or {})
             cost["clamped"] = ck_clamped
         refs = [
-            paths.session_traj_file(self.output_dir, outer, genid, "planner"),
+            paths.session_traj_file(self.output_dir, outer, genid, "planner", seat="plan"),
             paths.session_traj_file(self.output_dir, outer, genid, "task"),
-            paths.session_traj_file(self.output_dir, outer, genid, "evaluator"),
+            paths.session_traj_file(self.output_dir, outer, genid, "evaluator",
+                                    seat="evaluate"),
         ]
         rec = build_receipt(
             genid=genid, role="planner", stage="plan",

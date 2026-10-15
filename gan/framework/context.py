@@ -69,6 +69,10 @@ class EvalContext:
     # `weaknesses` is the structured comment carrier of the `trajectory_quality`
     # eval point (an audit surface).
     weaknesses: List[str] = field(default_factory=list)
+    # cost-budget state of this session, aggregated across all of its runs
+    # (blind + reveal). Mirrors the plan/self receipts' budget flags.
+    token_budget_exhausted: bool = False
+    truncated: bool = False
 
     def add_issue(self, issue: Dict[str, Any]) -> None:
         self.issues.append(issue)
@@ -166,6 +170,11 @@ class AccessContext:
     # id); the self seat declares {O, O-1}. Presentation (``session_cm_mode``)
     # never widens this set, and redaction stays the sole content filter.
     session_outers: Optional[frozenset] = None
+    # fix3 sandbox lifecycle flag: set False by the framework's
+    # begin/end_session bracket (access.py); tools and the workspace face
+    # consult it to refuse work on a closed session. Framework-owned,
+    # never agent-provided.
+    active: bool = True
 
     def __post_init__(self) -> None:
         from gan.framework.frozen import assert_seat
@@ -185,10 +194,14 @@ def set_access_context(broker, role: str, node_id: Any, trajectory_genids=None, 
 
 
 def get_access_context() -> Optional[AccessContext]:
-    return _ACCESS_CTX.get()
+    value = _ACCESS_CTX.get()
+    return value if value is not None and value.active else None
 
 
 def reset_access_context(token) -> None:
+    value = _ACCESS_CTX.get()
+    if value is not None:
+        value.active = False
     _ACCESS_CTX.reset(token)
 
 

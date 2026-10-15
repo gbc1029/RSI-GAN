@@ -2,6 +2,7 @@ import contextlib
 import contextvars
 import concurrent.futures as _cfutures
 import io
+import os
 import re
 import sys
 import json
@@ -15,15 +16,9 @@ from utils import trajectory_log
 # --- tool-execution packaging (C1/C2/C3) -------------------------------------
 # The tool loop's ONLY execution chokepoint is ``process_tool_call``, so the
 # dispatch-level safety net lives here, not inside each tool:
-#   C1 -- one wedged call must not sink the session: hard timeout per call
-#         (the killer thread CANNOT be cancelled -- Python threads are not
-#         killable -- so a timed-out call keeps running in the background and
-#         the per-tool wedge breaker below bounds the leak to
-#         ``max_workers + per-tool wedge limit``). Known residue: worker
-#         threads are NON-daemon, so interpreter exit joins them -- a wedged
-#         tool can delay process shutdown by up to its own completion time.
-#         Bounded in practice: the harness/outer timeouts already cap the
-#         enclosing process.
+#   C1 -- one wedged call must not retain a secure capability. Python threads
+#         cannot be cancelled, so secure role/task holders exit on timeout;
+#         legacy callers keep the bounded per-tool wedge breaker below.
 #   C2 -- a tool returning megabytes must not eat the context window: a
 #         CENTRAL cap with an explicit in-band marker (never silent).
 #   C3 -- tool ``print`` output is captured out of the loop's log stream and
@@ -219,6 +214,8 @@ def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
         # swallowing the main thread's output immediately
         proc_out.release()
         proc_err.release()
+        if os.environ.get("GAN_SECURE_CAPABILITY_HOLDER") == "1":
+            os._exit(124)
         meta["wedges"] = meta.get("wedges", 0) + 1
         wedged, limit = meta["wedges"], _WEDGE_DISABLE_LIMIT
         if wedged >= limit:

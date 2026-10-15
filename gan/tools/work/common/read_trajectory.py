@@ -23,7 +23,6 @@ import os
 from typing import Optional
 
 from gan.framework.context import get_access_context
-from gan.framework.trajectory import read
 
 
 def tool_info():
@@ -220,9 +219,12 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
     actx = get_access_context()
     if actx is None:
         return "Error: no access context"
-    output_dir = getattr(actx.broker, "output_dir", None) if actx.broker is not None else None
-    if not output_dir:
-        return "Error: no output directory available"
+    broker = actx.broker
+    # Sandboxed seat workers carry the RPC broker (method present);
+    # in-process sessions carry the plain AccessBroker and read files
+    # directly. Both are valid -- only a missing broker is fatal.
+    if broker is None:
+        return "Error: parent trajectory reader is unavailable"
     allowed = list(getattr(actx, "trajectory_genids", []) or [])
     if not allowed:
         return "No task trajectory is visible for this session."
@@ -230,6 +232,22 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         genid = allowed[0]
     if genid not in allowed and str(genid) not in [str(g) for g in allowed]:
         return f"Error: generation '{genid}' is not visible (allowed: {allowed})."
+    output_dir = getattr(actx.broker, "output_dir", None) if actx.broker is not None else None
+    if hasattr(broker, "session_trajectory_index"):
+        # Sandboxed seat worker: the blob crosses the parent-side RPC and
+        # redaction stays parent-side; kind=/tool=/flag=/offset=/fetch= are
+        # in-process slice-mode faces and degrade here (noted, never ignored).
+        extra = ("# note: kind=/tool=/flag=/offset=/fetch= are in-process "
+                 "slice-mode faces; a sandboxed seat worker reads the full "
+                 "redacted blob\n") if (kind or tool or flag or offset or fetch) else ""
+        blob = broker.read_trajectory(actx.role, actx.node_id, genid,
+                                      int(max_chars or 6000), seat=actx.seat)
+        if not blob:
+            return f"No archived trajectory for generation {genid}."
+        return extra + f"# generation {genid} trajectory\n{blob}"
+
+    if not output_dir:
+        return "Error: parent trajectory root is unavailable"
     cap = int(max_chars or 6000)
     mode = _session_cm_mode(actx)
     slice_mode = mode in ("slice", "compact_conservative", "custom")

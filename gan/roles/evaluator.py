@@ -124,6 +124,15 @@ class Evaluator(Role):
         own design through the frozen cost-key table and passes them here.
         """
         ctx = EvalContext()
+        tb_exhausted_any = False
+        truncated_any = False
+
+        def _absorb_flush_flags() -> None:
+            nonlocal tb_exhausted_any, truncated_any
+            info = getattr(self, "last_run_info", {}) or {}
+            tb_exhausted_any = tb_exhausted_any or bool(info.get("token_budget_exhausted"))
+            truncated_any = truncated_any or bool(info.get("truncated"))
+
         tok_eval = set_eval_context(ctx)
         akey = self.access_key(node_id)
         tok_access = (set_access_context(broker, "evaluator", akey,
@@ -141,6 +150,7 @@ class Evaluator(Role):
                             max_tool_calls=blind_cap,
                             tool_repeat_limit=tool_repeat_limit,
                             trajectory_file=self.session_trajectory(node_id))
+            _absorb_flush_flags()
             if benchmark_score is not None:
                 self.run(
                     self._reveal_instruction(benchmark_score),
@@ -149,10 +159,14 @@ class Evaluator(Role):
                     tool_repeat_limit=tool_repeat_limit,
                     trajectory_file=self.session_trajectory(node_id),
                 )
+                _absorb_flush_flags()
         finally:
             reset_eval_context(tok_eval)
             if tok_access is not None:
                 reset_access_context(tok_access)
+        # budget state of the session, aggregated across blind and reveal runs
+        ctx.token_budget_exhausted = tb_exhausted_any
+        ctx.truncated = truncated_any
         # evaluate adds no warn_dropped epilogue: it is read-only by design
         # (deep write verbs refuse in patch-less sessions at the tool layer),
         # so no "should have landed" workspace content can exist.

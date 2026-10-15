@@ -22,24 +22,28 @@ import json
 import math
 import os
 import random
+from pathlib import PurePosixPath
 import shutil
+import stat
 import subprocess
 import sys
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from gan.design.store import DesignStore
+from gan.framework.sandbox_etc import SANDBOX_HOSTNAME, validate_sandbox_etc
 from gan.patch import apply_patch
 from gan.tools.assembly import assemble_tools_dir_reported
 
-_PY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
+_PY_IGNORE = shutil.ignore_patterns(".env", "__pycache__", "*.pyc")
 # Benchmark labels / heavy assets must NOT be present in a task run (leakage
 # isolation). The parent harness reads labels from an explicit CLI path that is
 # never forwarded to the sandboxed task worker.
 _DOMAIN_IGNORE = shutil.ignore_patterns(
     "dataset*.csv", "*bench*.csv", "polyglot-benchmark", "SWE-bench",
-    "saved", "predictions", "logs", "__pycache__", "*.pyc",
+    "saved", "predictions", "logs", ".env", "__pycache__", "*.pyc",
 )
 # Allowlist of what a task run actually needs (never copy the whole repo).
 _RUNTIME_FILES = ["task_agent.py"]
@@ -55,8 +59,13 @@ _HARNESS_FILES = [
     "domains/report.py",
     "domains/task_worker.py",
 ]
-_PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
+_PARENT_SCORED_DOMAINS = {
+    "paper_review", "search_arena", "imo_grading", "polyglot",
+}
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
+_SANDBOX_PROFILE_KEYS = {
+    "enabled", "disabled_reason", "network", "gpu", "read_only_assets",
+}
 
 _TASK_ENV_NAMES = {
     "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -68,6 +77,7 @@ _TASK_ENV_NAMES = {
     # GAN_CM_EVENTS is the child's seam-audit sidecar (rw bind, §11.5)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
                       "GAN_CM_EVENTS",
+    "GAN_SECURE_MODE", "PYTHON_DOTENV_DISABLED",
     # timeout plumbing (consumers: domains/harness.py QUESTION_TIMEOUT,
     # agent/llm.py per-call client budget)
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -75,7 +85,7 @@ _TASK_ENV_NAMES = {
     "LITELLM_LOCAL_MODEL_COST_MAP",
 }
 _TASK_PARENT_ENV_NAMES = _TASK_ENV_NAMES | {
-    "GAN_LLM_PROXY_UNIX", "GAN_TASK_BROKER_UNIX", "GAN_TASK_BROKER_TOKEN",
+    "GAN_LLM_PROXY_UNIX", "GAN_TASK_BROKER_UNIX", "GAN_TASK_BROKER_OUTER",
 }
 
 def _task_safe_env(base_env: Dict[str, str]) -> Dict[str, str]:
@@ -89,17 +99,94 @@ def _task_parent_env(base_env: Dict[str, str]) -> Dict[str, str]:
             if key in _TASK_PARENT_ENV_NAMES or key.startswith("LC_")}
 
 
+def validate_domain_sandbox_profile(
+    domain: str,
+    profile: Any,
+    repo_root: str,
+) -> Dict[str, Any]:
+    """Validate and canonicalize the trusted per-domain harness policy."""
+    if not isinstance(profile, dict):
+        raise RuntimeError(f"domain {domain!r} has no sandbox profile")
+    unknown = set(profile) - _SANDBOX_PROFILE_KEYS
+    missing = _SANDBOX_PROFILE_KEYS - set(profile)
+    if unknown or missing:
+        raise RuntimeError(
+            f"domain {domain!r} has invalid sandbox profile fields "
+            f"(unknown={sorted(unknown)}, missing={sorted(missing)})"
+        )
+    if not isinstance(profile["enabled"], bool):
+        raise RuntimeError(f"domain {domain!r} sandbox enabled must be boolean")
+    reason = profile["disabled_reason"]
+    if reason is not None and not isinstance(reason, str):
+        raise RuntimeError(f"domain {domain!r} sandbox disabled_reason must be text or null")
+    if profile["network"] != "none":
+        raise RuntimeError(f"domain {domain!r} sandbox network must be 'none'")
+    if profile["gpu"] not in {"none", "wsl_cuda"}:
+        raise RuntimeError(f"domain {domain!r} sandbox gpu mode is unsupported")
+    assets = profile["read_only_assets"]
+    if not isinstance(assets, list) or any(not isinstance(item, str) for item in assets):
+        raise RuntimeError(f"domain {domain!r} sandbox read_only_assets must be a string list")
+
+    root = os.path.realpath(os.path.abspath(repo_root))
+    resolved_assets: List[str] = []
+    for relative in assets:
+        posix_path = PurePosixPath(relative)
+        if (not relative or "\\" in relative or posix_path.is_absolute() or
+                any(part in {"", ".", ".."} for part in posix_path.parts)):
+            raise RuntimeError(
+                f"domain {domain!r} has unsafe sandbox asset path: {relative!r}"
+            )
+        candidate = root
+        for part in posix_path.parts:
+            candidate = os.path.join(candidate, part)
+            if os.path.islink(candidate):
+                raise RuntimeError(
+                    f"domain {domain!r} sandbox asset contains a symlink: {relative!r}"
+                )
+        resolved = os.path.realpath(candidate)
+        try:
+            contained = os.path.commonpath([root, resolved]) == root
+        except ValueError:
+            contained = False
+        if not contained or resolved == root or not os.path.exists(resolved):
+            raise RuntimeError(
+                f"domain {domain!r} sandbox asset is missing or escapes repo_root: "
+                f"{relative!r}"
+            )
+        if resolved in resolved_assets:
+            raise RuntimeError(f"domain {domain!r} sandbox asset is duplicated: {relative!r}")
+        resolved_assets.append(resolved)
+
+    if not profile["enabled"]:
+        detail = (reason or "no reason supplied").strip()
+        raise RuntimeError(f"domain {domain!r} sandbox profile is disabled: {detail}")
+    if profile["gpu"] != "none":
+        raise RuntimeError(
+            f"domain {domain!r} requests {profile['gpu']!r}, but GPU sandbox exposure "
+            "is not configured or verified"
+        )
+    return {
+        "network": "none",
+        "gpu": "none",
+        "read_only_assets": resolved_assets,
+    }
+
+
 
 # Keep this probe deliberately small. It runs under the exact credentials and
-# interpreter used for the questions-only harness, so an inaccessible venv or
-# conda prefix is reported before Python emits an opaque init_fs_encoding error.
+# interpreter used for the sandboxed harness, so an inaccessible venv or conda
+# prefix is reported before Python emits an opaque init_fs_encoding error.
 _SANDBOX_RUNTIME_PREFLIGHT = r"""
+import errno
 import json
 import os
 import sys
 
 expected_euid = int(sys.argv[1])
 expected_egid = int(sys.argv[2])
+run_dir = sys.argv[3]
+output_dir = sys.argv[4]
+run_read_only = sys.argv[5] == "1"
 errors = []
 if os.geteuid() != expected_euid:
     errors.append("euid=%s (expected %s)" % (os.geteuid(), expected_euid))
@@ -107,24 +194,28 @@ if os.getegid() != expected_egid:
     errors.append("egid=%s (expected %s)" % (os.getegid(), expected_egid))
 
 no_new_privs = None
-cap_eff = None
+capability_names = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
+capabilities = {name: None for name in capability_names}
 try:
     with open("/proc/self/status", encoding="ascii") as status_file:
         for line in status_file:
             if line.startswith("NoNewPrivs:"):
                 no_new_privs = line.split(":", 1)[1].strip()
-            elif line.startswith("CapEff:"):
-                cap_eff = line.split(":", 1)[1].strip()
+            else:
+                name = line.split(":", 1)[0]
+                if name in capabilities:
+                    capabilities[name] = line.split(":", 1)[1].strip()
 except OSError as exc:
     errors.append("cannot read /proc/self/status: %s" % exc)
 if no_new_privs != "1":
     errors.append("NoNewPrivs=%s (expected 1)" % no_new_privs)
-try:
-    effective_capabilities = int(cap_eff or "-1", 16)
-except ValueError:
-    effective_capabilities = -1
-if effective_capabilities != 0:
-    errors.append("CapEff=%s (expected 0)" % cap_eff)
+for name, value in capabilities.items():
+    try:
+        capability_value = int(value or "-1", 16)
+    except ValueError:
+        capability_value = -1
+    if capability_value != 0:
+        errors.append("%s=%s (expected 0)" % (name, value))
 
 try:
     import encodings  # noqa: F401
@@ -141,11 +232,36 @@ if not sys.prefix or not os.path.isdir(sys.prefix):
 elif not os.access(sys.prefix, os.R_OK | os.X_OK):
     errors.append("sys.prefix is not accessible: %s" % sys.prefix)
 
+if not os.path.isdir(run_dir) or not os.access(run_dir, os.R_OK | os.X_OK):
+    errors.append("run directory is not readable/traversable: %s" % run_dir)
+elif run_read_only:
+    read_only_probe = os.path.join(run_dir, ".gan_ro_probe_%s" % os.getpid())
+    try:
+        probe_fd = os.open(read_only_probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            errors.append("unexpected run-directory write failure: %s" % exc)
+    else:
+        os.close(probe_fd)
+        os.unlink(read_only_probe)
+        errors.append("run directory is writable inside the harness sandbox")
+if not os.path.isdir(output_dir) or not os.access(output_dir, os.R_OK | os.W_OK | os.X_OK):
+    errors.append("output directory is not readable/writable/traversable: %s" % output_dir)
+else:
+    probe_path = os.path.join(output_dir, ".gan_acl_probe_%s" % os.getpid())
+    try:
+        probe_fd = os.open(probe_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(probe_fd)
+        os.unlink(probe_path)
+    except OSError as exc:
+        errors.append("cannot create output ACL probe: %s" % exc)
+
 print(json.dumps({
     "euid": os.geteuid(),
     "egid": os.getegid(),
     "no_new_privs": no_new_privs,
-    "cap_eff": cap_eff,
+    "cap_eff": capabilities["CapEff"],
+    "capabilities": capabilities,
     "executable": sys.executable,
     "prefix": sys.prefix,
     "errors": errors,
@@ -179,7 +295,7 @@ def heal_design_keys(config: Dict[str, Any], role: str,
     return stripped
 
 
-
+# -- design persistence -----------------------------------------------------
 def persist_design(design_store: DesignStore, config: Dict[str, Any], genid: Any) -> str:
     return design_store.save(config or {}, "task", node_id=genid)
 
@@ -422,6 +538,8 @@ def assemble_task_env(
     """
     env = dict(base_env)
     env.pop("GAN_DATASET_ROOT", None)
+    env["GAN_SECURE_MODE"] = "1"
+    env["PYTHON_DOTENV_DISABLED"] = "1"
 
     runtime_dir = os.path.join(run_dir, ".gan_runtime")
     os.makedirs(runtime_dir, exist_ok=True)
@@ -823,10 +941,11 @@ def prepare_questions(
 
 
 def _sandbox_identity(run_dir: str, run_id: str,
-                      expected_owner_uid: Optional[int] = None) -> Tuple[str, int, int]:
-    """Prepare a dedicated host uid and return (setpriv, uid, gid)."""
-    if os.name != "posix" or not hasattr(os, "chown"):
-        raise RuntimeError("the sandbox identity path requires a POSIX host with setpriv and chown")
+                      expected_owner_uid: Optional[int] = None,
+                      setpriv_path: Optional[str] = None) -> Tuple[str, int, int]:
+    """Validate the dedicated host identity without mutating the run tree."""
+    if os.name != "posix":
+        raise RuntimeError("G6b requires a POSIX host with setpriv")
 
     username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
     if not username:
@@ -845,9 +964,9 @@ def _sandbox_identity(run_dir: str, run_id: str,
     current_uid = int(os.geteuid())
     if current_uid not in (0, uid):
         raise RuntimeError(
-            "chown of the run copy requires root or the configured sandbox uid"
+            "G6b secure launch requires root or the configured sandbox uid"
         )
-    setpriv = shutil.which("setpriv")
+    setpriv = setpriv_path or shutil.which("setpriv")
     if not setpriv:
         raise RuntimeError("G6b requires the util-linux setpriv executable")
     if expected_owner_uid is not None:
@@ -855,15 +974,375 @@ def _sandbox_identity(run_dir: str, run_id: str,
         if run_stat.st_uid != int(expected_owner_uid) or os.path.islink(run_dir):
             raise RuntimeError("G6b task run directory has an unexpected owner or type")
 
-    output_dir = os.path.join(run_dir, "outputs", run_id)
-    os.makedirs(output_dir, exist_ok=True)
-    for root, dirs, files in os.walk(run_dir, followlinks=False):
-        os.chown(root, uid, gid, follow_symlinks=False)
-        for name in dirs + files:
-            path = os.path.join(root, name)
-            if not os.path.islink(path):
-                os.chown(path, uid, gid, follow_symlinks=False)
     return setpriv, uid, gid
+
+
+def _task_setfacl(setfacl: str, fd: int, operation: str, acl: str) -> None:
+    result = subprocess.run(
+        [setfacl, operation, acl, f"/proc/self/fd/{fd}"],
+        pass_fds=(fd,), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "setfacl failed").strip()
+        raise RuntimeError(detail[-2000:])
+
+
+def _task_open_absolute_parent_dirs(path: str,
+                                    allowed_uids: set[int]) -> List[int]:
+    """Open every directory before an absolute path's final component."""
+    absolute = os.path.abspath(path)
+    parts = [part for part in absolute.split(os.sep) if part]
+    if not absolute.startswith(os.sep) or len(parts) < 2:
+        return []
+    root_fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    current = root_fd
+    parents: List[int] = []
+    root_open = True
+    try:
+        for part in parts[:-1]:
+            child = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current,
+            )
+            try:
+                info = os.fstat(child)
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid not in allowed_uids:
+                    raise RuntimeError(
+                        f"task sandbox ancestor has an unexpected owner or type: {path}"
+                    )
+            except Exception:
+                os.close(child)
+                raise
+            if root_open:
+                os.close(root_fd)
+                root_open = False
+            parents.append(child)
+            current = child
+        return parents
+    except Exception:
+        if root_open:
+            os.close(root_fd)
+        for fd in parents:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+
+_TASK_TRAVERSE_LOCK = threading.Lock()
+_TASK_TRAVERSE_REFS: Dict[Tuple[int, int, int], int] = {}
+
+
+def _task_acquire_traverse(
+    fds: List[int], setfacl: str, sandbox_uid: int,
+) -> List[Tuple[int, Tuple[int, int, int]]]:
+    entries: List[Tuple[int, Tuple[int, int, int]]] = []
+    try:
+        with _TASK_TRAVERSE_LOCK:
+            for fd in fds:
+                info = os.fstat(fd)
+                key = (int(info.st_dev), int(info.st_ino), sandbox_uid)
+                if _TASK_TRAVERSE_REFS.get(key, 0) == 0:
+                    _task_setfacl(setfacl, fd, "-m", f"u:{sandbox_uid}:x")
+                _TASK_TRAVERSE_REFS[key] = _TASK_TRAVERSE_REFS.get(key, 0) + 1
+                entries.append((fd, key))
+        return entries
+    except Exception:
+        _task_release_traverse(entries, setfacl, sandbox_uid)
+        for fd in fds[len(entries):]:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+
+def _task_release_traverse(
+    entries: List[Tuple[int, Tuple[int, int, int]]],
+    setfacl: str,
+    sandbox_uid: int,
+) -> List[str]:
+    errors: List[str] = []
+    for fd, key in entries:
+        try:
+            with _TASK_TRAVERSE_LOCK:
+                remaining = _TASK_TRAVERSE_REFS.get(key, 0) - 1
+                if remaining <= 0:
+                    _TASK_TRAVERSE_REFS.pop(key, None)
+                    _task_setfacl(setfacl, fd, "-x", f"u:{sandbox_uid}")
+                else:
+                    _TASK_TRAVERSE_REFS[key] = remaining
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return errors
+
+
+def _task_walk_tree(root_fd: int, visit: Any, *, reclaim: bool = False) -> None:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+    errors: List[str] = []
+
+    def record(action: Any) -> None:
+        try:
+            action()
+        except Exception as exc:
+            if not reclaim:
+                raise
+            errors.append(str(exc))
+
+    def walk(directory_fd: int) -> None:
+        try:
+            names = os.listdir(directory_fd)
+        except OSError as exc:
+            if not reclaim:
+                raise
+            errors.append(str(exc))
+            return
+        for name in names:
+            try:
+                info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                if not reclaim:
+                    raise
+                errors.append(str(exc))
+                continue
+            valid = stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+            if (stat.S_ISLNK(info.st_mode) or not valid or
+                    (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)):
+                if reclaim:
+                    record(lambda name=name: os.unlink(name, dir_fd=directory_fd))
+                    continue
+                raise RuntimeError("task run tree contains a link or non-regular entry")
+            flags = directory_flags if stat.S_ISDIR(info.st_mode) else file_flags
+            try:
+                child = os.open(name, flags, dir_fd=directory_fd)
+            except OSError as exc:
+                if not reclaim:
+                    raise
+                errors.append(str(exc))
+                continue
+            try:
+                child_info = os.fstat(child)
+                if (stat.S_ISDIR(child_info.st_mode) != stat.S_ISDIR(info.st_mode)
+                        or (stat.S_ISREG(child_info.st_mode)
+                            and child_info.st_nlink != 1)):
+                    if reclaim:
+                        errors.append("task run tree changed during traversal")
+                        continue
+                    raise RuntimeError("task run tree changed during traversal")
+                if stat.S_ISDIR(child_info.st_mode):
+                    walk(child)
+                record(lambda: visit(child, child_info))
+            finally:
+                os.close(child)
+
+    walk(root_fd)
+    record(lambda: visit(root_fd, os.fstat(root_fd)))
+    if errors:
+        raise RuntimeError("; ".join(errors[:5]))
+
+
+def reconcile_stale_task_acl(setfacl: str, output_dir: str,
+                             owner_uid: int, owner_gid: int,
+                             sandbox_uid: int) -> None:
+    """Revoke task identity access left by a previously killed broker."""
+    if os.geteuid() != 0:
+        raise RuntimeError("task ACL recovery must run in the root broker")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    output_fd = os.open(output_dir, flags)
+    errors: List[str] = []
+
+    def revoke(fd: int, info: os.stat_result) -> None:
+        if info.st_uid not in {owner_uid, sandbox_uid}:
+            raise RuntimeError("task work tree contains an unexpected owner")
+        access = f"u:{sandbox_uid}:---"
+        remove = f"u:{sandbox_uid}"
+        if stat.S_ISDIR(info.st_mode):
+            access += f",d:u:{sandbox_uid}:---"
+            remove += f",d:u:{sandbox_uid}"
+        _task_setfacl(setfacl, fd, "-m", access)
+        if info.st_uid == sandbox_uid:
+            os.fchown(fd, owner_uid, owner_gid)
+        _task_setfacl(setfacl, fd, "-x", remove)
+
+    try:
+        output_info = os.fstat(output_fd)
+        if (not stat.S_ISDIR(output_info.st_mode)
+                or output_info.st_uid != owner_uid):
+            raise RuntimeError("task ACL recovery found an unexpected output root")
+        try:
+            _task_setfacl(setfacl, output_fd, "-m", f"u:{sandbox_uid}:---")
+        except Exception as exc:
+            errors.append(str(exc))
+        try:
+            work_fd = os.open("work", flags, dir_fd=output_fd)
+        except FileNotFoundError:
+            work_fd = -1
+        except Exception as exc:
+            errors.append(str(exc))
+            work_fd = -1
+        if work_fd >= 0:
+            try:
+                _task_walk_tree(work_fd, revoke, reclaim=True)
+            except Exception as exc:
+                errors.append(str(exc))
+            finally:
+                os.close(work_fd)
+        try:
+            _task_setfacl(setfacl, output_fd, "-x", f"u:{sandbox_uid}")
+        except Exception as exc:
+            errors.append(str(exc))
+    finally:
+        os.close(output_fd)
+    if errors:
+        raise RuntimeError("stale task ACL recovery failed: " + "; ".join(errors[:5]))
+
+
+def _task_open_beneath(root_fd: int, relative: str, owner_uid: int) -> int:
+    parts = [part for part in relative.split(os.sep) if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        raise RuntimeError("task output path is outside the run directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.dup(root_fd)
+    try:
+        for part in parts:
+            child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+            info = os.fstat(current)
+            if info.st_uid != owner_uid or not stat.S_ISDIR(info.st_mode):
+                raise RuntimeError("task output path has an unexpected owner or type")
+        return current
+    except Exception:
+        os.close(current)
+        raise
+
+
+class _TaskRunLease:
+    def __init__(self, run_fd: int, output_fd: int, setfacl: str,
+                 owner_uid: int, owner_gid: int, sandbox_uid: int,
+                 traverse_entries: List[Tuple[int, Tuple[int, int, int]]]) -> None:
+        self.run_fd = run_fd
+        self.output_fd = output_fd
+        self.setfacl = setfacl
+        self.owner_uid = owner_uid
+        self.owner_gid = owner_gid
+        self.sandbox_uid = sandbox_uid
+        self.traverse_entries = traverse_entries
+        self.closed = False
+
+    @classmethod
+    def acquire(cls, setfacl: str, run_dir: str, output_dir: str,
+                owner_uid: int, owner_gid: int,
+                sandbox_uid: int) -> "_TaskRunLease":
+        if os.geteuid() != 0:
+            raise RuntimeError("task ACL lease must be created by the root broker")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        run_fd = os.open(run_dir, flags)
+        output_fd = -1
+        lease = None
+        try:
+            run_info = os.fstat(run_fd)
+            if run_info.st_uid != owner_uid or not stat.S_ISDIR(run_info.st_mode):
+                raise RuntimeError("task run directory has an unexpected owner or type")
+            relative_output = os.path.relpath(output_dir, run_dir)
+            output_fd = _task_open_beneath(run_fd, relative_output, owner_uid)
+            ancestor_fds = _task_open_absolute_parent_dirs(run_dir, {0, owner_uid})
+            traverse_entries = _task_acquire_traverse(
+                ancestor_fds, setfacl, sandbox_uid)
+            lease = cls(
+                run_fd, output_fd, setfacl, owner_uid, owner_gid, sandbox_uid,
+                traverse_entries,
+            )
+            lease._grant()
+            return lease
+        except Exception:
+            if lease is not None:
+                lease.close(strict=False)
+            else:
+                if output_fd >= 0:
+                    os.close(output_fd)
+                os.close(run_fd)
+            raise
+
+    def _grant(self) -> None:
+        def grant_read(fd: int, info: os.stat_result) -> None:
+            if info.st_uid != self.owner_uid:
+                raise RuntimeError("task run tree contains an unexpected owner")
+            permissions = "r-x" if stat.S_ISDIR(info.st_mode) else "r--"
+            _task_setfacl(
+                self.setfacl, fd, "-m", f"u:{self.sandbox_uid}:{permissions}")
+            if stat.S_ISREG(info.st_mode) and os.fstat(fd).st_nlink != 1:
+                raise RuntimeError("task run file was hard-linked during ACL grant")
+
+        def grant_write(fd: int, info: os.stat_result) -> None:
+            if info.st_uid != self.owner_uid:
+                raise RuntimeError("task output tree contains an unexpected owner")
+            if stat.S_ISDIR(info.st_mode):
+                acl = (f"u:{self.sandbox_uid}:rwx,u:{self.owner_uid}:rwx,"
+                       f"d:u:{self.sandbox_uid}:rwx,d:u:{self.owner_uid}:rwx")
+            else:
+                acl = f"u:{self.sandbox_uid}:rw-,u:{self.owner_uid}:rw-"
+            _task_setfacl(self.setfacl, fd, "-m", acl)
+            if stat.S_ISREG(info.st_mode) and os.fstat(fd).st_nlink != 1:
+                raise RuntimeError("task output file was hard-linked during ACL grant")
+
+        _task_walk_tree(self.run_fd, grant_read)
+        _task_walk_tree(self.output_fd, grant_write)
+
+    def close(self, *, strict: bool = True) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        errors: List[str] = []
+
+        def record(action: Any) -> None:
+            try:
+                action()
+            except Exception as exc:  # keep revoking the remainder of the lease
+                errors.append(str(exc))
+
+        def remove_output_acl(fd: int, info: os.stat_result) -> None:
+            if info.st_uid not in {self.owner_uid, self.sandbox_uid}:
+                raise RuntimeError("task output owner changed unexpectedly")
+            record(lambda: _task_setfacl(
+                self.setfacl, fd, "-x", f"u:{self.owner_uid}"))
+            if stat.S_ISDIR(info.st_mode):
+                record(lambda: _task_setfacl(
+                    self.setfacl, fd, "-x", f"d:u:{self.sandbox_uid}"))
+                record(lambda: _task_setfacl(
+                    self.setfacl, fd, "-x", f"d:u:{self.owner_uid}"))
+
+        def reclaim(fd: int, info: os.stat_result) -> None:
+            if info.st_uid not in {self.owner_uid, self.sandbox_uid}:
+                raise RuntimeError("task run owner changed unexpectedly")
+            record(lambda: _task_setfacl(
+                self.setfacl, fd, "-x", f"u:{self.sandbox_uid}"))
+            record(lambda: os.fchown(fd, self.owner_uid, self.owner_gid))
+
+        try:
+            record(lambda: _task_walk_tree(
+                self.output_fd, remove_output_acl, reclaim=True))
+            record(lambda: _task_walk_tree(self.run_fd, reclaim, reclaim=True))
+        finally:
+            errors.extend(_task_release_traverse(
+                self.traverse_entries, self.setfacl, self.sandbox_uid))
+            self.traverse_entries = []
+            for fd in (self.output_fd, self.run_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if strict and errors:
+            raise RuntimeError("task ACL reclaim failed: " + "; ".join(errors[:5]))
 
 
 def _python_prefix_hint(python_executable: str) -> str:
@@ -877,6 +1356,108 @@ def _python_prefix_hint(python_executable: str) -> str:
     return str(getattr(sys, "prefix", "<unknown>"))
 
 
+def _sandbox_setpriv_command(setpriv: str, uid: int, gid: int,
+                             command: List[str]) -> List[str]:
+    """Run *command* as the sandbox identity with no residual capabilities."""
+    return [
+        setpriv,
+        "--reuid", str(uid),
+        "--regid", str(gid),
+        "--clear-groups",
+        "--bounding-set=-all",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--no-new-privs",
+        "--",
+        *command,
+    ]
+
+
+def _add_bwrap_empty_parents(command: List[str], path: str, created: set) -> None:
+    parent = os.path.dirname(path)
+    pending = []
+    while parent and parent != "/" and parent not in created:
+        pending.append(parent)
+        next_parent = os.path.dirname(parent)
+        if next_parent == parent:
+            break
+        parent = next_parent
+    for item in reversed(pending):
+        command.extend(["--dir", item])
+        created.add(item)
+
+
+def _harness_bwrap_command(
+    bwrap: str,
+    python_prefix: str,
+    run_dir: str,
+    output_dir: str,
+    read_only_assets: List[str],
+    proxy_socket: Optional[str],
+    child_command: List[str],
+    sandbox_etc_dir: Optional[str] = None,
+    proxy_token_fd: Optional[int] = None,
+    run_fd: Optional[int] = None,
+    output_fd: Optional[int] = None,
+) -> List[str]:
+    """Build the fixed G6c mount/network policy around the domain harness."""
+    if run_fd is None or output_fd is None:
+        raise RuntimeError("secure task sandbox requires fixed run/output descriptors")
+    if not sandbox_etc_dir:
+        raise RuntimeError("secure task sandbox requires a sanitized /etc projection")
+    sandbox_etc_dir = validate_sandbox_etc(sandbox_etc_dir)
+    command = [
+        bwrap, "--die-with-parent", "--new-session",
+        "--unshare-all", "--unshare-net", "--cap-drop", "ALL",
+        "--hostname", SANDBOX_HOSTNAME,
+    ]
+    created = {"/"}
+    system_roots = ("/usr", "/bin", "/sbin", "/lib", "/lib64")
+    for path in system_roots:
+        if os.path.exists(path):
+            command.extend(["--ro-bind", path, path])
+            created.add(path)
+    command.extend(["--ro-bind", sandbox_etc_dir, "/etc"])
+    created.add("/etc")
+
+    prefix = os.path.realpath(python_prefix)
+    if not any(prefix == root or prefix.startswith(root + os.sep)
+               for root in system_roots):
+        _add_bwrap_empty_parents(command, prefix, created)
+        command.extend(["--ro-bind", prefix, prefix])
+        created.add(prefix)
+
+    command.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
+    created = {path for path in created if not path.startswith("/tmp/")}
+    created.add("/tmp")
+
+    _add_bwrap_empty_parents(command, run_dir, created)
+    command.extend(["--ro-bind", f"/proc/self/fd/{int(run_fd)}", run_dir])
+    created.add(run_dir)
+    command.extend(["--bind", f"/proc/self/fd/{int(output_fd)}", output_dir])
+
+    for asset in read_only_assets:
+        _add_bwrap_empty_parents(command, asset, created)
+        command.extend(["--ro-bind", asset, asset])
+        created.add(asset)
+
+    if proxy_socket:
+        _add_bwrap_empty_parents(command, proxy_socket, created)
+        command.extend(["--ro-bind", proxy_socket, proxy_socket])
+    if proxy_token_fd is not None:
+        token_path = "/run/rsi-gan/task-proxy-token"
+        _add_bwrap_empty_parents(command, token_path, created)
+        command.extend(["--ro-bind-data", str(int(proxy_token_fd)), token_path])
+
+    command.extend([
+        "--chdir", run_dir,
+        "--setenv", "HOME", "/tmp",
+        "--setenv", "TMPDIR", "/tmp",
+        *child_command,
+    ])
+    return command
+
+
 def _sandbox_runtime_preflight(
     setpriv: str,
     uid: int,
@@ -884,23 +1465,38 @@ def _sandbox_runtime_preflight(
     username: str,
     python_executable: str,
     run_dir: str,
+    output_dir: str,
     env: Dict[str, str],
     timeout: int,
+    bwrap_path: Optional[str] = None,
+    python_prefix: Optional[str] = None,
+    read_only_assets: Optional[List[str]] = None,
+    proxy_socket: Optional[str] = None,
+    sandbox_etc_dir: Optional[str] = None,
+    run_fd: Optional[int] = None,
+    output_fd: Optional[int] = None,
 ) -> None:
     """Fail early if the sandbox uid cannot start the selected Python."""
-    prefix_hint = _python_prefix_hint(python_executable)
-    probe_cmd = [
-        setpriv,
-        "--reuid", str(uid),
-        "--regid", str(gid),
-        "--clear-groups",
-        "--no-new-privs",
-        "--",
+    prefix_hint = python_prefix or _python_prefix_hint(python_executable)
+    probe_child = [
         python_executable,
         "-c", _SANDBOX_RUNTIME_PREFLIGHT,
         str(uid),
         str(gid),
+        run_dir,
+        output_dir,
+        "1" if bwrap_path else "0",
     ]
+    if bwrap_path:
+        if not python_prefix:
+            raise RuntimeError("G6c sandbox runtime preflight is missing Python prefix")
+        probe_child = _harness_bwrap_command(
+            bwrap_path, python_prefix, run_dir, output_dir,
+            list(read_only_assets or []), proxy_socket, probe_child,
+            sandbox_etc_dir=sandbox_etc_dir,
+            run_fd=run_fd, output_fd=output_fd,
+        )
+    probe_cmd = _sandbox_setpriv_command(setpriv, uid, gid, probe_child)
     descriptor = (
         f"sandbox username={username!r}, uid={uid}, gid={gid}, "
         f"Python executable={python_executable!r}, Python prefix={prefix_hint!r}"
@@ -908,21 +1504,23 @@ def _sandbox_runtime_preflight(
     try:
         probe = subprocess.run(
             probe_cmd,
-            cwd=run_dir,
+            cwd="/" if bwrap_path else run_dir,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=max(1, min(int(timeout), 30)),
+            pass_fds=((int(run_fd), int(output_fd))
+                      if run_fd is not None and output_fd is not None else ()),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
-            f"G6b sandbox runtime preflight failed ({descriptor}): timed out"
+            f"G6b/G6c sandbox runtime preflight failed ({descriptor}): timed out"
         ) from exc
     except OSError as exc:
         raise RuntimeError(
-            f"G6b sandbox runtime preflight failed ({descriptor}): "
+            f"G6b/G6c sandbox runtime preflight failed ({descriptor}): "
             f"could not launch probe: {exc}"
         ) from exc
 
@@ -950,7 +1548,7 @@ def _sandbox_runtime_preflight(
         reason = stderr or stdout or "probe returned no diagnostic payload"
     if probe.returncode != 0 or not payload or reason:
         raise RuntimeError(
-            f"G6b sandbox runtime preflight failed ("
+            f"G6b/G6c sandbox runtime preflight failed ("
             f"sandbox username={username!r}, uid={uid}, gid={gid}, "
             f"Python executable={python_executable!r}, Python prefix={prefix!r}"
             f"): {reason[-2000:]}"
@@ -982,13 +1580,24 @@ def run_harness_and_report(
     """
     broker_socket = env.get("GAN_TASK_BROKER_UNIX")
     if broker_socket:
-        broker_token = env.get("GAN_TASK_BROKER_TOKEN")
-        if not broker_token or not scope_id:
-            raise RuntimeError("task broker requires a launch capability and generation id")
+        outer = env.get("GAN_TASK_BROKER_OUTER")
+        if not outer or not scope_id:
+            raise RuntimeError("task broker requires an outer id and generation id")
+        if (log_path and os.name == "posix" and hasattr(os, "geteuid") and
+                os.geteuid() == 0):
+            raise RuntimeError("refusing to write a task log from a root broker caller")
         from gan.framework.task_broker import request_task_run
-        return request_task_run(
-            broker_socket, broker_token, str(scope_id), int(timeout),
+        result = request_task_run(
+            broker_socket, int(outer), str(scope_id), int(timeout),
         )
+        if log_path:
+            rc, output = result
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"\n$ task-broker scope={scope_id} domain={domain} "
+                    f"(cwd={run_dir}, rc={rc})\n{output[-4000:]}\n"
+                )
+        return result
     return _run_harness_and_report_local(
         python, run_dir, domain, run_id, subset, num_samples, model, env, timeout,
         questions_path=questions_path, dataset_root=dataset_root,
@@ -1013,12 +1622,27 @@ def _run_harness_and_report_local(
     log_path: Optional[str] = None,
     proxy_socket: Optional[str] = None,
     proxy_token: Optional[str] = None,
+    proxy_token_fd: Optional[int] = None,
     expected_owner_uid: Optional[int] = None,
     reasoning_effort: Optional[str] = None,
     sample_seed: Optional[int] = None,
     anchor_ids: Optional[List[str]] = None,
+    expected_owner_gid: Optional[int] = None,
+    setpriv_path: Optional[str] = None,
+    setfacl_path: Optional[str] = None,
+    bwrap_path: Optional[str] = None,
+    python_prefix: Optional[str] = None,
+    sandbox_etc_dir: Optional[str] = None,
+    sandbox_profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, str]:
     """Run a fixed harness command; the privileged broker is its only secure caller.
+
+    Two LLM credential transports, never mixed: ``proxy_token_fd`` (a sealed
+    memfd descriptor minted by the root-side task broker) is the SECURE path --
+    the token value never appears in argv, only its fixed /run file path does.
+    ``proxy_token`` (a plain string, requested via the framework control
+    capability) is the LOCAL non-broker transport (developer/test runs without
+    the sandbox); a broker launch (``expected_owner_uid`` set) refuses it.
 
     ``sample_seed``/``anchor_ids`` apply ONLY to the ``dataset_root`` branch
     (domains that score in the harness): the questions read there are sliced by
@@ -1026,8 +1650,8 @@ def _run_harness_and_report_local(
     applied the selection in :func:`prepare_questions`, so no seed is forwarded
     (a second draw here would re-sample the already-sampled questions).
     """
-    harness_cmd = [
-        python, "-m", "domains.harness",
+    harness_args = [
+        "-m", "domains.harness",
         "--domain", domain,
         "--model", model,
         "--run_id", run_id,
@@ -1036,9 +1660,9 @@ def _run_harness_and_report_local(
     ]
     if reasoning_effort:
         # Explicit CLI transport (mirrors --model); never an env variable.
-        harness_cmd.extend(["--reasoning_effort", str(reasoning_effort)])
+        harness_args.extend(["--reasoning_effort", str(reasoning_effort)])
     proxy_socket = proxy_socket or env.get("GAN_LLM_PROXY_UNIX")
-    if proxy_socket and proxy_token is None:
+    if proxy_socket and proxy_token_fd is None and proxy_token is None:
         if not scope_id:
             raise RuntimeError("LLM proxy task scope requires a generation id")
         control_token = env.get("GAN_PROXY_CONTROL_TOKEN")
@@ -1048,58 +1672,124 @@ def _run_harness_and_report_local(
         proxy_token = request_task_token(
             proxy_socket, control_token, str(scope_id), model)
     if questions_path:
-        setpriv, uid, gid = _sandbox_identity(
-            run_dir, run_id, expected_owner_uid=expected_owner_uid,
-        )
-        python_executable = python if os.path.isabs(python) else shutil.which(python)
-        if not python_executable:
-            raise RuntimeError(f"cannot resolve Python executable: {python}")
-        harness_cmd = [
-            setpriv,
-            "--reuid", str(uid),
-            "--regid", str(gid),
-            "--clear-groups",
-            "--no-new-privs",
-            "--",
-            python_executable,
-            "-m", "domains.harness",
-            "--domain", domain,
-            "--model", model,
-            "--run_id", run_id,
-            "--subset", subset,
-            "--num_samples", str(num_samples),
-        ]
-        if reasoning_effort:
-            harness_cmd.extend(["--reasoning_effort", str(reasoning_effort)])
-        harness_cmd.extend(["--questions_path", os.path.abspath(questions_path)])
+        harness_args.extend(["--questions_path", os.path.abspath(questions_path)])
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
-        harness_cmd.extend(["--dataset_root", os.path.abspath(dataset_root)])
+        harness_args.extend(["--dataset_root", os.path.abspath(dataset_root)])
         if sample_seed is not None:
-            harness_cmd.extend(["--sample_seed", str(int(sample_seed))])
+            harness_args.extend(["--sample_seed", str(int(sample_seed))])
             if anchor_ids:
-                harness_cmd.extend(["--anchor_ids", ",".join(str(a) for a in anchor_ids)])
-    if proxy_token:
-        harness_cmd.extend([
+                harness_args.extend(["--anchor_ids", ",".join(str(a) for a in anchor_ids)])
+    if proxy_token_fd is not None:
+        harness_args.extend([
+            "--proxy_socket", os.path.abspath(proxy_socket),
+            "--proxy_token_file", "/run/rsi-gan/task-proxy-token",
+        ])
+    elif proxy_token is not None:
+        harness_args.extend([
             "--proxy_socket", os.path.abspath(proxy_socket),
             "--proxy_token", proxy_token,
         ])
+
+    broker_launch = expected_owner_uid is not None
+    secure_launch = questions_path is not None or broker_launch
     child_env = _task_safe_env(env)
-    if questions_path:
-        username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
-        _sandbox_runtime_preflight(
-            setpriv, uid, gid, username, python_executable,
-            run_dir, child_env, timeout,
+    lease = None
+    primary_error: Optional[BaseException] = None
+    try:
+        if secure_launch:
+            if (os.name == "posix" and hasattr(os, "geteuid") and
+                    os.geteuid() == 0 and not broker_launch):
+                raise RuntimeError(
+                    "refusing to launch a domain harness as root outside the secure task broker"
+                )
+            if broker_launch and proxy_token_fd is None:
+                raise RuntimeError(
+                    "secure task broker launch requires a sealed proxy token descriptor")
+            setpriv, uid, gid = _sandbox_identity(
+                run_dir, run_id, expected_owner_uid=expected_owner_uid,
+                setpriv_path=setpriv_path,
+            )
+            python_executable = python if os.path.isabs(python) else shutil.which(python)
+            if not python_executable:
+                raise RuntimeError(f"G6b cannot resolve Python executable: {python}")
+            output_dir = os.path.join(run_dir, "outputs", run_id)
+            if broker_launch:
+                if (expected_owner_gid is None or not setfacl_path or not bwrap_path or
+                        not python_prefix or not sandbox_etc_dir
+                        or not isinstance(sandbox_profile, dict)):
+                    raise RuntimeError("secure task broker is missing G6b/G6c configuration")
+                if (sandbox_profile.get("network") != "none" or
+                        sandbox_profile.get("gpu") != "none" or
+                        not isinstance(sandbox_profile.get("read_only_assets"), list)):
+                    raise RuntimeError("secure task broker received an invalid sandbox profile")
+                lease = _TaskRunLease.acquire(
+                    str(setfacl_path), run_dir, output_dir,
+                    int(expected_owner_uid), int(expected_owner_gid), uid,
+                )
+            harness_child = [python_executable, *harness_args]
+            if broker_launch:
+                harness_child = _harness_bwrap_command(
+                    str(bwrap_path), str(python_prefix), run_dir, output_dir,
+                    list(sandbox_profile["read_only_assets"]), proxy_socket,
+                    harness_child, sandbox_etc_dir=sandbox_etc_dir,
+                    proxy_token_fd=proxy_token_fd,
+                    run_fd=lease.run_fd, output_fd=lease.output_fd,
+                )
+            harness_cmd = _sandbox_setpriv_command(setpriv, uid, gid, harness_child)
+            username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
+            _sandbox_runtime_preflight(
+                setpriv, uid, gid, username, python_executable,
+                run_dir, output_dir, child_env, timeout,
+                bwrap_path=str(bwrap_path) if broker_launch else None,
+                python_prefix=str(python_prefix) if broker_launch else None,
+                read_only_assets=(list(sandbox_profile["read_only_assets"])
+                                  if broker_launch else None),
+                proxy_socket=proxy_socket if broker_launch else None,
+                sandbox_etc_dir=sandbox_etc_dir if broker_launch else None,
+                run_fd=lease.run_fd if lease is not None else None,
+                output_fd=lease.output_fd if lease is not None else None,
+            )
+        else:
+            if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0:
+                raise RuntimeError(
+                    "refusing to launch a domain harness as root outside the secure task broker"
+                )
+            harness_cmd = [python, *harness_args]
+
+        inherited_fds = []
+        if proxy_token_fd is not None:
+            inherited_fds.append(int(proxy_token_fd))
+        if lease is not None:
+            inherited_fds.extend([lease.run_fd, lease.output_fd])
+        proc = subprocess.run(
+            harness_cmd, cwd="/" if broker_launch else run_dir,
+            env=child_env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
+            pass_fds=tuple(inherited_fds),
         )
-    proc = subprocess.run(
-        harness_cmd, cwd=run_dir, env=child_env, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
-    )
-    out = proc.stdout or ""
-    if log_path:
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n$ {' '.join(harness_cmd)} (cwd={run_dir})\n{out[-4000:]}\n")
-    return proc.returncode, out
+        out = proc.stdout or ""
+        if log_path:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"\n$ {' '.join(harness_cmd)} (cwd={run_dir})\n{out[-4000:]}\n"
+                )
+        return proc.returncode, out
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if lease is not None:
+            try:
+                lease.close()
+            except Exception as reclaim_error:
+                if primary_error is None:
+                    raise
+                raise RuntimeError(
+                    "domain harness failed and task ACL reclaim also failed: "
+                    f"{type(primary_error).__name__}: {primary_error}; {reclaim_error}"
+                ) from primary_error
+
 
 
 def write_parent_report(
