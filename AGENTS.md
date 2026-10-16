@@ -117,9 +117,9 @@ scores,checkpoint,ledger}.py`, `gan/design/store.py` or the
 design operators — six suites (deep gate / batch-6 unification / batch-8
 isolation / c-dispatch / dynamic-keys / ledger-gate), one subprocess each.
 
-## Offline run analysis (scripts/local/, gitignored)
+## Offline analysis tools (analysis/)
 
-Two local analyzers read finished GAN run dirs (`scores.jsonl`,
+Two offline analyzers under `analysis/` read finished GAN run dirs (`scores.jsonl`,
 `runs/<genid>/`, `logs/events.jsonl`, `ckpt/`) — **offline only** (no network,
 no LLM calls), run with `venv_nat/bin/python`, and write artifacts into
 `<run_dir>/score_analysis/`. The base `analysis/*.py` scripts consume the DGM-H

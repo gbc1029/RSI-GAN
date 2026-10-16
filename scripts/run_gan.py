@@ -37,11 +37,11 @@ def _run_offline_analysis(output_dir: str, skip: bool = False) -> int:
         return 0
     import shutil
     analyzers = [
-        os.path.join(REPO_ROOT, "scripts", "local", "gan_scores_extract.py"),
-        os.path.join(REPO_ROOT, "scripts", "local", "gan_lineage_graph.py"),
-        os.path.join(REPO_ROOT, "scripts", "local", "gan_cost_report.py"),
+        os.path.join(REPO_ROOT, "analysis", "gan_scores_extract.py"),
+        os.path.join(REPO_ROOT, "analysis", "gan_lineage_graph.py"),
+        os.path.join(REPO_ROOT, "analysis", "gan_cost_report.py"),
     ]
-    if not os.path.isdir(os.path.join(REPO_ROOT, "scripts", "local")):
+    if not os.path.isdir(os.path.join(REPO_ROOT, "analysis")):
         return 0  # upstream checkout without the local tools: nothing to run
     py = sys.executable or shutil.which("python3")
     rc_first = 0
@@ -87,7 +87,7 @@ def main():
     p.add_argument("--in-process", action="store_true",
                    help="DISABLED legacy mode: bypasses the required process sandbox.")
     p.add_argument("--skip-analysis", action="store_true",
-                   help="Skip the offline post-run analysis (scripts/local/gan_*.py -> "
+                   help="Skip the offline post-run analysis (analysis/gan_*.py -> "
                         "<output_dir>/score_analysis/). Default: run it after the loop "
                         "exits, even on a failed run (judge a round by its artifacts).")
     args = p.parse_args()

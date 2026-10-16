@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""Offline score extraction + analysis for GAN run dirs (runs/<genid>/ layout).
+
+Reuses the DGM-H analysis toolkit `analysis/analysis_utils.py`
+(compute_bootstrap_ci / save_significance_tests) and adapts the
+`analysis/plot_progress.py` progress-curve idea to the GAN layout.
+
+Offline only: reads run artifacts + dataset ground truth; no network, no LLM.
+
+Usage:
+  venv_nat/bin/python analysis/gan_scores_extract.py RUN_DIR [RUN_DIR ...]
+
+Outputs (per run, into <run>/score_analysis/):
+  scores_extract.csv   per-sample rows: strict + lenient correctness, parse method
+  significance.txt     pairwise tests (reused save_significance_tests)
+  progress.png         per-gen curves + per-question correctness
+  REPORT.md            the analysis report
+
+Ground truth: auto-detected among domains/<domain>/dataset*.csv — the first
+file containing EVERY observed question_id (subset disambiguation).
+"""
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+
+import numpy as np
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+from analysis.analysis_utils import compute_bootstrap_ci, save_significance_tests  # noqa: E402
+from scipy import stats  # noqa: E402
+
+import matplotlib  # noqa: E402
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+csv.field_size_limit(10 ** 7)
+
+# ---------------------------------------------------------------- lenient parser
+_MODEL_EXACT = re.compile(r"^\s*model[_\s-]*([ab])\s*\.?\s*$", re.I)
+_VERDICT_DICT = re.compile(r"['\"]?verdict['\"]?\s*[:=]\s*['\"]?([ab])\b", re.I)
+_VERDICT_LINE = re.compile(r"\bverdict\b\s*[:\-]\s*(?:response\s*)?([ab])\b", re.I)
+_BARE = re.compile(r"^\s*([ab])\s*\.?\s*$", re.I)
+_RESP_BETTER = re.compile(
+    r"\bresponse\s+([ab])\b(?:\s+is)?\s+(?:the\s+)?(?:clearly\s+|significantly\s+|"
+    r"substantially\s+|more\s+)?better", re.I)
+_WINS = re.compile(r"\b([ab])\s+wins\b", re.I)
+_ANSWER = re.compile(r"\b(?:answer|choice)\s*[:\-]?\s*(?:is\s*)?(?:response\s*)?([ab])\b", re.I)
+_MODEL_MENTION = re.compile(r"\bmodel[_\s-]*([ab])\b", re.I)
+
+
+def lenient_verdict(pred):
+    """Return (verdict_letter_or_None, method_tag). Conservative, order matters."""
+    if pred is None:
+        return None, "empty"
+    p = pred.strip()
+    if not p:
+        return None, "empty"
+    if len(p) <= 8:
+        m = _MODEL_EXACT.match(p)
+        if m:
+            return m.group(1).lower(), "model_exact"
+        m = _BARE.match(p)
+        if m:
+            return m.group(1).lower(), "bare"
+    for rx, tag in ((_VERDICT_DICT, "dict_verdict"), (_VERDICT_LINE, "verdict_line"),
+                    (_RESP_BETTER, "response_better"), (_WINS, "wins"), (_ANSWER, "answer")):
+        m = rx.search(p)
+        if m:
+            return m.group(1).lower(), tag
+    m = _MODEL_MENTION.search(p)
+    if m:
+        return m.group(1).lower(), "model_mention"
+    return None, "unparsed"
+
+
+# ---------------------------------------------------------------- loaders
+def load_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def load_json(path):
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def detect_dataset(run_dir, domain, question_ids):
+    """Pick the dataset file that contains every observed question_id."""
+    ddir = os.path.join(REPO, "domains", domain)
+    if not os.path.isdir(ddir):
+        return None, None
+    wanted = set(question_ids)
+    cands = ["dataset_filtered_100_train.csv", "dataset_filtered_100_test.csv",
+             "dataset_filtered_100_val.csv", "dataset_filtered.csv", "dataset.csv"]
+    for name in cands:
+        path = os.path.join(ddir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            truth = {r["question_id"]: r["winner"].strip().lower()
+                     for r in csv.DictReader(open(path))}
+        except Exception:
+            continue
+        if wanted and wanted.issubset(truth):
+            return path, truth
+    return None, None
+
+
+def extract_run(run_dir):
+    """Pull everything score-relevant out of one GAN run dir."""
+    name = os.path.basename(os.path.normpath(run_dir))
+    scores = load_jsonl(os.path.join(run_dir, "scores", "scores.jsonl"))
+    events = load_jsonl(os.path.join(run_dir, "logs", "events.jsonl"))
+    gens = [str(s["genid"]) for s in scores]
+
+    # events
+    inner_done, harness_done = {}, {}
+    model_cfg, stagnation, brief_missing = None, [], 0
+    llm_calls, self_receipts = [], 0
+    for e in events:
+        t = e.get("type")
+        if t == "inner_done":
+            inner_done[str(e.get("genid"))] = e
+        elif t == "task_harness_done":
+            harness_done[str(e.get("genid"))] = e
+        elif t == "model_config" and model_cfg is None:
+            model_cfg = e
+        elif t == "stagnation_break":
+            stagnation.append((e.get("outer"), e.get("inner")))
+        elif t == "task_brief_missing":
+            brief_missing += 1
+        elif t == "llm_call":
+            llm_calls.append(e)
+        elif t == "self_receipt":
+            self_receipts += 1
+
+    # per-sample extraction
+    rows, per_gen = [], {}
+    sha_prev = {}
+    for s in scores:
+        g = str(s["genid"])
+        rep = load_json(os.path.join(run_dir, "runs", g, "report.json")) or {}
+        ev = load_json(os.path.join(run_dir, "runs", g, "eval.json")) or {}
+        rc = load_json(os.path.join(run_dir, "runs", g, "patch_receipt.json")) or {}
+        preds, pred_err = {}, None
+        ppath = os.path.join(run_dir, "runs", g, "predictions.csv")
+        if os.path.exists(ppath):
+            try:
+                preds = {r["question_id"]: r.get("prediction") or ""
+                         for r in csv.DictReader(open(ppath))}
+            except Exception as exc:
+                pred_err = str(exc)
+        issues = ev.get("issues") or []
+        ops = ((rc.get("design") or {}).get("ops")) or []
+        # cost ledger (docs/10 §9 A): runs/<genid>/cost.json — task cost from
+        # the proxy audit, plan/evaluate session sums from the trajectories.
+        # Absent file (pre-ledger runs) -> None columns, never 0.
+        cost = load_json(os.path.join(run_dir, "runs", g, "cost.json")) or {}
+        sha = s.get("report_sha")
+        rec = dict(
+            genid=g, score=s.get("score"), coverage=s.get("coverage"),
+            score_status=s.get("score_status"), valid_parent=s.get("valid_parent"),
+            report_sha=sha, same_report_as_prev=bool(sha and sha_prev.get("prev") == sha),
+            predicted_score=ev.get("predicted_score"),
+            n_issues=len(issues),
+            sev=dict(Counter(i.get("severity") for i in issues)),
+            n_ops=len(ops),
+            ops=dict(Counter(o.get("op") for o in ops)),
+            prompt_changed=bool((rc.get("design") or {}).get("prompt_changed")),
+            harness_s=(harness_done.get(g) or {}).get("duration_s"),
+            inner_s=(inner_done.get(g) or {}).get("duration_s"),
+            cost_tokens=(cost.get("task") or {}).get("cost_tokens"),
+            cost_wallclock_s=(cost.get("task") or {}).get("cost_wallclock_s"),
+            plan_tokens=(cost.get("planner_plan") or {}).get("total_tokens"),
+            eval_tokens=(cost.get("evaluator_evaluate") or {}).get("total_tokens"),
+            preds=preds, report=rep, pred_err=pred_err,
+        )
+        sha_prev["prev"] = sha
+        per_gen[g] = rec
+        for qid, raw in sorted(preds.items()):
+            rows.append(dict(run=name, genid=g, question_id=qid, raw_head=re.sub(r"\s+", " ", (raw or ""))[:120],
+                             strict_correct=None, lenient=None, method=None, lenient_correct=None))
+    return dict(name=name, dir=run_dir, gens=gens, per_gen=per_gen, rows=rows,
+                model_cfg=model_cfg, stagnation=stagnation, brief_missing=brief_missing,
+                llm_calls=llm_calls, self_receipts=self_receipts, domain=(scores or [{}])[0].get("domain"),
+                events=events)
+
+
+def attach_truth(run, truth):
+    for r in run["rows"]:
+        raw = run["per_gen"][r["genid"]]["preds"].get(r["question_id"], "")
+        tlab = truth.get(r["question_id"])
+        r["truth"] = tlab
+        r["strict_correct"] = int(bool(tlab) and (raw or "").strip().lower() == tlab)
+        v, method = lenient_verdict(raw)
+        r["lenient"], r["method"] = v, method
+        r["lenient_correct"] = int(bool(v and tlab and v == tlab.split("_")[-1]))
+
+
+def report_crosscheck(run):
+    """Compare recomputed strict correctness with the harness report.json.
+
+    report.json's `total` excludes invalid predictions (coverage<1), so only the
+    correctness COUNT is compared; a denominator difference is expected there.
+    """
+    mism, denom = [], []
+    for g in run["gens"]:
+        rep = run["per_gen"][g]["report"]
+        if not rep:
+            continue
+        mine = sum(r["strict_correct"] for r in run["rows"] if r["genid"] == g)
+        theirs = rep.get("total_correct")
+        if theirs is not None and mine != theirs:
+            mism.append((g, mine, theirs))
+        nrows = len([r for r in run["rows"] if r["genid"] == g])
+        if rep.get("total") is not None and nrows != rep["total"]:
+            denom.append((g, nrows, rep["total"]))
+    return mism, denom
+
+
+# ---------------------------------------------------------------- stats
+def run_vectors(run):
+    strict = np.array([r["strict_correct"] for r in run["rows"]], dtype=float)
+    lenient = np.array([r["lenient_correct"] for r in run["rows"]], dtype=float)
+    return strict, lenient
+
+
+def fmt_ci(ci):
+    return f"{ci[0]:.3f} [{ci[1]:.3f}, {ci[2]:.3f}]"
+
+
+# ---------------------------------------------------------------- outputs
+def write_extract_csv(run, outdir):
+    path = os.path.join(outdir, "scores_extract.csv")
+    cols = ["run", "genid", "question_id", "truth", "strict_correct",
+            "lenient", "method", "lenient_correct", "raw_head"]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(run["rows"])
+    return path
+
+
+def write_report(run, truth_path, outdir, cross=None):
+    gens = run["gens"]
+    strict, lenient = run_vectors(run)
+    valid = np.array([r["lenient"] is not None for r in run["rows"]], dtype=float)
+    L = []  # markdown lines
+
+    L.append(f"# 成绩分析：`{run['name']}`\n")
+    cfg = (run["model_cfg"] or {})
+    body = {k: v for k, v in cfg.items() if k not in ("type", "ts", "time")}
+    if body:
+        L.append(f"- 模型配置：`{json.dumps(body, ensure_ascii=False)}`")
+    outer_done = [e for e in run["events"] if e.get("type") == "outer_done"]
+    L.append(f"- 规模：{len(gens)} generations（outer_done ×{len(outer_done)}），"
+             f"domain=`{run['domain']}`")
+    L.append(f"- ground truth：`{os.path.relpath(truth_path, REPO) if truth_path else 'N/A'}`")
+    if run["brief_missing"]:
+        L.append(f"- ⚠ `task_brief_missing` ×{run['brief_missing']}（task_brief 注入缺失）")
+    if run["stagnation"]:
+        L.append(f"- `stagnation_break`：{run['stagnation']}")
+    L.append("")
+
+    # per-gen table
+    L.append("## 每 generation 一览\n")
+    L.append("| gen | score | cov | evaluator预测 | 宽松正确 | issues | patch ops | 无效子代 | harness_s | inner_s | cost_tokens | plan_tok | eval_tok |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for g in gens:
+        r = run["per_gen"][g]
+        lk = sum(x["lenient_correct"] for x in run["rows"] if x["genid"] == g)
+        lt = sum(1 for x in run["rows"] if x["genid"] == g)
+        nokey = "同report_sha" if r["same_report_as_prev"] else ""
+        L.append(f"| {g} | {r['score']} | {r['coverage']} | {r['predicted_score']} "
+                 f"| {lk}/{lt} | {r['n_issues']} {r['sev'] or ''} | {r['n_ops']} "
+                 f"| {nokey} | {r['harness_s']} | {r['inner_s']} "
+                 f"| {r['cost_tokens']} | {r['plan_tokens']} | {r['eval_tokens']} |")
+    L.append("")
+
+    # strict vs lenient
+    L.append("## 严格 vs 宽松重判\n")
+    ns = len(strict)
+    L.append(f"| 口径 | 正确 | n | 准确率 | bootstrap CI(median of per-gen accs) | 二项检验 vs 0.5（greater） |")
+    L.append("|---|---|---|---|---|---|")
+    for label, vec in (("严格（exact `model_a/model_b`）", strict), ("宽松（verdict 重判）", lenient)):
+        k = int(vec.sum())
+        bt = stats.binomtest(k, ns, 0.5, alternative="greater") if ns else None
+        p = f"{bt.pvalue:.4f}" if bt else "—"
+        L.append(f"| {label} | {k}/{ns} | {ns} | {k / ns:.3f} | — | {p} |")
+    # bootstrap CI on per-generation accuracies (reused compute_bootstrap_ci)
+    gen_accs = np.array([np.mean([x["lenient_correct"] for x in run["rows"] if x["genid"] == g])
+                         for g in gens], dtype=float)
+    if len(gen_accs) >= 2:
+        L.append(f"- 每 gen 宽松准确率：{', '.join(f'{g}:{a:.2f}' for g, a in zip(gens, gen_accs))}；"
+                 f"跨 gen 分布 median/CI = {fmt_ci(compute_bootstrap_ci(gen_accs))}")
+    L.append("")
+
+    # per-question
+    L.append("## 逐题（系统性错误定位）\n")
+    qids = sorted({r["question_id"] for r in run["rows"]})
+    L.append("| question_id | truth | 各 gen 宽松判定（方法） | 宽松正确 | 判定 |")
+    L.append("|---|---|---|---|---|")
+    for q in qids:
+        rs = [r for r in run["rows"] if r["question_id"] == q]
+        seq = "/".join(f"{r['lenient'] or '∅'}({(r['method'] or '')[:4]})" for r in rs)
+        k = sum(r["lenient_correct"] for r in rs)
+        verdict = "全对" if k == len(rs) else ("全错（系统性反相关）" if k == 0 else "混合")
+        L.append(f"| {q} | {rs[0]['truth']} | {seq} | {k}/{len(rs)} | {verdict} |")
+    L.append("")
+
+    # evaluator calibration
+    L.append("## evaluator 校准与 issue 走向\n")
+    L.append("| gen | benchmark | evaluator预测 | 高severity issues |")
+    L.append("|---|---|---|---|")
+    for g in gens:
+        r = run["per_gen"][g]
+        L.append(f"| {g} | {r['score']} | {r['predicted_score']} | {r['sev'].get('high', 0)} |")
+    L.append("")
+
+    # evolution activity
+    L.append("## 进化活动\n")
+    noop = [g for g in gens if run["per_gen"][g]["same_report_as_prev"]]
+    L.append(f"- 无效子代（report_sha 与前代相同）：{noop or '无'}")
+    applied = [g for g in gens if run["per_gen"][g]["n_ops"]]
+    L.append(f"- 有 design ops 的 gen：{applied or '无'}；"
+             f"prompt_changed 的 gen：{[g for g in gens if run['per_gen'][g]['prompt_changed']] or '无'}")
+    L.append(f"- self_receipt（双角色 self-improve 收据）事件：{run['self_receipts']}")
+    calls = run["llm_calls"]
+    if calls:
+        eff = Counter(c.get("reasoning_effort") for c in calls)
+        tok = (sum(c.get("prompt_tokens") or 0 for c in calls),
+               sum(c.get("completion_tokens") or 0 for c in calls))
+        lat = [c.get("latency_ms") or 0 for c in calls]
+        L.append(f"- llm_call ×{len(calls)}，effort 分布 {dict(eff)}，tokens P/C {tok}，"
+                 f"latency 中位 {int(np.median(lat))}ms")
+    L.append("")
+
+    if cross:
+        L.append("## 跨运行对比\n")
+        L.append("| run | n | 严格 | 宽松 | 宽松acc |")
+        L.append("|---|---|---|---|---|")
+        for other, s2, l2 in cross:
+            L.append(f"| {other['name']} | {len(s2)} | {int(s2.sum())} | {int(l2.sum())} | {l2.mean():.3f} |")
+        L.append("")
+
+    # auto conclusion
+    L.append("## 结论（自动摘要）\n")
+    qs = {}
+    for r in run["rows"]:
+        qs.setdefault(r["question_id"], []).append(r["lenient_correct"])
+    all_wrong = sorted(q for q, v in qs.items() if sum(v) == 0)
+    all_right = sorted(q for q, v in qs.items() if sum(v) == len(v))
+    k, n = int(lenient.sum()), len(lenient)
+    bt = stats.binomtest(k, n, 0.5, alternative="greater")
+    L.append(f"- 严格 {int(strict.sum())}/{n} vs 宽松 {k}/{n}（{k / n:.1%}）："
+             + ("输出格式失败而非判断失败（strict 被答案接口钉死）。" if strict.sum() == 0 and k > 0
+                else "两口径差距见上表。"))
+    if all_wrong:
+        L.append(f"- 系统性错误（全部 gen 判错）：question {all_wrong} —— 单题集中，非均匀噪声。")
+    if all_right:
+        L.append(f"- 全对题：{all_right}。")
+    L.append(f"- 宽松口径 vs 随机(0.5) 二项检验（greater）：p={bt.pvalue:.4f}。")
+    noop = [g for g in gens if run["per_gen"][g]["same_report_as_prev"]]
+    if noop:
+        L.append(f"- 无效子代：gen {noop}（与前代同 report_sha，patch 未产生有效变化）。")
+    pcorr = [run["per_gen"][g]["predicted_score"] for g in gens]
+    if pcorr and all(v is not None for v in pcorr) and len(set(pcorr)) > 1:
+        rho = stats.spearmanr(pcorr, gen_accs).statistic if len(gen_accs) >= 3 else float("nan")
+        L.append(f"- evaluator 预测分 {pcorr} 与宽松 acc 的 Spearman ρ={rho:.2f}"
+                 f"（strict 全 0 的平台期，预测分只反映过程/宽松质量）。")
+    L.append(f"- 产物：scores_extract.csv / significance.txt / progress.png（本目录）。")
+    coincide = [g for g in gens
+                if run["per_gen"][g]["score"] is not None
+                and abs((run["per_gen"][g]["score"]
+                         - float(np.mean([r["lenient_correct"] for r in run["rows"]
+                                          if r["genid"] == g]) or 0))) < 1e-9]
+    if coincide:
+        L.append(f"- 注：gen {','.join(coincide)} 的 strict 与 lenient 完全重合"
+                 f"（预测全部为精确格式，hollow 大标记即可在 progress.png 中同时看到两条线）。")
+    L.append("")
+
+    path = os.path.join(outdir, "REPORT.md")
+    with open(path, "w") as f:
+        f.write("\n".join(L) + "\n")
+    return path
+
+
+def write_plot(run, outdir):
+    gens = run["gens"]
+    x = np.arange(1, len(gens) + 1)
+    strict_g = [run["per_gen"][g]["score"] for g in gens]
+    lenient_g = [np.mean([r["lenient_correct"] for r in run["rows"] if r["genid"] == g]) for g in gens]
+    pred_g = [run["per_gen"][g]["predicted_score"] if run["per_gen"][g]["predicted_score"] is not None else np.nan
+              for g in gens]
+    best = np.maximum.accumulate([0.0] + lenient_g)[1:]
+
+    qids = sorted({r["question_id"] for r in run["rows"]})
+    q_ok = [sum(r["lenient_correct"] for r in run["rows"] if r["question_id"] == q) for q in qids]
+    q_truth = [next(r["truth"] for r in run["rows"] if r["question_id"] == q) for q in qids]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+    # strict drawn LAST with a HOLLOW, larger marker: when strict == lenient
+    # (exact-format predictions) the two curves coincide and an opaque
+    # overlay would hide strict entirely.
+    ax1.plot(x, lenient_g, "s-", ms=5, label="lenient acc", zorder=3)
+    ax1.plot(x, strict_g, "o-", ms=10, markerfacecolor="none",
+             markeredgewidth=1.6, label="strict score", zorder=4)
+    ax1.plot(x, pred_g, "^--", label="evaluator predicted")
+    ax1.plot(x, best, ":", color="gray", label="best-so-far (lenient)")
+    ax1.axhline(0.5, color="r", lw=0.8, alpha=0.6, label="random guess")
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.set_xticks(x)
+    ax1.set_xlabel("generation")
+    ax1.set_title(f"{run['name']} progress")
+    ax1.legend(fontsize=7)
+    ax1.grid(alpha=0.3)
+
+    ax2.bar(range(len(qids)), q_ok, color="#4C72B0")
+    ax2.set_xticks(range(len(qids)))
+    ax2.set_xticklabels([f"{q}\ntruth={t.split('_')[-1]}" for q, t in zip(qids, q_truth)], fontsize=8)
+    ax2.set_ylim(0, len(gens))
+    ax2.set_ylabel("lenient correct (of all gens)")
+    ax2.set_title("per-question correctness")
+    ax2.grid(alpha=0.3, axis="y")
+    fig.tight_layout()
+    path = os.path.join(outdir, "progress.png")
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    return path
+
+
+# ---------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("run_dirs", nargs="+")
+    ap.add_argument("--skip-plots", action="store_true")
+    args = ap.parse_args()
+
+    runs = [extract_run(d) for d in args.run_dirs]
+    for run in runs:
+        qids = {r["question_id"] for r in run["rows"]}
+        tp, truth = detect_dataset(run["dir"], run["domain"] or "search_arena", qids)
+        if truth is None:
+            print(f"[ERROR] {run['name']}: no dataset file covers question ids {sorted(qids)}")
+            return 2
+        attach_truth(run, truth)
+        run["truth_path"] = tp
+        mism, denom = report_crosscheck(run)
+        if mism:
+            print(f"[WARN] {run['name']} strict cross-check mismatch: {mism}")
+        if denom:
+            print(f"[NOTE] {run['name']} report total excludes invalid samples: {denom}")
+
+    # significance file (reused util): only runs with n>=2 give meaningful tests;
+    # n=1 smoke runs would just add nan/-inf noise to every pairwise cell.
+    methods = {}
+    meta = {}
+    for run in runs:
+        s, l = run_vectors(run)
+        if len(s) >= 2:
+            methods[f"{run['name']}:strict"] = s
+            methods[f"{run['name']}:lenient"] = l
+            meta.setdefault("n_samples", []).append(f"{run['name']}={len(s)}")
+    if not methods:  # fallback: all lenient
+        for run in runs:
+            _, l = run_vectors(run)
+            methods[f"{run['name']}:lenient"] = l
+            meta.setdefault("n_samples", []).append(f"{run['name']}={len(l)}")
+    sig_path = os.path.join(runs[0]["dir"], "score_analysis")
+    os.makedirs(sig_path, exist_ok=True)
+    save_significance_tests({k: v for k, v in methods.items()},
+                            os.path.join(sig_path, "significance.txt"),
+                            metadata={"domain": runs[0]["domain"],
+                                      "samples": "; ".join(meta["n_samples"])})
+
+    cross = None
+    if len(runs) > 1:
+        base = runs[0]
+        base_q = {r["question_id"] for r in base["rows"]}
+        cross = []
+        for other in runs[1:]:
+            oq = {r["question_id"] for r in other["rows"]}
+            shared = base_q & oq
+            s2 = np.array([r["strict_correct"] for r in other["rows"] if r["question_id"] in shared], dtype=float)
+            l2 = np.array([r["lenient_correct"] for r in other["rows"] if r["question_id"] in shared], dtype=float)
+            cross.append((other, s2, l2))
+
+    for run in runs:
+        outdir = os.path.join(run["dir"], "score_analysis")
+        os.makedirs(outdir, exist_ok=True)
+        csv_path = write_extract_csv(run, outdir)
+        rep_path = write_report(run, run["truth_path"], outdir, cross=cross if run is runs[0] else None)
+        plot_path = None if args.skip_plots else write_plot(run, outdir)
+        s, l = run_vectors(run)
+        print(f"[OK] {run['name']}: strict {int(s.sum())}/{len(s)}, "
+              f"lenient {int(l.sum())}/{len(l)} ({l.mean():.1%})")
+        for p in (csv_path, rep_path, plot_path):
+            if p:
+                print(f"     {p}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
