@@ -33,6 +33,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from analysis.analysis_utils import compute_bootstrap_ci, save_significance_tests  # noqa: E402
+from gan.framework import cost_ledger  # noqa: E402
 from scipy import stats  # noqa: E402
 
 import matplotlib  # noqa: E402
@@ -112,8 +113,13 @@ def detect_dataset(run_dir, domain, question_ids):
         if not os.path.exists(path):
             continue
         try:
-            truth = {r["question_id"]: r["winner"].strip().lower()
-                     for r in csv.DictReader(open(path))}
+            truth = {}
+            for r in csv.DictReader(open(path)):
+                # Label column varies by domain: search_analysis uses "winner",
+                # paper_review-style datasets use "outcome".
+                lab = (r.get("winner") or r.get("outcome") or "").strip().lower()
+                if lab:
+                    truth[r["question_id"]] = lab
         except Exception:
             continue
         if wanted and wanted.issubset(truth):
@@ -197,7 +203,9 @@ def extract_run(run_dir):
                              strict_correct=None, lenient=None, method=None, lenient_correct=None))
     return dict(name=name, dir=run_dir, gens=gens, per_gen=per_gen, rows=rows,
                 model_cfg=model_cfg, stagnation=stagnation, brief_missing=brief_missing,
-                llm_calls=llm_calls, self_receipts=self_receipts, domain=(scores or [{}])[0].get("domain"),
+                llm_calls=llm_calls, self_receipts=self_receipts,
+                sessions=cost_ledger.read_session_costs(run_dir),
+                domain=(scores or [{}])[0].get("domain"),
                 events=events)
 
 
@@ -235,8 +243,8 @@ def report_crosscheck(run):
 
 # ---------------------------------------------------------------- stats
 def run_vectors(run):
-    strict = np.array([r["strict_correct"] for r in run["rows"]], dtype=float)
-    lenient = np.array([r["lenient_correct"] for r in run["rows"]], dtype=float)
+    strict = np.array([r["strict_correct"] or 0 for r in run["rows"]], dtype=float)
+    lenient = np.array([r["lenient_correct"] or 0 for r in run["rows"]], dtype=float)
     return strict, lenient
 
 
@@ -279,8 +287,8 @@ def write_report(run, truth_path, outdir, cross=None):
 
     # per-gen table
     L.append("## 每 generation 一览\n")
-    L.append("| gen | score | cov | evaluator预测 | 宽松正确 | issues | patch ops | 无效子代 | harness_s | inner_s | cost_tokens | plan_tok | eval_tok |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("| gen | score | cov | evaluator预测 | 宽松正确 | issues | patch ops | 无效子代 | harness_s | inner_s | 时长(s) | cost_tokens | plan_tok | eval_tok |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for g in gens:
         r = run["per_gen"][g]
         lk = sum(x["lenient_correct"] for x in run["rows"] if x["genid"] == g)
@@ -289,8 +297,26 @@ def write_report(run, truth_path, outdir, cross=None):
         L.append(f"| {g} | {r['score']} | {r['coverage']} | {r['predicted_score']} "
                  f"| {lk}/{lt} | {r['n_issues']} {r['sev'] or ''} | {r['n_ops']} "
                  f"| {nokey} | {r['harness_s']} | {r['inner_s']} "
+                 f"| {r['cost_wallclock_s'] if r['cost_wallclock_s'] is not None else '—'} "
                  f"| {r['cost_tokens']} | {r['plan_tokens']} | {r['eval_tokens']} |")
     L.append("")
+
+    # per-session cost ledger (docs/10 §9 B / A7): runs that predate the
+    # ledger (no logs/cost_sessions.jsonl) or with a garbled file yield no rows.
+    sessions = run.get("sessions") or []
+    if sessions:
+        L.append("## 会话成本（cost_sessions.jsonl）\n")
+        L.append("| role | seat | outer | genid | attempt | llm_calls | tool_calls | prompt_tok | complet_tok | reason_tok | total_tok | 时长(s) |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for s in sessions:
+            L.append(f"| {s.get('role') or '—'} | {s.get('seat') or '—'} "
+                     f"| {s.get('outer') if s.get('outer') is not None else '—'} "
+                     f"| {s.get('genid') if s.get('genid') is not None else '—'} "
+                     f"| {s.get('attempt') or '—'} | {s.get('llm_calls') or '—'} "
+                     f"| {s.get('tool_calls') or '—'} | {s.get('prompt_tokens') or '—'} "
+                     f"| {s.get('completion_tokens') or '—'} | {s.get('reasoning_tokens') or '—'} "
+                     f"| {s.get('total_tokens') or '—'} | {s.get('wallclock_s') or '—'} |")
+        L.append("")
 
     # strict vs lenient
     L.append("## 严格 vs 宽松重判\n")
@@ -318,7 +344,7 @@ def write_report(run, truth_path, outdir, cross=None):
     for q in qids:
         rs = [r for r in run["rows"] if r["question_id"] == q]
         seq = "/".join(f"{r['lenient'] or '∅'}({(r['method'] or '')[:4]})" for r in rs)
-        k = sum(r["lenient_correct"] for r in rs)
+        k = sum((r["lenient_correct"] or 0) for r in rs)
         verdict = "全对" if k == len(rs) else ("全错（系统性反相关）" if k == 0 else "混合")
         L.append(f"| {q} | {rs[0]['truth']} | {seq} | {k}/{len(rs)} | {verdict} |")
     L.append("")
