@@ -179,6 +179,12 @@ class GanLoop:
         # Per-role self receipts: one entry per role, so a role can never render
         # another role's receipt.
         self._self_receipts: Dict[str, Dict[str, Any]] = {}
+        # Per-role design as it was BEFORE this outer's self-improve sessions
+        # ran. The exit heal compares against it to tell a name the session
+        # DROPPED from one that was never declared -- restoring the former is the
+        # reverse-dangling alignment, restoring the latter would be a guess.
+        # In-memory only (no disk write, no checkpoint).
+        self._self_design_pre: Dict[str, Dict[str, Any]] = {}
         # Names stripped from a role design by the STARTUP repair; merged
         # into that role's first self receipt so the actionable note reaches it
         self.preflight_design_stripped: Dict[str, list] = {}
@@ -956,6 +962,14 @@ class GanLoop:
 
         The durable record is the code commit; no separate patch file is kept.
         Validation failure rolls back to the previous commit.
+
+        EVERY exit then heals the role's design file (``_heal_self_design``):
+        the session already persisted its draft (``Role.save_self_config`` runs
+        at session end, before the loop learns the outcome), so an exit that
+        leaves it un-healed keeps a design that disagrees with the committed
+        tree -- forward dangling names after a rejected patch, and silently
+        dropped selections when a scheduled removal never landed. The heal's
+        ``stage`` names the exit.
         """
         patch = (res or {}).get("patch") if isinstance(res, dict) else None
         if not patch:
@@ -963,6 +977,13 @@ class GanLoop:
             if rejected:
                 self.log_event({"type": "self_improve_rejected", "role": role,
                                 "outer": outer, "reason": str(rejected)[:300]})
+            # No commit landed: the outer's entry commit is the authority for
+            # what this role can assemble, and the draft on disk may already
+            # disagree with it. Align it (a rejected or abandoned patch must not
+            # leave the design claiming a state the tree never reached).
+            self._heal_self_design(role, outer, res,
+                                   stage="self_improve_exhausted",
+                                   outcome=("exhausted" if rejected else "empty_patch"))
             return
         if not self.code_root:
             return
@@ -973,39 +994,202 @@ class GanLoop:
             self._role_commits[role] = sha
             self.log_event({"type": "self_improve_commit", "role": role,
                             "outer": outer, "commit": sha})
-            # The successful commit makes the committed
-            # registry the new authority, so any dangling name in the just-saved
-            # self design (e.g. an unregister whose deselect was forgotten) is
-            # stripped and the file re-saved -- "persisted design == committed
-            # tree deliverable" now holds for role designs on the success path
-            # too. The exhausted/rejected exit keeps the old file for now
-            # (backlog: docs/7 section 6.1); heal removes names only. The
-            # stripped names ride the self receipt (design_stripped) so the
-            # role's next self-improve sees its own heal.
-            from gan.design.store import DesignStore
-            from gan.framework.task_execution import heal_design_slots, heal_design_keys
-            store = DesignStore(paths.design_root(self.output_dir),
-                                writer=self.ledger_writer)
-            cfg = store.load(role)
-            stripped = heal_design_keys(cfg, role, self.code_root)
-            stripped += heal_design_slots(cfg, role, self.code_root)
-            if stripped:
-                store.save(cfg, role)
-                self.log_event({"type": "design_dangling_stripped", "role": role,
-                                "stage": "self_improve",
-                                "stripped": stripped})
-            if isinstance(res, dict):
-                res["design_stripped"] = stripped
+            # The successful commit makes the committed registry the new
+            # authority, so any dangling name in the just-saved self design
+            # (e.g. an unregister whose deselect was forgotten) is stripped and
+            # the file re-saved -- "persisted design == committed tree
+            # deliverable" holds for role designs on this path too. The stripped
+            # names ride the self receipt (design_stripped) so the role's next
+            # self-improve sees its own heal.
+            self._heal_self_design(role, outer, res,
+                                   stage="self_improve_success", outcome="applied")
         except code_repo.PatchRejected as e:
             # agent-attributable rejection: recover to the previous commit and
-            # keep the run going (B-level; the receipt carries the reason)
+            # keep the run going (B-level; the receipt carries the reason).
+            # The design is aligned to that same recovered commit.
             code_repo.checkout(self.code_root, prev)
             self.log_event({"type": "self_improve_apply_failed", "role": role,
                             "outer": outer, "error": str(e)[:300]})
+            self._heal_self_design(role, outer, res,
+                                   stage="self_improve_exhausted",
+                                   outcome="apply_failed")
         # RepoIntegrityError (git-layer failure during apply/rollback) and any
         # other unexpected error propagate: the outer worker exits non-zero and
         # the driver aborts the run — continuing on an undefined code tree would
         # poison the lineage.
+
+    def _heal_self_design(self, role: str, outer: int, res: Any,
+                          stage: str, outcome: str) -> None:
+        """Align a role's just-persisted self design with the committed tree.
+
+        Runs at EVERY self-improve exit, not only the successful one, because
+        the design file is written by the SESSION (before the loop learns the
+        outcome). Both heal directions are driven by the COMMITTED tree -- the
+        code commit for a landed patch, the outer's entry commit otherwise --
+        never by the session workspace, which the exit may be discarding:
+
+        * forward (``heal_design_keys`` + ``heal_design_slots``): strip names the
+          committed tree cannot deliver;
+        * reverse (``heal_design_removals``): put back the selections the session
+          dropped for a removal that never landed (``unregister_component`` was
+          scheduled, the patch was dropped, the component is still committed) --
+          the state a forward-only heal can never see, since nothing is dangling.
+
+        The session's DRAFT is copied to ``paths.design_draft_path`` first
+        (audit / replay only, never a lineage parent): it is the same bytes as
+        the design file at this instant -- nothing writes a role design between
+        the session end and this exit -- and the file is then overwritten by the
+        healed version. ``DesignStore.save`` is already atomic (tmp +
+        ``os.replace``), so that second write opens no new torn-file window:
+        worst case the draft stays, i.e. the pre-change behaviour. The facts ride
+        the self receipt: ``design_stripped`` / ``design_restored`` /
+        ``design_heal`` (stage, outcome, converged, draft path, final ckpt path).
+
+        **Convergence (nested / chained heal safety).** Both directions share ONE
+        predicate -- "does the committed tree resolve this name" -- so the
+        post-state is closed: forward leaves ``tools subset-of resolvable``, and
+        the reverse direction may only add a name it has ALREADY resolved, so a
+        pass can never manufacture a new dangling reference. Passing twice is a
+        no-op, hence the heal is idempotent and chaining it (this exit -> the
+        next outer's startup ``repair_dangling_designs``) cannot oscillate. The
+        invariant is not merely asserted: ``_self_design_residue`` re-runs all
+        three heal stages on the persisted result and any second-pass change is
+        reported loudly (``design_heal_not_converged`` +
+        ``design_heal.converged=false``), so a future edit that breaks the fixed
+        point shows up in the event stream instead of silently drifting the design.
+
+        Advisory: a heal failure is recorded loudly but never aborts the run --
+        it leaves exactly the state the pre-heal code left (a possibly
+        misaligned design that the next outer's startup repair can strip).
+        """
+        if not self.code_root or not isinstance(res, dict):
+            return
+        try:
+            from gan.design.store import DesignStore
+            from gan.framework.task_execution import (heal_design_keys,
+                                                      heal_design_removals,
+                                                      heal_design_slots)
+            store = DesignStore(paths.design_root(self.output_dir),
+                                writer=self.ledger_writer)
+            # Draft snapshot BEFORE any heal: the attempt's own proposal.
+            draft = self._archive_self_draft(role, outer)
+            cfg = store.load(role)  # the draft save_self_config just wrote
+            records = res.get("records")
+            pre = self._self_design_pre.get(role)
+            stripped = heal_design_keys(cfg, role, self.code_root)
+            stripped += heal_design_slots(cfg, role, self.code_root)
+            restored = heal_design_removals(cfg, role, self.code_root, records, pre)
+            if stripped or restored:
+                store.save(cfg, role)
+                if stripped:
+                    self.log_event({"type": "design_dangling_stripped", "role": role,
+                                    "stage": stage, "outcome": outcome,
+                                    "stripped": stripped})
+                if restored:
+                    self.log_event({"type": "design_selection_restored", "role": role,
+                                    "stage": stage, "outcome": outcome,
+                                    "restored": restored})
+            # Convergence probe: heal must be a FIXED POINT (idempotent, and
+            # unable to manufacture a new dangling by itself). A second pass over
+            # the just-persisted result that still wants changes means the
+            # invariant broke -- loud, never silent.
+            residue = self._self_design_residue(cfg, role, records, pre)
+            if residue:
+                soft_fail(f"self-design heal did NOT converge ({role}, outer "
+                          f"{outer}, stage={stage}): a second pass would still "
+                          f"change {residue} -- the persisted design is not a "
+                          f"fixed point",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="design_heal_not_converged", role=role,
+                          outer=outer, stage=stage, residue=residue)
+            res["design_stripped"] = stripped
+            res["design_restored"] = restored
+            res["design_heal"] = {
+                "stage": stage,
+                "outcome": outcome,
+                "converged": not residue,
+                "draft_path": draft,
+                "ckpt_path": store.path(role),
+            }
+        except Exception as e:  # noqa: BLE001 -- see docstring: loud, never fatal
+            soft_fail(f"self-design exit heal failed ({role}, outer {outer}, "
+                      f"stage={stage}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="design_heal_failed", role=role, outer=outer,
+                      stage=stage)
+
+    def _archive_self_draft(self, role: str, outer: int) -> Optional[str]:
+        """Audit snapshot of one role's session draft (never fatal).
+
+        Called at the exit BEFORE the heal overwrites the design file, so the
+        snapshot is byte-for-byte what the self-improve session proposed. Kept
+        under ``ckpt/design_drafts/`` (never read by the framework, never a
+        lineage parent) so an audit / replay can answer "what did this attempt
+        do, and what did the heal then strip or restore?" without guessing from
+        the overwritten file. A re-run of the same outer preserves the earlier
+        attempt's snapshot under a millisecond stamp, mirroring the
+        ``ckpt/outer_<N>.json`` convention.
+
+        Deliberately a plain writer rather than ``DesignStore.save``: this is an
+        audit artifact, not a decision-grade design write (B46's WriterToken
+        guards the design/scores/checkpoints that the next generation consumes).
+        """
+        src = os.path.join(paths.design_root(self.output_dir), role, "config.json")
+        if not os.path.isfile(src):
+            return None
+        try:
+            import time as _time
+            p = paths.design_draft_path(self.output_dir, role, outer)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            if os.path.exists(p):
+                os.replace(p, f"{p[:-len('.json')]}_{int(_time.time() * 1000)}.json")
+            with open(src, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            payload = {
+                "role": role,
+                "outer": outer,
+                "kind": "self_improve_draft",
+                "note": ("audit/replay only -- this self-improve session's design "
+                         "as it ended, BEFORE the outer-exit heal. The lineage "
+                         "parent is design/<role>/config.json (healed / aligned "
+                         "to the committed tree)."),
+                "saved_at": _time.time(),
+                "config": cfg,
+            }
+            tmp = f"{p}.save-tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+            return p
+        except Exception as e:  # noqa: BLE001 -- audit-only, must not fail the exit
+            soft_fail(f"design draft archive failed ({role}, outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="design_draft_archive_failed", role=role, outer=outer)
+            return None
+
+    def _self_design_residue(self, cfg: Dict[str, Any], role: str,
+                             records: Any, pre: Any) -> List[Dict[str, Any]]:
+        """What a SECOND heal pass over an already-healed config would change.
+
+        Empty = the config is a fixed point of the heal = the invariant "a heal
+        cannot leave (or create) a state the heal would touch again" holds. Both
+        directions share the single predicate "does the committed tree resolve
+        this name", so forward pruning leaves ``tools subset-of resolvable`` and
+        the reverse direction may only re-add a name it already resolved -- the
+        composition is therefore idempotent by construction, and this probe is
+        the tripwire that keeps it so (it also covers the chained case: a state
+        the next outer's startup ``repair_dangling_designs`` would strip).
+
+        Read-only: works on a copy, so probing never mutates the saved design.
+        """
+        from gan.framework.task_execution import (heal_design_keys,
+                                                  heal_design_removals,
+                                                  heal_design_slots)
+        probe = deepcopy(cfg)
+        residue: List[Dict[str, Any]] = heal_design_keys(probe, role, self.code_root)
+        residue += heal_design_slots(probe, role, self.code_root)
+        residue += heal_design_removals(probe, role, self.code_root, records, pre)
+        return residue
 
     def _resync_workspace(self, outer: Any, files: List[str], drop_missing: bool = False) -> None:
         """Keep granted workspace copies in sync with the code baseline.
@@ -1226,12 +1410,15 @@ class GanLoop:
             genid=f"outer_{outer}", role=role, stage="self_improve",
             records=r.get("records"), patch=r.get("patch_proposed", ""),
             patch_applied=bool(r.get("patch")), rejected_reason=rejected, budget=budget,
-            # The successful-exit heal strips dangling names from the
-            # self design; the role sees its own heal at the next self-improve.
-            # Merge the STARTUP repair for this role (consumed once, so a
-            # one-off startup event does not repeat every outer).
+            # The exit heal (ANY exit -- see _heal_self_design) strips dangling
+            # names from the self design and restores selections dropped for a
+            # removal that never landed; the role sees its own heal at the next
+            # self-improve. Merge the STARTUP repair for this role (consumed
+            # once, so a one-off startup event does not repeat every outer).
             design_stripped=((r.get("design_stripped") or [])
                              + self.preflight_design_stripped.pop(role, [])),
+            design_restored=r.get("design_restored"),
+            design_heal=r.get("design_heal"),
             component_drift=self._component_drift(r.get("patch_proposed", ""),
                                                   bool(r.get("patch"))),
             catalog_stale=self._catalog_stale(role),
@@ -1850,6 +2037,23 @@ class GanLoop:
                 p = getattr(last, "parent_genid", None) if last is not None else None
                 if p is not None and str(p) != "initial" and p not in si_refs:
                     si_refs.append(p)
+            # Pre-session design snapshot: the reference the EXIT heal compares
+            # against. Without it, "absent from the draft" cannot be told apart
+            # from "never declared", and putting a name back would be a guess.
+            # The roles only READ their design file up to this point (plan /
+            # evaluate sessions persist the TASK design), so this is the true
+            # pre-session state. Advisory: on failure the heal degrades to the
+            # in-session `deselect_component` record as its evidence.
+            try:
+                from gan.design.store import DesignStore
+                _pre_store = DesignStore(paths.design_root(self.output_dir),
+                                         writer=self.ledger_writer)
+                for _role in ("planner", "evaluator"):
+                    self._self_design_pre[_role] = _pre_store.load(_role)
+            except Exception as e:  # noqa: BLE001 -- never fatal
+                soft_fail(f"pre-session design snapshot failed (outer {outer}): {e}",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="design_pre_snapshot_failed", outer=outer)
             # The two self-improve sessions are INDEPENDENT (each role reads its
             # own trajectory/design and writes only its own seat surface --
             # frozen.SEAT_WRITE guarantees the path sets are disjoint) and run

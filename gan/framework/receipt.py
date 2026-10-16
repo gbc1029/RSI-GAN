@@ -193,6 +193,8 @@ def build_receipt(
     trajectory_refs: Optional[List[str]] = None,
     toolset: Optional[Dict[str, Any]] = None,
     design_stripped: Optional[List[Dict[str, Any]]] = None,
+    design_restored: Optional[List[Dict[str, Any]]] = None,
+    design_heal: Optional[Dict[str, Any]] = None,
     component_drift: Optional[List[Dict[str, Any]]] = None,
     catalog_stale: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
@@ -214,6 +216,15 @@ def build_receipt(
         # right before persisting, because the committed tree cannot deliver them
         # (a patch that was rejected, or an inherited dangling reference).
         "design_stripped": design_stripped or [],
+        # The mirror image: component selections the framework put BACK because
+        # the session dropped them for a removal that never landed (the
+        # component is still committed). Separate from design_stripped so an
+        # audit can tell "removed" from "restored" without parsing prose.
+        "design_restored": design_restored or [],
+        # Which exit healed, and where the two design versions live: the DRAFT
+        # the self-improve session proposed (audit / replay only, never a
+        # lineage parent) vs the FINAL config.json the next outer inherits.
+        "design_heal": design_heal or {},
         "code_patch": {
             "proposed": bool((patch or "").strip()),
             "applied": bool(patch_applied),
@@ -291,6 +302,15 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
                      f"— inspect with list_components; fix via register_component / "
                      f"select_component / deselect_component")
     stripped = receipt.get("design_stripped") or []
+    restored = receipt.get("design_restored") or []
+    heal = receipt.get("design_heal") or {}
+    # Which exit healed (successful commit vs exhausted/rejected vs empty
+    # patch): without it an operator cannot tell "cleaned up after a landed
+    # commit" from "aligned after a failed attempt" -- two different stories.
+    heal_tag = ""
+    if heal.get("stage") or heal.get("outcome"):
+        heal_tag = (f" [heal: {heal.get('stage')}"
+                    + (f"/{heal.get('outcome')}" if heal.get("outcome") else "") + "]")
     if stripped:
         # The design must never keep claiming what the tree cannot
         # deliver; the role sees exactly what was dropped and why.
@@ -301,7 +321,18 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"design note: dangling design entries STRIPPED before persist: {snames} "
                      f"— re-add tools only after the component is committed "
                      f"(register_component + patch); re-declare keys via add_config_key "
-                     f"(with a committed consumer)")
+                     f"(with a committed consumer){heal_tag}")
+    if restored:
+        # Reverse direction: the exit heal put these selections BACK -- the
+        # session dropped them for a removal (unregister_component) that never
+        # landed, so the component is still in the committed tree. Otherwise the
+        # design would silently stop declaring something that still exists.
+        rnames = ", ".join(f"'{s.get('name')}' ({str(s.get('reason'))[:60]})"
+                           for s in restored)
+        parts.append(f"design note: selections RESTORED before persist: {rnames} "
+                     f"-- the scheduled removal never landed (the component is still "
+                     f"committed); redo it as one change (unregister_component THEN "
+                     f"deselect_component in the SAME accepted patch){heal_tag}")
     drift = receipt.get("component_drift") or []
     if drift:
         names = ", ".join(

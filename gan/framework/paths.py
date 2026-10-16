@@ -13,6 +13,12 @@ Everything a run writes lives under ONE of the main buckets:
           planner/config.json
           evaluator/config.json
           task/<genid>/config.json
+        design_drafts/             AUDIT-ONLY snapshots of each outer's
+          <role>/outer_<N>_draft.json
+                                   self-improve design DRAFT as the session
+                                   ended (taken before the exit heal); NEVER a
+                                   lineage parent -- the aligned state is
+                                   design/<role>/config.json
       logs/        append-only logs
         events.jsonl
         task_tree.jsonl / planner_tree.jsonl / evaluator_tree.jsonl
@@ -68,6 +74,26 @@ def checkpoint_outer(output_dir: str, index: int) -> str:
 
 def design_root(output_dir: str) -> str:
     return os.path.join(ckpt_dir(output_dir), "design")
+
+
+def design_drafts_dir(output_dir: str) -> str:
+    """Audit-only design-draft snapshots (see ``design_draft_path``)."""
+    return os.path.join(ckpt_dir(output_dir), "design_drafts")
+
+
+def design_draft_path(output_dir: str, role: str, outer: int | str) -> str:
+    """The self-improve design DRAFT of one outer, as the session left it.
+
+    Written by the loop at the outer-exit heal (``GanLoop._heal_self_design``),
+    which copies the role's design file BEFORE healing it. The two are the SAME
+    bytes at that moment (nothing writes a role design between the session end
+    and the exit heal), but only the healed ``design/<role>/config.json`` is
+    inherited by the next outer. This snapshot answers "what did this
+    self-improve attempt actually propose, and what did the heal then
+    strip/restore?" -- audit / replay only, never loaded as a lineage parent.
+    """
+    return os.path.join(design_drafts_dir(output_dir), role,
+                        f"outer_{outer}_draft.json")
 
 
 # -- logs -------------------------------------------------------------------

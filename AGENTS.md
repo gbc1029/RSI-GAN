@@ -166,6 +166,47 @@ with a GAN-native data layer.
 - After a `modify` grant, planner/evaluator edit their granted copies with `edit_source`, confined to the instance workspace `src/`. Roles are never given raw `bash` (it cannot be confined). A repeated `request_source_access` on an already-granted path does NOT re-copy from `code_root` — in-scope edits survive; pass `refresh=true` to discard them and re-sync.
 - The task agent has **no always-on tools**; its capabilities are all opt-in tools.
 
+### Design healing (self-improve exit) — batch 35, B26 phase 2
+
+- The role design file is written by the SESSION (`Role.save_self_config`, at
+  session end, BEFORE the loop learns the patch outcome), so EVERY self-improve
+  exit heals it against the **committed** tree: `loop._heal_self_design` runs on
+  the success commit, on the exhausted/rejected exit, on the empty-patch exit and
+  after a failed apply. Both directions are legality-only (never an effect
+  review, so a deliberate shallow edit is never touched):
+  - **forward** — `heal_design_keys` + `heal_design_slots` strip names/keys the
+    committed tree cannot deliver (`design_dangling_stripped`,
+    receipt `design_stripped`);
+  - **reverse** — `heal_design_removals` puts a selection BACK when the session
+    scheduled a deep removal (`unregister_component`), dropped the name, and the
+    component is *still* committed (the removal never landed:
+    `design_selection_restored`, receipt `design_restored`). A forward-only heal
+    can never see this state — nothing is *dangling* when the design merely stops
+    declaring a live component.
+  - Evidence is structured only: the session `records` + the role design as it
+    was BEFORE the sessions ran (`loop._self_design_pre`; without it a this-session
+    `deselect_component` record is the only admissible evidence — absence alone
+    never licenses adding a name back).
+- The stage makes the two stories distinguishable: `design_dangling_stripped`
+  carries `stage` = `self_improve_success` / `self_improve_exhausted` plus
+  `outcome` = applied / exhausted / rejected / empty_patch / apply_failed.
+- **Convergent & idempotent** (nested / chained heal): both directions share ONE
+  predicate ("does the committed tree resolve this name"), so forward pruning
+  leaves `tools subset-of resolvable` and the reverse direction may only re-add a
+  name it already resolved — no pass can manufacture a new dangling reference, a
+  second pass is a no-op, and chaining into the next outer's startup
+  `repair_dangling_designs` cannot oscillate. `loop._self_design_residue`
+  re-runs all three stages on the persisted result as a tripwire: any second-pass
+  change is reported (`design_heal_not_converged` + `design_heal.converged=false`).
+- The DRAFT the session proposed is snapshotted before the heal overwrites the
+  file (`ckpt/design_drafts/<role>/outer_<N>_draft.json`, audit / replay only,
+  never a lineage parent): **draft = what the attempt proposed; `design/<role>/
+  config.json` = the aligned state that becomes the next outer's parent**. The
+  facts ride the self receipt (`design_stripped` / `design_restored` /
+  `design_heal{stage,outcome,converged,draft_path,ckpt_path}`). `save_self_config`
+  stays where it is — `DesignStore.save` is atomic (tmp + `os.replace`), so the
+  heal's re-save opens no new torn-file window.
+
 ### Knowledge base (pull-based)
 
 - `gan/components/<role>/knowledge/*.md` are **data** — not registry entries, no `name=stem` contract, never executed.
@@ -185,7 +226,7 @@ with a GAN-native data layer.
 
 | path | contents |
 |---|---|
-| `ckpt/` | recovery; per-run git tree `code/`; `code.json` manifest; `design/` |
+| `ckpt/` | recovery; per-run git tree `code/`; `code.json` manifest; `design/`; `design_drafts/<role>/outer_<N>_draft.json` (audit-only pre-heal self-design snapshots) |
 | `logs/` | `events.log`, `*_tree.log`, `*.log` |
 | `trajectory/outer_<O>/…` | role trajectories; outer-level files are attempt-keyed `<role>__<attempt>.log` (one per loop instance, assigned at role construction so content + stop records share one file; directly-constructed roles use `<role>.log`; readers merge canonical + attempt siblings, newest first) |
 | `scores/scores.log` | decision records |

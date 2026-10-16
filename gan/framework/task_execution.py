@@ -481,10 +481,11 @@ def heal_design_slots(config: Dict[str, Any], role: str,
     Every role's design is healed. Role self-designs select against the
     effective (workspace-first) registry, so they accumulate dangling names
     exactly like the task design -- the loop's ``_apply_self_patch`` runs this
-    heal at the SUCCESSFUL apply exit (where the committed registry is the new
-    authority) and re-saves the design file when anything was stripped. The
-    exhausted/rejected exit persists the session's un-healed design draft; an
-    exit heal there remains backlog (docs/7 section 6.1).
+    heal at EVERY self-improve exit (successful commit, exhausted/rejected,
+    empty patch) and re-saves the design file when anything was stripped (see
+    ``loop._heal_self_design``). This is the FORWARD direction; the reverse
+    direction -- a name the session dropped for a removal that never landed --
+    is ``heal_design_removals`` below.
     """
     if not isinstance(config, dict):
         return []
@@ -519,6 +520,103 @@ def heal_design_slots(config: Dict[str, Any], role: str,
     if stripped:
         config[slot] = kept
     return stripped
+
+
+# Deep ops whose INTENT is "this component should leave the system". A session
+# that scheduled one of these AND dropped the name from the component slot has
+# said "X is no longer used"; if the removal never landed (the patch was
+# exhausted/rejected wholesale, so the committed registry still has X), the
+# aligned design is the one that DECLARES X -- anything else is the
+# reverse-dangling state (component real, design silent) that no forward heal
+# can see and that the audit trail contradicts (records claim a removal).
+_REMOVAL_INTENT_OPS = ("unregister_component",)
+
+
+def heal_design_removals(config: Dict[str, Any], role: str,
+                         code_root: Optional[str],
+                         records: Optional[List[Dict[str, Any]]] = None,
+                         pre_config: Optional[Dict[str, Any]] = None
+                         ) -> List[Dict[str, str]]:
+    """Put BACK the component selections this session dropped for a removal
+    that never landed (the reverse-dangling alignment).
+
+    ``heal_design_slots``/``heal_design_keys`` only strip forward: names the
+    committed tree cannot deliver. This one is the mirror image and is the
+    reason an exhausted exit cannot simply reuse them -- "component exists but
+    the design no longer declares it" is not a dangling *reference*, so no strip
+    rule can see it.
+
+    Legality only, never an effect review (so a *deliberate* shallow edit is
+    never touched). A name is restored iff ALL four hold:
+
+    1. the session recorded a REMOVAL intent for it (``_REMOVAL_INTENT_OPS``),
+    2. the session itself dropped it from the slot -- exact when ``pre_config``
+       (the pre-session snapshot) declares the name; without the snapshot, a
+       this-session ``deselect_component`` record is the only admissible
+       evidence (absence alone is never a licence to add a name back),
+    3. the committed registry STILL resolves it (the removal did not land --
+       if it did land, the drop is the truth and nothing happens), and
+    4. it is not already in the slot.
+
+    Convergence: every condition is stated over the SAME predicate the strip
+    direction uses ("does the committed tree resolve this name"), so a pass
+    leaves ``slot subset-of resolvable`` and may only re-add a name it already
+    resolved -- running this (or the whole heal) twice is a no-op, and no pass
+    can manufacture a new dangling reference.
+
+    ``records``/``pre_config`` are read-only inputs; the caller passes the
+    session's structured records (never free text) and the design as it was
+    BEFORE the session ran. Mutates ``config[slot]`` in place when it restores
+    something (appending in pre-session order, so repeated heals are stable).
+    Returns ``[{"name", "reason"}]`` (empty = untouched).
+    """
+    if not isinstance(config, dict) or role not in ("task", "planner", "evaluator"):
+        return []
+    intent: List[str] = []
+    dropped_now: set = set()
+    for r in records or []:
+        if not isinstance(r, dict):
+            continue
+        op = str(r.get("op") or "")
+        name = r.get("name")
+        if not name:
+            continue
+        if op in _REMOVAL_INTENT_OPS:
+            intent.append(str(name))
+        elif op == "deselect_component":
+            dropped_now.add(str(name))
+    if not intent:
+        return []
+    slot = "tools"
+    cur = config.get(slot)
+    cur = [str(n) for n in cur] if isinstance(cur, (list, tuple)) else []
+    cur_set = set(cur)
+    pre_names: Optional[List[str]] = None
+    if isinstance(pre_config, dict):
+        pv = pre_config.get(slot)
+        pre_names = [str(n) for n in pv] if isinstance(pv, (list, tuple)) else []
+    from gan.registries.loader import load_registry_for_role
+    from gan.tools.assembly import gan_roots
+    _tools, rdir, cdir = gan_roots(code_root)
+    reg = load_registry_for_role(role, registry_dir=rdir, components_dir=cdir)
+    restored: List[Dict[str, str]] = []
+    for name in (pre_names if pre_names is not None else sorted(set(intent))):
+        if name not in intent or name in cur_set:
+            continue  # no removal scheduled, or the design still declares it
+        if pre_names is not None:
+            if name not in pre_names:
+                continue  # not declared before the session -> nothing was dropped
+        elif name not in dropped_now:
+            continue  # no snapshot and no in-session deselect evidence
+        if reg.module_path(name) is None:
+            continue  # the removal landed (or it never existed): the drop is truth
+        restored.append({"name": name,
+                         "reason": ("dropped for a removal that did not land -- the "
+                                    "component is still committed, so the selection "
+                                    "is restored")})
+    if restored:
+        config[slot] = cur + [r["name"] for r in restored if r["name"] not in cur_set]
+    return restored
 
 
 def assemble_task_env(
