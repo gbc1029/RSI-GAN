@@ -432,15 +432,16 @@ class DomainTaskRunner:
                 dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
                 reasoning_effort=self.reasoning_effort,
             )
-            try:
-                report = tx.run_existing_domain_report(self.domain, output_path, model)
-            except Exception as e:
-                # Same visibility contract as the parent-scoring path.
-                report = None
-                from utils.soft_fail import soft_fail
-                soft_fail(f"existing-domain report failed for genid {genid}: {e}",
-                          event_path=paths.events_path(self.output_dir),
-                          event_type="existing_domain_report_failed", genid=str(genid))
+            report = None
+            if rc == 0 or self.domain not in {"balrog_babyai", "balrog_babaisai"}:
+                try:
+                    report = tx.run_existing_domain_report(self.domain, output_path, model)
+                except Exception as e:
+                    # Same visibility contract as the parent-scoring path.
+                    from utils.soft_fail import soft_fail
+                    soft_fail(f"existing-domain report failed for genid {genid}: {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="existing_domain_report_failed", genid=str(genid))
         # Context-management audit exit (docs/10 §11.5): fold the child's
         # seam events into events.jsonl on EVERY post-harness path (the child
         # may have run a seam session even when scoring later failed).
@@ -502,7 +503,7 @@ class DomainTaskRunner:
             from utils.soft_fail import soft_fail
             soft_fail(f"report.json exists but is unparseable for genid {genid} "
                       f"(score will read None/failed): {report_path}")
-        score = tx.extract_score(report, self.score_key)
+        score = tx.extract_score(report, self.score_key, self.domain)
         report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
 
         report_sha = scores.sha256_file(report_path)

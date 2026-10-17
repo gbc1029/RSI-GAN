@@ -26,6 +26,11 @@ from utils.common import summarize_error
 # 150-350s on ONE long call, so hard domains override upward.
 QUESTION_TIMEOUT = int(os.environ.get("GAN_QUESTION_TIMEOUT_S", "300"))
 
+_SANDBOXED_BALROG_MODULES = {
+    "balrog_babyai": "domains.balrog.environments.babyai_text.babyai_env",
+    "balrog_babaisai": "domains.balrog.environments.babaisai.babaisai_env",
+}
+
 _TASK_ENV_NAMES = {
     "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
@@ -98,6 +103,67 @@ def _accepted_kwargs(cls, kwargs):
         return dict(kwargs)
     return {k: v for k, v in kwargs.items() if k in params}
 
+
+class _SandboxedBalrogAgent:
+    def __init__(self, model, chat_history_file, proxy_socket, proxy_token,
+                 reasoning_effort=None, cost_overrides=None):
+        self.model = model
+        self.chat_history_file = chat_history_file
+        self.proxy_socket = proxy_socket
+        self.proxy_token = proxy_token
+        self.reasoning_effort = reasoning_effort
+        self.cost_overrides = cost_overrides
+
+    def forward(self, inputs):
+        prediction = _run_sandboxed_agent(
+            self.model,
+            inputs,
+            "./task_agent.py",
+            self.chat_history_file,
+            self.proxy_socket,
+            self.proxy_token,
+            self.reasoning_effort,
+            self.cost_overrides,
+        )
+        return prediction, []
+
+
+class _SandboxedBalrogAgentFactory:
+    def __init__(self, model, proxy_socket, proxy_token, reasoning_effort=None):
+        if not proxy_socket or not proxy_token:
+            raise RuntimeError("GAN Balrog evaluation requires a scoped task proxy")
+        if not shutil.which("bwrap"):
+            raise RuntimeError(
+                "GAN Balrog evaluation requires bwrap; refusing an unsandboxed run"
+            )
+        proxy_socket = os.path.realpath(proxy_socket)
+        if (not os.path.exists(proxy_socket)
+                or not stat.S_ISSOCK(os.stat(proxy_socket).st_mode)):
+            raise RuntimeError("GAN Balrog task proxy socket is missing or invalid")
+        self.model = model
+        self.proxy_socket = proxy_socket
+        self.proxy_token = proxy_token
+        self.reasoning_effort = reasoning_effort
+        self.cost_overrides = _design_cost_overrides()
+
+    def create_agent(self, chat_history_file):
+        return _SandboxedBalrogAgent(
+            self.model,
+            chat_history_file,
+            self.proxy_socket,
+            self.proxy_token,
+            self.reasoning_effort,
+            self.cost_overrides,
+        )
+
+
+def _require_sandboxed_balrog_runtime(domain):
+    try:
+        importlib.import_module(_SANDBOXED_BALROG_MODULES[domain])
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"{domain} dependency is missing: {exc.name or exc}"
+        ) from exc
 
 
 def get_dataset(domain, subset="", dataset_root=None):
@@ -800,16 +866,25 @@ if __name__ == "__main__":
 
     # Balrog game domains
     elif "balrog" in domain:
+        env_name = domain.split("_")[-1]
+        agent_factory = None
+        if domain in _SANDBOXED_BALROG_MODULES and args.dataset_root is not None:
+            _require_sandboxed_balrog_runtime(domain)
+            agent_factory = _SandboxedBalrogAgentFactory(
+                args.model,
+                args.proxy_socket,
+                args.proxy_token,
+                args.reasoning_effort,
+            )
         from domains.balrog.eval import harness_balrog
 
-        env_name = domain.split("_")[-1]
         config_dir = os.path.join(os.getcwd(), "./domains/balrog/config")
         with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
             cfg = compose(
                 config_name="config",
                 overrides=[
                     f"eval.output_dir={args.output_dir}",
-                    f"eval.num_workers={args.num_workers}",
+                    f"eval.num_workers={1 if agent_factory is not None else args.num_workers}",
                     f"envs.names={env_name}",
                     f"eval.run_id={args.run_id if args.run_id is not None else 'null'}",
                     f"model={args.model}",
@@ -825,7 +900,7 @@ if __name__ == "__main__":
                     else []
                 ),
             )
-            output_folder = harness_balrog(cfg)
+            output_folder = harness_balrog(cfg, agent_factory=agent_factory)
             # Save cfg in output folder
             from omegaconf import OmegaConf
             OmegaConf.save(config=cfg, f=os.path.join(output_folder, "config.yaml"))

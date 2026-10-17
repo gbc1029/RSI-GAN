@@ -9,7 +9,6 @@ import hydra
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig
 
-from domains.balrog.agents import AgentFactory
 from domains.balrog.evaluator import EvaluatorManager
 from domains.balrog.utils import collect_and_summarize_results, print_summary_table
 
@@ -24,7 +23,7 @@ def redirect_to_file(filepath):
         finally:
             sys.stdout = original
 
-def harness_balrog(config):
+def harness_balrog(config, agent_factory=None):
     # original_cwd = get_original_cwd()
     original_cwd = ""
 
@@ -51,7 +50,9 @@ def harness_balrog(config):
 
     # Create an EvaluatorManager and run evaluation
     evaluator_manager = EvaluatorManager(config, original_cwd=original_cwd, output_dir=output_dir)
-    agent_factory = AgentFactory(config)
+    if agent_factory is None:
+        from domains.balrog.agents import AgentFactory
+        agent_factory = AgentFactory(config)
     with redirect_to_file(log_filename):
         evaluator_manager.run(agent_factory)
 

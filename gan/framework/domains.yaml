@@ -145,6 +145,19 @@ domains:
       case_insensitive: true
       strip: true
 
+  balrog_babyai:
+    harness_timeout_s: 3600
+    task_brief: >-
+      Play the BabyAI navigation environment. At each step, inspect the mission
+      and observation and respond with exactly one valid environment action.
+
+  balrog_babaisai:
+    question_timeout_s: 600
+    harness_timeout_s: 7200
+    task_brief: >-
+      Play the Baba Is AI puzzle environment. At each step, inspect the active
+      rules and object positions and respond with exactly one valid action.
+
 # family prefixes (longest match wins)
 families:
   balrog:

@@ -56,6 +56,7 @@ _HARNESS_FILES = [
     "domains/task_worker.py",
 ]
 _PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
+_SANDBOXED_BALROG_DOMAINS = {"balrog_babyai", "balrog_babaisai"}
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
 
 _TASK_ENV_NAMES = {
@@ -555,7 +556,10 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(run_dir, name), ignore=_PY_IGNORE)
     if domain:
-        dom = domain.split("_")[0] if "imo_" in domain else domain
+        if domain in _SANDBOXED_BALROG_DOMAINS:
+            dom = "balrog"
+        else:
+            dom = domain.split("_")[0] if "imo_" in domain else domain
         src = os.path.join(source_root, "domains", dom)
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(run_dir, "domains", dom), ignore=_DOMAIN_IGNORE)
@@ -750,7 +754,9 @@ def ensure_sampling_seed(
         base_seed = int.from_bytes(os.urandom(8), "big")
     anchor_ids: List[str] = []
     try:
-        pool = load_dataset_ids(dataset_root, domain, subset)
+        pool = [] if domain in _SANDBOXED_BALROG_DOMAINS else load_dataset_ids(
+            dataset_root, domain, subset
+        )
         k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
         if pool and k > 0:
             rng = random.Random(f"{int(base_seed)}:anchor")
@@ -1040,7 +1046,10 @@ def _run_harness_and_report_local(
         from gan.framework.llm_proxy import request_task_token
         proxy_token = request_task_token(
             proxy_socket, control_token, str(scope_id), model)
-    if questions_path:
+    needs_sandbox_identity = questions_path is not None or (
+        domain in _SANDBOXED_BALROG_DOMAINS and dataset_root is not None
+    )
+    if needs_sandbox_identity:
         setpriv, uid, gid = _sandbox_identity(
             run_dir, run_id, expected_owner_uid=expected_owner_uid,
         )
@@ -1064,6 +1073,7 @@ def _run_harness_and_report_local(
         ]
         if reasoning_effort:
             harness_cmd.extend(["--reasoning_effort", str(reasoning_effort)])
+    if questions_path:
         harness_cmd.extend(["--questions_path", os.path.abspath(questions_path)])
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
@@ -1078,7 +1088,7 @@ def _run_harness_and_report_local(
             "--proxy_token", proxy_token,
         ])
     child_env = _task_safe_env(env)
-    if questions_path:
+    if needs_sandbox_identity:
         username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
         _sandbox_runtime_preflight(
             setpriv, uid, gid, username, python_executable,
@@ -1137,8 +1147,9 @@ def read_report(report_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def extract_score(report: Optional[Dict[str, Any]], score_key: str) -> Optional[float]:
-    """Numeric objective score, or None when absent/NaN (score standard unchanged)."""
+def extract_score(report: Optional[Dict[str, Any]], score_key: str,
+                  domain: Optional[str] = None) -> Optional[float]:
+    """Numeric objective score, or None when absent/NaN."""
     if not isinstance(report, dict) or not score_key:
         return None
     val = report.get(score_key)
@@ -1150,6 +1161,8 @@ def extract_score(report: Optional[Dict[str, Any]], score_key: str) -> Optional[
         return None
     if math.isnan(f) or math.isinf(f):
         return None
+    if domain in _SANDBOXED_BALROG_DOMAINS:
+        f /= 100.0
     return f
 
 
