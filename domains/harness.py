@@ -618,6 +618,7 @@ def harness(
             dataset, question_id_col, num_samples,
             sample_seed=sample_seed, anchor_ids=anchor_ids,
         )
+        dataset = dataset.reset_index(drop=True)
         if _sample_info.get("mode") == "seeded":
             print(f"[sample] mode=seeded seed={_sample_info['sample_seed']} "
                   f"anchor={_sample_info['anchor_ids']} "

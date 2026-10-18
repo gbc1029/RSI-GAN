@@ -105,6 +105,7 @@ class DomainTaskRunner:
 
         reg = load_registry()
         self.domain_cfg = resolve_domain(reg, domain)
+        self.timeout = int(self.domain_cfg.get("harness_timeout_s") or timeout)
         self.score_key = self.domain_cfg.get("score_key")
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
@@ -432,8 +433,17 @@ class DomainTaskRunner:
                 dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
                 reasoning_effort=self.reasoning_effort,
             )
+            if self.domain == "imo_proof":
+                self._event("task_harness_done", genid=str(genid), rc=rc,
+                            question_timeout_s=question_timeout_s,
+                            harness_timeout_s=self.timeout)
             report = None
-            if rc == 0 or self.domain not in {"balrog_babyai", "balrog_babaisai"}:
+            if self.domain == "imo_proof":
+                # Proof grading is completed inside the privileged broker with
+                # the same scoped proxy token; never run the legacy in-process
+                # report path from the outer worker.
+                report = tx.read_report(report_path) if rc == 0 else None
+            elif rc == 0 or self.domain not in {"balrog_babyai", "balrog_babaisai"}:
                 try:
                     report = tx.run_existing_domain_report(self.domain, output_path, model)
                 except Exception as e:

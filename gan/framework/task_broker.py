@@ -126,7 +126,10 @@ class _TaskBrokerState:
         from gan.framework import llm_proxy
         from gan.framework import task_execution as tx
 
+        domain = str(self.config["domain"])
         model = str(self.config["model"])
+        total_timeout = int(self.config["timeout"])
+        stage_timeout = max(1, total_timeout // 2) if domain == "imo_proof" else total_timeout
         proxy_token = llm_proxy.request_task_token(
             str(self.config["proxy_socket"]),
             str(self.config["proxy_control_token"]),
@@ -201,16 +204,16 @@ class _TaskBrokerState:
                     anchor_ids = list(seed_info.get("anchor_ids") or [])
                 except (OSError, ValueError, KeyError):
                     sample_seed = None  # fall back to the legacy prefix slice
-            return tx._run_harness_and_report_local(
+            rc, output = tx._run_harness_and_report_local(
                 str(self.config["python"]),
                 run_dir,
-                str(self.config["domain"]),
+                domain,
                 f"gan_{scope_id}",
                 str(self.config["subset"]),
                 int(self.config["num_samples"]),
                 model,
                 env,
-                int(self.config["timeout"]),
+                stage_timeout,
                 questions_path=questions_path if parent_scored else None,
                 dataset_root=None if parent_scored else str(self.config["repo_root"]),
                 proxy_socket=str(self.config["proxy_socket"]),
@@ -223,6 +226,23 @@ class _TaskBrokerState:
                 sample_seed=sample_seed,
                 anchor_ids=anchor_ids,
             )
+            if domain == "imo_proof" and rc == 0:
+                grading_rc, grading_output = tx.run_imo_proof_grading(
+                    str(self.config["python"]),
+                    run_dir,
+                    f"gan_{scope_id}",
+                    int(self.config["num_samples"]),
+                    model,
+                    env,
+                    stage_timeout,
+                    str(self.config["proxy_socket"]),
+                    proxy_token,
+                    log_path=os.path.join(self.config["output_dir"], "logs", "task_runner.log"),
+                    reasoning_effort=self.config.get("reasoning_effort"),
+                )
+                output = f"{output}\n[imo_proof_grading]\n{grading_output}"
+                rc = grading_rc
+            return rc, output
         finally:
             if os.path.isdir(run_dir):
                 _restore_directory_ownership(

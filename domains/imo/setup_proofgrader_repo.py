@@ -331,7 +331,10 @@ def main():
 
     print("\nDone.")
     print("Next steps:")
-    print("pip install -e ./proofgrader_repo")
+    print(
+        "python -m pip install --no-deps --no-build-isolation "
+        "--force-reinstall ./proofgrader_repo"
+    )
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -57,6 +58,9 @@ _HARNESS_FILES = [
 ]
 _PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
 _SANDBOXED_BALROG_DOMAINS = {"balrog_babyai", "balrog_babaisai"}
+_SANDBOXED_HARNESS_DOMAINS = _SANDBOXED_BALROG_DOMAINS | {
+    "imo_proof", "imo_proof_grading",
+}
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
 
 _TASK_ENV_NAMES = {
@@ -1016,6 +1020,8 @@ def _run_harness_and_report_local(
     reasoning_effort: Optional[str] = None,
     sample_seed: Optional[int] = None,
     anchor_ids: Optional[List[str]] = None,
+    agent_path: str = "./task_agent.py",
+    proofs_dname: Optional[str] = None,
 ) -> Tuple[int, str]:
     """Run a fixed harness command; the privileged broker is its only secure caller.
 
@@ -1027,6 +1033,7 @@ def _run_harness_and_report_local(
     """
     harness_cmd = [
         python, "-m", "domains.harness",
+        "--agent_path", agent_path,
         "--domain", domain,
         "--model", model,
         "--run_id", run_id,
@@ -1047,7 +1054,7 @@ def _run_harness_and_report_local(
         proxy_token = request_task_token(
             proxy_socket, control_token, str(scope_id), model)
     needs_sandbox_identity = questions_path is not None or (
-        domain in _SANDBOXED_BALROG_DOMAINS and dataset_root is not None
+        domain in _SANDBOXED_HARNESS_DOMAINS and dataset_root is not None
     )
     if needs_sandbox_identity:
         setpriv, uid, gid = _sandbox_identity(
@@ -1065,6 +1072,7 @@ def _run_harness_and_report_local(
             "--",
             python_executable,
             "-m", "domains.harness",
+            "--agent_path", agent_path,
             "--domain", domain,
             "--model", model,
             "--run_id", run_id,
@@ -1082,6 +1090,8 @@ def _run_harness_and_report_local(
             harness_cmd.extend(["--sample_seed", str(int(sample_seed))])
             if anchor_ids:
                 harness_cmd.extend(["--anchor_ids", ",".join(str(a) for a in anchor_ids)])
+    if proofs_dname:
+        harness_cmd.extend(["--proofs_dname", os.path.abspath(proofs_dname)])
     if proxy_token:
         harness_cmd.extend([
             "--proxy_socket", os.path.abspath(proxy_socket),
@@ -1105,6 +1115,92 @@ def _run_harness_and_report_local(
     return proc.returncode, out
 
 
+def _write_proofgrader_shim(run_dir: str) -> str:
+    """Create a framework-owned grader entry point inside the run copy."""
+    runtime_dir = os.path.join(run_dir, ".gan_runtime")
+    os.makedirs(runtime_dir, exist_ok=True)
+    shim_path = os.path.join(runtime_dir, "proofgrader_task_agent.py")
+    with open(shim_path, "w", encoding="utf-8") as stream:
+        stream.write("from proofgrader.task_agent import TaskAgent\n")
+    os.chmod(shim_path, 0o644)
+    return "./.gan_runtime/proofgrader_task_agent.py"
+
+
+def _require_sandboxable_proofgrader() -> None:
+    """Require proofgrader to live inside the trusted Python prefix."""
+    try:
+        spec = importlib.util.find_spec("proofgrader.task_agent")
+    except (ImportError, ModuleNotFoundError, ValueError) as exc:
+        raise RuntimeError("proofgrader.task_agent is not importable") from exc
+    origin = os.path.realpath(str(spec.origin or "")) if spec else ""
+    prefix = os.path.realpath(sys.prefix)
+    if not origin or not (
+        origin == prefix
+        or origin.startswith(prefix + os.sep)
+        or origin.startswith(os.path.realpath("/usr") + os.sep)
+    ):
+        raise RuntimeError(
+            "proofgrader.task_agent must be installed inside the trusted Python "
+            "environment; editable source outside the sandbox is refused"
+        )
+
+
+def run_imo_proof_grading(
+    python: str,
+    run_dir: str,
+    run_id: str,
+    num_samples: int,
+    model: str,
+    env: Dict[str, str],
+    timeout: int,
+    proxy_socket: str,
+    proxy_token: str,
+    log_path: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+) -> Tuple[int, str]:
+    """Grade generated proofs through the same scoped, sandboxed task path."""
+    _require_sandboxable_proofgrader()
+    predictions_dir = os.path.join(run_dir, "outputs", run_id)
+    predictions_path = os.path.join(predictions_dir, "predictions.csv")
+    if not os.path.isfile(predictions_path):
+        raise RuntimeError(f"imo_proof predictions are missing: {predictions_path}")
+    agent_path = _write_proofgrader_shim(run_dir)
+    grading_run_id = f"{run_id}_proof_grading"
+    grading_env = dict(env)
+    grading_env.pop("GAN_TASK_BRIEF", None)
+    rc, output = _run_harness_and_report_local(
+        python,
+        run_dir,
+        "imo_proof_grading",
+        grading_run_id,
+        "",
+        num_samples,
+        model,
+        grading_env,
+        timeout,
+        dataset_root=run_dir,
+        proxy_socket=proxy_socket,
+        proxy_token=proxy_token,
+        log_path=log_path,
+        reasoning_effort=reasoning_effort,
+        agent_path=agent_path,
+        proofs_dname=predictions_dir,
+    )
+    if rc != 0:
+        return rc, output
+
+    grading_dir = os.path.join(run_dir, "outputs", grading_run_id)
+    from domains.imo.proof_eval import report_proof_grading
+    report_proof_grading(grading_dir)
+    src = os.path.join(grading_dir, "report.json")
+    dst = os.path.join(predictions_dir, "report.json")
+    if not os.path.isfile(src):
+        raise RuntimeError(f"imo_proof grading report is missing: {src}")
+    os.chmod(src, 0o644)
+    os.replace(src, dst)
+    return rc, output
+
+
 def write_parent_report(
     predictions_path: str,
     report_path: str,
@@ -1126,8 +1222,9 @@ def write_parent_report(
 def run_existing_domain_report(domain: str, dname: str, model: str) -> Optional[Dict[str, Any]]:
     """Call the existing independent-domain report entry point in this parent."""
     if domain == "imo_proof":
-        from domains.report import report_imo_proof
-        report_imo_proof(dname=dname, model=model)
+        # GAN mode completes proof grading inside the privileged task broker;
+        # never fall back to the legacy in-process proofgrader path here.
+        return read_report(os.path.join(dname, "report.json"))
     elif "balrog" in domain:
         from domains.balrog.eval import report_balrog
         report_balrog(output_dir=dname)

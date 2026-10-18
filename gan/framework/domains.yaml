@@ -125,6 +125,7 @@ domains:
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
     question_timeout_s: 1500  # full formal proof: longest single calls
+    harness_timeout_s: 7200  # generation + controlled proof grading
     task_brief: >-
       Write a rigorous proof for the given math problem. Your final answer is
       the proof itself.

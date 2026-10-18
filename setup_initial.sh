@@ -49,7 +49,8 @@ python -m domains.report --domain paper_review --dname ./outputs/initial_paper_r
 # # imo_proof
 # python -m domains.imo.setup_proofgrader_repo --proofautograder  # ProofAutoGrader
 # # python -m domains.imo.setup_proofgrader_repo --generate_dir <dir to run on imo_grading>  # Or use a generated grader
-# pip install -e ./proofgrader_repo
+# Editable installs are rejected by the secure GAN path; install into the active trusted Python environment.
+# python -m pip install --no-deps --no-build-isolation --force-reinstall ./proofgrader_repo
 # python -m domains.harness --domain imo_proof --run_id initial_imo_proof_0 --num_samples 10
 # python -m domains.report --domain imo_proof --dname ./outputs/initial_imo_proof_0
 
