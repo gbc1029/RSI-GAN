@@ -23,6 +23,10 @@ import os
 from typing import Optional
 
 from gan.framework.context import get_access_context
+from gan.framework.trajectory import read  # passthrough full-read path
+                                           # (import lost in the 2d0a19a
+                                           # dispatch rewrite — fixed in the
+                                           # docs/10 §15 batch, pre-existing)
 
 
 def tool_info():
