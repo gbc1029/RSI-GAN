@@ -21,7 +21,8 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from .blocks import (Block, Universe, View, cut, excerpt_saving, placeholder,
-                       PLACEHOLDER_OVERHEAD, MIN_COMPACT_SAVE)
+                       PLACEHOLDER_OVERHEAD, MIN_COMPACT_SAVE,
+                       DERIVED_PIECE_KEEP, estimate_tokens)
 
 AGENT_FACES = ("index", "fetch", "budget_query", "pin", "unpin", "note",
                "view_state", "call")
@@ -95,15 +96,28 @@ def substitute(universe: Universe, view: View, block_id: str, form: str,
 
 
 def compact(universe: Universe, view: View, block_ids: List[str],
-            strategy: str, floor_chars: int) -> Dict[str, Any]:
-    """Mechanical compaction (excerpt-ish, NO LLM). The source blocks become
-    excerpts (sticky) — the derived block is metadata record-keeping, not a
-    fabricated replacement (占位必须引用块 id, §5.2 不变量)."""
+            strategy: str, floor_chars: int, turn: int) -> Dict[str, Any]:
+    """Mechanical compaction (NO LLM). ``excerpt``/``first_last`` stay
+    form-level (single-block strategies — the sticky excerpt achieves them).
+    ``merge``/``template`` materialize a DERIVED block whose text is built
+    HERE from the sources only — register_derived is not on any face, so
+    no-fabrication holds by construction (docs/10 §15).
+
+    Host = the first source bound to the canonical history (``msg_index``):
+    its span renders the derived text IN FULL (the merge already did the
+    compressing); every other canonical source becomes a ``merged-into``
+    placeholder; stale references to consumed derived sources are re-pointed
+    the same way (one view representation per piece of content). A derived
+    source is PINNED on consumption — consumed nodes never re-compact, the
+    lineage stays a tree, not a DAG. Validate first, mutate only on success."""
     if strategy not in ("excerpt", "first_last", "merge", "template"):
         return {"op": "compact", "refs": list(block_ids), "ok": False,
                 "error": f"unknown strategy {strategy!r}"}
     if not block_ids:
         return {"op": "compact", "refs": [], "ok": False, "error": "no refs"}
+    if len(set(block_ids)) != len(block_ids):
+        return {"op": "compact", "refs": list(block_ids), "ok": False,
+                "error": "duplicate refs"}
     saved, blocks = 0, []
     for bid in block_ids:
         block = universe.get(bid)
@@ -116,6 +130,10 @@ def compact(universe: Universe, view: View, block_ids: List[str],
         if block.kind == "note":
             return {"op": "compact", "refs": list(block_ids), "ok": False,
                     "error": "note blocks are never dropped"}
+        if view.form_of(block.block_id) != "full":
+            return {"op": "compact", "refs": list(block_ids), "ok": False,
+                    "error": (f"block {block.block_id} already substituted "
+                              f"({view.form_of(block.block_id)})")}
         if block.chars < floor_chars:
             return {"op": "compact", "refs": list(block_ids), "ok": False,
                     "error": f"below drop floor ({floor_chars})"}
@@ -128,34 +146,83 @@ def compact(universe: Universe, view: View, block_ids: List[str],
                         "error": ("compaction saves nothing "
                                   f"({block.block_id} saves {saving})")}
             saved += saving
-    elif strategy == "template":
         for block in blocks:
-            if excerpt_saving(block) < MIN_COMPACT_SAVE:
-                return {"op": "compact", "refs": list(block_ids), "ok": False,
-                        "error": "compaction saves nothing"}
-            saved += excerpt_saving(block)
-    else:  # merge
+            view.set(block.block_id, "excerpt", f"compacted:{strategy}")
+        return {"op": "compact", "refs": list(block_ids), "ok": True,
+                "rule": f"compacted:{strategy}", "saved": saved}
+
+    # -- materializing strategies: build the derived text from the sources --
+    if strategy == "merge":
         if len(blocks) < 2:
             return {"op": "compact", "refs": list(block_ids), "ok": False,
                     "error": "merge needs >= 2 blocks"}
-        total = sum(b.chars for b in blocks)
-        merged = "".join(cut(b.text, 300) for b in blocks)
-        merged_len = len(merged) + 16 * len(blocks)
-        if total - merged_len < MIN_COMPACT_SAVE:
+        host = next((b for b in blocks if b.msg_index is not None), None)
+        if host is None:
             return {"op": "compact", "refs": list(block_ids), "ok": False,
-                    "error": "compaction saves nothing"}
-        saved = total - merged_len
-    for block in blocks:
-        view.set(block.block_id, "excerpt", f"compacted:{strategy}")
+                    "error": "no hostable source (none bound to history)"}
+        derived_text = "\n".join(f"[{b.block_id}] {cut(b.text, DERIVED_PIECE_KEEP)}"
+                                 for b in blocks)
+    else:  # template — frozen metadata + key lines, one entry per source
+        host = next((b for b in blocks if b.msg_index is not None), None)
+        if host is None:
+            return {"op": "compact", "refs": list(block_ids), "ok": False,
+                    "error": "no hostable source (none bound to history)"}
+        lines = [f"[derived template: "
+                 f"sources={','.join(b.block_id for b in blocks)}]"]
+        for b in blocks:
+            seg_lines = b.text.splitlines() or [""]
+            lines.append(f"- {b.block_id} kind={b.kind} chars={b.chars} "
+                         f"token_est={estimate_tokens(b.text)} "
+                         f"head={seg_lines[0][:120]!r} "
+                         f"tail={seg_lines[-1][:120]!r}")
+        derived_text = "\n".join(lines)
+    saved = sum(b.chars for b in blocks) - len(derived_text)
+    if saved < MIN_COMPACT_SAVE:
+        return {"op": "compact", "refs": list(block_ids), "ok": False,
+                "error": "compaction saves nothing"}
+
+    # all gates passed — materialize and rewrite the view
+    dblock = universe.register_derived("compact", derived_text, turn,
+                                       [b.block_id for b in blocks])
+    consumed = {b.block_id for b in blocks if b.kind == "derived"}
+    for b in blocks:
+        if b.kind == "derived":
+            b.pinned = True   # consumed node: never re-compact (tree, not DAG)
+    view.set(host.block_id, "derived_host", f"derived={dblock.block_id}")
+    for b in blocks:
+        if b.block_id != host.block_id and b.msg_index is not None:
+            view.set(b.block_id, "placeholder",
+                     f"merged-into:{dblock.block_id}")
+    if consumed:
+        # former hosts / pointers of a consumed derived re-point to the
+        # newest representation (one view representation per content)
+        for bid, rule in list(view.rules.items()):
+            if bid == host.block_id or not isinstance(rule, str):
+                continue
+            target = None
+            if rule.startswith("derived="):
+                target = rule[len("derived="):]
+            elif rule.startswith("merged-into:"):
+                target = rule[len("merged-into:"):]
+            if target in consumed:
+                view.set(bid, "placeholder",
+                         f"merged-into:{dblock.block_id}")
     return {"op": "compact", "refs": list(block_ids), "ok": True,
-            "rule": f"compacted:{strategy}", "saved": saved}
+            "rule": f"compacted:{strategy}", "saved": saved,
+            "derived": dblock.block_id}
 
 
 def order(universe: Universe, view: View, block_ids: List[str]) -> Dict[str, Any]:
-    """v1: view order follows creation order (tool_result adjacency must not
-    break); ``order`` validates but is a no-op — it exists so policies that
-    were written against the full vocabulary still validate cleanly. A
-    semantics-bearing reorder needs the L4 gateway first (docs/10 §10.4)."""
+    """Validating no-op (evidence-verified, docs/10 §15): the view order IS
+    the canonical history order — one block per message entry over an
+    append-only history (register_history binds msg_index; notes and derived
+    blocks never inject into it), so a semantics-bearing reorder has no safe
+    target in this chat protocol (message structure is the seam's
+    (history, msg) contract; tool_result adjacency must not break).
+    ``order`` still validates refs so policies written against the full
+    vocabulary behave identically. Revisit only if the block model gains
+    multi-block messages, a structured tool-message protocol, or a
+    floatable-block injection surface."""
     for bid in block_ids:
         block = universe.get(bid)
         if block is None:

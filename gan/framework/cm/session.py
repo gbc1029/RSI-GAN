@@ -187,7 +187,7 @@ class ViewHandle:
         if err := self._gate("compact"):
             return err
         return self._audit(ops.compact(self._s.universe, self._s.view, list(block_ids),
-                           strategy, self._s.drop_floor_chars))
+                           strategy, self._s.drop_floor_chars, self._s.turn))
 
     def substitute(self, block_id: str, form: str) -> Dict[str, Any]:
         if err := self._gate("substitute"):
@@ -779,7 +779,7 @@ class CMSession:
                 continue  # the excerpt would save nothing: leave to the window
             out.append(ops.compact(self.universe, self.view,
                                    [block.block_id], "first_last",
-                                   self.drop_floor_chars))
+                                   self.drop_floor_chars, self.turn))
         return out
 
     def budget_snapshot(self, tokens_used: Optional[int] = None,
@@ -960,6 +960,18 @@ class CMSession:
                     keep = EXCERPT_KEEP if form == "excerpt" else HEAD_TAIL_KEEP
                     new_text = (cut(block.text, keep)
                                 + f"\n[block {block.block_id} {form}: {rule or 'view'}]")
+                elif form == "derived_host":
+                    # the host span renders the DERIVED text IN FULL (the
+                    # merge/template already did the compressing). The baked
+                    # marker carries the HOST id, so the idempotency check
+                    # and the view-marker re-bind above keep working on the
+                    # next turn (docs/10 §15).
+                    dblock = (self.universe.get(rule[len("derived="):])
+                              if rule.startswith("derived=") else None)
+                    if dblock is None:
+                        continue  # unreachable (universe add-only): stay raw
+                    new_text = (dblock.text
+                                + f"\n[block {block.block_id} derived_host: {rule}]")
                 elif form == "dedup":
                     if self.system_prefix and new_content.startswith(self.system_prefix):
                         new_text = _DEDUP_MARKER + new_content[len(self.system_prefix):]
@@ -1013,10 +1025,16 @@ class CMSession:
         for rec in (records or [])[:max(1, self.max_ops_per_turn)]:
             if not rec.get("ok") or rec.get("op") == "policy":
                 continue  # refusals ride cm_violation; the run itself is not a view op
-            ops_brief.append({"op": rec.get("op"),
-                              "refs": list(rec.get("refs") or []),
-                              "rule": str(rec.get("rule")
-                                          or rec.get("form") or "")[:60]})
+            brief = {"op": rec.get("op"),
+                     "refs": list(rec.get("refs") or []),
+                     "rule": str(rec.get("rule")
+                                 or rec.get("form") or "")[:60]}
+            if rec.get("derived"):
+                # conditional audit field: materializes only on ops that
+                # minted a derived block (the baseline event shape stays
+                # byte-identical — same pattern as degraded/assembly_disabled)
+                brief["derived"] = str(rec.get("derived"))
+            ops_brief.append(brief)
         stats: Dict[str, Any] = {"blocks": len(self.universe.blocks),
                                  "substituted": len(self.view.forms),
                                  "saved_chars": saved,

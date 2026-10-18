@@ -20,8 +20,13 @@ list must not advertise them):
 ``boundary``     RETAINED vocabulary: question-boundary marker, no materializing
                  code path in v1 (multi-question sessions only, docs/10 §11.4)
 ``derived``      compaction product; id ``derived:<op>:<n>``, refs its sources
-                 (v1: ``compact`` marks the source blocks instead — register_derived
-                 is unused; enabled with L4, docs/10 §11.5/§11.7)
+                 (merge/template materialize it — docs/10 §15; excerpt/
+                 first_last stay form-level. register_derived is NOT on any
+                 face, so no caller can fabricate derived text — no-
+                 fabrication by construction. A derived block becomes PINNED
+                 the moment it is consumed as a source of a higher derived
+                 block: consumed nodes never re-compact, keeping the lineage
+                 a tree, not a DAG)
 
 View forms: ``full`` | ``head_tail`` | ``excerpt`` | ``placeholder`` | ``template``.
 Rendering is PURE: every form derives from the block's own text or is a
@@ -32,7 +37,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-FORMS = ("full", "head_tail", "excerpt", "placeholder", "template", "dedup")
+FORMS = ("full", "head_tail", "excerpt", "placeholder", "template", "dedup",
+         "derived_host")
 KINDS = ("turn_output", "tool_output", "traj_seg", "kb_note", "note",
          "boundary", "derived")
 
@@ -40,6 +46,7 @@ HEAD_TAIL_KEEP = 400    # chars kept on each side for head_tail
 EXCERPT_KEEP = 600      # chars kept on each side for excerpt
 MIN_COMPACT_SAVE = 200  # refuse compaction that saves less than this
 PLACEHOLDER_OVERHEAD = 96  # ~ chars a placeholder costs (drop-floor guard)
+DERIVED_PIECE_KEEP = 300  # per-source head+tail keep inside a merge derived text
 
 
 def estimate_tokens(text: str) -> int:
@@ -92,16 +99,24 @@ class Block:
     source: str = ""     # origin descriptor (tool name / genid / ...)
     pinned: bool = False
     msg_index: Optional[int] = None   # where this text lives in the history
+    sources: List[str] = field(default_factory=list)  # derived lineage (parents)
+    depth: int = 0       # 0 = canonical block, N = Nth derivation generation
 
     @property
     def chars(self) -> int:
         return len(self.text)
 
     def to_meta(self) -> Dict[str, Any]:
-        """Metadata projection (ctx_index / cm_view): sizes + flags, NO text."""
-        return {"block_id": self.block_id, "kind": self.kind, "turn": self.turn,
+        """Metadata projection (ctx_index / cm_view): sizes + flags, NO text.
+        Lineage fields materialize only on derived blocks (conditional audit
+        fields — the canonical block projection stays byte-identical)."""
+        meta = {"block_id": self.block_id, "kind": self.kind, "turn": self.turn,
                 "chars": self.chars, "token_est": estimate_tokens(self.text),
                 "pinned": self.pinned, "source": self.source[:60]}
+        if self.kind == "derived":
+            meta["sources"] = list(self.sources)
+            meta["depth"] = self.depth
+        return meta
 
 
 @dataclass
@@ -138,12 +153,20 @@ class Universe:
 
     def register_derived(self, op: str, text: str, turn: int,
                          sources: List[str]) -> Block:
-        """Compaction product: refs its source blocks (溯源). The caller must
-        build ``text`` from the sources only — the post-segment verifies it."""
+        """Compaction product: refs its source blocks (溯源). NOT on any
+        face — only frozen ops code may mint derived blocks, and the
+        primitive builds ``text`` from the sources only, so no-fabrication
+        holds by construction (docs/10 §15). Sources must already exist
+        (the caller validates); the shared counter keeps ids unique, so the
+        lineage is acyclic by construction. Depth = 1 + max(parent depths)."""
         self._counter += 1
+        srcs = [str(s) for s in sources]
+        parent_depth = max((self.blocks[s].depth for s in srcs
+                            if s in self.blocks), default=0)
         block = Block(block_id=f"derived:{op}:{self._counter}", kind="derived",
                       text=text or "", turn=turn,
-                      source=",".join(sources)[:120])
+                      source=",".join(srcs)[:120],
+                      sources=srcs, depth=parent_depth + 1)
         self.blocks[block.block_id] = block
         return block
 
