@@ -62,6 +62,11 @@ class TaskAgent(AgentSystem):
     """
     An automatic grader for IMO-Proof Bench.
     """
+    def __init__(self, model, chat_history_file='./outputs/trajectory.jsonl',
+                 reasoning_effort=None):
+        super().__init__(model, chat_history_file=chat_history_file)
+        self.reasoning_effort = reasoning_effort
+
     def forward(self, inputs):
         # Check if all required inputs are present
         if not all(key in inputs for key in ["problem", "solution", "grading_guidelines", "student_answer"]):
@@ -74,7 +79,10 @@ class TaskAgent(AgentSystem):
             grading_guidelines=inputs["grading_guidelines"],
             student_answer=inputs["student_answer"],
         )
-        new_msg_history = chat_with_agent(instruction, model=self.model, msg_history=[], logging=self.log)
+        new_msg_history = chat_with_agent(
+            instruction, model=self.model, msg_history=[], logging=self.log,
+            reasoning_effort=self.reasoning_effort,
+        )
 
         # Extract the response
         prediction = "None"
