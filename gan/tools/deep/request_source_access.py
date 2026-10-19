@@ -6,6 +6,7 @@ through here: request ``view``/``modify`` access, then edit the granted copies.
 Requested paths are copied into the role workspace ``src/`` so they can then be
 edited with the ``edit_source`` work tool.
 """
+from gan.framework.access import SourceAccessDisabled
 from gan.framework.context import (get_access_context, get_design_context,
                                    illegal_seat_error)
 
@@ -59,9 +60,14 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
     # Default (if_absent): never overwrite a workspace copy that already exists -- it may
     # hold this session's edit_source edits or unregister_component deletions. refresh=True
     # is the explicit escape hatch that discards them and re-copies the repo version.
-    granted = actx.broker.grant(actx.role, actx.node_id, paths or [], intent=intent,
-                                reason=reason, if_absent=not refresh,
-                                 seat=actx.seat)
+    try:
+        granted = actx.broker.grant(actx.role, actx.node_id, paths or [],
+                                    intent=intent, reason=reason,
+                                    if_absent=not refresh, seat=actx.seat)
+    except SourceAccessDisabled:
+        return ("Deep source access is DISABLED for this run "
+                "(source_access.deny_deep=true). Do not retry; continue with "
+                "shallow design/config operators only.")
     kept = list((getattr(actx.broker, "last_result", None) or {}).get("skipped") or [])
     if dctx is not None:
         dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)

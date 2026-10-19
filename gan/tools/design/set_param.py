@@ -1,5 +1,5 @@
 """Design operator: set a free parameter under config.params."""
-from gan.framework.context import get_design_context
+from gan.framework.context import get_design_context, shallow_op_error
 
 
 def tool_info():
@@ -18,6 +18,9 @@ def tool_function(name, value, **kwargs):
     ctx = get_design_context()
     if ctx is None:
         return "Error: no design context"
+    err = shallow_op_error("set_param")
+    if err:
+        return err
     if str(name) == "model":
         # Frozen framework setting: the role model is resolved from
         # ``gan/framework/models.yaml`` (pure lookup), never from an evolvable

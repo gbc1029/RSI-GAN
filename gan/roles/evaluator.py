@@ -23,6 +23,7 @@ class Evaluator(Role):
         blind_enabled: bool = True,
         task_brief: Optional[str] = None,
         cost_statement: str = "",
+        benchmark_score: Optional[float] = None,
     ) -> str:
         parts = [
             "Evaluate the task agent this round.",
@@ -36,6 +37,16 @@ class Evaluator(Role):
                 "\n## BLIND PHASE\nYou are NOT told the benchmark objective score yet. "
                 "Use `record_predicted_score` for your predicted score, and `report_issue` "
                 "for each problem you find (process / cheating / detail / overfitting)."
+            )
+        elif benchmark_score is not None:
+            # C1 ablation (ablation.disable_blind=true): the objective score is
+            # revealed up front; the blind discipline is off.
+            parts.append(
+                f"\n## SCORE KNOWN (blind disabled)\n"
+                f"The benchmark objective score is: `benchmark_score = {benchmark_score}`. "
+                f"Use `record_predicted_score` for your predicted score, and "
+                f"`report_issue` for each problem you find (process / cheating / "
+                f"detail / overfitting)."
             )
         parts.append(f"\n## Run artifacts (trajectory / results summary)\n```json\n{json.dumps(run_summary, ensure_ascii=False, indent=2)[:6000]}\n```")
         if parent_feedback and parent_feedback.get("digest"):
@@ -134,7 +145,8 @@ class Evaluator(Role):
                       else max(6, blind_cap // 3))
         try:
             hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief,
-                                                    cost_statement=cost_statement),
+                                                    cost_statement=cost_statement,
+                                                    benchmark_score=(benchmark_score if not blind_enabled else None)),
                             max_tool_calls=blind_cap,
                             tool_repeat_limit=tool_repeat_limit,
                             trajectory_file=self.session_trajectory(node_id))

@@ -1,0 +1,3 @@
+[submodule "baselines/rqgm"]
+	path = baselines/rqgm
+	url = https://github.com/kingkillery/red-queen-godel-machine.git

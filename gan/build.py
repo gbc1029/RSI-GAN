@@ -19,7 +19,7 @@ from gan.framework.loop import GanLoop
 from gan.framework.task_runner import DomainTaskRunner
 
 
-def _seed_self_designs(output_dir: str, ledger_writer=None) -> None:
+def _seed_self_designs(output_dir: str, drop_eval_points: Optional[List[str]] = None, ledger_writer=None) -> None:
     """First-time initialization of planner/evaluator self-designs.
 
     An existing design file is AUTHORITATIVE — including deliberately empty
@@ -65,7 +65,15 @@ def _seed_self_designs(output_dir: str, ledger_writer=None) -> None:
         if role in ("planner", "evaluator"):
             from gan.registries.loader import load_registry_for_role
             reg = load_registry_for_role(role)
-            cfg["tools"] = reg.names()
+            if role == "evaluator":
+                drop = set(drop_eval_points or [])
+                # E-group ablation (docs/11): seed WITHOUT the dropped eval_points.
+                # Only affects a MISSING design file; an existing design file is
+                # authoritative and is never rewritten (change the drop list by
+                # deleting the design file or deselecting manually).
+                cfg["tools"] = [n for n in reg.names() if n not in drop]
+            else:
+                cfg["tools"] = reg.names()
         store.save(cfg, role)
 
 
@@ -141,7 +149,9 @@ def build_gan_loop(
     # never stored module-global.
     from gan.framework.ledger import open_run as _ledger_open_run
     ledger_writer = _ledger_open_run(output_dir)
-    _seed_self_designs(output_dir, ledger_writer=ledger_writer)
+    _seed_self_designs(output_dir, drop_eval_points=list(
+        cfg.get("ablation.evaluator_drop_eval_points") or []),
+        ledger_writer=ledger_writer)
 
     code_root = ensure_code_root(repo_root, output_dir) if code_repo else None
 
@@ -185,6 +195,10 @@ def build_gan_loop(
     broker = AccessBroker(
         code_root or repo_root, output_dir,
         deny_paths=frozen_deny_paths(),
+        deny_deep=bool(cfg.get("source_access.deny_deep", False)),
+        deep_view_only=bool(cfg.get("ablation.deep_view_only", False)),
+        shallow_prompt_only=bool(cfg.get("ablation.shallow_prompt_only", False)),
+        disable_shallow=bool(cfg.get("ablation.disable_shallow", False)),
         max_files=int(cfg.get("source_access.max_files_per_grant", 500)),
         max_bytes=int(cfg.get("source_access.max_bytes_per_grant", 50 * 1024 * 1024)),
     )

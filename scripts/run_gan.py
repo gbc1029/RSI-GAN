@@ -60,6 +60,31 @@ def _run_offline_analysis(output_dir: str, skip: bool = False) -> int:
     return rc_first
 
 
+def _parse_ablation_value(raw: str):
+    """Type-infer a single --ablation KEY=VALUE value.
+
+    comma-separated -> list (elements type-inferred individually);
+    true/false/yes/no/1/0 -> bool; int/float; else string.
+    """
+    raw = raw.strip()
+    if "," in raw:
+        return [_parse_ablation_value(p) for p in raw.split(",") if p.strip()]
+    low = raw.lower()
+    if low in ("true", "yes", "1"):
+        return True
+    if low in ("false", "no", "0"):
+        return False
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
 def main():
     p = argparse.ArgumentParser(description="Run the GAN dual-loop (planner/evaluator/task).")
     p.add_argument("--repo_root", default=".")
@@ -90,6 +115,13 @@ def main():
                    help="Skip the offline post-run analysis (analysis/gan_*.py -> "
                         "<output_dir>/score_analysis/). Default: run it after the loop "
                         "exits, even on a failed run (judge a round by its artifacts).")
+    p.add_argument("--ablation", action="append", default=None, metavar="KEY=VALUE",
+                   help="Ablation switch (repeatable). Maps into the loop.yaml "
+                        "'ablation.*' section; 'deny_deep' is aliased to "
+                        "source_access.deny_deep (B1). Values are type-inferred: "
+                        "true/false, int/float, comma-separated -> list, else string. "
+                        "Example: --ablation disable_planner=true "
+                        "--ablation trajectory_visibility=all")
     args = p.parse_args()
 
     if args.in_process:
@@ -140,6 +172,24 @@ def main():
         overrides.setdefault("loop", {})["outer_generations"] = args.outer
     if args.inner is not None:
         overrides.setdefault("loop", {})["inner_max"] = args.inner
+
+    # --ablation KEY=VALUE (repeatable) -> loop.yaml 'ablation.*' section.
+    # 'deny_deep' is a B1 alias resolved to source_access.deny_deep (its only
+    # consumer); everything else lands under the ablation block.
+    if args.ablation:
+        ablation = {}
+        for kv in args.ablation:
+            if "=" not in kv:
+                p.error(f"--ablation 需要 KEY=VALUE 形式（收到 {kv!r}）")
+            key, raw = kv.split("=", 1)
+            key = key.strip()
+            value = _parse_ablation_value(raw.strip())
+            if key == "deny_deep":
+                overrides.setdefault("source_access", {})["deny_deep"] = value
+            else:
+                ablation[key] = value
+        if ablation:
+            overrides["ablation"] = {**overrides.get("ablation", {}), **ablation}
 
     if args.resume and args.force:
         p.error("--resume and --force are mutually exclusive")

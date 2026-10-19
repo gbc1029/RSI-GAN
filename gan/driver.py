@@ -927,6 +927,18 @@ def run_gan_driver(
                     cmd.extend(["--sample-seed-base", str(sample_seed_base)])
                     if anchor_ids:
                         cmd.extend(["--anchor-ids", ",".join(anchor_ids)])
+                # Ablation switches (docs/11) must reach the per-outer worker: the
+                # worker rebuilds its own loop config from loop.yaml + overrides, so
+                # the driver's merged ablation section rides an explicit JSON arg.
+                worker_overrides: Dict[str, Any] = {}
+                ab = cfg.get("ablation") or {}
+                if ab:
+                    worker_overrides["ablation"] = dict(ab)
+                # B1 rides source_access.deny_deep (its only consumer), not ablation.
+                worker_overrides.setdefault("source_access", {})["deny_deep"] = \
+                    bool(cfg.get("source_access.deny_deep", False))
+                if worker_overrides:
+                    cmd.extend(["--cfg-overrides", json.dumps(worker_overrides)])
                 if inner is not None:
                     cmd.extend(["--inner", str(inner)])
                 if resume:

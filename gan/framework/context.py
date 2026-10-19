@@ -256,3 +256,45 @@ def session_overlay_root():
     except Exception:  # noqa: BLE001 -- a stub broker: no overlay, never a crash
         return None
     return src if (src and os.path.isdir(os.path.join(src, "gan"))) else None
+
+
+def ablation_flags() -> Dict[str, bool]:
+    """Read the run's B-group ablation flags from the access context's broker.
+
+    Used by the DESIGN tool layer to enforce ``disable_shallow`` (B4: freeze the
+    whole shallow surface) and ``shallow_prompt_only`` (B3: only prompt edits).
+    ``deep_view_only`` (B2) and the full-deep freeze (B1/B3) are enforced at the
+    broker grant layer, not here. Returns all-false when no access context /
+    broker is present (framework plumbing, tests) -- never raise.
+    """
+    actx = get_access_context()
+    broker = getattr(actx, "broker", None) if actx is not None else None
+    return {
+        "disable_shallow": bool(getattr(broker, "disable_shallow", False)),
+        "shallow_prompt_only": bool(getattr(broker, "shallow_prompt_only", False)),
+        "deep_view_only": bool(getattr(broker, "deep_view_only", False)),
+    }
+
+
+def shallow_op_error(op_name: str, key: Optional[str] = None) -> Optional[str]:
+    """Return an error string when a B-group ablation forbids this shallow op.
+
+    ``disable_shallow`` (B4) freezes the WHOLE shallow surface; the design tools
+    refuse before mutating. ``shallow_prompt_only`` (B3) allows only
+    ``set_prompt`` / ``set_config(key=\"prompt\")`` and refuses everything else.
+    Returns ``None`` when the op is allowed (no ablation, or a prompt op under
+    B3). Read-only: never mutates state, never raises.
+    """
+    flags = ablation_flags()
+    if flags["disable_shallow"]:
+        return ("Error: shallow design operators are DISABLED this run "
+                "(ablation.disable_shallow=true); only deep source access "
+                "(request_source_access + edit_source) is available.")
+    if flags["shallow_prompt_only"]:
+        is_prompt = (op_name == "set_prompt") or (
+            op_name == "set_config" and str(key or "") == "prompt")
+        if not is_prompt:
+            return ("Error: only prompt edits are allowed this run "
+                    "(ablation.shallow_prompt_only=true); component selection "
+                    "and other config keys are frozen.")
+    return None
