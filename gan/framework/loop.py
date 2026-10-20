@@ -909,6 +909,130 @@ class GanLoop:
             writer=self.ledger_writer,
         )
 
+    # -- supernode (docs/13 §2.3) -----------------------------------------
+    def _read_per_question(self, genid: Any) -> Dict[str, float]:
+        """Reconstruct per-question 0/1 from report.json question_ids_{passed,failed}."""
+        try:
+            p = os.path.join(paths.runs_dir(self.output_dir, genid), "report.json")
+            if not os.path.isfile(p):
+                return {}
+            with open(p, "r", encoding="utf-8") as f:
+                rep = json.load(f)
+            out: Dict[str, float] = {}
+            for qid in rep.get("question_ids_passed") or []:
+                out[str(qid)] = 1.0
+            for qid in rep.get("question_ids_failed") or []:
+                out[str(qid)] = 0.0
+            return out
+        except Exception:  # noqa: BLE001 -- advisory
+            return {}
+
+    def _read_eval_points(self, genid: Any) -> List[str]:
+        try:
+            p = os.path.join(paths.runs_dir(self.output_dir, genid), "eval.json")
+            if not os.path.isfile(p):
+                return []
+            with open(p, "r", encoding="utf-8") as f:
+                rec = json.load(f)
+            return [str(r.get("point")) for r in rec.get("eval_point_results") or []
+                    if isinstance(r, dict) and r.get("point")]
+        except Exception:  # noqa: BLE001 -- advisory
+            return []
+
+    def _record_supernode(self, outer: int, outer_genids: List[Any]) -> None:
+        """Aggregate + persist the per-outer supernode (advisory sink)."""
+        try:
+            from gan.framework import code_repo
+            from gan.framework.supernode import record_supernode
+            task_commit = None
+            roles_head = None
+            if self.code_root:
+                task_commit = code_repo.current_commit(self._task_root())
+                if self.roots.layout == "split":
+                    roles_head = code_repo.current_commit(self._roles_root())
+
+            scores: List[float] = []
+            per_question: Dict[str, List[float]] = {}
+            coverage = None
+            op_dist: Dict[str, int] = {}
+            response_kind: Dict[str, int] = {}
+            issues: List[Dict[str, Any]] = []
+            eval_points = set()
+            predicted: List[float] = []
+            actual: List[float] = []
+            for g in outer_genids:
+                node = self.task_tree.get(g)
+                if node is None:
+                    continue
+                if node.value.score is not None and node.value.score_status in _MEASURED:
+                    scores.append(node.value.score)
+                if node.value.coverage is not None:
+                    coverage = node.value.coverage
+                for qid, v in self._read_per_question(g).items():
+                    per_question.setdefault(qid, []).append(v)
+                rec = (node.meta or {}).get("receipt") or {}
+                for o in (rec.get("design") or {}).get("ops") or []:
+                    if isinstance(o, dict) and o.get("op"):
+                        op = str(o["op"])
+                        op_dist[op] = op_dist.get(op, 0) + 1
+                for r in (node.meta or {}).get("records") or []:
+                    if isinstance(r, dict) and r.get("op") == "respond_issue" and r.get("response_kind"):
+                        rk = str(r["response_kind"])
+                        response_kind[rk] = response_kind.get(rk, 0) + 1
+                fb = (node.meta or {}).get("feedback") or {}
+                issues.extend(fb.get("issues") or [])
+                eval_points.update(self._read_eval_points(g))
+                p = node.meta.get("predicted_score")
+                a = node.meta.get("benchmark_score")
+                if p is not None and a is not None:
+                    predicted.append(float(p))
+                    actual.append(float(a))
+
+            severity: Dict[str, int] = {}
+            for it in issues:
+                if isinstance(it, dict):
+                    sv = str(it.get("severity", "unknown"))
+                    severity[sv] = severity.get(sv, 0) + 1
+            bias = None
+            if predicted and actual:
+                bias = {"predicted": float(statistics.mean(predicted)),
+                        "actual": float(statistics.mean(actual))}
+
+            payload = {
+                "outer": outer,
+                "planner_design_hash": self._design_hash("planner"),
+                "evaluator_design_hash": self._design_hash("evaluator"),
+                "code_commits": {
+                    "task": task_commit,
+                    "planner": self._role_commits.get("planner") or roles_head,
+                    "evaluator": self._role_commits.get("evaluator") or roles_head,
+                },
+                "root_genid": str(outer_genids[0]) if outer_genids else None,
+                "subtree": [str(g) for g in outer_genids],
+                "benchmark": {
+                    "per_question": {q: list(v) for q, v in per_question.items()},
+                    "mean": float(statistics.mean(scores)) if scores else None,
+                    "std": float(statistics.pstdev(scores)) if len(scores) > 1 else 0.0,
+                    "coverage": coverage,
+                    "n_valid": len(scores),
+                },
+                "planner_stats": {"op_dist": op_dist, "response_kind": response_kind},
+                "evaluator_stats": {
+                    "issues_per_task": (len(issues) / len(outer_genids)) if outer_genids else None,
+                    "severity": severity,
+                    "eval_points_run": sorted(eval_points),
+                    "bias": bias,
+                },
+            }
+            record_supernode(self.output_dir, outer, payload, writer=self.ledger_writer)
+            self.log_event({"type": "supernode_recorded", "outer": outer,
+                            "subtree": payload["subtree"],
+                            "n_valid": payload["benchmark"]["n_valid"]})
+        except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
+            soft_fail(f"supernode record failed (outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="supernode_record_failed", outer=outer)
+
     def _refresh_roles(self, outer: int) -> None:
         """Rebuild planner/evaluator for a new outer generation (instance refresh).
 
@@ -2289,5 +2413,6 @@ class GanLoop:
                             "self_cost_tokens": self_own_costs,
                             "duration_s": round(time.time() - _outer_t0, 1)})
             self._save_checkpoint("outer", outer, I_max)
+            self._record_supernode(outer, outer_genids)
 
         return self.task_tree
