@@ -168,7 +168,8 @@ class TreeStore:
         return len(self.nodes)
 
     # -- selection ---------------------------------------------------------
-    def _candidates(self, branch_limit: int, depth_limit: int) -> List[Node]:
+    def _candidates(self, branch_limit: int, depth_limit: int,
+                    outer_id: Optional[int] = None) -> List[Node]:
         out = []
         for k in self.order:
             n = self.nodes[k]
@@ -178,6 +179,12 @@ class TreeStore:
                 continue
             if n.depth >= depth_limit:
                 continue
+            if outer_id is not None:
+                # Subtree selection (docs/13 §2.4): keep this outer's nodes plus
+                # legacy/initial nodes that carry no outer_id (back-compat).
+                n_outer = n.meta.get("outer_id")
+                if n_outer is not None and n_outer != outer_id:
+                    continue
             out.append(n)
         return out
 
@@ -200,9 +207,15 @@ class TreeStore:
         ucb_c: float = 1.0,
         depth_penalty: float = 0.05,
         cost_penalty: float = 0.0,
+        outer_id: Optional[int] = None,
     ) -> List[Node]:
-        """Return up to ``k`` parents (``k>1`` used by crossover)."""
-        cands = self._candidates(branch_limit, depth_limit)
+        """Return up to ``k`` parents (``k>1`` used by crossover).
+
+        ``outer_id`` restricts the candidate pool to that outer's subtree
+        (nodes with a different ``meta.outer_id`` are excluded; nodes without
+        an ``outer_id`` — ``initial`` and pre-migration nodes — stay eligible).
+        """
+        cands = self._candidates(branch_limit, depth_limit, outer_id=outer_id)
         if not cands:
             return []
         if method == "latest":
@@ -224,8 +237,10 @@ class TreeStore:
         ucb_c: float = 1.0,
         depth_penalty: float = 0.05,
         cost_penalty: float = 0.0,
+        outer_id: Optional[int] = None,
     ) -> Optional[Node]:
-        ps = self.select_parents(1, branch_limit, depth_limit, method, ucb_c, depth_penalty, cost_penalty)
+        ps = self.select_parents(1, branch_limit, depth_limit, method, ucb_c,
+                                 depth_penalty, cost_penalty, outer_id=outer_id)
         return ps[0] if ps else None
 
     # -- import from DGM-H -------------------------------------------------

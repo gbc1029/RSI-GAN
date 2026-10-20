@@ -35,8 +35,10 @@ accept/reject and no parent selection for roles; ``outer_improved`` is logged on
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import os
+import random
 import shutil
 import statistics
 import threading
@@ -339,6 +341,20 @@ class GanLoop:
         return digest
 
     # -- scoring / failure handling ---------------------------------------
+    def _design_hash(self, role: str) -> Optional[str]:
+        """sha256 of the role's design config content (docs/13 §2.2).
+
+        Advisory: a missing/unparseable design yields None (the stamp is
+        evidence, never a hard gate).
+        """
+        try:
+            from gan.design.store import DesignStore
+            cfg = DesignStore(paths.design_root(self.output_dir)).load(role)
+            data = json.dumps(cfg, sort_keys=True, ensure_ascii=False, default=str)
+            return hashlib.sha256(data.encode("utf-8")).hexdigest()
+        except Exception:  # noqa: BLE001 -- advisory stamp
+            return None
+
     def _impute_score(self, parent: Optional[Node]) -> Optional[float]:
         """Impute a missing benchmark score: siblings' median, else parent score."""
         if parent is None:
@@ -801,6 +817,9 @@ class GanLoop:
         self, reason: str, parent: Optional[Node], parents: List[Node], genid: Any,
         detail: str = "", outer: Optional[int] = None, inner: Optional[int] = None,
     ) -> Node:
+        meta = {"invalid": True, "invalid_reason": reason, "invalid_detail": detail[:500]}
+        if outer is not None:
+            meta["outer_id"] = outer
         node = Node(
             genid=genid,
             parent_genid=(parent.genid if parent is not None else None),
@@ -808,7 +827,7 @@ class GanLoop:
             valid_parent=False,
             status="invalid",
             value=NodeValue(score=None, score_status="invalid"),
-            meta={"invalid": True, "invalid_reason": reason, "invalid_detail": detail[:500]},
+            meta=meta,
         )
         self._finalize_invalid_node(node, reason, detail, outer, inner)
         return node
@@ -1609,6 +1628,8 @@ class GanLoop:
         depth_penalty = float(cfg.get("tree.depth_penalty", 0.05))
         cost_penalty = float(cfg.get("tree.cost_penalty", 0.0))
         n_parents = int(cfg.get("tree.num_parents", 1))  # >1 enables crossover
+        cross_subtree = bool(cfg.get("tree.cross_subtree", False))
+        cross_subtree_epsilon = float(cfg.get("tree.cross_subtree_epsilon", 0.1))
 
         if self.resume and len(self.task_tree):
             # resume_boundary: "outer" (never resume from a crashed outer's
@@ -1667,9 +1688,11 @@ class GanLoop:
             inner_start = self._start_inner if (only_outer is None and outer == self._start_outer) else 1
             for inner in range(inner_start, I_max + 1):
                 _inner_t0 = time.time()
+                use_global = cross_subtree and random.random() < cross_subtree_epsilon
                 parents = self.task_tree.select_parents(
                     k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                     ucb_c=ucb_c, depth_penalty=depth_penalty, cost_penalty=cost_penalty,
+                    outer_id=None if use_global else outer,
                 )
                 if not parents:
                     self.log_event({"type": "inner_skip", "reason": "no_candidate", "outer": outer, "inner": inner})
@@ -1808,6 +1831,15 @@ class GanLoop:
                 child.parent_genid = parent.genid
                 plan_cfg = plan_result.get("config")
                 child.meta["config_dict"] = plan_cfg if isinstance(plan_cfg, dict) else parent_cfg
+                # Design stamp (docs/13 §2.2): outer + design hashes + three commits
+                # + which candidate pool supplied the parent (blood-lineage audit).
+                child.meta["outer_id"] = outer
+                child.meta["planner_design_hash"] = self._design_hash("planner")
+                child.meta["evaluator_design_hash"] = self._design_hash("evaluator")
+                child.meta["task_commit"] = child.meta.get("code_commit")
+                child.meta["planner_commit"] = self._role_commits.get("planner")
+                child.meta["evaluator_commit"] = self._role_commits.get("evaluator")
+                child.meta["source_pool"] = "global" if use_global else "subtree"
                 if base and self.code_root:
                     # audit: per-generation ref pinned by the patch application
                     self.log_event({"type": "code_branch", "genid": str(genid),
