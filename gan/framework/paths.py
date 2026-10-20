@@ -64,6 +64,35 @@ def code_manifest(output_dir: str) -> str:
     return os.path.join(ckpt_dir(output_dir), "code.json")
 
 
+def code_dir(output_dir: str) -> str:
+    """Container of the per-run code roots (single tree, or base/task/roles)."""
+    return os.path.join(ckpt_dir(output_dir), "code")
+
+
+def base_root(output_dir: str) -> str:
+    """Split layout (docs/12): read-only frozen base snapshot."""
+    return os.path.join(code_dir(output_dir), "base")
+
+
+def task_root(output_dir: str) -> str:
+    """Split layout (docs/12): task-owned git repo."""
+    return os.path.join(code_dir(output_dir), "task")
+
+
+def roles_root(output_dir: str) -> str:
+    """Split layout (docs/12): role-owned git repo (planner + evaluator)."""
+    return os.path.join(code_dir(output_dir), "roles")
+
+
+def supernodes_dir(output_dir: str) -> str:
+    """Per-outer supernode records (docs/13)."""
+    return os.path.join(ckpt_dir(output_dir), "supernodes")
+
+
+def supernode_path(output_dir: str, outer: int | str) -> str:
+    return os.path.join(supernodes_dir(output_dir), f"outer_{outer}.json")
+
+
 def checkpoint_latest(output_dir: str) -> str:
     return os.path.join(ckpt_dir(output_dir), "checkpoint.json")
 

@@ -11,6 +11,7 @@ is the second line of defence after the workspace confinement.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import shutil
 import subprocess
@@ -110,6 +111,77 @@ def materialize(repo_root: str, code_root: str) -> str:
     _git(code_root, "init", "--quiet")
     _lock_frozen(code_root)
     return _git_commit(code_root, "initial")
+
+
+def materialize_split(repo_root: str, base_dir: str, task_dir: str,
+                      roles_dir: str) -> Dict[str, str]:
+    """Materialize the split layout (docs/12): read-only base + task/roles git repos; returns the two initial commits."""
+    from gan.framework.repo_roots import owner_repo
+
+    for d in (base_dir, task_dir, roles_dir):
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+    for name in _COPY_TOP:
+        src = os.path.join(repo_root, name)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(base_dir, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, ignore=_ignore)
+        else:
+            shutil.copy2(src, dst)
+
+    def _owned_files(owners):
+        out: Dict[str, str] = {}
+        for dirpath, _dirs, files in os.walk(base_dir):
+            for n in files:
+                full = os.path.join(dirpath, n)
+                rel = os.path.relpath(full, base_dir)
+                if owner_repo(rel) in owners:
+                    out[rel] = full
+        return out
+
+    def _copy_into(dst_root: str, files: Dict[str, str]) -> None:
+        for rel, src in files.items():
+            dst = os.path.join(dst_root, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+
+    _copy_into(task_dir, _owned_files({"task"}))
+    _copy_into(roles_dir, _owned_files({"planner", "evaluator"}))
+
+    _git(task_dir, "init", "--quiet")
+    _git(roles_dir, "init", "--quiet")
+    _lock_frozen(base_dir)
+    return {
+        "task": _git_commit(task_dir, "initial task"),
+        "roles": _git_commit(roles_dir, "initial roles"),
+    }
+
+
+def write_manifest(output_dir: str, payload: Dict[str, Any]) -> None:
+    """Atomically write the code-tree manifest (``ckpt/code.json``)."""
+    from gan.framework import paths
+    p = paths.code_manifest(output_dir)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, p)
+
+
+def read_manifest(output_dir: str) -> Dict[str, Any]:
+    """Read the code-tree manifest (legacy no-``layout`` migrates to ``single``)."""
+    from gan.framework import paths
+    p = paths.code_manifest(output_dir)
+    if not os.path.isfile(p):
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "layout" not in data:
+        data["layout"] = "single"
+    return data
 
 
 def _lock_frozen(code_root: str) -> None:

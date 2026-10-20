@@ -91,10 +91,46 @@ def ensure_code_root(repo_root: str, output_dir: str) -> str:
                 f"or delete the checkpoint + manifest to start over."
             )
         commit = code_repo_mod.materialize(repo_root, cr)
-        os.makedirs(os.path.dirname(manifest), exist_ok=True)
-        with open(manifest, "w", encoding="utf-8") as f:
-            json.dump({"commit": commit, "repo_root": os.path.abspath(repo_root)}, f, indent=2)
+        code_repo_mod.write_manifest(output_dir, {
+            "layout": "single",
+            "commit": commit,
+            "repo_root": os.path.abspath(repo_root),
+        })
     return cr
+
+
+def ensure_roots(repo_root: str, output_dir: str, layout: str = "single"):
+    """Materialize the per-run code layout once (idempotent); single or split (docs/12)."""
+    from gan.framework import code_repo as code_repo_mod
+    from gan.framework.repo_roots import RepoRoots
+
+    if layout == "split":
+        base_dir = paths.base_root(output_dir)
+        task_dir = paths.task_root(output_dir)
+        roles_dir = paths.roles_root(output_dir)
+        manifest = code_repo_mod.read_manifest(output_dir)
+        task_git = os.path.join(task_dir, ".git")
+        roles_git = os.path.join(roles_dir, ".git")
+        if not (os.path.isdir(task_git) and os.path.isdir(roles_git)):
+            if manifest.get("layout") == "split":
+                raise RuntimeError(
+                    f"split code repos missing ({task_dir} / {roles_dir}) while "
+                    f"{paths.code_manifest(output_dir)} declares split layout — "
+                    f"refusing to silently re-materialize. Restore the repos or "
+                    f"delete the checkpoint + manifest to start over."
+                )
+            commits = code_repo_mod.materialize_split(repo_root, base_dir, task_dir, roles_dir)
+            code_repo_mod.write_manifest(output_dir, {
+                "layout": "split",
+                "repo_root": os.path.abspath(repo_root),
+                "base": {"path": base_dir},
+                "task": {"commit": commits["task"]},
+                "roles": {"commit": commits["roles"]},
+            })
+        return RepoRoots(base=base_dir, task=task_dir, roles=roles_dir, layout="split")
+
+    code_root = ensure_code_root(repo_root, output_dir)
+    return RepoRoots.single(code_root)
 
 
 def build_gan_loop(

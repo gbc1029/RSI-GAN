@@ -128,6 +128,7 @@ class GanLoop:
         evaluator_factory: Optional[Callable[[int], Any]] = None,
         code_root: Optional[str] = None,
         ledger_writer: Optional[Any] = None,
+        roots: Optional[Any] = None,
     ):
         self.output_dir = os.path.abspath(output_dir)
         # B46 step-1 gate: the per-run WriterToken guards every decision-grade
@@ -170,6 +171,9 @@ class GanLoop:
         # the instance attribute through Role.run).
         self.tool_call_timeout_s = int(cfg.get("loop.tool_call_timeout_s", 600))
         self.code_root = os.path.abspath(code_root) if code_root else None
+        # Split layout (docs/12): per-owner repo roots; single layout == code_root.
+        from gan.framework.repo_roots import RepoRoots
+        self.roots = roots if roots is not None else RepoRoots.single(self.code_root)
         # The rolling mirrors below carry PARENT-CHILD semantics only --
         # they are refreshed at parent selection (from parent.meta) and are NEVER
         # written at settle time. The durable per-round record lives on the child
@@ -624,8 +628,9 @@ class GanLoop:
             except Exception:  # noqa: BLE001 -- advisory resolution; the
                 # committed-tree fallback below still applies
                 pass
-        if self.code_root:
-            cand = os.path.join(self.code_root, rel)
+        cm_root = self._roles_root()
+        if cm_root:
+            cand = os.path.join(cm_root, rel)
             if os.path.isfile(cand):
                 return cand
         return None
@@ -864,7 +869,9 @@ class GanLoop:
             # A git-layer failure must NOT be recorded as "no code layer" —
             # the resume path would then silently skip code-state restoration and
             # run on an undefined baseline. Let RepoIntegrityError abort the run.
-            code = {"commit": code_repo.current_commit(self.code_root)}
+            code = {"commit": code_repo.current_commit(self._task_root())}
+            if self.roots.layout == "split":
+                code["roles_commit"] = code_repo.current_commit(self._roles_root())
         ckpt.save_checkpoint(
             self.output_dir,
             boundary=boundary,
@@ -985,12 +992,13 @@ class GanLoop:
                                    stage="self_improve_exhausted",
                                    outcome=("exhausted" if rejected else "empty_patch"))
             return
-        if not self.code_root:
+        roles_root = self._roles_root()
+        if not roles_root:
             return
         from gan.framework import code_repo
-        prev = code_repo.current_commit(self.code_root)
+        prev = code_repo.current_commit(roles_root)
         try:
-            sha = code_repo.apply_self_patch(self.code_root, role, patch, seat="self_improve")
+            sha = code_repo.apply_self_patch(roles_root, role, patch, seat="self_improve")
             self._role_commits[role] = sha
             self.log_event({"type": "self_improve_commit", "role": role,
                             "outer": outer, "commit": sha})
@@ -1007,7 +1015,7 @@ class GanLoop:
             # agent-attributable rejection: recover to the previous commit and
             # keep the run going (B-level; the receipt carries the reason).
             # The design is aligned to that same recovered commit.
-            code_repo.checkout(self.code_root, prev)
+            code_repo.checkout(roles_root, prev)
             self.log_event({"type": "self_improve_apply_failed", "role": role,
                             "outer": outer, "error": str(e)[:300]})
             self._heal_self_design(role, outer, res,
@@ -1076,9 +1084,9 @@ class GanLoop:
             cfg = store.load(role)  # the draft save_self_config just wrote
             records = res.get("records")
             pre = self._self_design_pre.get(role)
-            stripped = heal_design_keys(cfg, role, self.code_root)
-            stripped += heal_design_slots(cfg, role, self.code_root)
-            restored = heal_design_removals(cfg, role, self.code_root, records, pre)
+            stripped = heal_design_keys(cfg, role, self._roles_root())
+            stripped += heal_design_slots(cfg, role, self._roles_root())
+            restored = heal_design_removals(cfg, role, self._roles_root(), records, pre)
             if stripped or restored:
                 store.save(cfg, role)
                 if stripped:
@@ -1186,9 +1194,9 @@ class GanLoop:
                                                   heal_design_removals,
                                                   heal_design_slots)
         probe = deepcopy(cfg)
-        residue: List[Dict[str, Any]] = heal_design_keys(probe, role, self.code_root)
-        residue += heal_design_slots(probe, role, self.code_root)
-        residue += heal_design_removals(probe, role, self.code_root, records, pre)
+        residue: List[Dict[str, Any]] = heal_design_keys(probe, role, self._roles_root())
+        residue += heal_design_slots(probe, role, self._roles_root())
+        residue += heal_design_removals(probe, role, self._roles_root(), records, pre)
         return residue
 
     def _resync_workspace(self, outer: Any, files: List[str], drop_missing: bool = False) -> None:
@@ -1250,7 +1258,7 @@ class GanLoop:
         out: List[Dict[str, Any]] = []
         for role in ("task", "planner", "evaluator"):
             try:
-                reg = load_registry_for_role(role, code_root=self.code_root)
+                reg = load_registry_for_role(role, code_root=self.roots.repo_dir_for_role(role))
             except Exception:  # noqa: BLE001
                 continue
             stale_names = {s["name"] for s in stale_metadata(reg)}
@@ -1273,7 +1281,7 @@ class GanLoop:
         """This role's stale catalog entries, for its own receipt."""
         try:
             from gan.framework.preflight import catalog_stale
-            return catalog_stale(role, code_root=self.code_root)
+            return catalog_stale(role, code_root=self.roots.repo_dir_for_role(role))
         except Exception:  # noqa: BLE001 -- advisory
             return []
 
@@ -1489,6 +1497,18 @@ class GanLoop:
         return ok
 
     # -- branch-per-node blood lineage ---------------------------------
+    def _task_root(self) -> Optional[str]:
+        """Task-code repo root (== code_root in single layout; falls back to it)."""
+        roots = getattr(self, "roots", None)
+        return roots.task if roots is not None else getattr(self, "code_root", None)
+
+    def _roles_root(self) -> Optional[str]:
+        """Role-code repo root (== code_root in single layout; falls back to it)."""
+        roots = getattr(self, "roots", None)
+        if roots is not None:
+            return roots.roles if roots.roles else roots.task
+        return getattr(self, "code_root", None)
+
     def _pin_outer_base(self, outer: int) -> None:
         """Anchor the outer's entry HEAD as ``outer_<O>_base`` (once per outer).
 
@@ -1496,11 +1516,12 @@ class GanLoop:
         for ``parent == "initial"`` generations must be pinned BEFORE any task
         commit moves it. Idempotent (re-runs of the same outer).
         """
-        if not self.code_root:
+        task_root = self._task_root()
+        if not task_root:
             return
         from gan.framework import code_repo
         ref = code_repo.outer_base_ref_name(outer)
-        ok, mode = code_repo.ensure_branch(self.code_root, ref, code_repo.current_commit(self.code_root))
+        ok, mode = code_repo.ensure_branch(task_root, ref, code_repo.current_commit(task_root))
         self.log_event({"type": "code_branch", "kind": "outer_base", "outer": outer,
                         "ref": ref, "mode": mode, "ok": bool(ok)})
 
@@ -1511,7 +1532,7 @@ class GanLoop:
         HEAD (behavior identical to the pre-branch time-line; audited).
         """
         from gan.framework import code_repo
-        head = code_repo.current_commit(self.code_root)
+        head = code_repo.current_commit(self._task_root())
         if str(parent.genid) == "initial":
             return code_repo.outer_base_ref_name(outer)
         sha = (parent.meta or {}).get("code_commit") or (parent.meta or {}).get("task_code_commit")
@@ -1531,7 +1552,7 @@ class GanLoop:
             return None
         from gan.framework import code_repo
         base = self._resolve_base(parent, outer)
-        checked = code_repo.checkout_base(self.code_root, base)
+        checked = code_repo.checkout_base(self._task_root(), base)
         self.log_event({"type": "code_lineage", "genid": str(genid),
                         "parent_genid": str(parent.genid),
                         "base": str(base), "checked": checked})
@@ -1589,7 +1610,7 @@ class GanLoop:
                         if sha:
                             commits[str(k)] = str(sha)
                     if commits:
-                        rep = code_repo.reconcile_refs(self.code_root, commits)
+                        rep = code_repo.reconcile_refs(self._task_root(), commits)
                         if rep.get("missing") or rep.get("drifted"):
                             self.log_event({"type": "code_ref_missing", "report": rep})
 
