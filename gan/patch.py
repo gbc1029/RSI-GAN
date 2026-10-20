@@ -178,7 +178,8 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
         if not rel or rel in seen:
             continue
         seen.add(rel)
-        a_root = os.path.join(broker.repo_root, rel)
+        repo_root = broker.repo_dir(rel)
+        a_root = os.path.join(repo_root, rel)
         b_root = os.path.join(src_root, rel)
         if not os.path.exists(a_root):
             # A granted path may be a newly-created file/directory.  It is
@@ -194,8 +195,8 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
         if not os.path.exists(b_root):
             # the whole granted file/dir was deleted in the workspace
             for a_file in _iter_files(a_root):
-                rel_file = os.path.relpath(a_file, broker.repo_root).replace(os.sep, "/")
-                chunks.append(_deletion_diff(broker.repo_root, rel_file))
+                rel_file = os.path.relpath(a_file, repo_root).replace(os.sep, "/")
+                chunks.append(_deletion_diff(repo_root, rel_file))
             continue
         # modifications/additions
         b_files = set()
@@ -204,7 +205,7 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
             b_files.add(rel_file)
             # repo side ABSENT => the workspace file is a genuine ADDITION;
             # repo side PRESENT but unreadable => raise
-            a_lines = _read_lines(os.path.join(broker.repo_root, rel_file), missing_ok=True)
+            a_lines = _read_lines(os.path.join(repo_root, rel_file), missing_ok=True)
             b_lines = _read_lines(b_file)
             if a_lines == b_lines:
                 continue
@@ -216,9 +217,9 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
         # deletions inside a granted directory
         if os.path.isdir(a_root):
             for a_file in _iter_files(a_root):
-                rel_file = os.path.relpath(a_file, broker.repo_root).replace(os.sep, "/")
+                rel_file = os.path.relpath(a_file, repo_root).replace(os.sep, "/")
                 if rel_file not in b_files:
-                    chunks.append(_deletion_diff(broker.repo_root, rel_file))
+                    chunks.append(_deletion_diff(repo_root, rel_file))
     return "".join(chunks)
 
 

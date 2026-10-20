@@ -27,6 +27,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from gan.framework import frozen, paths
+from gan.framework.repo_roots import RepoRoots
 from gan.framework.context import (  # noqa: F401
     AccessContext,
     get_access_context,
@@ -45,9 +46,11 @@ class AccessBroker:
         auto_approve: bool = True,
         max_files: int = 500,
         max_bytes: int = 50 * 1024 * 1024,
+        roots: Optional[Any] = None,
     ):
         self.repo_root = os.path.abspath(str(repo_root))
         self._repo_real = os.path.realpath(self.repo_root)
+        self.roots = roots if roots is not None else RepoRoots.single(self.repo_root)
         self.output_dir = os.path.abspath(str(output_dir))
         self.workspaces_dir = os.path.abspath(
             str(workspaces_dir) if workspaces_dir is not None
@@ -86,6 +89,10 @@ class AccessBroker:
         p = os.path.join(self.workspace(role, node_id), "src")
         os.makedirs(p, exist_ok=True)
         return p
+
+    def repo_dir(self, rel: str) -> str:
+        """Repo dir owning ``rel`` (== repo_root in single layout)."""
+        return self.roots.repo_dir(rel) or self.repo_root
 
     def clear_workspace(self, role: str) -> None:
         """Drop a role's granted-source workspace (called on instance refresh).
@@ -218,7 +225,7 @@ class AccessBroker:
         so the patch builder keeps tracking it.
         """
         try:
-            s = self._safe_join(self.repo_root, rel)
+            s = self._safe_join(self.repo_dir(rel), rel)
         except ValueError:
             denied_list.append(rel)
             return
@@ -296,9 +303,10 @@ class AccessBroker:
                 continue
             if frozen.has_glob(rel):
                 # expand a glob pattern (e.g. from list_editable) to concrete files
+                glob_root = self.repo_dir(rel)
                 matches = sorted({
-                    os.path.relpath(m, self.repo_root).replace(os.sep, "/")
-                    for m in glob.glob(os.path.join(self.repo_root, rel), recursive=True)
+                    os.path.relpath(m, glob_root).replace(os.sep, "/")
+                    for m in glob.glob(os.path.join(glob_root, rel), recursive=True)
                 })
                 if not matches:
                     missing.append(rel)
