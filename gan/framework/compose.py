@@ -50,12 +50,29 @@ def _is_privilege_error(e: OSError) -> bool:
     return e.errno in (errno.EPERM, errno.EACCES)
 
 
+def _rmtree_force(path: str) -> None:
+    """Remove ``path`` including read-only files (Windows: chmod first)."""
+    if not os.path.isdir(path) and not os.path.islink(path):
+        return
+    for root, dirs, files in os.walk(path):
+        for d in dirs:
+            try:
+                os.chmod(os.path.join(root, d), 0o755)
+            except OSError:
+                pass
+        for f in files:
+            try:
+                os.chmod(os.path.join(root, f), 0o666)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def build_composed_view(base: str, task: str, roles: str, dest: str,
                         prefer_symlink: bool = True) -> Dict[str, Any]:
     """Overlay base+task+roles into ``dest``; returns a summary manifest."""
     layers = {"base": base, "task": task, "roles": roles}
-    if os.path.isdir(dest):
-        shutil.rmtree(dest, ignore_errors=True)
+    _rmtree_force(dest)
     os.makedirs(dest, exist_ok=True)
 
     linked = copied = 0

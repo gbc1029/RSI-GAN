@@ -160,6 +160,74 @@ def materialize_split(repo_root: str, base_dir: str, task_dir: str,
     }
 
 
+def migrate_single_to_split(repo_root: str, output_dir: str) -> Dict[str, str]:
+    """One-time legacy single -> split migration (docs/12 §13.3).
+
+    The existing per-run single tree (``ckpt/code``) keeps its git history,
+    refs and evolution commits and becomes the TASK repo unchanged; the roles
+    repo is initialized from the role-owned files currently on disk; base is a
+    read-only snapshot of the tree. Returns ``{"task": sha, "roles": sha}``.
+    """
+    from gan.framework import paths
+    from gan.framework.repo_roots import owner_repo
+
+    code_root = paths.code_root(output_dir)
+    task_dir = paths.task_root(output_dir)
+    roles_dir = paths.roles_root(output_dir)
+    base_dir = paths.base_root(output_dir)
+
+    if not os.path.isdir(os.path.join(code_root, ".git")):
+        raise RuntimeError(
+            f"single->split migration requires the single tree at {code_root} (.git missing)"
+        )
+    if os.path.isdir(task_dir) or os.path.isdir(roles_dir):
+        raise RuntimeError("split dirs already exist; refusing to migrate over them")
+
+    # Move the single tree aside, create the container, move it into task/ so
+    # the task repo keeps its .git, refs and history byte-for-byte.
+    tmp = code_root + ".migrate_tmp"
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp, ignore_errors=True)
+    os.rename(code_root, tmp)
+    os.makedirs(code_root, exist_ok=True)
+    os.rename(tmp, task_dir)
+    task_sha = current_commit(task_dir)
+
+    # base = read-only snapshot of the (evolved) task tree, history excluded.
+    os.makedirs(base_dir, exist_ok=True)
+    for name in os.listdir(task_dir):
+        if name == ".git":
+            continue
+        src = os.path.join(task_dir, name)
+        dst = os.path.join(base_dir, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, ignore=_ignore)
+        else:
+            shutil.copy2(src, dst)
+
+    # roles = role-owned files from the snapshot, as a fresh git repo.
+    def _owned_files(owners):
+        out: Dict[str, str] = {}
+        for dirpath, _dirs, files in os.walk(base_dir):
+            for n in files:
+                full = os.path.join(dirpath, n)
+                rel = os.path.relpath(full, base_dir)
+                if owner_repo(rel) in owners:
+                    out[rel] = full
+        return out
+
+    os.makedirs(roles_dir, exist_ok=True)
+    for rel, src in _owned_files({"planner", "evaluator"}).items():
+        dst = os.path.join(roles_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+
+    _git(roles_dir, "init", "--quiet")
+    _lock_frozen(base_dir)
+    roles_sha = _git_commit(roles_dir, "initial roles (migrated)")
+    return {"task": task_sha, "roles": roles_sha}
+
+
 def write_manifest(output_dir: str, payload: Dict[str, Any]) -> None:
     """Atomically write the code-tree manifest (``ckpt/code.json``)."""
     from gan.framework import paths

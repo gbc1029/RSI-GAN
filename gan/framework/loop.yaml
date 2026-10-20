@@ -9,6 +9,10 @@
 # 双循环调度
 # ---------------------------------------------------------------------------
 loop:
+  code_layout: single           # code-tree layout: single | split (docs/12). First-run
+                                # default only; consumer: gan/build.py build_gan_loop
+                                # (a resume auto-detects from the persisted code manifest,
+                                # which wins over this key).
   outer_generations: 2          # G: number of meta-level (outer) generations
   inner_max: 3                  # I_max: max inner iterations per outer generation
   stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break

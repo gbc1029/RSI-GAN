@@ -119,14 +119,34 @@ def ensure_roots(repo_root: str, output_dir: str, layout: str = "single"):
                     f"refusing to silently re-materialize. Restore the repos or "
                     f"delete the checkpoint + manifest to start over."
                 )
-            commits = code_repo_mod.materialize_split(repo_root, base_dir, task_dir, roles_dir)
+            # Legacy single archive -> one-time migration (docs/12 §13.3): the
+            # old single tree keeps its git history as the task repo; roles/base
+            # are derived from it. Anything else materializes a fresh split tree.
+            migrated = False
+            if (manifest.get("layout") == "single"
+                    and os.path.isdir(os.path.join(paths.code_root(output_dir), ".git"))):
+                commits = code_repo_mod.migrate_single_to_split(repo_root, output_dir)
+                migrated = True
+            else:
+                commits = code_repo_mod.materialize_split(repo_root, base_dir, task_dir, roles_dir)
             code_repo_mod.write_manifest(output_dir, {
                 "layout": "split",
                 "repo_root": os.path.abspath(repo_root),
                 "base": {"path": base_dir},
                 "task": {"commit": commits["task"]},
                 "roles": {"commit": commits["roles"]},
+                "planner": {"commit": commits["roles"]},
+                "evaluator": {"commit": commits["roles"]},
             })
+            if migrated:
+                try:
+                    from utils import trajectory_log as _tlog
+                    _tlog.append(paths.events_path(output_dir), {
+                        "type": "migration_event", "from_layout": "single",
+                        "to_layout": "split", "task_commit": commits["task"],
+                        "roles_commit": commits["roles"]})
+                except Exception:  # noqa: BLE001 -- audit write: never fail the run
+                    pass
         return RepoRoots(base=base_dir, task=task_dir, roles=roles_dir, layout="split")
 
     code_root = ensure_code_root(repo_root, output_dir)
@@ -142,7 +162,7 @@ def build_gan_loop(
     cfg_overrides: Optional[dict] = None,
     preflight: bool = False,
     code_repo: bool = True,
-    layout: str = "single",
+    layout: Optional[str] = None,
     sample_seed_base: Optional[int] = None,
     anchor_ids: Optional[list] = None,
 ) -> GanLoop:
@@ -183,6 +203,18 @@ def build_gan_loop(
     code_root = None
     roots = None
     if code_repo:
+        # Layout precedence: explicit arg > existing code manifest (resume
+        # auto-detect) > loop.yaml code_layout > single. An explicit arg that
+        # contradicts the persisted manifest is a hard error — the operator must
+        # omit layout to resume the run as its manifest declares.
+        from gan.framework import code_repo as code_repo_mod
+        manifest_layout = code_repo_mod.read_manifest(output_dir).get("layout")
+        if layout is None:
+            layout = manifest_layout or cfg.get("loop.code_layout", "single")
+        elif manifest_layout and manifest_layout != layout:
+            raise ValueError(
+                f"layout={layout!r} conflicts with the existing code manifest "
+                f"(layout={manifest_layout!r}); omit layout to auto-detect")
         if layout not in ("single", "split"):
             raise ValueError(f"layout must be 'single' or 'split' (got {layout!r})")
         roots = ensure_roots(repo_root, output_dir, layout)

@@ -871,7 +871,14 @@ class GanLoop:
             # run on an undefined baseline. Let RepoIntegrityError abort the run.
             code = {"commit": code_repo.current_commit(self._task_root())}
             if self.roots.layout == "split":
-                code["roles_commit"] = code_repo.current_commit(self._roles_root())
+                # Three-commit record (docs/12 §11): task HEAD + roles HEAD + the
+                # per-role last self-improve commits (planner/evaluator share the
+                # roles repo, so the HEAD fallback covers a role that never
+                # self-improved this outer).
+                roles_head = code_repo.current_commit(self._roles_root())
+                code["roles_commit"] = roles_head
+                code["planner_commit"] = self._role_commits.get("planner") or roles_head
+                code["evaluator_commit"] = self._role_commits.get("evaluator") or roles_head
         ckpt.save_checkpoint(
             self.output_dir,
             boundary=boundary,
