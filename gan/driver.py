@@ -576,6 +576,24 @@ def _start_role_broker(socket_path: str, config: Dict[str, Any]) -> _RoleBrokerC
     return _RoleBrokerController(process, parent_control)
 
 
+def _materialize_run_roots(repo_root: str, output_dir: str, layout: str):
+    """Materialize the run layout; returns (code_root, roots).
+
+    ``code_root`` is what workers/roles RUN from: the single git tree, or the
+    derived composed view (base+task+roles) in split layout (docs/12). ``roots``
+    carries the per-owner repos for git-state routing (resume checkout).
+    """
+    from gan.build import ensure_roots
+    roots = ensure_roots(repo_root, output_dir, layout)
+    if layout == "split":
+        from gan.framework.compose import build_composed_view
+        code_root = paths.compose_root(output_dir)
+        build_composed_view(roots.base, roots.task, roots.roles, code_root)
+    else:
+        code_root = roots.task
+    return code_root, roots
+
+
 @_private_driver_umask
 def run_gan_driver(
     repo_root: str,
@@ -589,7 +607,6 @@ def run_gan_driver(
     resume: bool = False,
     force: bool = False,
 ) -> str:
-    from gan.build import ensure_code_root
     from gan.framework import checkpoint as ckpt_mod
     from gan.framework import models as model_registry
     from gan.framework import task_execution as task_execution
@@ -600,6 +617,7 @@ def run_gan_driver(
         raise ValueError("--resume and --force are mutually exclusive")
 
     cfg = load_gan_loop_config(cfg_overrides)
+    layout = str(cfg.get("loop.code_layout", "single"))
     G = int(cfg.get("loop.outer_generations", 2))
     I_max = int(cfg.get("loop.inner_max", 3))
     task_llm_calls_per_question = int(
@@ -782,7 +800,8 @@ def run_gan_driver(
     try:
         role_broker = _start_role_broker(role_broker_socket, {
             "output_dir": output_dir,
-            "code_root": paths.code_root(output_dir),
+            "code_root": (paths.compose_root(output_dir)
+                          if layout == "split" else paths.code_root(output_dir)),
             "owner_uid": owner_uid,
             "owner_gid": owner_gid,
             "accounts": role_accounts,
@@ -835,7 +854,7 @@ def run_gan_driver(
                 f"or --force to re-run from outer 1 (legacy duplicate-prone behaviour, "
                 f"explicit escape hatch).")
 
-        code_root = ensure_code_root(repo_root, output_dir)
+        code_root, roots = _materialize_run_roots(repo_root, output_dir, layout)
 
         # Question-sampling scheme (loop.yaml sampling.*). Created post-drop so
         # the seed file is owned by the run owner; idempotent across resume.
@@ -878,11 +897,15 @@ def run_gan_driver(
                 return code_root
             payload = ckpt_mod.load_checkpoint(output_dir, "outer") or {}
             commit = (payload.get("code") or {}).get("commit")
-            if code_root and commit:
+            if commit:
                 from gan.framework import code_repo
-                current = code_repo.current_commit(code_root)
+                checkout_target = roots.task if layout == "split" else code_root
+                current = code_repo.current_commit(checkout_target)
                 if current != commit:
-                    code_repo.checkout(code_root, commit)
+                    code_repo.checkout(checkout_target, commit)
+                    if layout == "split":
+                        from gan.framework.compose import build_composed_view
+                        build_composed_view(roots.base, roots.task, roots.roles, code_root)
                     _log_event(output_dir, {"type": "code_state_restored",
                                             "from": current, "to": commit})
             else:
