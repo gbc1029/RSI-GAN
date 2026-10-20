@@ -142,6 +142,7 @@ def build_gan_loop(
     cfg_overrides: Optional[dict] = None,
     preflight: bool = False,
     code_repo: bool = True,
+    layout: str = "single",
     sample_seed_base: Optional[int] = None,
     anchor_ids: Optional[list] = None,
 ) -> GanLoop:
@@ -179,7 +180,31 @@ def build_gan_loop(
     ledger_writer = _ledger_open_run(output_dir)
     _seed_self_designs(output_dir, ledger_writer=ledger_writer)
 
-    code_root = ensure_code_root(repo_root, output_dir) if code_repo else None
+    code_root = None
+    roots = None
+    if code_repo:
+        if layout not in ("single", "split"):
+            raise ValueError(f"layout must be 'single' or 'split' (got {layout!r})")
+        roots = ensure_roots(repo_root, output_dir, layout)
+        if layout == "split":
+            # The derived overlay is what role processes and the harness run on;
+            # authoritative source lives in base/task/roles (see docs/12).
+            from gan.framework.compose import build_composed_view
+            code_root = paths.compose_root(output_dir)
+            build_composed_view(roots.base, roots.task, roots.roles, code_root)
+        else:
+            code_root = roots.task
+
+    # The loop owns the composed-view lifecycle (rebuild after each task/roles
+    # commit or checkout), but the task runner applies the task patch INSIDE
+    # its run; hand it a late-bound callback so the view is fresh before the
+    # harness launches.
+    loop_holder: dict = {}
+
+    def _rebuild_view() -> None:
+        lp = loop_holder.get("loop")
+        if lp is not None:
+            lp._rebuild_composed_view()
 
     # Fresh role instances per outer generation (design + tools + chat + workspace).
     # The loop's per-instantiation attempt id rides along so the role binds its
@@ -208,6 +233,8 @@ def build_gan_loop(
         # domains/task_worker.py carry it into the sandbox.
         reasoning_effort=t_effort,
         code_root=code_root,
+        task_repo=roots.task if (roots is not None and layout == "split") else None,
+        rebuild_view=_rebuild_view,
         sample_seed_base=sample_seed_base,
         anchor_ids=anchor_ids,
         # Reserved cost-key ceiling (docs/10 §10): bounds the task design's
@@ -223,6 +250,7 @@ def build_gan_loop(
         deny_paths=frozen_deny_paths(),
         max_files=int(cfg.get("source_access.max_files_per_grant", 500)),
         max_bytes=int(cfg.get("source_access.max_bytes_per_grant", 50 * 1024 * 1024)),
+        roots=roots,
     )
     loop = GanLoop(
         output_dir, domains, cfg,
@@ -232,12 +260,14 @@ def build_gan_loop(
         evaluator_factory=_evaluator_factory,
         code_root=code_root,
         ledger_writer=ledger_writer,
+        roots=roots,
     )
+    loop_holder["loop"] = loop
     # explicit runtime record of the model configuration actually used
     loop.log_event({"type": "model_config",
                     **model_registry.describe(["gan.task", "gan.planner", "gan.evaluator"])})
     if code_root:
-        loop.log_event({"type": "code_init", "code_root": code_root})
+        loop.log_event({"type": "code_init", "code_root": code_root, "layout": layout})
     # Repair a persisted role design that names something the committed tree
     # cannot deliver (strip + forensic copy + report), BEFORE the integrity probe
     # so that probe sees the repaired tree. Non-fatal by design: the design file

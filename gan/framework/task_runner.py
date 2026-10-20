@@ -80,10 +80,17 @@ class DomainTaskRunner:
         anchor_ids: Optional[list] = None,
         token_budget_per_gen: Optional[int] = None,
         ledger_writer: Optional[Any] = None,
+        task_repo: Optional[str] = None,
+        rebuild_view: Optional[Any] = None,
     ):
         self.repo_root = os.path.abspath(repo_root)
         self.output_dir = os.path.abspath(output_dir)
         self.code_root = os.path.abspath(code_root) if code_root else None
+        # Split layout (docs/12): the task patch lands in the task repo, and the
+        # derived composed view is re-materialized afterwards so the harness runs
+        # on the just-applied code.  None in single layout (== self.code_root).
+        self.task_repo = os.path.abspath(task_repo) if task_repo else None
+        self.rebuild_view = rebuild_view
         self.domain = domain
         self.subset = subset
         self.num_samples = num_samples
@@ -201,6 +208,7 @@ class DomainTaskRunner:
         # base itself — the per-node lineage never has a gap. (When code_repo is
         # off, fall back to patching the run copy.)
         source_root = self.code_root or self.repo_root
+        apply_target = self.task_repo or self.code_root
         task_code_commit = None
         base_commit: Optional[str] = None
         code_ref_ok = True
@@ -210,7 +218,7 @@ class DomainTaskRunner:
         task_patch_rejected = None
         if self.code_root and base:
             res = code_repo.apply_task_patch(
-                self.code_root, "planner", patch_str, genid,
+                apply_target, "planner", patch_str, genid,
                 (parent.genid if parent is not None else "initial"), base,
                 seat="plan")
             task_code_commit = res["code_commit"]
@@ -223,11 +231,11 @@ class DomainTaskRunner:
             # Only a PROPOSED patch with no new commit is a rejection --
             # "no patch proposed" must not masquerade as one.
             task_patch_rejected = task_patch_rejection(patch_str, task_code_commit, base_commit)
-        elif (patch_str or "").strip() and self.code_root:
+        elif (patch_str or "").strip() and apply_target:
             # legacy path (no base resolved): pre-branch time-line HEAD behaviour
             try:
                 task_code_commit = code_repo.apply_code_patch(
-                    self.code_root, "planner", patch_str, f"task gen {genid}",
+                    apply_target, "planner", patch_str, f"task gen {genid}",
                     seat="plan")
                 task_patch_files = code_repo.changed_files(patch_str)
                 patch_applied = True
@@ -244,6 +252,11 @@ class DomainTaskRunner:
                 except OSError:
                     pass  # best-effort local audit line; the meta string is durable
             patch_str = ""  # applied to code_root (or rejected -> nothing to apply)
+
+        # Split layout: re-materialize the composed view so the harness runs on
+        # the just-applied task code (no-op in single layout / code_repo off).
+        if self.rebuild_view is not None:
+            self.rebuild_view()
 
         # Polyglot (Arch 2): the task child needs the whitelisted file-write
         # tool to produce its solution patch. Framework-injected capability

@@ -69,6 +69,11 @@ def code_dir(output_dir: str) -> str:
     return os.path.join(ckpt_dir(output_dir), "code")
 
 
+def compose_root(output_dir: str) -> str:
+    """Split layout (docs/12): derived overlay base+task+roles (the composed view)."""
+    return os.path.join(ckpt_dir(output_dir), "composed")
+
+
 def base_root(output_dir: str) -> str:
     """Split layout (docs/12): read-only frozen base snapshot."""
     return os.path.join(code_dir(output_dir), "base")

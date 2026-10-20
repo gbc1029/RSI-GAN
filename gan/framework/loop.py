@@ -1011,6 +1011,7 @@ class GanLoop:
             # self-improve sees its own heal.
             self._heal_self_design(role, outer, res,
                                    stage="self_improve_success", outcome="applied")
+            self._rebuild_composed_view()
         except code_repo.PatchRejected as e:
             # agent-attributable rejection: recover to the previous commit and
             # keep the run going (B-level; the receipt carries the reason).
@@ -1509,6 +1510,21 @@ class GanLoop:
             return roots.roles if roots.roles else roots.task
         return getattr(self, "code_root", None)
 
+    def _rebuild_composed_view(self) -> None:
+        """Split layout: re-materialize the derived overlay after a repo change.
+
+        The composed view is derived (base+task+roles); on symlink platforms it
+        tracks the repos automatically, but on copy-fallback platforms (Windows
+        without Developer Mode) it must be rebuilt after any task/roles commit
+        or checkout. No-op in single layout / code_repo off.
+        """
+        roots = getattr(self, "roots", None)
+        if roots is None or roots.layout != "split" or not self.code_root:
+            return
+        from gan.framework.compose import build_composed_view
+        info = build_composed_view(roots.base, roots.task, roots.roles, self.code_root)
+        self.log_event({"type": "compose_view_rebuilt", **info})
+
     def _pin_outer_base(self, outer: int) -> None:
         """Anchor the outer's entry HEAD as ``outer_<O>_base`` (once per outer).
 
@@ -1556,6 +1572,9 @@ class GanLoop:
         self.log_event({"type": "code_lineage", "genid": str(genid),
                         "parent_genid": str(parent.genid),
                         "base": str(base), "checked": checked})
+        # The checkout moved the task repo HEAD; refresh the derived overlay so
+        # the resync below reads the new base (no-op in single layout).
+        self._rebuild_composed_view()
         granted_files: List[str] = []
         if self.broker is not None:
             for rec in self._source_access_log(outer):
