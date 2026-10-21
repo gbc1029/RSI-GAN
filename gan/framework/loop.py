@@ -1177,6 +1177,132 @@ class GanLoop:
                       event_path=paths.events_path(self.output_dir),
                       event_type="archive_upsert_failed", outer=outer)
 
+    def _resolve_eval_base(self) -> Optional[str]:
+        """The fixed eval root (docs/14 §5.5): eval_base ref, else the run's initial task commit."""
+        task_root = self._task_root()
+        if not task_root:
+            return None
+        from gan.framework import code_repo
+        try:
+            r = code_repo.resolve_ref(task_root, self.eval_base_ref)
+            if r:
+                return r
+        except Exception:  # noqa: BLE001 -- advisory
+            pass
+        try:
+            m = code_repo.read_manifest(self.output_dir)
+            if m.get("layout") == "split":
+                initial = (m.get("task") or {}).get("commit")
+            else:
+                initial = m.get("commit")
+            if initial:
+                code_repo.ensure_branch(task_root, self.eval_base_ref, initial)
+                return initial
+        except Exception:  # noqa: BLE001 -- advisory
+            pass
+        return None
+
+    def _evaluate_supernode(self, outer: int) -> None:
+        """Fixed-root evaluation of the just-recorded supernode (docs/14 §5.5).
+
+        Uses a SEPARATE planner instance (eval_* namespace) so evaluation never
+        pollutes the main-line trajectory / cost / workspace. Requires a live
+        planner session (LLM); offline smoke injects a stub. The task rounds run
+        on the fixed eval base; the task tree / scores are NOT written, and the
+        main-line task HEAD is restored afterwards (evaluation commits become
+        orphans).
+        """
+        if not self.outer_select_enabled:
+            return
+        try:
+            from gan.framework import eval_on_root as E
+            from gan.framework import code_repo
+            from gan.framework.supernode import load_supernode, update_supernode
+
+            sn = load_supernode(self.output_dir, outer)
+            if not sn:
+                return
+            eval_base = self._resolve_eval_base()
+            if eval_base is None:
+                self.log_event({"type": "eval_base_missing", "outer": outer})
+                return
+
+            # separate planner instance (docs/14 §5.5 isolation)
+            eval_planner = None
+            if self.planner_factory is not None:
+                try:
+                    eval_planner = self.planner_factory(
+                        outer, f"{self._attempt}_eval", instance=f"outer_{outer}_eval")
+                except TypeError:
+                    eval_planner = self.planner_factory(outer, f"{self._attempt}_eval")
+            if eval_planner is None:
+                eval_planner = self.planner  # stub / offline fallback
+
+            initial = self.task_tree.get("initial")
+
+            def run_once(sample: int):
+                genid = E.eval_genid(outer, sample)
+                plan_result = eval_planner.plan(
+                    parent_summary=(self._parent_summary(initial) if initial else {}),
+                    parents=[],
+                    parent_feedback=None,
+                    evaluator_issues=None,
+                    config=(self._parent_config(initial) if initial else {}),
+                    node_id=genid,
+                    broker=self.broker,
+                    task_brief=self.task_brief,
+                    trajectory_genids=[],
+                    receipt=None,
+                    parent_predicted_score=None,
+                    parent_benchmark_score=None,
+                    patch_retry_k=self.patch_retry_k,
+                    max_tool_calls=self.plan_max_tool_calls,
+                    tool_repeat_limit=self.tool_repeat_limit,
+                ) or {}
+                child = self.task_runner(plan=plan_result, parent=initial,
+                                         genid=genid, base=eval_base)
+                if child is None:
+                    return None
+                return child.value.score
+
+            # preserve the main-line task HEAD; the rounds move it to eval tips
+            task_root = self._task_root()
+            main_head = None
+            if task_root:
+                try:
+                    main_head = code_repo.current_commit(task_root)
+                except Exception:  # noqa: BLE001 -- advisory
+                    main_head = None
+
+            result = E.run_eval_rounds(run_once, self.eval_samples)
+
+            # restore the main-line task HEAD (evaluation commits become orphans)
+            if task_root and main_head:
+                try:
+                    code_repo.checkout(task_root, main_head)
+                    self._rebuild_composed_view()
+                except Exception:  # noqa: BLE001 -- advisory restore
+                    pass
+            try:
+                close = getattr(eval_planner, "close", None)
+                if close is not None and eval_planner is not self.planner:
+                    close()
+            except Exception:  # noqa: BLE001 -- advisory
+                pass
+
+            sn["benchmark"]["mean"] = result["mean"]
+            sn["benchmark"]["std"] = result["std"]
+            sn["benchmark"]["n_valid"] = result["n_valid"]
+            sn["benchmark"]["eval_baseline"] = self.eval_base_ref
+            sn["benchmark"]["reevaluated"] = True
+            update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
+            self.log_event({"type": "supernode_evaluated", "outer": outer,
+                            "mean": result["mean"], "n_valid": result["n_valid"]})
+        except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
+            soft_fail(f"fixed-root evaluation failed (outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="eval_on_root_failed", outer=outer)
+
     def _refresh_roles(self, outer: int) -> None:
         """Rebuild planner/evaluator for a new outer generation (instance refresh).
 
@@ -2559,6 +2685,7 @@ class GanLoop:
                             "duration_s": round(time.time() - _outer_t0, 1)})
             self._save_checkpoint("outer", outer, I_max)
             self._record_supernode(outer, outer_genids)
+            self._evaluate_supernode(outer)
             self._archive_supernode(outer)
 
         return self.task_tree

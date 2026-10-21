@@ -308,6 +308,15 @@ def checkout(code_root: str, sha: Optional[str]) -> None:
         ) from e
 
 
+def resolve_ref(code_root: str, ref_name_or_sha: str) -> Optional[str]:
+    """Resolve a ref name / SHA to a full SHA; None when it does not exist."""
+    r = _git(code_root, "rev-parse", "--verify", "--quiet",
+             f"{ref_name_or_sha}^{{commit}}", check=False)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    return None
+
+
 # -- branch-per-node blood lineage --------------------------------------------
 def task_ref_name(genid: Any) -> str:
     """Persistent lightweight branch ref for a task generation's code state."""

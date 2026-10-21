@@ -46,6 +46,21 @@ def record_supernode(output_dir: str, outer: int, payload: Dict[str, Any],
     return target
 
 
+def update_supernode(output_dir: str, outer: int, payload: Dict[str, Any],
+                     writer: Any = None) -> str:
+    """Atomically OVERWRITE the canonical supernode record (in-place update).
+
+    Used by the fixed-root evaluation to stamp the benchmark estimate back onto
+    the just-recorded supernode — unlike ``record_supernode``, which never
+    overwrites a canonical file.
+    """
+    payload = dict(payload)
+    payload.setdefault("outer", outer)
+    target = paths.supernode_path(output_dir, outer)
+    _atomic_write_json(target, payload)
+    return target
+
+
 def load_supernode(output_dir: str, outer: int) -> Optional[Dict[str, Any]]:
     """Read the canonical supernode record for ``outer`` (None if absent)."""
     p = paths.supernode_path(output_dir, outer)

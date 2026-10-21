@@ -242,13 +242,15 @@ def build_gan_loop(
     # The loop's per-instantiation attempt id rides along so the role binds its
     # OUTER-level trajectory file to the attempt-keyed name at construction
     # (session content and stop records share one file; see loop._refresh_roles).
-    def _planner_factory(outer: int, attempt: str):
-        return RoleProcess("planner", p_model, output_dir, instance=f"outer_{outer}",
+    def _planner_factory(outer: int, attempt: str, instance: Optional[str] = None):
+        return RoleProcess("planner", p_model, output_dir,
+                           instance=(instance or f"outer_{outer}"),
                            code_root=code_root, attempt_id=attempt,
                            reasoning_effort=p_effort)
 
-    def _evaluator_factory(outer: int, attempt: str):
-        return RoleProcess("evaluator", e_model, output_dir, instance=f"outer_{outer}",
+    def _evaluator_factory(outer: int, attempt: str, instance: Optional[str] = None):
+        return RoleProcess("evaluator", e_model, output_dir,
+                           instance=(instance or f"outer_{outer}"),
                            code_root=code_root, attempt_id=attempt,
                            reasoning_effort=e_effort)
 
