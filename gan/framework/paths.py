@@ -98,6 +98,15 @@ def supernode_path(output_dir: str, outer: int | str) -> str:
     return os.path.join(supernodes_dir(output_dir), f"outer_{outer}.json")
 
 
+def archive_dir(output_dir: str) -> str:
+    """MOME archive (docs/14 §3.2): derived index over supernodes."""
+    return os.path.join(ckpt_dir(output_dir), "archive")
+
+
+def archive_path(output_dir: str) -> str:
+    return os.path.join(archive_dir(output_dir), "mome.json")
+
+
 def checkpoint_latest(output_dir: str) -> str:
     return os.path.join(ckpt_dir(output_dir), "checkpoint.json")
 
