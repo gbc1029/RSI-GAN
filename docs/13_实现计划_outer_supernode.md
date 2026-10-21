@@ -57,7 +57,7 @@ evaluator_commit      # evaluator 代码 commit（拆仓库后，角色侧）
 }
 ```
 
-> benchmark 的 `per_question` 以「唯一题」为键，逐题存分数序列，供后续 $F_p$ 的 $\sigma$（逐题 std）与 bootstrap 使用。
+> benchmark 的 `per_question` 以「唯一题」为键，逐题存分数序列，**保留用于审计与未来分析**；当前里程碑 B 的 $F_p$ 方差取**该届 inner 分数的总体标准差**（`statistics.pstdev(scores)`），**不使用 bootstrap**（`eval_samples` 太小、且逐题方差度量的是题库难度而非策略稳健性）。
 
 ### 2.4 inner 父代候选池与 `cross_subtree` 开关
 
