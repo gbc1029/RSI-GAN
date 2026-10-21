@@ -215,7 +215,7 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
             "Refusing to run TaskAgent without benchmark isolation."
         )
 
-    agent_host = os.path.realpath(os.path.join(run_root, agent_path))
+    agent_host = os.path.normpath(os.path.join(run_root, agent_path))
     _sandbox_path(run_root, agent_host)  # validates containment
 
     required_binds = (
@@ -328,8 +328,11 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
 
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
                          reasoning_effort=None, cost_overrides=None):
-    run_root = os.path.realpath(os.getcwd())
-    trajectory_path = os.path.realpath(trajectory_path)
+    # Private run ancestors deliberately remain non-traversable to the
+    # sandbox uid. Bubblewrap also cannot reliably open bind sources through
+    # /proc/self/fd, so stage only the allowlisted inputs in a private /tmp
+    # directory owned by this uid and bind from there.
+    trajectory_path = os.path.abspath(trajectory_path)
     os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
     # A file bind must exist before Bubblewrap constructs the namespace. The
     # trajectory may live outside run_root when resuming from an external
@@ -362,25 +365,64 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
     # The result channel is an anonymous temporary file. Only the trusted
     # task_worker receives its fd; the TaskAgent child is spawned later with
     # close_fds=True and a different, worker-local result fd.
-    with tempfile.TemporaryFile(mode="w+b") as result_file:
-        result_fd = result_file.fileno()
-        payload["result_fd"] = result_fd
-        proc = subprocess.run(
-            _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket),
-            input=json.dumps(payload, ensure_ascii=False, default=str),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            timeout=QUESTION_TIMEOUT,
-            pass_fds=(result_fd,),
+    run_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    run_root = f"/proc/self/fd/{run_fd}"
+    stage_root = tempfile.mkdtemp(prefix="rsi-gan-task-", dir="/tmp")
+    try:
+        run_real = os.path.realpath(run_root)
+        trajectory_real = os.path.realpath(trajectory_path)
+        try:
+            in_run = os.path.commonpath([run_real, trajectory_real]) == run_real
+        except ValueError:
+            in_run = False
+        trajectory_source = (
+            os.path.join(run_root, os.path.relpath(trajectory_real, run_real))
+            if in_run else trajectory_path
         )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
-            raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
 
-        result_file.seek(0)
-        raw_result = result_file.read()
+        # Copy only the files needed by the task worker. The source paths use
+        # the inherited directory fd, while bwrap sees ordinary /tmp paths.
+        shutil.copy2(os.path.join(run_root, "task_agent.py"),
+                     os.path.join(stage_root, "task_agent.py"))
+        for name in ("agent", "utils"):
+            shutil.copytree(os.path.join(run_root, name),
+                            os.path.join(stage_root, name), symlinks=False)
+        os.makedirs(os.path.join(stage_root, "domains"), exist_ok=True)
+        for name in ("__init__.py", "task_worker.py"):
+            shutil.copy2(os.path.join(run_root, "domains", name),
+                         os.path.join(stage_root, "domains", name))
+        runtime_source = os.path.join(run_root, ".gan_runtime")
+        if os.path.isdir(runtime_source):
+            shutil.copytree(runtime_source,
+                            os.path.join(stage_root, ".gan_runtime"),
+                            symlinks=False)
+        staged_trajectory = os.path.join(stage_root, "trajectory.jsonl")
+        shutil.copy2(trajectory_source, staged_trajectory)
+
+        with tempfile.TemporaryFile(mode="w+b") as result_file:
+            result_fd = result_file.fileno()
+            payload["result_fd"] = result_fd
+            proc = subprocess.run(
+                _sandbox_command(stage_root, "./task_agent.py", staged_trajectory,
+                                 proxy_socket),
+                input=json.dumps(payload, ensure_ascii=False, default=str),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                timeout=QUESTION_TIMEOUT,
+                pass_fds=(result_fd,),
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
+                raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
+
+            result_file.seek(0)
+            raw_result = result_file.read()
+            shutil.copyfile(staged_trajectory, trajectory_source)
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        os.close(run_fd)
 
     if not raw_result:
         raise RuntimeError("Trusted TaskAgent worker returned no result")

@@ -242,6 +242,15 @@ class _TaskBrokerState:
                 )
                 output = f"{output}\n[imo_proof_grading]\n{grading_output}"
                 rc = grading_rc
+            elif domain == "polyglot" and rc == 0:
+                # Docker stays in this root-only broker; neither the outer
+                # worker nor the TaskAgent receives the host socket.
+                output_path = os.path.join(run_dir, "outputs", f"gan_{scope_id}")
+                tx.run_polyglot_eval(
+                    os.path.join(output_path, "predictions.csv"),
+                    str(self.config["repo_root"]),
+                    output_path,
+                )
             return rc, output
         finally:
             if os.path.isdir(run_dir):

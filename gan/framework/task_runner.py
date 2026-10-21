@@ -362,25 +362,10 @@ class DomainTaskRunner:
                         duration_s=round(time.time() - _t_harness, 1),
                         question_timeout_s=question_timeout_s,
                         harness_timeout_s=harness_timeout)
-            predictions_path = os.path.join(output_path, "predictions.csv")
-            report = None
-            if os.path.exists(predictions_path):
-                try:
-                    _t_eval = time.time()
-                    report = tx.run_polyglot_eval(
-                        predictions_path, self.domain_cfg, self.repo_root,
-                        output_path)
-                    self._event("task_eval_done", genid=str(genid),
-                                duration_s=round(time.time() - _t_eval, 1),
-                                eval_kind="docker")
-                except Exception as e:
-                    # A docker/eval failure must not degrade silently;
-                    # score reads None -> score_status="failed".
-                    report = None
-                    from utils.soft_fail import soft_fail
-                    soft_fail(f"polyglot eval failed for genid {genid}: {e}",
-                              event_path=paths.events_path(self.output_dir),
-                              event_type="polyglot_eval_failed", genid=str(genid))
+            report = tx.read_report(report_path) if rc == 0 else None
+            if report is not None:
+                self._event("task_eval_done", genid=str(genid),
+                            eval_kind="docker_broker")
         elif tx.uses_parent_scoring(self.domain):
             per_gen_seed = (
                 tx.derive_sample_seed(self.sample_seed_base, str(genid))

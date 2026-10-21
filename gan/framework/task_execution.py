@@ -56,7 +56,9 @@ _HARNESS_FILES = [
     "domains/report.py",
     "domains/task_worker.py",
 ]
-_PARENT_SCORED_DOMAINS = {"paper_review", "search_arena", "imo_grading"}
+_PARENT_SCORED_DOMAINS = {
+    "paper_review", "search_arena", "imo_grading", "polyglot",
+}
 _SANDBOXED_BALROG_DOMAINS = {"balrog_babyai", "balrog_babaisai"}
 _SANDBOXED_HARNESS_DOMAINS = _SANDBOXED_BALROG_DOMAINS | {
     "imo_proof", "imo_proof_grading",
@@ -603,7 +605,6 @@ def prepare_polyglot_questions(
 
 def run_polyglot_eval(
     predictions_path: str,
-    domain_cfg: Dict[str, Any],
     dataset_root: str,
     output_path: str,
 ) -> Dict[str, Any]:
@@ -620,7 +621,7 @@ def run_polyglot_eval(
         pred = row.get("prediction")
         if isinstance(pred, str) and pred.strip():
             patches[str(row["question_id"])] = pred
-    task_list = domain_cfg.get("eval_task_list") or None
+    task_list = [str(value) for value in df["question_id"].tolist()]
     from domains.polyglot.harness import harness as polyglot_harness
     run_id = "gan_polyglot"
     polyglot_harness(
@@ -758,8 +759,9 @@ def ensure_sampling_seed(
         base_seed = int.from_bytes(os.urandom(8), "big")
     anchor_ids: List[str] = []
     try:
-        pool = [] if domain in _SANDBOXED_BALROG_DOMAINS else load_dataset_ids(
-            dataset_root, domain, subset
+        pool = (
+            [] if domain == "polyglot" or domain in _SANDBOXED_BALROG_DOMAINS
+            else load_dataset_ids(dataset_root, domain, subset)
         )
         k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
         if pool and k > 0:
@@ -1076,22 +1078,32 @@ def _run_harness_and_report_local(
             "--domain", domain,
             "--model", model,
             "--run_id", run_id,
+            "--output_dir", "/proc/self/cwd/outputs",
             "--subset", subset,
             "--num_samples", str(num_samples),
         ]
         if reasoning_effort:
             harness_cmd.extend(["--reasoning_effort", str(reasoning_effort)])
+    def child_path(path: str) -> str:
+        absolute = os.path.realpath(os.path.abspath(path))
+        run_root = os.path.realpath(run_dir)
+        # The broker enters run_dir before setpriv. Keep private ancestors
+        # closed while letting the sandbox resolve its authorized run copy.
+        if needs_sandbox_identity and os.path.commonpath([run_root, absolute]) == run_root:
+            return os.path.join("/proc/self/cwd", os.path.relpath(absolute, run_root))
+        return absolute
+
     if questions_path:
-        harness_cmd.extend(["--questions_path", os.path.abspath(questions_path)])
+        harness_cmd.extend(["--questions_path", child_path(questions_path)])
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
-        harness_cmd.extend(["--dataset_root", os.path.abspath(dataset_root)])
+        harness_cmd.extend(["--dataset_root", child_path(dataset_root)])
         if sample_seed is not None:
             harness_cmd.extend(["--sample_seed", str(int(sample_seed))])
             if anchor_ids:
                 harness_cmd.extend(["--anchor_ids", ",".join(str(a) for a in anchor_ids)])
     if proofs_dname:
-        harness_cmd.extend(["--proofs_dname", os.path.abspath(proofs_dname)])
+        harness_cmd.extend(["--proofs_dname", child_path(proofs_dname)])
     if proxy_token:
         harness_cmd.extend([
             "--proxy_socket", os.path.abspath(proxy_socket),
@@ -1099,6 +1111,7 @@ def _run_harness_and_report_local(
         ])
     child_env = _task_safe_env(env)
     if needs_sandbox_identity:
+        child_env["PYTHONPATH"] = "/proc/self/cwd"
         username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
         _sandbox_runtime_preflight(
             setpriv, uid, gid, username, python_executable,

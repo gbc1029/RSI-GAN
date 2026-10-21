@@ -55,14 +55,11 @@ python -m domains.report --domain paper_review --dname ./outputs/initial_paper_r
 # python -m domains.report --domain imo_proof --dname ./outputs/initial_imo_proof_0
 
 
-# # polyglot
-# cd domains/polyglot
-# git clone https://github.com/princeton-nlp/SWE-bench.git
-# cd SWE-bench
-# git checkout dc4c087c2b9e4cefebf2e3d201d27e36
-# pip install -e .
-# cd ../../../
-# python -m domains.polyglot.prepare_polyglot_dataset
-# python -m domains.polyglot.harness --subset small --output_dir ./outputs/initial_polyglot_0 --model_name_or_path eval_run
-# python -m domains.polyglot.report --output_dir ./outputs/initial_polyglot_0 --model_name_or_path eval_run
+# # polyglot data + GAN evaluation images (run as the normal WSL user, never sudo/root)
+# # This reuses the repository's image builder. Do not install SWE-bench editable,
+# # change docker.sock permissions, or expose the socket to a task container.
+# /opt/rsi-gan/hyperagents/bin/python -m domains.polyglot.prepare_polyglot_dataset \
+#   --build-images go__bottle-song go__react
+# # GAN evaluation must be launched through scripts/run_gan.py so only the
+# # root-only broker reaches Docker; never mount docker.sock into a task container.
 

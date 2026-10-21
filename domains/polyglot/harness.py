@@ -344,6 +344,7 @@ def harness(
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         model_name_or_path = timestamp
     pred_dname = Path(pred_dname)
+    output_dir = Path(output_dir)
     pred_dname.mkdir(exist_ok=True)
     out_dnames = []
     

@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 from pathlib import Path
@@ -226,7 +227,38 @@ def register_git(benchmark_path):
         
     return all_commits
         
-def main():
+def build_selected_images(metadata, instance_ids):
+    if getattr(os, "geteuid", lambda: -1)() == 0:
+        raise PermissionError(
+            "Polyglot images must be prepared as the normal WSL user, not root"
+        )
+
+    selected = [
+        entry for entry in metadata if entry["instance_id"] in instance_ids
+    ]
+    missing = sorted(set(instance_ids) - {entry["instance_id"] for entry in selected})
+    if missing:
+        raise ValueError(f"Unknown Polyglot instance IDs: {', '.join(missing)}")
+
+    import docker
+    from domains.polyglot.docker_build import build_env_images
+
+    client = docker.from_env()
+    try:
+        client.ping()
+        _, failed = build_env_images(client, selected, max_workers=1)
+    finally:
+        client.close()
+    if failed:
+        raise RuntimeError(f"Failed to build Polyglot images: {', '.join(failed)}")
+
+
+def main(build_images_for=None):
+    if build_images_for and getattr(os, "geteuid", lambda: -1)() == 0:
+        raise PermissionError(
+            "Polyglot images must be prepared as the normal WSL user, not root"
+        )
+
     # Assuming script is run from the polyglot directory
     benchmark_dir = "./domains/polyglot"
 
@@ -253,5 +285,16 @@ def main():
     print(f"Generated metadata for {len(metadata)} tasks")
     print(f"Metadata written to {output_path}")
 
+    if build_images_for:
+        build_selected_images(metadata, build_images_for)
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--build-images",
+        nargs="+",
+        metavar="INSTANCE_ID",
+        help="Build the existing Polyglot base/environment images for these tasks",
+    )
+    args = parser.parse_args()
+    main(args.build_images)
