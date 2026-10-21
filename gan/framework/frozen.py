@@ -218,14 +218,22 @@ def expand_roots(root_dir: str, roots: List[str], cap: int = 500) -> List[str]:
 
 
 # -- back-compat ------------------------------------------------------------
+# Isolation of the archive / supernode records from role access (docs/14 §5.3):
+# they live under output_dir/ckpt (never inside a code repo), and this deny is
+# defence-in-depth should a future grant surface ever include output_dir.
+_ARCHIVE_DENY = ("ckpt/**",)
+
+
 def deny_paths() -> List[str]:
     """Read-only view of the explicit trust anchor (``TRUST_ANCHOR``).
 
     ``build.py`` passes it to ``AccessBroker(deny_paths=...)`` as the broker's
     runtime deny list, and ``is_allowed`` enforces it directly. Currently
-    redundant with the role roots (defence-in-depth).
+    redundant with the role roots (defence-in-depth). The archive/supernode
+    records (``ckpt/**``) are additionally denied as an isolation backstop
+    (docs/14 §5.3).
     """
-    return list(TRUST_ANCHOR)
+    return list(TRUST_ANCHOR) + list(_ARCHIVE_DENY)
 
 
 def is_frozen(rel_path: str) -> bool:

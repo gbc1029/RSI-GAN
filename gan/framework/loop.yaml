@@ -83,6 +83,36 @@ tree:
   cross_subtree_epsilon: 0.1    # probability of a global-pool draw when cross_subtree=true
 
 # ---------------------------------------------------------------------------
+# outer 级父代选择（docs/14）：MOME 档案 + 锦标赛 + novelty
+#   enabled=false 时以下所有键短路，outer 保持单链（里程碑 A 行为）。
+# ---------------------------------------------------------------------------
+outer_select:
+  enabled: false                # 总开关；false = 现有单链行为（完全不变）
+  tournament_k: 3               # 锦标赛抽签数
+  restore_max_tries: 3          # 恢复父代设计 + heal 的最大尝试数（全失败退回链式）
+  heal_tool_overlap: 0.5        # heal 后 tools 与父代 tools 的 Jaccard 重叠阈值（低于则放弃该父代）
+
+mome:
+  x_buckets: 6                  # 声明性（固定边界见 archive.bucket_*）
+  y_buckets: 5
+  z_buckets: 3
+  reference_window: 10          # 赛季 M（novelty 参考集 + z-score 基准）
+  novelty_k: 5
+  cold_start_min: 10            # 档案少于此数 → 完全链式（不选父）
+  max_elites_per_cell: 3        # 每格 Pareto 前沿容量上限
+
+fitness:
+  beta_variance: 0.1
+  lambda_novelty: 0.2
+  w1_calibration: 0.6
+  w2_verdict_stability: 0.4
+
+eval:
+  eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
+  eval_samples: 3               # 每个 supernode 入档评估次数
+  eval_timeout_s: 1800          # 单次评估预算
+
+# ---------------------------------------------------------------------------
 # 修改深度 / 源码门控（v1.1 修订）
 #   说明：算子预算（max_ops_per_gen / max_code_edits_per_gen）与补丁大小上限
 #   属"可做但暂不做"（见 docs/6_v5改动.md R2）；每代一个补丁由架构保证。

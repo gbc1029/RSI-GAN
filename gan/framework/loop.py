@@ -200,6 +200,19 @@ class GanLoop:
         self._attempt = uuid.uuid4().hex[:8]
         # role self-edit commits made by this run (audit)
         self._role_commits: Dict[str, str] = {}
+        # -- outer-level selection (docs/14) ---------------------------------
+        self.outer_select_enabled = bool(cfg.get("outer_select.enabled", False))
+        self.tournament_k = int(cfg.get("outer_select.tournament_k", 3))
+        self.restore_max_tries = int(cfg.get("outer_select.restore_max_tries", 3))
+        self.heal_tool_overlap = float(cfg.get("outer_select.heal_tool_overlap", 0.5))
+        self.cold_start_min = int(cfg.get("mome.cold_start_min", 10))
+        self.reference_window = int(cfg.get("mome.reference_window", 10))
+        self.novelty_k = int(cfg.get("mome.novelty_k", 5))
+        self.max_elites_per_cell = int(cfg.get("mome.max_elites_per_cell", 3))
+        self.eval_samples = int(cfg.get("eval.eval_samples", 3))
+        self.eval_base_ref = str(cfg.get("eval.eval_base", "eval_base"))
+        self._archive: Any = None
+        self._outer_select_rng = random.Random()
         os.makedirs(self.output_dir, exist_ok=True)
         self.task_tree = TreeStore(self.output_dir, "task").load()
         self.planner_tree = TreeStore(self.output_dir, "planner").load()
@@ -1090,6 +1103,80 @@ class GanLoop:
                       event_path=paths.events_path(self.output_dir),
                       event_type="supernode_record_failed", outer=outer)
 
+    # -- outer-level selection (docs/14) -----------------------------------
+    def _archive_obj(self) -> Any:
+        if self._archive is None:
+            from gan.framework.archive import MomeArchive
+            self._archive = MomeArchive(
+                self.output_dir,
+                reference_window=self.reference_window,
+                max_elites_per_cell=self.max_elites_per_cell,
+            )
+        return self._archive
+
+    def _select_outer_parent(self, outer: int) -> None:
+        """Outer-level parent selection (docs/14 §5.1 step 1); no-op when disabled."""
+        if not self.outer_select_enabled:
+            return
+        arch = self._archive_obj()
+        if len(arch.reference) < self.cold_start_min:
+            return  # cold start: complete chain
+        try:
+            from gan.framework.outer_select import select_and_restore
+            sn, report = select_and_restore(
+                self.output_dir, arch, self._roles_root(), self.ledger_writer,
+                self._outer_select_rng, tournament_k=self.tournament_k,
+                max_tries=self.restore_max_tries,
+                tool_overlap_threshold=self.heal_tool_overlap)
+            if sn is None:
+                self.log_event({"type": "outer_parent_none", "outer": outer,
+                                "reason": report.get("reason")})
+                return
+            self.log_event({"type": "outer_parent_selected", "outer": outer,
+                            "parent_outer": report.get("outer")})
+        except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+            soft_fail(f"outer parent selection failed (outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="outer_select_failed", outer=outer)
+
+    def _archive_supernode(self, outer: int) -> None:
+        """Hard gate -> fitness -> MOME archive (docs/14 §5.1 step 8); no-op when disabled."""
+        if not self.outer_select_enabled:
+            return
+        try:
+            from gan.framework.supernode import load_supernode
+            from gan.framework import fitness as F
+            sn = load_supernode(self.output_dir, outer)
+            if not sn:
+                return
+            arch = self._archive_obj()
+            # hard gate (docs/14 §5.3): triggered + locatable evidence -> exclude
+            rv = (sn.get("evaluator_stats") or {}).get("rule_violation") or {}
+            if rv.get("triggered") and rv.get("evidence_ref"):
+                self.log_event({"type": "supernode_excluded", "outer": outer,
+                                "reason": "rule_violation"})
+                return
+            refs = [r for o in arch.reference
+                    if (r := load_supernode(self.output_dir, o)) is not None]
+            fp = F.fitness_p(sn, refs, novelty_k=self.novelty_k)
+            fe = F.fitness_e(sn, refs, novelty_k=self.novelty_k)
+            key = arch.upsert({
+                "outer": outer,
+                "fitness_p": fp,
+                "fitness_e": fe,
+                "design_hash": sn.get("planner_design_hash"),
+                "op_dist": (sn.get("planner_stats") or {}).get("op_dist"),
+                "issues_per_task": (sn.get("evaluator_stats") or {}).get("issues_per_task"),
+                "eval_points_run": (sn.get("evaluator_stats") or {}).get("eval_points_run"),
+            })
+            arch.save()
+            self.log_event({"type": "supernode_archived", "outer": outer,
+                            "fitness_p": fp, "fitness_e": fe, "cell": key})
+        except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
+            soft_fail(f"archive upsert failed (outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="archive_upsert_failed", outer=outer)
+
     def _refresh_roles(self, outer: int) -> None:
         """Rebuild planner/evaluator for a new outer generation (instance refresh).
 
@@ -1861,6 +1948,7 @@ class GanLoop:
             self.log_event({"type": "outer_start", "outer": outer})
             _outer_t0 = time.time()
             # fresh role instances (design + tools + chat + workspace) for this outer
+            self._select_outer_parent(outer)
             self._refresh_roles(outer)
             # pin the outer's entry HEAD as the base for parent=initial children
             # (HEAD drifts to task-branch tips during the outer)
@@ -2471,5 +2559,6 @@ class GanLoop:
                             "duration_s": round(time.time() - _outer_t0, 1)})
             self._save_checkpoint("outer", outer, I_max)
             self._record_supernode(outer, outer_genids)
+            self._archive_supernode(outer)
 
         return self.task_tree
