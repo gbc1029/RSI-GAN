@@ -48,7 +48,7 @@
 | 参考伙伴 | 赛季化 M=10；作为 **novelty 距离参考集** + **z-score 基准** |
 | 设计快照存储 | **supernode 内嵌** planner/evaluator 设计快照 |
 | task 起点 | **继续当前 task HEAD**（task 连续演化，outer 只换 P/E 策略） |
-| 违规处理 | `rule_violation=true` 且 `evidence_ref` 可定位 → **直接排除** |
+| 违规处理 | 当前代码：`rule_violation=true` 且 `evidence_ref` **非空** → 排除（"可定位"校验与第二意见尚未实现，见 §11） |
 | 冷却（漏洞 10） | 最近 `cooldown_window` 届被选过的父代移出候选池；空池则放宽 |
 | verdict_stability 口径 | **客观事实命中率**：`fix_verdict`（evaluator 判"修好没"）与 benchmark 相对父代是否真的提升，一致率 |
 
@@ -88,9 +88,9 @@
 - `rule_violation`：从该届各 `runs/<genid>/eval.json` 的 `eval_point_results` 聚合（`point == "rule_violation"`）。
 - `accepted_fixed_rate`：evaluator 提出的 issues 中被 planner 接受并修复的比例（从 `feedback.issues` + `fix_verdicts` + `respond_issue` 聚合）。
 - `calibration_error`：$\lvert\text{predicted}-\text{actual}\rvert$ 均值（越低越好，$F_e$ 主指标；数据来自 `eval.json` 的 `predicted_score` + `benchmark_score`）。
-- `verdict_stability`：判准稳定性（fix_verdict 与 accepted 的一致率）；数据不足时 `null`，$F_e$ 自动退化为只用 `calibration_error`。
+- `verdict_stability`：客观事实命中率 = `fix_verdict` 与 **benchmark 相对父代是否真的提升**的一致率；数据不足（无 fix_verdict / 无父代 benchmark）时 `null`，$F_e$ 自动退化为只用 `calibration_error`。
 - `benchmark.eval_baseline`：本次评估使用的固定 root ref（所有条目相同 → 可比）。
-- `benchmark.reevaluated`：恒为 `true`（入档必评估，不再有"复用该届分数"路径）。
+- `benchmark.reevaluated`：**评估成功时为 `true`**；`eval_base` 缺失或评估异常时保持 `false`（降级：benchmark 仍是该届 inner 分数）。
 
 ### 3.2 MOME 档案（`ckpt/archive/mome.json`）
 
@@ -113,7 +113,7 @@
 - 每格 `max_elites_per_cell` 上限，超出按 $(F_p, F_e)$ 支配 + fitness 淘汰。
 - 档案是**派生索引**，可从 `ckpt/supernodes/*.json` 重建（提供 `rebuild` 以便修复）。
 
-### 3.3 格子（固定边界，`loop.yaml` 可调）
+### 3.3 格子（固定边界，**当前硬编码在 `archive.bucket_*`**）
 
 | 轴 | 定义 | 固定桶 |
 |---|---|---|
@@ -153,7 +153,7 @@ $$F_e = -\;w_1\cdot z_{\text{ref}}(\text{calibration\_error})\;+\;w_2\cdot\text{
 - $z_{\text{ref}}$ = 相对参考伙伴窗口的运行 z-score（bench 与 calibration_error 共用同一基准）。
 - $F_e$ **不挂 bench**（漏洞 3）：只由"校准误差（取负）"与"判准稳定性"构成；`verdict_stability` 缺数据时该项取 0 并标记 `fitness_partial`。
 - 两维都是"越高越好"，Pareto 支配方向一致（漏洞 3 的方向问题）。
-- 默认权重（`loop.yaml` 可调）：$\beta=0.1$，$\lambda=0.2$，$w_1=0.6$，$w_2=0.4$。
+- 权重：当前**硬编码**为 $\beta=0.1$，$\lambda=0.2$，$w_1=0.6$，$w_2=0.4$（`loop.yaml` 的 `fitness.*` 键尚未接入，见 §11）。
 
 ---
 
@@ -183,12 +183,14 @@ outer N 结束
 
 - **第 1 层**：在所有**非空格子**里均匀随机抽一格。
 - **第 2 层**：在该格的 Pareto 前沿里随机抽一个精英。
+- **冷却（漏洞 10）**：候选中排除最近 `cooldown_window`（默认 3）届被选过的 outer；若排除后候选池空，则**放宽**（允许复用）。
 - 重复抽 `tournament_k` 个（默认 3），取 $F_p$ 最高者（同分用 $F_e$ 破平）。
 - 候选池为空 / 冷启动 → 返回 None（链式）。
 
 ### 5.3 硬门与隔离（漏洞 4）
 
-- 排除条件：`rule_violation.triggered == true` 且 `evidence_ref` 可定位（`evidence_ref` 非空且指向存在的文件）。
+- 当前代码的排除条件：`rule_violation.triggered == true` 且 `evidence_ref` **非空**。
+  （“可定位”校验、独立第二意见、`rule_violation_unconfirmed` 事件、申诉通道**均未实现**，已记入 §11 已知风险。）
 - 结果：不入档案、不进 population、不可被选中（事件 `supernode_excluded`）。
 - 隔离落点：archive/supernode 读函数仅 framework 内部；不注册任何 role 工具；`AccessBroker`/`frozen` deny `ckpt/**`；回归断言 evaluator 无法触达 `ckpt/supernodes`、`ckpt/archive`。
 
@@ -200,7 +202,7 @@ outer N 结束
 
 ### 5.5 固定 root 评估（漏洞 1 + 漏洞 9）
 
-- 每个 supernode 入档前，在**固定 root 基线**（`eval_base` ref，初始 = run 的 initial task commit）上跑 `eval_samples`（默认 3）次独立 inner，取均值写入 `benchmark.mean/std`。
+- 每个 supernode 入档前，在**固定 root 基线**（`eval_base` ref，初始 = run 的 initial task commit）上跑 `eval_samples`（默认 3）次独立 **plan+task 轮次**（不含 evaluator 环节），取均值写入 `benchmark.mean/std`。
 - 评估**旁路运行**：独立 run_dir；**不写 task tree**、**不写 `scores.log`**、不进角色可见轨迹；设 token/时间预算上限。
 - 主线 task 代码照常连续演化，评估与主线解耦。
 
@@ -209,7 +211,7 @@ outer N 结束
 1. 写回 `S.designs` 到 `ckpt/design/<role>/config.json`（ledger 守卫，失败回滚）。
 2. 立即 `heal_design_keys/slots`（对当前 roles HEAD）。
 3. 记录 `restored_then_healed`（含 heal 前后 diff）。
-4. **幅度校验**：heal 引入的组件/键增删数 > 0 **且** prompt 相似度 < 0.9 → 判定差异过大，放弃 S。
+4. **幅度校验**：heal 后 `tools` 与父代 `tools` 的 **Jaccard 重叠 < `heal_tool_overlap`（默认 0.5）且确实发生了 heal** → 判定差异过大，放弃 S。
 5. 放弃后从锦标赛**重新抽下一个**，最多 `restore_max_tries`（默认 3）次；全失败 → 本轮不选父代（链式）。
 
 ---
@@ -218,7 +220,7 @@ outer N 结束
 
 | 文件 | 改动 |
 |---|---|
-| `gan/framework/paths.py` | 新增 `archive_dir` / `archive_path` / `eval_base_ref` |
+| `gan/framework/paths.py` | 新增 `archive_dir` / `archive_path`（`eval_base` 是 loop 配置值，不是 paths 函数） |
 | `gan/framework/supernode.py` | payload 字段扩展；读取兼容缺字段 |
 | `gan/framework/archive.py` | **新增**：格子映射、Pareto 插入（方向统一）、容量淘汰、参考伙伴窗口、`rebuild` |
 | `gan/framework/fitness.py` | **新增**：特征提取、$z_{\text{ref}}$、novelty（含自身 z-score）、$F_p$/$F_e$ |
@@ -235,20 +237,21 @@ outer N 结束
 ```yaml
 outer_select:
   enabled: false          # 总开关；false = 现有单链行为（完全不变）
-  tournament_k: 3
-  restore_max_tries: 3
-  heal_prompt_similarity: 0.9   # 幅度校验阈值
+  tournament_k: 3         # 锦标赛抽签数
+  restore_max_tries: 3    # 恢复父代设计 + heal 的最大尝试数（全失败退回链式）
+  heal_tool_overlap: 0.5  # 幅度校验：heal 后 tools 与父代 tools 的 Jaccard 重叠阈值
+  cooldown_window: 3      # 漏洞 10 冷却：最近 N 届选过的父代移出候选池（空池则放宽）
 
 mome:
-  x_buckets: 6
-  y_buckets: 5
-  z_buckets: 3
-  reference_window: 10    # 赛季 M
+  reference_window: 10    # 赛季 M（novelty 参考集 + z-score 基准）
   novelty_k: 5
   cold_start_min: 10      # 低于此数 → 完全链式
-  max_elites_per_cell: 3
+  max_elites_per_cell: 3  # 每格 Pareto 前沿容量上限
+  # 【当前未接入】x_buckets / y_buckets / z_buckets：分桶边界在 archive.bucket_* 硬编码。
 
 fitness:
+  # 【当前未接入】以下 4 个权重在 fitness.fitness_p / fitness_e 里硬编码为默认值
+  # （beta=0.1, lambda=0.2, w1=0.6, w2=0.4）；改这里不生效，见 §11。
   beta_variance: 0.1
   lambda_novelty: 0.2
   w1_calibration: 0.6
@@ -257,7 +260,7 @@ fitness:
 eval:
   eval_base: eval_base    # 固定 root ref（初始 = initial task commit）
   eval_samples: 3         # 每个 supernode 入档评估次数
-  eval_timeout_s: 1800    # 单次评估预算
+  # 【当前未接入】eval_timeout_s：run_eval_rounds 目前没有超时控制。
 ```
 
 > `outer_select.enabled=false` 时，本计划的所有新逻辑**短路**，行为与里程碑 A 完全一致。
@@ -278,7 +281,7 @@ eval:
 
 ---
 
-## 9. 测试计划（`scripts/local/regress_outer_select.py`，新增）
+## 9. 测试计划（`scripts/local/regress_repo_split.py`）
 
 - **格子映射**：top-1 op / issues 阈值 / eval_point 覆盖 → 固定桶正确。
 - **Pareto 前沿**：方向统一后同格被支配条目被裁剪，非支配保留；容量上限生效。
@@ -296,7 +299,7 @@ eval:
 
 | 风险 | 说明 | 缓解 |
 |---|---|---|
-| **每届固定评估成本** | 入档必评估 2–3 次，每届成本稳定但更高 | `eval_samples` 可调；`enabled=false` 可整体关闭 |
+| **每届固定评估成本** | 评估成功时每届跑 2–3 次 plan+task，成本稳定但更高 | `eval_samples` 可调；`enabled=false` 可整体关闭；`eval_base` 缺失/异常时跳过 |
 | **heal 可能放弃父代** | 历史设计与当前代码不兼容时被放弃 | `restore_max_tries` 限制尝试；全失败退回链式 |
 | **$F_e$ 数据稀疏** | `verdict_stability` 多数届无数据 | 自动退化只留 `calibration_error`，标记 `fitness_partial` |
 | **evaluator 单方面淘汰** | `rule_violation` 由当届 evaluator 单方判定，误判即永久排除好 supernode（无第二意见/申诉） | 暂不解决，记为已知风险（§11） |
@@ -312,6 +315,7 @@ eval:
 2. `accepted_fixed_rate` 是否把 `acted_differently` 计为接受（当前按 `acted`）。
 3. 参考伙伴窗口"赛季"是滚动还是按 outer 编号分段（当前滚动）。
 4. `eval_base` ref 的命名与固定策略（当前 = initial task commit，永不移动）。
+5. **【消融前必须处理】配置键未接入**：`fitness.{beta_variance,lambda_novelty,w1_calibration,w2_verdict_stability}`、`mome.{x_buckets,y_buckets,z_buckets}`、`eval.eval_timeout_s` 当前**无代码 consumer**——改这些键不会生效。消融实验开始前必须接上 consumer 或从 `loop.yaml` 移除。
 
 > 已解决：漏洞 10（冷却，`outer_select.cooldown_window`）、verdict_stability（客观事实命中率 = `fix_verdict` vs benchmark 相对父代的一致率）。
 
