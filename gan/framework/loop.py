@@ -1334,6 +1334,14 @@ class GanLoop:
                              w2=self.w2_verdict_stability,
                              lambda_=self.lambda_novelty,
                              novelty_k=self.novelty_k, x_ops=self.buckets[0])
+            # An entry with no benchmark at all has NO comparable F_p: it would
+            # never be pruned (_dominates returns False on None), would occupy a
+            # per-cell capacity slot, and could win a tournament draw when its
+            # cell holds only such entries. Keep it out of the archive.
+            if fp is None:
+                self.log_event({"type": "supernode_not_archived", "outer": outer,
+                                "reason": "no_benchmark"})
+                return
             key = arch.upsert({
                 "outer": outer,
                 "fitness_p": fp,
@@ -1388,6 +1396,7 @@ class GanLoop:
         """
         if not self.outer_select_enabled:
             return
+        eval_planner: Any = None
         try:
             from gan.framework import eval_on_root as E
             from gan.framework import code_repo
@@ -1401,13 +1410,19 @@ class GanLoop:
                 self.log_event({"type": "eval_base_missing", "outer": outer})
                 return
 
-            # separate planner instance (docs/14 §5.5 isolation)
-            eval_planner = None
+            # separate planner instance (docs/14 §5.5 isolation). The call
+            # shape is decided by SIGNATURE PROBING, not ``except TypeError``:
+            # the old fallback masked any TypeError raised INSIDE the factory
+            # by silently re-calling it and losing the real error.
             if self.planner_factory is not None:
                 try:
+                    params = inspect.signature(self.planner_factory).parameters
+                except (TypeError, ValueError):  # builtins / C callables
+                    params = {}
+                if "instance" in params:
                     eval_planner = self.planner_factory(
                         outer, f"{self._attempt}_eval", instance=f"outer_{outer}_eval")
-                except TypeError:
+                else:
                     eval_planner = self.planner_factory(outer, f"{self._attempt}_eval")
             if eval_planner is None:
                 eval_planner = self.planner  # stub / offline fallback
@@ -1416,23 +1431,31 @@ class GanLoop:
 
             def run_once(sample: int):
                 genid = E.eval_genid(outer, sample)
-                plan_result = eval_planner.plan(
-                    parent_summary=(self._parent_summary(initial) if initial else {}),
-                    parents=[],
-                    parent_feedback=None,
-                    evaluator_issues=None,
-                    config=(self._parent_config(initial) if initial else {}),
-                    node_id=genid,
-                    broker=self.broker,
-                    task_brief=self.task_brief,
-                    trajectory_genids=[],
-                    receipt=None,
-                    parent_predicted_score=None,
-                    parent_benchmark_score=None,
-                    patch_retry_k=self.patch_retry_k,
-                    max_tool_calls=self.plan_max_tool_calls,
-                    tool_repeat_limit=self.tool_repeat_limit,
-                ) or {}
+                eval_cfg = (self._parent_config(initial) if initial else {})
+                if self._ab("disable_planner"):
+                    # A1 = "no planner at all". Planning inside the fixed-root
+                    # evaluation would silently re-introduce the very mechanism
+                    # the arm removes, making an A0-vs-A1 comparison under
+                    # outer_select meaningless. Same empty plan as the main line.
+                    plan_result = self._empty_plan_result(eval_cfg)
+                else:
+                    plan_result = eval_planner.plan(
+                        parent_summary=(self._parent_summary(initial) if initial else {}),
+                        parents=[],
+                        parent_feedback=None,
+                        evaluator_issues=None,
+                        config=eval_cfg,
+                        node_id=genid,
+                        broker=self.broker,
+                        task_brief=self.task_brief,
+                        trajectory_genids=[],
+                        receipt=None,
+                        parent_predicted_score=None,
+                        parent_benchmark_score=None,
+                        patch_retry_k=self.patch_retry_k,
+                        max_tool_calls=self.plan_max_tool_calls,
+                        tool_repeat_limit=self.tool_repeat_limit,
+                    ) or {}
                 child = self.task_runner(plan=plan_result, parent=initial,
                                          genid=genid, base=eval_base)
                 if child is None:
@@ -1451,33 +1474,56 @@ class GanLoop:
             result = E.run_eval_rounds(run_once, self.eval_samples,
                                        timeout_s=self.eval_timeout_s)
 
-            # restore the main-line task HEAD (evaluation commits become orphans)
+            # restore the main-line task HEAD (evaluation commits become orphans).
+            # A SILENT failure here leaves the main line on an eval commit and
+            # silently corrupts every later generation's lineage -- it must be
+            # reported, not swallowed.
             if task_root and main_head:
                 try:
                     code_repo.checkout(task_root, main_head)
                     self._rebuild_composed_view()
-                except Exception:  # noqa: BLE001 -- advisory restore
-                    pass
+                except Exception as e:  # noqa: BLE001 -- report, never abort
+                    soft_fail(f"main-line HEAD restore failed after eval "
+                              f"(outer {outer}, want {main_head}): {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="eval_head_restore_failed", outer=outer)
+            elif task_root:
+                soft_fail(f"main-line HEAD unknown after eval (outer {outer}); "
+                          f"cannot restore it",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="eval_head_restore_unavailable", outer=outer)
+
+            # Only a batch with at least one VALID round may overwrite the
+            # benchmark. Assigning a None mean on total failure would ERASE the
+            # main-line score -- the degradation must keep the old value.
+            if result["n_valid"] > 0:
+                sn["benchmark"]["mean"] = result["mean"]
+                sn["benchmark"]["std"] = result["std"]
+                sn["benchmark"]["n_valid"] = result["n_valid"]
+                sn["benchmark"]["eval_baseline"] = self.eval_base_ref
+                sn["benchmark"]["reevaluated"] = True
+            else:
+                sn["benchmark"]["reevaluated"] = False
+                self.log_event({"type": "supernode_eval_degraded", "outer": outer,
+                                "keep_mean": (sn.get("benchmark") or {}).get("mean")})
+            update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
+            self.log_event({"type": "supernode_evaluated", "outer": outer,
+                            "mean": result["mean"], "n_valid": result["n_valid"],
+                            "timed_out": result.get("timed_out", False),
+                            "reevaluated": bool(result["n_valid"])})
+        except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
+            soft_fail(f"fixed-root evaluation failed (outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="eval_on_root_failed", outer=outer)
+        finally:
+            # close the throwaway planner on EVERY path (a role_process planner
+            # is a child process; leaking one per failed outer would accumulate)
             try:
                 close = getattr(eval_planner, "close", None)
                 if close is not None and eval_planner is not self.planner:
                     close()
             except Exception:  # noqa: BLE001 -- advisory
                 pass
-
-            sn["benchmark"]["mean"] = result["mean"]
-            sn["benchmark"]["std"] = result["std"]
-            sn["benchmark"]["n_valid"] = result["n_valid"]
-            sn["benchmark"]["eval_baseline"] = self.eval_base_ref
-            sn["benchmark"]["reevaluated"] = True
-            update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
-            self.log_event({"type": "supernode_evaluated", "outer": outer,
-                            "mean": result["mean"], "n_valid": result["n_valid"],
-                            "timed_out": result.get("timed_out", False)})
-        except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
-            soft_fail(f"fixed-root evaluation failed (outer {outer}): {e}",
-                      event_path=paths.events_path(self.output_dir),
-                      event_type="eval_on_root_failed", outer=outer)
 
     def _refresh_roles(self, outer: int) -> None:
         """Rebuild planner/evaluator for a new outer generation (instance refresh).

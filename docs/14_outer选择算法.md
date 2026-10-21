@@ -90,7 +90,8 @@
 - `calibration_error`：$\lvert\text{predicted}-\text{actual}\rvert$ 均值（越低越好，$F_e$ 主指标；数据来自 `eval.json` 的 `predicted_score` + `benchmark_score`）。
 - `verdict_stability`：客观事实命中率 = `fix_verdict` 与 **benchmark 相对父代是否真的提升**的一致率；数据不足（无 fix_verdict / 无父代 benchmark）时 `null`，$F_e$ 自动退化为只用 `calibration_error`。
 - `benchmark.eval_baseline`：本次评估使用的固定 root ref（所有条目相同 → 可比）。
-- `benchmark.reevaluated`：**评估成功时为 `true`**；`eval_base` 缺失或评估异常时保持 `false`（降级：benchmark 仍是该届 inner 分数）。
+- `benchmark.reevaluated`：**有 ≥1 轮有效时为 `true`**；`eval_base` 缺失、全部轮次失败或评估异常时为 `false`，此时**保留该届 inner 分数**（绝不写 `None` 把唯一分数抹掉），并记 `supernode_eval_degraded`。
+- **无 benchmark 的 supernode 不入档**（`supernode_not_archived: no_benchmark`）：$F_p$ 缺失的条目永不被支配裁剪、却会占满每格容量，还可能在锦标赛中胜出。
 
 ### 3.2 MOME 档案（`ckpt/archive/mome.json`）
 
@@ -205,6 +206,7 @@ outer N 结束
 ### 5.5 固定 root 评估（漏洞 1 + 漏洞 9）
 
 - 每个 supernode 入档前，在**固定 root 基线**（`eval_base` ref，初始 = run 的 initial task commit）上跑 `eval_samples`（默认 3）次独立 **plan+task 轮次**（不含 evaluator 环节），取均值写入 `benchmark.mean/std`。
+- **A1 一致性**：`ablation.disable_planner=true` 时评估轮次同样走空 `plan_result`（否则评估会偷偷把“被消融掉的 planner”装回来，A0 vs A1 不可比）。
 - 评估**旁路运行**：独立 run_dir；**不写 task tree**、**不写 `scores.log`**、不进角色可见轨迹；设 token/时间预算上限。
 - 主线 task 代码照常连续演化，评估与主线解耦。
 
@@ -307,6 +309,7 @@ eval:
 | **evaluator 单方面淘汰** | `rule_violation` 由当届 evaluator 单方判定，误判即永久排除好 supernode（无第二意见/申诉） | 暂不解决，记为已知风险（§11） |
 | **$F_e$ 自评可刷分** | `calibration_error` / `verdict_stability` 均由当届 evaluator 产出，存在"保守预测/固定 verdict"刷分空间 | 暂不解决，记为已知风险（§11） |
 | **档案是派生索引** | 与 supernode 文件可能不一致 | `rebuild` 从 `ckpt/supernodes/*.json` 重建；启动时校验 |
+| **混合基准（未消除）** | `reevaluated=true` 条目用固定 root 分数，`false` 条目用主线 inner 分数，两者**尺度不同**却同进一个 $z_{\text{ref}}$ 池 | 每条自带 `eval_baseline` + `reevaluated` 可审计；如需严格可比，消融时固定 `eval_base` 并保证评估不降级（看 `supernode_eval_degraded`） |
 | **固定 root 与主线解耦** | 评估基线与主线 task 代码不同 | 明确 `eval_base` 语义；审计记录两套代码 commit |
 
 ---
