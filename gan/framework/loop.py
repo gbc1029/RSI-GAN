@@ -228,6 +228,22 @@ class GanLoop:
         self.max_elites_per_cell = int(cfg.get("mome.max_elites_per_cell", 3))
         self.eval_samples = int(cfg.get("eval.eval_samples", 3))
         self.eval_base_ref = str(cfg.get("eval.eval_base", "eval_base"))
+        # Per-batch wall-clock budget for the fixed-root evaluation (s). 0/None =
+        # unbounded. Checked BETWEEN rounds (a single in-flight round cannot be
+        # interrupted in-process, so a hung round still overruns).
+        self.eval_timeout_s = float(cfg.get("eval.eval_timeout_s", 0) or 0.0)
+        # docs/14 §3.3 / §4.3: bucket specs + fitness weights are config-driven.
+        # int bucket values assert the built-in count (fail loud on mismatch);
+        # list values are explicit boundaries. Resolved eagerly so a bad config
+        # refuses the run at construction instead of silently degrading.
+        from gan.framework.archive import resolve_buckets
+        self.buckets = resolve_buckets(cfg.get("mome.x_buckets"),
+                                       cfg.get("mome.y_buckets"),
+                                       cfg.get("mome.z_buckets"))
+        self.beta_variance = float(cfg.get("fitness.beta_variance", 0.1))
+        self.lambda_novelty = float(cfg.get("fitness.lambda_novelty", 0.2))
+        self.w1_calibration = float(cfg.get("fitness.w1_calibration", 0.6))
+        self.w2_verdict_stability = float(cfg.get("fitness.w2_verdict_stability", 0.4))
         self._archive: Any = None
         self._outer_select_rng = random.Random()
         self.cooldown_window = int(cfg.get("outer_select.cooldown_window", 3))
@@ -1255,6 +1271,9 @@ class GanLoop:
                 self.output_dir,
                 reference_window=self.reference_window,
                 max_elites_per_cell=self.max_elites_per_cell,
+                x_ops=self.buckets[0],
+                y_edges=self.buckets[1],
+                z_edges=self.buckets[2],
             )
         return self._archive
 
@@ -1308,8 +1327,13 @@ class GanLoop:
                 return
             refs = [r for o in arch.reference
                     if (r := load_supernode(self.output_dir, o)) is not None]
-            fp = F.fitness_p(sn, refs, novelty_k=self.novelty_k)
-            fe = F.fitness_e(sn, refs, novelty_k=self.novelty_k)
+            fp = F.fitness_p(sn, refs, beta=self.beta_variance,
+                             lambda_=self.lambda_novelty,
+                             novelty_k=self.novelty_k, x_ops=self.buckets[0])
+            fe = F.fitness_e(sn, refs, w1=self.w1_calibration,
+                             w2=self.w2_verdict_stability,
+                             lambda_=self.lambda_novelty,
+                             novelty_k=self.novelty_k, x_ops=self.buckets[0])
             key = arch.upsert({
                 "outer": outer,
                 "fitness_p": fp,
@@ -1424,7 +1448,8 @@ class GanLoop:
                 except Exception:  # noqa: BLE001 -- advisory
                     main_head = None
 
-            result = E.run_eval_rounds(run_once, self.eval_samples)
+            result = E.run_eval_rounds(run_once, self.eval_samples,
+                                       timeout_s=self.eval_timeout_s)
 
             # restore the main-line task HEAD (evaluation commits become orphans)
             if task_root and main_head:
@@ -1447,7 +1472,8 @@ class GanLoop:
             sn["benchmark"]["reevaluated"] = True
             update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
             self.log_event({"type": "supernode_evaluated", "outer": outer,
-                            "mean": result["mean"], "n_valid": result["n_valid"]})
+                            "mean": result["mean"], "n_valid": result["n_valid"],
+                            "timed_out": result.get("timed_out", False)})
         except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
             soft_fail(f"fixed-root evaluation failed (outer {outer}): {e}",
                       event_path=paths.events_path(self.output_dir),

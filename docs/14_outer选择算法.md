@@ -39,7 +39,7 @@
 | 恢复后对齐（漏洞 2） | 恢复设计 → `heal_design_keys/slots` 适配当前 roles HEAD → 标记 `restored_then_healed` → **幅度校验**：差异过大则放弃该父代、换下一个（最多 N 次，全失败退回链式） |
 | $F_e$ 目标（漏洞 3） | **不挂 bench**，改为评估器自身的 **校准误差 + 判准稳定性**（方向统一为"越高越好"，校准误差取负） |
 | 档案隔离（漏洞 4） | **接口层强隔离**：archive/supernode 读 API 仅 framework 内部；不注册任何 role 工具；`AccessBroker`/`frozen` deny `ckpt/**` |
-| MOME 分桶 | **固定边界**（写进配置，冷启动也稳定） |
+| MOME 分桶 | **默认固定边界**（`mome.*_buckets` 可覆盖，冷启动也稳定） |
 | 冷启动（漏洞 5） | 档案 < `cold_start_min` → **完全链式**（不选父、直接返回 None），不只关 novelty |
 | 锦标赛采样（漏洞 6） | **两层采样**：先均匀抽格 → 再在格内抽精英 |
 | 档案容量（漏洞 7） | 每格 `max_elites_per_cell` 上限，超出按 Pareto + fitness 淘汰 |
@@ -113,7 +113,7 @@
 - 每格 `max_elites_per_cell` 上限，超出按 $(F_p, F_e)$ 支配 + fitness 淘汰。
 - 档案是**派生索引**，可从 `ckpt/supernodes/*.json` 重建（提供 `rebuild` 以便修复）。
 
-### 3.3 格子（固定边界，**当前硬编码在 `archive.bucket_*`**）
+### 3.3 格子（默认边界见 `archive.DEFAULT_*`，由 `mome.*_buckets` 控制）
 
 | 轴 | 定义 | 固定桶 |
 |---|---|---|
@@ -122,6 +122,8 @@
 | **Z** = eval_point 覆盖 | `len(evaluator_stats.eval_points_run)` | 3 桶：`0–1` / `2` / `3–4` |
 
 > 冷启动（档案条目 < `cold_start_min`）：**完全链式**，不选父代、不分桶、不计算 fitness（见 §5.1）。
+>
+> **配置形式**（`mome.{x,y,z}_buckets`）：给 **int** = 使用上表内置边界，并**断言桶数**（不一致直接启动报错，避免“改了不生效”的哑键）；给 **list** = 显式边界（消融用）。X 是 op 名顺序表（末尾自动 `other`），Y/Z 是闭区间上界（桶数 = `len(edges)+1`）。
 
 ---
 
@@ -153,7 +155,7 @@ $$F_e = -\;w_1\cdot z_{\text{ref}}(\text{calibration\_error})\;+\;w_2\cdot\text{
 - $z_{\text{ref}}$ = 相对参考伙伴窗口的运行 z-score（bench 与 calibration_error 共用同一基准）。
 - $F_e$ **不挂 bench**（漏洞 3）：只由"校准误差（取负）"与"判准稳定性"构成；`verdict_stability` 缺数据时该项取 0 并标记 `fitness_partial`。
 - 两维都是"越高越好"，Pareto 支配方向一致（漏洞 3 的方向问题）。
-- 权重：当前**硬编码**为 $\beta=0.1$，$\lambda=0.2$，$w_1=0.6$，$w_2=0.4$（`loop.yaml` 的 `fitness.*` 键尚未接入，见 §11）。
+- 权重：$\beta$=`fitness.beta_variance`(0.1)，$\lambda$=`fitness.lambda_novelty`(0.2)，$w_1$=`fitness.w1_calibration`(0.6)，$w_2$=`fitness.w2_verdict_stability`(0.4)（`loop.yaml` 可调）。
 
 ---
 
@@ -243,24 +245,24 @@ outer_select:
   cooldown_window: 3      # 漏洞 10 冷却：最近 N 届选过的父代移出候选池（空池则放宽）
 
 mome:
+  x_buckets: 6            # int = 内置边界+断言桶数；list = 显式 op 名顺序表
+  y_buckets: 5            # int = 断言 5 桶；list = 上界 [0.0,0.5,1.0,2.0]
+  z_buckets: 3            # int = 断言 3 桶；list = 上界 [1.0,2.0]
   reference_window: 10    # 赛季 M（novelty 参考集 + z-score 基准）
   novelty_k: 5
   cold_start_min: 10      # 低于此数 → 完全链式
   max_elites_per_cell: 3  # 每格 Pareto 前沿容量上限
-  # 【当前未接入】x_buckets / y_buckets / z_buckets：分桶边界在 archive.bucket_* 硬编码。
 
 fitness:
-  # 【当前未接入】以下 4 个权重在 fitness.fitness_p / fitness_e 里硬编码为默认值
-  # （beta=0.1, lambda=0.2, w1=0.6, w2=0.4）；改这里不生效，见 §11。
-  beta_variance: 0.1
-  lambda_novelty: 0.2
-  w1_calibration: 0.6
-  w2_verdict_stability: 0.4
+  beta_variance: 0.1      # F_p: z_mean - beta*z_std + lambda*novelty
+  lambda_novelty: 0.2     # F_p / F_e 共用
+  w1_calibration: 0.6     # F_e: -w1*z_calibration_error
+  w2_verdict_stability: 0.4  # F_e: +w2*verdict_stability
 
 eval:
   eval_base: eval_base    # 固定 root ref（初始 = initial task commit）
   eval_samples: 3         # 每个 supernode 入档评估次数
-  # 【当前未接入】eval_timeout_s：run_eval_rounds 目前没有超时控制。
+  eval_timeout_s: 1800    # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 ```
 
 > `outer_select.enabled=false` 时，本计划的所有新逻辑**短路**，行为与里程碑 A 完全一致。
@@ -315,7 +317,7 @@ eval:
 2. `accepted_fixed_rate` 是否把 `acted_differently` 计为接受（当前按 `acted`）。
 3. 参考伙伴窗口"赛季"是滚动还是按 outer 编号分段（当前滚动）。
 4. `eval_base` ref 的命名与固定策略（当前 = initial task commit，永不移动）。
-5. **【消融前必须处理】配置键未接入**：`fitness.{beta_variance,lambda_novelty,w1_calibration,w2_verdict_stability}`、`mome.{x_buckets,y_buckets,z_buckets}`、`eval.eval_timeout_s` 当前**无代码 consumer**——改这些键不会生效。消融实验开始前必须接上 consumer 或从 `loop.yaml` 移除。
+5. ~~配置键未接入~~ **已解决**：`fitness.{beta_variance,lambda_novelty,w1_calibration,w2_verdict_stability}`、`mome.{x_buckets,y_buckets,z_buckets}`、`eval.eval_timeout_s` 均已接入 consumer（`loop.__init__` 读取 → `_archive_obj` / `_archive_supernode` / `run_eval_rounds` 消费）。分桶给 int 时是**断言**（桶数不一致启动报错），给 list 才是显式边界。
 
 > 已解决：漏洞 10（冷却，`outer_select.cooldown_window`）、verdict_stability（客观事实命中率 = `fix_verdict` vs benchmark 相对父代的一致率）。
 

@@ -94,24 +94,27 @@ outer_select:
   cooldown_window: 3            # 漏洞 10 冷却：最近 N 届被选过的父代移出候选池（空池则放宽）
 
 mome:
-  x_buckets: 6                  # 声明性（固定边界见 archive.bucket_*）
-  y_buckets: 5
-  z_buckets: 3
+  # 分桶边界（docs/14 §3.3）：int = 用内置边界并断言桶数（不一致 → 启动即报错）；
+  # list = 显式边界（消融用）。X 为 op 名顺序表（末尾自动加 "other"），
+  # Y/Z 为闭区间上界（桶数 = len(edges)+1）。
+  x_buckets: 6                  # 默认内置：5 个具名 op + other
+  y_buckets: 5                  # 默认内置边界 [0.0, 0.5, 1.0, 2.0]
+  z_buckets: 3                  # 默认内置边界 [1.0, 2.0]
   reference_window: 10          # 赛季 M（novelty 参考集 + z-score 基准）
   novelty_k: 5
   cold_start_min: 10            # 档案少于此数 → 完全链式（不选父）
   max_elites_per_cell: 3        # 每格 Pareto 前沿容量上限
 
 fitness:
-  beta_variance: 0.1
-  lambda_novelty: 0.2
-  w1_calibration: 0.6
-  w2_verdict_stability: 0.4
+  beta_variance: 0.1            # F_p: z_mean - beta*z_std + lambda*novelty
+  lambda_novelty: 0.2           # F_p / F_e 共用的 novelty 权重
+  w1_calibration: 0.6           # F_e: -w1*z_calibration_error
+  w2_verdict_stability: 0.4     # F_e: +w2*verdict_stability
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
   eval_samples: 3               # 每个 supernode 入档评估次数
-  eval_timeout_s: 1800          # 单次评估预算
+  eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 
 # ---------------------------------------------------------------------------
 # 修改深度 / 源码门控（v1.1 修订）
