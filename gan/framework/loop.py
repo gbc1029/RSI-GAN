@@ -939,6 +939,42 @@ class GanLoop:
         except Exception:  # noqa: BLE001 -- advisory
             return []
 
+    def _read_rule_violation(self, genid: Any) -> Optional[Dict[str, Any]]:
+        """First triggered rule_violation eval point for a generation (docs/14 §3.1)."""
+        try:
+            p = os.path.join(paths.runs_dir(self.output_dir, genid), "eval.json")
+            if not os.path.isfile(p):
+                return None
+            with open(p, "r", encoding="utf-8") as f:
+                rec = json.load(f)
+            for r in rec.get("eval_point_results") or []:
+                if isinstance(r, dict) and r.get("point") == "rule_violation" and r.get("violation"):
+                    return {"triggered": True, "evidence_ref": r.get("evidence")}
+            return {"triggered": False, "evidence_ref": None}
+        except Exception:  # noqa: BLE001 -- advisory
+            return None
+
+    def _read_mae(self, genid: Any) -> Optional[float]:
+        """Normalized MAE from report.json (imo_grading etc.); None elsewhere."""
+        try:
+            p = os.path.join(paths.runs_dir(self.output_dir, genid), "report.json")
+            if not os.path.isfile(p):
+                return None
+            with open(p, "r", encoding="utf-8") as f:
+                rep = json.load(f)
+            mae = rep.get("normalized_mean_absolute_error")
+            return float(mae) if mae is not None else None
+        except Exception:  # noqa: BLE001 -- advisory
+            return None
+
+    def _design_snapshot(self, role: str) -> Optional[Dict[str, Any]]:
+        """The role's effective design config at this moment (docs/14 §3.1)."""
+        try:
+            from gan.design.store import DesignStore
+            return DesignStore(paths.design_root(self.output_dir)).load(role)
+        except Exception:  # noqa: BLE001 -- advisory
+            return None
+
     def _record_supernode(self, outer: int, outer_genids: List[Any]) -> None:
         """Aggregate + persist the per-outer supernode (advisory sink)."""
         try:
@@ -960,6 +996,8 @@ class GanLoop:
             eval_points = set()
             predicted: List[float] = []
             actual: List[float] = []
+            rule_violation: Dict[str, Any] = {"triggered": False, "evidence_ref": None}
+            mae: Optional[float] = None
             for g in outer_genids:
                 node = self.task_tree.get(g)
                 if node is None:
@@ -982,6 +1020,12 @@ class GanLoop:
                 fb = (node.meta or {}).get("feedback") or {}
                 issues.extend(fb.get("issues") or [])
                 eval_points.update(self._read_eval_points(g))
+                rv = self._read_rule_violation(g)
+                if rv and rv.get("triggered") and not rule_violation["triggered"]:
+                    rule_violation = rv
+                m = self._read_mae(g)
+                if m is not None:
+                    mae = m
                 p = node.meta.get("predicted_score")
                 a = node.meta.get("benchmark_score")
                 if p is not None and a is not None:
@@ -994,14 +1038,21 @@ class GanLoop:
                     sv = str(it.get("severity", "unknown"))
                     severity[sv] = severity.get(sv, 0) + 1
             bias = None
+            calibration_error = None
             if predicted and actual:
                 bias = {"predicted": float(statistics.mean(predicted)),
                         "actual": float(statistics.mean(actual))}
+                calibration_error = float(statistics.mean(
+                    [abs(p - a) for p, a in zip(predicted, actual)]))
 
             payload = {
                 "outer": outer,
                 "planner_design_hash": self._design_hash("planner"),
                 "evaluator_design_hash": self._design_hash("evaluator"),
+                "designs": {
+                    "planner": self._design_snapshot("planner"),
+                    "evaluator": self._design_snapshot("evaluator"),
+                },
                 "code_commits": {
                     "task": task_commit,
                     "planner": self._role_commits.get("planner") or roles_head,
@@ -1015,6 +1066,9 @@ class GanLoop:
                     "std": float(statistics.pstdev(scores)) if len(scores) > 1 else 0.0,
                     "coverage": coverage,
                     "n_valid": len(scores),
+                    "mae": mae,
+                    "eval_baseline": None,   # filled by evaluate_on_root (B4)
+                    "reevaluated": False,    # -> true after evaluate_on_root (B4)
                 },
                 "planner_stats": {"op_dist": op_dist, "response_kind": response_kind},
                 "evaluator_stats": {
@@ -1022,6 +1076,9 @@ class GanLoop:
                     "severity": severity,
                     "eval_points_run": sorted(eval_points),
                     "bias": bias,
+                    "rule_violation": rule_violation,
+                    "calibration_error": calibration_error,
+                    "verdict_stability": None,  # data collection deferred (docs/14 §11)
                 },
             }
             record_supernode(self.output_dir, outer, payload, writer=self.ledger_writer)
