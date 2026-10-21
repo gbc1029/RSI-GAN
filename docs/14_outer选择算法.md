@@ -268,6 +268,10 @@ eval:
 ```
 
 > `outer_select.enabled=false` 时，本计划的所有新逻辑**短路**，行为与里程碑 A 完全一致。
+>
+> **CLI 覆盖**（无需改 `loop.yaml`）：`--ablation` 只写 `ablation.*`，里程碑 B 的键走 `--set`，例如
+> `--set outer_select.enabled=true --set eval.eval_samples=2`，分桶可用 JSON：`--set 'mome.y_buckets=[0.0,1.0]'`。
+> 覆盖通过 driver 的 `--cfg-overrides` 显式 argv 下发（不走 env），并记录在运行产物里。
 
 ---
 

@@ -8,6 +8,7 @@ Example (paper_review, minimal):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -85,6 +86,33 @@ def _parse_ablation_value(raw: str):
     return raw
 
 
+def _parse_override_value(raw: str):
+    """Type-infer a single --set value: JSON first (lists/objects/numbers/bools),
+    then the --ablation inference (bool / int / float / comma-list / string)."""
+    raw = raw.strip()
+    if raw[:1] in ("[", "{"):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    return _parse_ablation_value(raw)
+
+
+def _apply_dotted(overrides: dict, key: str, value) -> None:
+    """Merge ``section.sub.key=value`` into the nested override dict."""
+    parts = [s for s in key.split(".") if s]
+    if not parts:
+        raise ValueError(f"empty config key: {key!r}")
+    node = overrides
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+
+
 def main():
     p = argparse.ArgumentParser(description="Run the GAN dual-loop (planner/evaluator/task).")
     p.add_argument("--repo_root", default=".")
@@ -122,6 +150,13 @@ def main():
                         "true/false, int/float, comma-separated -> list, else string. "
                         "Example: --ablation disable_planner=true "
                         "--ablation trajectory_visibility=all")
+    p.add_argument("--set", action="append", default=None, metavar="SECTION.KEY=VALUE",
+                   help="Override ANY loop.yaml key (repeatable; dotted path). "
+                        "Needed for the milestone-B knobs that are not ablations: "
+                        "outer_select.enabled, fitness.*, mome.*, eval.*. "
+                        "Values: JSON when starting with [ or { (e.g. "
+                        "--set 'mome.y_buckets=[0.0,1.0]'), else type-inferred "
+                        "like --ablation. Example: --set outer_select.enabled=true")
     args = p.parse_args()
 
     if args.in_process:
@@ -190,6 +225,20 @@ def main():
                 ablation[key] = value
         if ablation:
             overrides["ablation"] = {**overrides.get("ablation", {}), **ablation}
+
+    # --set SECTION.KEY=VALUE (repeatable) -> arbitrary loop.yaml override.
+    # The milestone-B knobs (outer_select.* / fitness.* / mome.* / eval.*) have
+    # no --ablation alias, and editing the trust-anchor loop.yaml per arm is
+    # error-prone -- so they ride the same cfg_overrides channel the driver
+    # already forwards to the worker as an explicit argv JSON.
+    for kv in (getattr(args, "set", None) or []):
+        if "=" not in kv:
+            p.error(f"--set 需要 SECTION.KEY=VALUE 形式（收到 {kv!r}）")
+        key, raw = kv.split("=", 1)
+        try:
+            _apply_dotted(overrides, key.strip(), _parse_override_value(raw))
+        except ValueError as e:
+            p.error(str(e))
 
     if args.resume and args.force:
         p.error("--resume and --force are mutually exclusive")
