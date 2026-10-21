@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from gan.framework import paths
 
 # X-axis: top-1 op -> fixed category (6 buckets).
-_OP_BUCKETS = {
+OP_BUCKETS = {
     "set_prompt": 0,
     "set_config": 1,
     "set_param": 2,
@@ -33,7 +33,7 @@ def bucket_x(op_dist: Optional[Dict[str, Any]]) -> int:
         return _OP_OTHER
     top = max(op_dist.items(),
               key=lambda kv: (kv[1] if isinstance(kv[1], (int, float)) else 0))
-    return _OP_BUCKETS.get(str(top[0]), _OP_OTHER)
+    return OP_BUCKETS.get(str(top[0]), _OP_OTHER)
 
 
 def bucket_y(issues_per_task: Optional[float]) -> int:
