@@ -91,6 +91,7 @@ outer_select:
   tournament_k: 3               # 锦标赛抽签数
   restore_max_tries: 3          # 恢复父代设计 + heal 的最大尝试数（全失败退回链式）
   heal_tool_overlap: 0.5        # heal 后 tools 与父代 tools 的 Jaccard 重叠阈值（低于则放弃该父代）
+  cooldown_window: 3            # 漏洞 10 冷却：最近 N 届被选过的父代移出候选池（空池则放宽）
 
 mome:
   x_buckets: 6                  # 声明性（固定边界见 archive.bucket_*）

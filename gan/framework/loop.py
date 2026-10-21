@@ -213,6 +213,9 @@ class GanLoop:
         self.eval_base_ref = str(cfg.get("eval.eval_base", "eval_base"))
         self._archive: Any = None
         self._outer_select_rng = random.Random()
+        self.cooldown_window = int(cfg.get("outer_select.cooldown_window", 3))
+        self._selected_history: Dict[int, int] = {}
+        self._parent_supernode: Optional[Dict[str, Any]] = None
         os.makedirs(self.output_dir, exist_ok=True)
         self.task_tree = TreeStore(self.output_dir, "task").load()
         self.planner_tree = TreeStore(self.output_dir, "planner").load()
@@ -875,6 +878,7 @@ class GanLoop:
             "prev_predicted": self._prev_predicted,
             "prev_benchmark": self._prev_benchmark,
             "role_commits": dict(self._role_commits),
+            "selected_history": {str(k): v for k, v in self._selected_history.items()},
             "attempt": self._attempt,
             "outer": outer,
             "inner": inner,
@@ -891,6 +895,8 @@ class GanLoop:
         self._prev_predicted = state.get("prev_predicted")
         self._prev_benchmark = state.get("prev_benchmark")
         self._role_commits = dict(state.get("role_commits") or {})
+        self._selected_history = {int(k): int(v)
+                                  for k, v in (state.get("selected_history") or {}).items()}
 
     def _save_checkpoint(self, boundary: str, outer: int, inner: int) -> None:
         if not self.enable_checkpoint:
@@ -988,6 +994,18 @@ class GanLoop:
         except Exception:  # noqa: BLE001 -- advisory
             return None
 
+    def _read_fix_verdicts(self, genid: Any) -> List[Dict[str, Any]]:
+        """fix_verdicts from eval.json (the evaluator's judge_fix outcomes)."""
+        try:
+            p = os.path.join(paths.runs_dir(self.output_dir, genid), "eval.json")
+            if not os.path.isfile(p):
+                return []
+            with open(p, "r", encoding="utf-8") as f:
+                rec = json.load(f)
+            return [v for v in rec.get("fix_verdicts") or [] if isinstance(v, dict)]
+        except Exception:  # noqa: BLE001 -- advisory
+            return []
+
     def _record_supernode(self, outer: int, outer_genids: List[Any]) -> None:
         """Aggregate + persist the per-outer supernode (advisory sink)."""
         try:
@@ -1011,6 +1029,7 @@ class GanLoop:
             actual: List[float] = []
             rule_violation: Dict[str, Any] = {"triggered": False, "evidence_ref": None}
             mae: Optional[float] = None
+            fix_verdicts: List[Dict[str, Any]] = []
             for g in outer_genids:
                 node = self.task_tree.get(g)
                 if node is None:
@@ -1039,6 +1058,7 @@ class GanLoop:
                 m = self._read_mae(g)
                 if m is not None:
                     mae = m
+                fix_verdicts.extend(self._read_fix_verdicts(g))
                 p = node.meta.get("predicted_score")
                 a = node.meta.get("benchmark_score")
                 if p is not None and a is not None:
@@ -1057,6 +1077,18 @@ class GanLoop:
                         "actual": float(statistics.mean(actual))}
                 calibration_error = float(statistics.mean(
                     [abs(p - a) for p, a in zip(predicted, actual)]))
+            # verdict_stability: fix_verdict vs objective benchmark delta (vs parent).
+            # "用客观事实代替 planner 的 accepted" (docs/14 §11): the evaluator's
+            # "fixed" claim is verified against whether the score really improved
+            # over the selected parent's benchmark.
+            verdict_stability = None
+            parent_bench = (((self._parent_supernode or {}).get("benchmark") or {}).get("mean")
+                            if self._parent_supernode else None)
+            if fix_verdicts and parent_bench is not None and scores:
+                this_bench = float(statistics.mean(scores))
+                hits = sum(1 for fv in fix_verdicts
+                           if bool(fv.get("fixed")) == (this_bench > parent_bench))
+                verdict_stability = hits / len(fix_verdicts)
 
             payload = {
                 "outer": outer,
@@ -1091,7 +1123,7 @@ class GanLoop:
                     "bias": bias,
                     "rule_violation": rule_violation,
                     "calibration_error": calibration_error,
-                    "verdict_stability": None,  # data collection deferred (docs/14 §11)
+                    "verdict_stability": verdict_stability,
                 },
             }
             record_supernode(self.output_dir, outer, payload, writer=self.ledger_writer)
@@ -1121,19 +1153,25 @@ class GanLoop:
         arch = self._archive_obj()
         if len(arch.reference) < self.cold_start_min:
             return  # cold start: complete chain
+        exclude = {oid for oid, last in self._selected_history.items()
+                   if last >= outer - self.cooldown_window}
         try:
             from gan.framework.outer_select import select_and_restore
             sn, report = select_and_restore(
                 self.output_dir, arch, self._roles_root(), self.ledger_writer,
                 self._outer_select_rng, tournament_k=self.tournament_k,
                 max_tries=self.restore_max_tries,
-                tool_overlap_threshold=self.heal_tool_overlap)
+                tool_overlap_threshold=self.heal_tool_overlap,
+                exclude=exclude)
             if sn is None:
                 self.log_event({"type": "outer_parent_none", "outer": outer,
                                 "reason": report.get("reason")})
                 return
+            parent_outer = report.get("outer")
+            self._selected_history[int(parent_outer)] = outer
+            self._parent_supernode = sn
             self.log_event({"type": "outer_parent_selected", "outer": outer,
-                            "parent_outer": report.get("outer")})
+                            "parent_outer": parent_outer})
         except Exception as e:  # noqa: BLE001 -- advisory, never fatal
             soft_fail(f"outer parent selection failed (outer {outer}): {e}",
                       event_path=paths.events_path(self.output_dir),

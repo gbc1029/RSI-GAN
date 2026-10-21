@@ -18,20 +18,33 @@ from gan.framework.supernode import load_supernode
 
 
 def select_parent(archive: MomeArchive, rng: random.Random,
-                  tournament_k: int = 3) -> Optional[Dict[str, Any]]:
+                  tournament_k: int = 3,
+                  exclude: Optional[set] = None) -> Optional[Dict[str, Any]]:
     """Two-level sampling tournament (docs/14 §5.2).
 
     Level 1 draws a uniformly-random non-empty cell; level 2 draws a random
     elite from that cell's Pareto frontier. The highest $F_p$ (tie-break $F_e$)
     over ``tournament_k`` draws wins. Returns the entry (with ``cell``) or None.
+
+    ``exclude`` = set of outer ids in the cooldown window (漏洞 10): those
+    elites are skipped; if that empties the pool, the exclusion is relaxed.
     """
+    exclude = set(exclude or [])
     cells = archive.nonempty_cells()
-    if not cells:
+    candidates = []
+    for ck in cells:
+        elite = [e for e in archive.cells[ck]["elite"]
+                 if e.get("outer") not in exclude]
+        if elite:
+            candidates.append((ck, elite))
+    if not candidates:
+        # relax: every candidate is in cooldown -> allow reuse
+        candidates = [(ck, archive.cells[ck]["elite"]) for ck in cells]
+    if not candidates:
         return None
     picked = []
     for _ in range(int(tournament_k)):
-        ck = rng.choice(cells)
-        elite = archive.cells[ck]["elite"]
+        ck, elite = rng.choice(candidates)
         picked.append({**rng.choice(elite), "cell": ck})
     return max(picked, key=lambda e: (
         e.get("fitness_p") if e.get("fitness_p") is not None else float("-inf"),
@@ -75,13 +88,14 @@ def restore_role_design(output_dir: str, role: str, cfg: Optional[Dict[str, Any]
 def select_and_restore(output_dir: str, archive: MomeArchive,
                        roles_root: Optional[str], writer: Any,
                        rng: random.Random, tournament_k: int = 3,
-                       max_tries: int = 3, tool_overlap_threshold: float = 0.5
-                       ) -> tuple:
+                       max_tries: int = 3, tool_overlap_threshold: float = 0.5,
+                       exclude: Optional[set] = None) -> tuple:
     """Pick a parent and restore its designs; returns (supernode, report).
 
     ``report`` = {"outer", "reports", "tries"}; the returned supernode is None
     on cold start / all-divergent (chain fallback). A divergent candidate is
-    rolled back to the pre-attempt designs before the next try.
+    rolled back to the pre-attempt designs before the next try. ``exclude`` =
+    cooldown outer ids passed through to the tournament.
     """
     from gan.design.store import DesignStore
 
@@ -103,7 +117,7 @@ def select_and_restore(output_dir: str, archive: MomeArchive,
 
     tried: List[Dict[str, Any]] = []
     for _ in range(int(max_tries)):
-        entry = select_parent(archive, rng, tournament_k)
+        entry = select_parent(archive, rng, tournament_k, exclude=exclude)
         if entry is None:
             rollback()
             return None, {"outer": None, "reports": [], "tries": tried,
