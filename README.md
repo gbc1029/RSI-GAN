@@ -192,6 +192,28 @@ python -m domains.report  --domain paper_review --dname ./outputs/demo
 python scripts/dgmh/generate_loop.py --domains paper_review
 ```
 
+### RQGM baseline (git submodule)
+
+> This repository uses RQGM reproduction code as a git submodule.
+> RQGM reproduction source: https://github.com/kingkillery/red-queen-godel-machine, License: MIT.
+> The submodule code retains its original license and copyright.
+
+```bash
+# one-time: add the submodule (needs GitHub access; see baselines/rqgm_bridge/README.md)
+git submodule add https://github.com/kingkillery/red-queen-godel-machine.git baselines/rqgm
+
+# convert paper_review -> RQGM tasks/anchor, then run
+python -m domains.paper_review.curate_subsets
+python baselines/rqgm_bridge/convert.py \
+  --csv domains/paper_review/dataset_filtered_100_train.csv
+python baselines/rqgm_bridge/run.py \
+  --tasks baselines/rqgm_bridge/data/tasks.jsonl \
+  --anchor baselines/rqgm_bridge/data/anchor.jsonl
+```
+
+See `baselines/rqgm_bridge/README.md` for details and the documented
+reviewer-degradation limitation on `paper_review`.
+
 ## Data (excluded from this repo, fetch separately)
 
 Large datasets are intentionally **not** committed (see `.gitignore`):

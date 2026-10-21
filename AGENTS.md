@@ -117,9 +117,9 @@ scores,checkpoint,ledger}.py`, `gan/design/store.py` or the
 design operators — six suites (deep gate / batch-6 unification / batch-8
 isolation / c-dispatch / dynamic-keys / ledger-gate), one subprocess each.
 
-## Offline run analysis (scripts/local/, gitignored)
+## Offline analysis tools (analysis/)
 
-Two local analyzers read finished GAN run dirs (`scores.jsonl`,
+Two offline analyzers under `analysis/` read finished GAN run dirs (`scores.jsonl`,
 `runs/<genid>/`, `logs/events.jsonl`, `ckpt/`) — **offline only** (no network,
 no LLM calls), run with `venv_nat/bin/python`, and write artifacts into
 `<run_dir>/score_analysis/`. The base `analysis/*.py` scripts consume the DGM-H
@@ -165,6 +165,12 @@ with a GAN-native data layer.
   - *deep add/modify* — new tool or logic; must touch source via the gated `gan/tools/deep/request_source_access`.
 - After a `modify` grant, planner/evaluator edit their granted copies with `edit_source`, confined to the instance workspace `src/`. Roles are never given raw `bash` (it cannot be confined). A repeated `request_source_access` on an already-granted path does NOT re-copy from `code_root` — in-scope edits survive; pass `refresh=true` to discard them and re-sync.
 - The task agent has **no always-on tools**; its capabilities are all opt-in tools.
+
+### Ablation switches (`docs/11_消融实验设计.md` is the authority)
+
+- Keys live in `gan/framework/loop.yaml`: the `ablation.*` block (A/B/C/D/E groups) plus `source_access.deny_deep` (B1). CLI: `--ablation KEY=VALUE` (repeatable; `deny_deep` is aliased to `source_access.deny_deep`). The driver forwards the merged section to `gan.outer_worker` as an explicit `--cfg-overrides` JSON argv arg (never env).
+- Enforcement is **split across the process boundary** under the fix3 sandbox (see "Sandboxing & activation"): A1–A6 / C1–C4 / D / E are projections computed in `loop.py` before the role call and cross as plain args; B1 / B2 / B3(deep) are enforced by the root-side `AccessBroker` the child reaches via RPC; B3(shallow) / B4 are enforced by the design tools' `shallow_op_error()` **inside the child**, reading the flags mirrored onto `_RemoteBroker`. Moving a check from one side to the other without a cross-process test silently voids that arm.
+- Guards: `scripts/local/verify_deny_deep.py` (B1 in-process, 19 assertions) and `scripts/local/test_b1_cross_process.py` (B-group over real IPC, 14 assertions).
 
 ### Design healing (self-improve exit) — batch 35, B26 phase 2
 
@@ -246,6 +252,7 @@ with a GAN-native data layer.
 
 - Each generation runs in a **minimal allowlist copy** `work/<genid>/repo` (agent runtime + domain package, datasets excluded; patched inside the copy when a deep patch exists). Benchmark labels are read by the harness from `repo_root`, passed only via the CLI `--dataset_root` argument to the parent harness — never written into the task child's env/payload; `GAN_DATASET_ROOT` is scrubbed from every child env.
 - **Secure sandbox boundary (fix3-main-sync)**: the GAN loop runs ONLY through the sandboxed driver (`scripts/run_gan.py` / `gan.driver.run_gan_driver`, launched via `sudo` as a normal user with the three `*_SANDBOX_USER` env vars — see README "Environment deployment"); the legacy `--in-process` option is hard-disabled and only ONE `--domains` value is accepted. Every worker is dropped to a dedicated UID (`setpriv --bounding-set=-all --no-new-privs`) inside a bubblewrap namespace (`--unshare-all --unshare-net --cap-drop ALL`, a synthetic credential-free `/etc` from `gan/framework/sandbox_etc.py`), with role/seat-scoped write roots granted and reclaimed via POSIX ACL (root-side brokers reconcile stale ACLs after a crash). Provider credentials never leave the root-side `ParentLLMProxy`: children get scoped `sk-gan-` tokens delivered as sealed memfds (never argv/env), planner/evaluator run as separate seat processes hosted by `gan/framework/role_process.py` (the one sanctioned framework→roles import). Per-domain sandbox profiles in `domains.yaml` are fail-closed (missing/disabled profile or `gpu != none` refuses the run). Resource budgets (cgroup/CPU/mem/pid/disk, #7) remain deferred.
+- **Cross-process contract (role seat ↔ broker, fix3)**: because a role session runs in a child and its tools call back over IPC, three things are NOT automatic — (a) `role_process._validated_result` validates each role method's return dict by **exact field set**, so a field added to `planner.plan()` / `base_role.self_improve()` / `EvalContext` must be mirrored there or *every* result is rejected (plan -> `planner_failed`/`inner_invalid` with a null score; self-improve -> `self_improve_error` degrading to `kept`, i.e. the role never evolves); (b) `_RemoteBroker` must mirror the broker's ablation flags (`deny_deep`/`deep_view_only`/`shallow_prompt_only`/`disable_shallow`, carried in `broker_info`) or the child's tool-layer checks see all-false and B3/B4 silently no-op; (c) an exception raised in the broker reaches the child only if `_RemoteBroker._rpc`'s name→type map knows it, else it degrades to a generic `RuntimeError` the catcher misses (this is how B1's `SourceAccessDisabled` broke).
 - **Activation**: always-on → `gan/tools/`; opt-in → `gan/components/` (registered, selected by design config). Plumbing (`deep/`, `design/`, `work/common/`) is frozen; only `work/<role>/` and the task components/registry are evolvable.
 
 ### Model config
@@ -350,7 +357,9 @@ non-repeatable:
   `gan_tools_*.md`, `注释审查报告.md`). Line-number citations to "docs/N L…" in the
   integrated docs refer to these archived files.
 - Active design docs outside that consolidation: `docs/9_多域评测设计.md`,
-  `docs/10_成本反馈闭环设计.md` (and `docs/cost_tem.md`).
+  `docs/10_成本反馈闭环设计.md`, `docs/11_消融实验设计.md` (ablation matrix +
+  switch→consumer authority, incl. §3.1 new-sandbox execution-position map)
+  (and `docs/cost_tem.md`).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

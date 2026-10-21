@@ -121,8 +121,10 @@ eval:
 source_access:
   deny_deep: false              # true = deny every deep source-access request (deep surface frozen; ablation)
                                 # [renamed from auto_approve, v5+] semantics: NO human approval path exists
-                                # (no TTY/IPC/queue) -> this is a hard deny switch. Wiring pending (code untouched);
-                                # see docs/7_遗留问题与待办.md §3.2.1.
+                                # (no TTY/IPC/queue) -> this is a hard deny switch. WIRED: consumer is
+                                # gan/build.py -> AccessBroker(deny_deep=...) -> grant() raises
+                                # SourceAccessDisabled (audited as source_access_denied); every deep
+                                # tool returns a terminal do-not-retry message.
   # ACCESS BOUNDARY is an allowlist by role, declared once in
   # gan/framework/frozen.py (single source of truth):
   #   - task      : no source access
@@ -182,3 +184,32 @@ cost:
 sampling:
   mode: seeded
   anchor_k: 2
+
+# ---------------------------------------------------------------------------
+# 消融实验开关（A/B/C/D/E 组；权威映射表 + 实验矩阵见 docs/11_消融实验设计.md）
+# 默认全 false / parent = A0 完整系统基线。B1 复用 source_access.deny_deep
+# （已接线），不在此重复。每个键都有代码消费者（loop.py / build.py /
+# 工具层），消融臂一次只开一个（组合臂按矩阵表显式声明）。
+# ---------------------------------------------------------------------------
+ablation:
+  # --- A 组：角色层（验证 GAN 三角色框架） ---
+  disable_planner: false                # A1：跳过 plan，task 用父代(seed)配置跑，evaluator 照常
+  disable_evaluator: false              # A2：跳过 evaluate，planner 只拿 benchmark 分改进
+  disable_self_improve: false           # A3：双角色都禁 self_improve
+  disable_planner_self_improve: false   # A4：只禁 planner self_improve
+  disable_evaluator_self_improve: false # A5：只禁 evaluator self_improve
+  task_only_single_round: false         # A6：只跑 gen0 task 单轮，完全跳过 planner/evaluator/进化
+  # --- B 组：深浅层进化轴（修改深度 L2/L3） ---
+  deep_view_only: false                 # B2：request_source_access 只许 view，拒绝 modify
+  shallow_prompt_only: false            # B3：只许 set_prompt/set_config(prompt)，禁组件选择 + 禁 deep
+  disable_shallow: false                # B4：禁所有 shallow（config 冻结），deep 照常
+  # --- C 组：反馈信号轴 ---
+  disable_blind: false                  # C1：关闭盲评，evaluator 一开始就看到 benchmark 分
+  feedback_numeric_only: false          # C2：无文本反馈，只给两分数（predicted+benchmark）
+  feedback_no_diff_summary: false       # C3：去掉 diff 差异摘要（planner/evaluator 两侧）
+  feedback_benchmark_score_only: false  # C4：仅给 benchmark 分数，无预测分，无文本
+  # --- D 组：轨迹可见性轴 ---
+  trajectory_visibility: parent         # parent(基线) | current | all
+  # --- E 组：评估点增减轴 ---
+  freeze_evaluator: false               # 冻结 evaluator design（跳过 self_improve，防组件被选回）
+  evaluator_drop_eval_points: []        # E1-E5：首次 seed 时从 evaluator tools 移除的 eval_point 名

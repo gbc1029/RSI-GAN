@@ -21,7 +21,7 @@ heal on the successful path. The exhausted-exit heal remains backlog
 (docs/7 section 6.1). There is no committed-only exception for role
 self-designs.
 """
-from gan.framework.context import get_design_context, session_overlay_root
+from gan.framework.context import get_design_context, session_overlay_root, shallow_op_error
 from gan.registries.loader import load_registry_for_role
 
 # legacy slot names accepted and folded into ``tools``
@@ -54,6 +54,9 @@ def tool_function(slot, name, **kwargs):
     if ctx is None:
         return "Error: no design context"
     slot = _SLOT_ALIASES.get(str(slot), str(slot))
+    err = shallow_op_error("select_component")
+    if err:
+        return err
     if slot != "tools":
         return f"Error: unknown slot '{slot}' (the design config has exactly one component slot: 'tools')"
     # Every role selects against the effective (workspace-first) registry;

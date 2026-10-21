@@ -20,6 +20,31 @@ from gan.roles.base_role import Role, warn_dropped_workspace_edits
 from gan.summary import validate_feedback
 
 
+_DENY_DEEP_NOTE = (
+    "\n## Deep source access is DISABLED this run\n"
+    "`source_access.deny_deep=true`: the deep surface is frozen for this run. "
+    "Do NOT call `request_source_access`, `register_component`, "
+    "`unregister_component` or `update_component` -- they will be refused. "
+    "Proceed with shallow design/config operators only."
+)
+
+_SHALLOW_PROMPT_ONLY_NOTE = (
+    "\n## Shallow evolution is LIMITED to prompt edits this run\n"
+    "`ablation.shallow_prompt_only=true`: only `set_prompt` / "
+    "`set_config(key=\"prompt\")` are allowed. Component selection "
+    "(`select_component` / `deselect_component`) and deep source access are "
+    "frozen. Do not retry them."
+)
+
+_DISABLE_SHALLOW_NOTE = (
+    "\n## Shallow design operators are DISABLED this run\n"
+    "`ablation.disable_shallow=true`: the design config is frozen. "
+    "`set_prompt` / `set_config` / `select_component` / `deselect_component` "
+    "will be refused. Improve the agent only via deep source access "
+    "(`request_source_access` + `edit_source`)."
+)
+
+
 class Planner(Role):
     def __init__(self, model: str, output_dir: str, instance: Optional[str] = None, **kwargs):
         super().__init__("planner", model, output_dir, load_seed("planner"), instance=instance, **kwargs)
@@ -36,6 +61,9 @@ class Planner(Role):
         parent_predicted_score: Optional[float] = None,
         parent_benchmark_score: Optional[float] = None,
         cost_statement: str = "",
+        deny_deep: bool = False,
+        shallow_prompt_only: bool = False,
+        disable_shallow: bool = False,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -57,6 +85,12 @@ class Planner(Role):
             "component LOGIC still requires a DEEP change: call "
             "`request_source_access` (gated) then edit the granted copies with `edit_source`."
         )
+        if deny_deep:
+            parts.append(_DENY_DEEP_NOTE)
+        if shallow_prompt_only:
+            parts.append(_SHALLOW_PROMPT_ONLY_NOTE)
+        if disable_shallow:
+            parts.append(_DISABLE_SHALLOW_NOTE)
         if parents and len(parents) > 1:
             parts.append(
                 f"\n## Multiple candidate parents (you may CROSSOVER their designs)\n```json\n"
@@ -145,10 +179,17 @@ class Planner(Role):
 
         try:
             hist = self.run(
-                self._plan_instruction(parent_summary or {}, parent_feedback, evaluator_issues,
-                                       parents, task_brief, receipt,
-                                       parent_predicted_score, parent_benchmark_score,
-                                       cost_statement=cost_statement),
+                self._plan_instruction(
+                    parent_summary or {}, parent_feedback, evaluator_issues,
+                    parents, task_brief, receipt,
+                    parent_predicted_score, parent_benchmark_score,
+                    cost_statement=cost_statement,
+                    deny_deep=bool(getattr(broker, "deny_deep", False))
+                    if broker is not None else False,
+                    shallow_prompt_only=bool(getattr(broker, "shallow_prompt_only", False))
+                    if broker is not None else False,
+                    disable_shallow=bool(getattr(broker, "disable_shallow", False))
+                    if broker is not None else False),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
             _absorb_run_flags()
@@ -245,6 +286,14 @@ class Planner(Role):
             + ((f"\n{cost_stmt}\n") if cost_stmt else "")
             + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k not in ('receipt', 'cost_statement')}, ensure_ascii=False)[:2000]}"
         )
+        # B-group ablation notes (docs/11): inform the planner up front so it
+        # does not burn tool calls on surfaces frozen for this run.
+        if getattr(broker, "deny_deep", False):
+            instruction += _DENY_DEEP_NOTE
+        if getattr(broker, "shallow_prompt_only", False):
+            instruction += _SHALLOW_PROMPT_ONLY_NOTE
+        if getattr(broker, "disable_shallow", False):
+            instruction += _DISABLE_SHALLOW_NOTE
         # Scaffold (design context, self-seat access, session run, patch retry
         # loop, result contract) is shared with the evaluator in
         # Role._self_improve_session; only the instruction above is

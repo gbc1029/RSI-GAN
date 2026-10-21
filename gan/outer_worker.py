@@ -7,6 +7,7 @@ changes therefore take effect for the next outer only.
 from __future__ import annotations
 
 import argparse
+import json
 
 
 def main() -> None:
@@ -31,6 +32,10 @@ def main() -> None:
     p.add_argument("--anchor-ids", dest="anchor_ids", default="",
                    help="Comma-separated anchor question ids evaluated every "
                         "generation (paired core); empty = none.")
+    p.add_argument("--cfg-overrides", dest="cfg_overrides", default="",
+                   help="JSON-encoded loop.yaml overrides (ablation.* + "
+                        "source_access.deny_deep) passed from the driver; "
+                        "empty = none.")
     args = p.parse_args()
 
     # Entry validation before building/running anything: empty and multi-value
@@ -45,8 +50,14 @@ def main() -> None:
     from gan.build import build_gan_loop
 
     cfg_overrides = None
+    if args.cfg_overrides:
+        try:
+            cfg_overrides = json.loads(args.cfg_overrides)
+        except Exception as e:
+            p.error(f"--cfg-overrides 解析失败: {e}")
     if args.inner is not None:
-        cfg_overrides = {"loop": {"inner_max": args.inner}}
+        cfg_overrides = cfg_overrides or {}
+        cfg_overrides.setdefault("loop", {})["inner_max"] = args.inner
 
     loop = build_gan_loop(
         repo_root=args.repo_root,

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from gan.framework import frozen
+from gan.framework.access import SourceAccessDisabled
 from gan.framework.context import (get_access_context, get_design_context,
                                    illegal_seat_error)
 from gan.registries.loader import (
@@ -296,12 +297,17 @@ def tool_function(name, module, description=None, **kwargs):
     #      path is patch-visible; if even then ``broker.covers`` says no, the state is
     #      genuinely unwritable (denied/oversized) and the tool refuses loudly with
     #      the gate's own reason instead of writing a registration it cannot commit.
-    if not broker.covers(role, node, reg_rel):
-        broker.grant(role, node, [reg_rel], intent="modify", reason="register",
-                     seat=actx.seat)
-    if not os.path.isfile(ws_reg):
-        broker.grant(role, node, [reg_rel], intent="modify", reason="register",
-                     if_absent=True, seat=actx.seat)
+    try:
+        if not broker.covers(role, node, reg_rel):
+            broker.grant(role, node, [reg_rel], intent="modify", reason="register",
+                         seat=actx.seat)
+        if not os.path.isfile(ws_reg):
+            broker.grant(role, node, [reg_rel], intent="modify", reason="register",
+                         if_absent=True, seat=actx.seat)
+    except SourceAccessDisabled:
+        return ("Deep source access is DISABLED for this run "
+                "(source_access.deny_deep=true). Do not retry; continue with "
+                "shallow design/config operators only.")
     if not broker.covers(role, node, reg_rel):
         denied = (getattr(broker, "last_result", {}) or {}).get("denied") or []
         why = f" (denied: {', '.join(denied[:3])})" if reg_rel in [str(d) for d in denied] else ""

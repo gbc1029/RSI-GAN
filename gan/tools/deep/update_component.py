@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 
 from gan.framework import frozen
+from gan.framework.access import SourceAccessDisabled
 from gan.framework.context import (get_access_context, get_design_context,
                                    illegal_seat_error)
 from gan.registries.loader import (entry_reason, parse_registry_file,
@@ -132,12 +133,17 @@ def tool_function(name, description=None, params_schema=None, **kwargs):
     # -- bring the registry into the workspace: covers-guided grant dance,
     #    identical to register_component (``broker.covers`` is the single
     #    definition of patch visibility; ``if_absent`` protects in-session edits)
-    if not broker.covers(role, node, rel):
-        broker.grant(role, node, [rel], intent="modify", reason="update",
-                     seat=actx.seat)
-    if not os.path.isfile(ws_reg):
-        broker.grant(role, node, [rel], intent="modify", reason="update",
-                     if_absent=True, seat=actx.seat)
+    try:
+        if not broker.covers(role, node, rel):
+            broker.grant(role, node, [rel], intent="modify", reason="update",
+                         seat=actx.seat)
+        if not os.path.isfile(ws_reg):
+            broker.grant(role, node, [rel], intent="modify", reason="update",
+                         if_absent=True, seat=actx.seat)
+    except SourceAccessDisabled:
+        return ("Deep source access is DISABLED for this run "
+                "(source_access.deny_deep=true). Do not retry; continue with "
+                "shallow design/config operators only.")
     if not broker.covers(role, node, rel):
         return (f"Error: cannot write {rel}: the path is not patch-visible. "
                 f"Nothing was updated. Inspect it with request_source_access and "
