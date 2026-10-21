@@ -1,6 +1,6 @@
 # 里程碑 B 计划：outer 级父代选择（MOME 档案 + 锦标赛 + novelty）
 
-> **状态**：定稿；实施中（B1–B6 完成并回归全绿；固定 root 评估运行 B6b 待办）
+> **状态**：定稿；实施中（B1–B6b 完成并回归全绿；真实 LLM 运行待 Linux 部署环境验证）
 > **前置**：里程碑 A 已完成（拆仓库 + supernode 记录 + 设计戳 + inner 子树内选，见 `docs/13`）。
 > **本计划只描述 outer 级选择**：inner 的 task 父代继续使用现有 UCB + 子树内选（P6），**不改**。
 
@@ -305,7 +305,7 @@ eval:
 ## 11. 待办 / 未决
 
 1. **反复选中同一父代（漏洞 10，暂不解决）**：加"最近 K 届未被选中"温度/惩罚，或与"继承上一届"按概率混合。
-2. **固定 root 评估运行（B6b，未实现）**：`eval_on_root.run_eval_rounds` 已就绪，但 `loop._evaluate_supernode` 的 `run_once`（用当前 planner 会话从 `eval_base` 跑 plan+task）依赖 LLM，需 Linux 部署环境端到端实现+验证；在此之前 `benchmark.mean/std` 复用该届 inner 分数、`reevaluated=false`。
+2. **固定 root 评估运行（B6b，已实现骨架）**：`loop._evaluate_supernode` 用独立 planner 实例（`outer_<N>_eval`）从 `eval_base` 跑 `run_eval_rounds`，覆盖 supernode 的 `benchmark.mean/std` 并在评估后恢复主线 task HEAD（评估 commit 成为孤儿）；离线 stub 回归已绿，真实 LLM 运行待 Linux 部署环境验证。
 3. `accepted_fixed_rate` 是否把 `acted_differently` 计为接受（当前按 `acted`）。
 4. `verdict_stability` 的精确定义与数据采集（需 P7 扩展；数据不足时退化）。
 5. 参考伙伴窗口"赛季"是滚动还是按 outer 编号分段（当前滚动）。
