@@ -118,7 +118,7 @@
 | 轴 | 定义 | 固定桶 |
 |---|---|---|
 | **X** = op 类型构成 | `planner_stats.op_dist` 的 **top-1 op** 映射到固定类别 | 6 类：`set_prompt` / `set_config` / `set_param` / `select_component` / `deselect_component` / `other`（含 `add_config_key` / `add_config_value` / `respond_issue` 及未识别） |
-| **Y** = 相对 issue 强度 | `evaluator_stats.issues_per_task` 阈值 | 5 桶：`0` / `(0,0.5]` / `(0.5,1]` / `(1,2]` / `>2` |
+| **Y** = 平均 issue 数量（`issues_per_task`） | `该届 issue 总数 ÷ task 节点数`（纯计数均值：不做 severity 加权、不做跨届归一化） | 5 桶：`0` / `(0,0.5]` / `(0.5,1]` / `(1,2]` / `>2` |
 | **Z** = eval_point 覆盖 | `len(evaluator_stats.eval_points_run)` | 3 桶：`0–1` / `2` / `3–4` |
 
 > 冷启动（档案条目 < `cold_start_min`）：**完全链式**，不选父代、不分桶、不计算 fitness（见 §5.1）。
@@ -299,6 +299,8 @@ eval:
 | **每届固定评估成本** | 入档必评估 2–3 次，每届成本稳定但更高 | `eval_samples` 可调；`enabled=false` 可整体关闭 |
 | **heal 可能放弃父代** | 历史设计与当前代码不兼容时被放弃 | `restore_max_tries` 限制尝试；全失败退回链式 |
 | **$F_e$ 数据稀疏** | `verdict_stability` 多数届无数据 | 自动退化只留 `calibration_error`，标记 `fitness_partial` |
+| **evaluator 单方面淘汰** | `rule_violation` 由当届 evaluator 单方判定，误判即永久排除好 supernode（无第二意见/申诉） | 暂不解决，记为已知风险（§11） |
+| **$F_e$ 自评可刷分** | `calibration_error` / `verdict_stability` 均由当届 evaluator 产出，存在"保守预测/固定 verdict"刷分空间 | 暂不解决，记为已知风险（§11） |
 | **档案是派生索引** | 与 supernode 文件可能不一致 | `rebuild` 从 `ckpt/supernodes/*.json` 重建；启动时校验 |
 | **固定 root 与主线解耦** | 评估基线与主线 task 代码不同 | 明确 `eval_base` 语义；审计记录两套代码 commit |
 
@@ -312,3 +314,14 @@ eval:
 4. `eval_base` ref 的命名与固定策略（当前 = initial task commit，永不移动）。
 
 > 已解决：漏洞 10（冷却，`outer_select.cooldown_window`）、verdict_stability（客观事实命中率 = `fix_verdict` vs benchmark 相对父代的一致率）。
+
+### 已知风险：不冻结 evaluator（暂不解决）
+
+不冻结 evaluator（evaluator 随 outer 自进化）的两个真实问题，已评估但本轮不修：
+
+1. **evaluator 单方面淘汰 supernode**（急性、不可逆）：当前硬门 = `triggered ∧ evidence_ref 非空`，缺 4 项保护——evidence 可定位校验、独立只读 evaluator 第二意见、`rule_violation_unconfirmed` 审计事件、申诉/复核通道。一次误判即永久损失一个好 supernode。
+2. **$F_e$ 自评 Goodhart**（慢性、影响排名）：$F_e$ 的两项都由当届 evaluator 产出，存在"永远预测均值以降低 $\text{calibration\_error}$"、"固定 fix_verdict 刷 $\text{verdict\_stability}$"的刷分空间，排名会偏向"会刷分"而非"真正更好"的 evaluator。
+3. **特征漂移**（低危）：`issues_per_task` / `severity` 随 evaluator 标准漂移，影响 Y 轴分桶与 novelty，但不影响 $F_p$/$F_e$ 的绝对排名。
+4. **反馈漂移**（低危）：evaluator 标准变化使 planner 追着改，可能振荡；属学习动力学，不影响选择器。
+
+> 前三项均不影响 `outer_select.enabled=false` 的默认行为。

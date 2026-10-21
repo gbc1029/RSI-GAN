@@ -37,7 +37,7 @@ def bucket_x(op_dist: Optional[Dict[str, Any]]) -> int:
 
 
 def bucket_y(issues_per_task: Optional[float]) -> int:
-    """issues_per_task -> 5 fixed threshold buckets."""
+    """Average issue COUNT per task (no severity weighting) -> 5 fixed buckets."""
     if issues_per_task is None or issues_per_task <= 0:
         return 0
     if issues_per_task <= 0.5:
