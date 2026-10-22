@@ -261,7 +261,46 @@ def static_methods_problems(path: str) -> List[str]:
 # An assembly must be importable in BOTH postures (snapshot top-level ``cm``
 # and in-process ``gan.framework.cm``), so its top-level imports are
 # stdlib-only — plus the guarded dual-idiom import of the core itself. A
-# ``gan.*`` import would work in-process and break the snapshot: banned.
+# ``gan.*`` import would work in-process and break the snapshot: banned —
+# EXCEPT inside a ``try`` body whose handler catches an import-style exception
+# (that is the sanctioned dual-posture idiom; see below).
+_GUARD_EXC = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+
+
+def _guarded_import_ids(tree: ast.AST) -> set:
+    """ids of import nodes inside a ``try`` BODY whose handler catches an
+    import-style exception (bare / ImportError / ModuleNotFoundError /
+    Exception / BaseException). This is the sanctioned dual-posture idiom:
+
+        try:
+            from gan.framework import cm as _cm
+        except ImportError:
+            import cm as _cm
+
+    Only the TRY body counts — an import in ``except``/``else``/``finally``
+    is not protected by the fallback."""
+    guarded: set = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        catches = False
+        for h in node.handlers:
+            if h.type is None:
+                catches = True
+            elif isinstance(h.type, ast.Name) and h.type.id in _GUARD_EXC:
+                catches = True
+            elif isinstance(h.type, ast.Tuple) and any(
+                    isinstance(e, ast.Name) and e.id in _GUARD_EXC
+                    for e in h.type.elts):
+                catches = True
+        if not catches:
+            continue
+        for stmt in node.body:
+            for sub in ast.walk(stmt):
+                guarded.add(id(sub))
+    return guarded
+
+
 def _gan_import_problems(path: str) -> List[str]:
     problems: List[str] = []
     try:
@@ -269,7 +308,10 @@ def _gan_import_problems(path: str) -> List[str]:
             tree = ast.parse(f.read())
     except (OSError, SyntaxError) as e:
         return [f"assembly file unreadable/unparsable: {e}"]
+    guarded = _guarded_import_ids(tree)
     for node in ast.walk(tree):
+        if id(node) in guarded:
+            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name.split(".")[0] == "gan":

@@ -235,7 +235,7 @@ with a GAN-native data layer.
 | `ckpt/` | recovery; per-run git tree `code/`; `code.json` manifest; `design/`; `design_drafts/<role>/outer_<N>_draft.json` (audit-only pre-heal self-design snapshots) |
 | `logs/` | `events.log`, `*_tree.log`, `*.log` |
 | `trajectory/outer_<O>/…` | role trajectories; outer-level files are attempt-keyed `<role>__<attempt>.log` (one per loop instance, assigned at role construction so content + stop records share one file; directly-constructed roles use `<role>.log`; readers merge canonical + attempt siblings, newest first) |
-| `scores/scores.log` | decision records |
+| `scores/scores.jsonl` | decision records (JSONL, one per row) |
 | `runs/<genid>/` | small evidence: `packet.json`, `eval.json`, `feedback_digest.md`, `patch_receipt.json`, `patch_proposed.diff` |
 | `work/<genid>/` | ephemeral, pruned |
 | `workspaces/<role>/outer_<O>/` | per-role workspaces |
@@ -262,7 +262,7 @@ with a GAN-native data layer.
 ### Write path, ledger, and audit
 
 - **Front-loaded write policy**: `edit_source` is the only official source-edit entry and uses the centralized frozen authorization helper before mutation. Dispatch validates declared `edit_source` inputs before invoking tool code. Commit and load/preflight layers also apply a conservative AST policy rejecting raw writes, subprocesses, and dynamic execution in agent-owned Python. Framework plumbing is explicitly exempt because it legitimately writes state; the AST policy is defense in depth, not a replacement for a real sandbox.
-- **Ledger write gate (B46 step-1)**: decision-grade artifacts (`scores.log`, design configs, checkpoints) are written only through guarded framework entry points that require the per-run `WriterToken` (`gan/framework/ledger.py`, minted once in `build_gan_loop` and threaded explicitly — never env, never module-global). Unguarded writes raise `LedgerError`; agent-owned source importing a guarded writer module (`gan.framework.scores` / `gan.design.store` / `gan.framework.checkpoint`) is refused at the registry and commit gate via the same AST issues channel (`observed_ledger_writer`). The token is an identity, not a secret — file-level tamper DETECTION is deferred step 2 (hash chain, unchanged trigger); step 2's role (batch 4): the detection compensation for application-step BYPASS — the write side's existence control (grants / AST gate / `WriterToken`) is strong but heuristic, the read side's is absolute. Regression suite: `scripts/local/regress_ledger_gate.py`.
+- **Ledger write gate (B46 step-1)**: decision-grade artifacts (`scores/scores.jsonl`, design configs, checkpoints) are written only through guarded framework entry points that require the per-run `WriterToken` (`gan/framework/ledger.py`, minted once in `build_gan_loop` and threaded explicitly — never env, never module-global). Unguarded writes raise `LedgerError`; agent-owned source importing a guarded writer module (`gan.framework.scores` / `gan.design.store` / `gan.framework.checkpoint`) is refused at the registry and commit gate via the same AST issues channel (`observed_ledger_writer`). The token is an identity, not a secret — file-level tamper DETECTION is deferred step 2 (hash chain, unchanged trigger); step 2's role (batch 4): the detection compensation for application-step BYPASS — the write side's existence control (grants / AST gate / `WriterToken`) is strong but heuristic, the read side's is absolute. Regression suite: `scripts/local/regress_ledger_gate.py`.
 
 ### Data flow and boundaries
 

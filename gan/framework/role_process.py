@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import inspect
 import json
 import os
 import socket
@@ -881,7 +882,22 @@ def _worker_main() -> None:
                     kwargs["broker"] = remote
             try:
                 with contextlib.redirect_stdout(sys.stderr):
-                    result = getattr(role, method)(*args, **kwargs)
+                    sink = getattr(role, method)
+                    # Filter kwargs against the REAL method signature. The IPC
+                    # proxy forwards ``**kwargs`` verbatim, so a kwarg the
+                    # child's (possibly older, resumed) code does not declare
+                    # must be dropped here — the exact TypeError the caller's
+                    # ``_cost_statement_accepted`` probe exists to avoid.
+                    try:
+                        sig = inspect.signature(sink)
+                    except (TypeError, ValueError):
+                        sig = None
+                    if sig is not None and not any(
+                            p.kind is inspect.Parameter.VAR_KEYWORD
+                            for p in sig.parameters.values()):
+                        kwargs = {k: v for k, v in kwargs.items()
+                                  if k in sig.parameters}
+                    result = sink(*args, **kwargs)
             finally:
                 _purge_role_workspace(
                     init["output_dir"], role_name,

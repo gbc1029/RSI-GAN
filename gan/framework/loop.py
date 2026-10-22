@@ -726,11 +726,20 @@ class GanLoop:
     def _cost_statement_accepted(self, fn: Any, name: str = "cost_statement") -> bool:
         """Signature probe: older role source (a resumed checkpoint's code
         tree) may predate the ``cost_statement`` kwarg — the statement is then
-        silently absent for that session (audited, never a TypeError)."""
+        silently absent for that session (audited, never a TypeError).
+
+        A ``**kwargs``-accepting callable (the IPC role proxy in driver mode)
+        is treated as accepting the kwarg too: the proxy forwards it to the
+        child, where the worker filters kwargs against the REAL method
+        signature before calling — so old child code still never sees it."""
         try:
-            return name in inspect.signature(fn).parameters
+            params = inspect.signature(fn).parameters
         except (TypeError, ValueError):
             return False
+        if name in params:
+            return True
+        return any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values())
 
     def _accepts_kwarg(self, fn: Any, name: str) -> bool:
         return self._cost_statement_accepted(fn, name)

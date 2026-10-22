@@ -44,7 +44,7 @@
 | 锦标赛采样（漏洞 6） | **两层采样**：先均匀抽格 → 再在格内抽精英 |
 | 档案容量（漏洞 7） | 每格 `max_elites_per_cell` 上限，超出按 Pareto + fitness 淘汰 |
 | novelty 归一化（漏洞 8） | novelty **自身也运行 z-score**（相对参考伙伴） |
-| 评估副作用（漏洞 9） | 固定 root 评估**旁路运行**：独立 run_dir、不写 task tree、不写 `scores.log`、不进角色可见轨迹、设预算上限 |
+| 评估副作用（漏洞 9） | 固定 root 评估**旁路运行**：独立 run_dir、不写 task tree、不写 `scores/scores.jsonl`、不进角色可见轨迹、设预算上限 |
 | 参考伙伴 | 赛季化 M=10；作为 **novelty 距离参考集** + **z-score 基准** |
 | 设计快照存储 | **supernode 内嵌** planner/evaluator 设计快照 |
 | task 起点 | **继续当前 task HEAD**（task 连续演化，outer 只换 P/E 策略） |
@@ -207,7 +207,7 @@ outer N 结束
 
 - 每个 supernode 入档前，在**固定 root 基线**（`eval_base` ref，初始 = run 的 initial task commit）上跑 `eval_samples`（默认 3）次独立 **plan+task 轮次**（不含 evaluator 环节），取均值写入 `benchmark.mean/std`。
 - **A1 一致性**：`ablation.disable_planner=true` 时评估轮次同样走空 `plan_result`（否则评估会偷偷把“被消融掉的 planner”装回来，A0 vs A1 不可比）。
-- 评估**旁路运行**：独立 run_dir；**不写 task tree**、**不写 `scores.log`**、不进角色可见轨迹；设 token/时间预算上限。
+- 评估**旁路运行**：独立 run_dir；**不写 task tree**、**不写 `scores/scores.jsonl`**、不进角色可见轨迹；设 token/时间预算上限。
 - 主线 task 代码照常连续演化，评估与主线解耦。
 
 ### 5.6 恢复设计 + heal 闭环（漏洞 2）
