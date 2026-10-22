@@ -872,8 +872,16 @@ def run_polyglot_eval(
         "total": total,
         "coverage": (evaluated / total) if total else None,
     }
-    with open(os.path.join(output_path, "report.json"), "w", encoding="utf-8") as f:
+    report_path = os.path.join(output_path, "report.json")
+    with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
+    # The broker runs under the driver's private umask (_private_driver_umask,
+    # 0o077), so root-owned files land at 0o600/0o700 and the outer worker —
+    # the run owner, who reads this report for scoring — is refused with
+    # EACCES. That surfaced as a misleading "report.json exists but is
+    # unparseable" soft-fail plus a task_runner_failed generation. Same
+    # compensation the imo_proof grading report already applies.
+    os.chmod(report_path, 0o644)
     return report
 
 
