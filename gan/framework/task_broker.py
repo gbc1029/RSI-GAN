@@ -350,6 +350,7 @@ class _TaskBrokerState:
                 reasoning_effort=self.config.get("reasoning_effort"),
                 sample_seed=sample_seed,
                 anchor_ids=anchor_ids,
+                num_workers=int(self.config["harness_num_workers"]),
                 expected_owner_gid=int(self.config["owner_gid"]),
                 setpriv_path=str(self.config["setpriv"]),
                 setfacl_path=str(self.config["setfacl"]),
@@ -378,6 +379,7 @@ class _TaskBrokerState:
                     python_prefix=str(self.config["python_prefix"]),
                     sandbox_etc_dir=str(self.config["sandbox_etc_dir"]),
                     sandbox_profile=dict(self.config["sandbox_profile"]),
+                    num_workers=int(self.config["harness_num_workers"]),
                 )
                 output = f"{output}\n[imo_proof_grading]\n{grading_output}"
                 rc = grading_rc

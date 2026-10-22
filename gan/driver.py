@@ -748,6 +748,9 @@ def run_gan_driver(
     safe_broker_env["PYTHON_DOTENV_DISABLED"] = "1"
     question_timeout_s = int(domain_config.get("question_timeout_s") or 300)
     harness_timeout = int(num_samples) * question_timeout_s + 900
+    harness_num_workers = int(domain_cfg.get("harness_num_workers", 5))
+    if harness_num_workers < 1:
+        raise ValueError(f"domain {domain!r} harness_num_workers must be positive")
     broker_config = {
         "output_dir": output_dir,
         "repo_root": repo_root,
@@ -766,6 +769,7 @@ def run_gan_driver(
         "question_timeout_s": int(domain_cfg.get("question_timeout_s")
                                   or cfg.get("loop.question_timeout_s", 300)),
         "llm_client_timeout_s": float(cfg.get("loop.llm_client_timeout_s", 600)),
+        "harness_num_workers": harness_num_workers,
         "python": python_executable,
         "python_prefix": python_prefix,
         "timeout": int(domain_cfg.get("harness_timeout_s") or harness_timeout),
