@@ -963,6 +963,16 @@ def run_gan_driver(
                     for seat in ("evaluate", "self_improve")
                 },
             }
+            # Fixed-root evaluation (docs/14 §5.5) needs a SECOND planner
+            # instance per outer: the loop builds ``outer_<N>_eval``. Give the
+            # planner's plan seat a second proxy token; the role broker registers
+            # it as a separate launchable scope (outer_<N>_eval).
+            role_proxy_tokens["planner"]["plan"] = [
+                role_proxy_tokens["planner"]["plan"],
+                proxy.issue_scope(
+                    "planner", str(outer), models["planner"], seat="plan",
+                    peer_uid=int(role_accounts["planner"]["uid"])),
+            ]
             role_broker.register_outer(outer, role_proxy_tokens)
             proc = None
             try:

@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Tuple
 
 from gan.framework.sandbox_etc import SANDBOX_HOSTNAME, validate_sandbox_etc
 
-_INSTANCE_RE = re.compile(r"outer_(0|[1-9][0-9]{0,11})\Z")
+_INSTANCE_RE = re.compile(r"outer_(0|[1-9][0-9]{0,11})(_eval)?\Z")
 _MAX_AUTH_BYTES = 16 * 1024
 _ROLE_SEATS = {
     "planner": {"plan", "self_improve"},
@@ -545,27 +545,39 @@ class _RoleBrokerState:
                        proxy_tokens: Dict[str, Dict[str, str]]) -> None:
         if outer < 1 or set(proxy_tokens) != set(_ROLE_SEATS):
             raise ValueError("invalid role broker outer registration")
-        normalized: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        normalized: Dict[Tuple[int, str, str, str], Dict[str, Any]] = {}
         seen_tokens = set()
         for role, seats in _ROLE_SEATS.items():
             supplied = proxy_tokens.get(role)
             if not isinstance(supplied, dict) or set(supplied) != seats:
                 raise ValueError("invalid role broker seat registration")
             for seat in seats:
-                token = supplied.get(seat)
-                if (not isinstance(token, str) or not token.startswith("sk-gan-")
-                        or len(token.encode("utf-8")) > 4096 or "\x00" in token
-                        or token in seen_tokens):
-                    raise ValueError("invalid role proxy capability")
-                seen_tokens.add(token)
-                normalized[(int(outer), role, seat)] = {
-                    "role": role,
-                    "seat": seat,
-                    "outer": int(outer),
-                    "instance": f"outer_{int(outer)}",
-                    "proxy_token": token,
-                    "consumed": False,
-                }
+                value = supplied.get(seat)
+                # 固定 root 评估（docs/14 §5.5）需要一个独立的 planner 实例：
+                # planner 的 plan 座可以带第二个 token（list/tuple 长度 2）。
+                tokens = list(value) if isinstance(value, (list, tuple)) \
+                    else [value]
+                if role != "planner" or seat != "plan":
+                    if len(tokens) != 1:
+                        raise ValueError("invalid role broker seat registration")
+                elif len(tokens) not in (1, 2):
+                    raise ValueError("invalid role broker seat registration")
+                for idx, token in enumerate(tokens):
+                    token = str(token)
+                    if (not token.startswith("sk-gan-")
+                            or len(token.encode("utf-8")) > 4096 or "\x00" in token
+                            or token in seen_tokens):
+                        raise ValueError("invalid role proxy capability")
+                    seen_tokens.add(token)
+                    instance = f"outer_{int(outer)}" + ("_eval" if idx == 1 else "")
+                    normalized[(int(outer), role, seat, instance)] = {
+                        "role": role,
+                        "seat": seat,
+                        "outer": int(outer),
+                        "instance": instance,
+                        "proxy_token": token,
+                        "consumed": False,
+                    }
         with self._lock:
             if any(key in self._scopes for key in normalized) or outer in self._outers:
                 raise ValueError("role broker outer was already registered")
@@ -618,10 +630,10 @@ class _RoleBrokerState:
             raise PermissionError("role broker peer has an unexpected identity")
         with self._lock:
             active = dict(self._outers.get(outer) or {})
-            scope = self._scopes.get((outer, role, seat))
+            scope = self._scopes.get((outer, role, seat, instance))
             if not active:
                 raise _OuterNotActive("role broker outer is not active")
-            if scope is None or scope["instance"] != instance:
+            if scope is None:
                 raise PermissionError("invalid role launch capability descriptor")
             if scope["consumed"]:
                 raise PermissionError("role seat was already launched")
