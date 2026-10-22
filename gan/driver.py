@@ -867,15 +867,21 @@ def run_gan_driver(
         sample_seed_base: Optional[int] = None
         anchor_ids: list = []
         if sampling_mode == "seeded":
+            # A FIXED base seed makes every ARM of an ablation matrix sample the
+            # SAME questions (pairing / fairness); 0/absent keeps the old
+            # random-per-run behaviour (default, no behaviour change).
+            fixed_seed = int(sampling_cfg.get("base_seed") or 0)
             seed_info = task_execution.ensure_sampling_seed(
                 output_dir, domain, subset, repo_root, int(num_samples),
                 anchor_k=int(sampling_cfg.get("anchor_k", 2)),
+                base_seed=fixed_seed or None,
             )
             sample_seed_base = int(seed_info["base_seed"])
             anchor_ids = list(seed_info.get("anchor_ids") or [])
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": "seeded",
                                     "base_seed": sample_seed_base,
+                                    "fixed_by_config": bool(fixed_seed),
                                     "anchor_ids": anchor_ids})
         else:
             _log_event(output_dir, {"type": "sampling_seed_ready",
@@ -883,13 +889,29 @@ def run_gan_driver(
 
         start = (int(newest["index"]) + 1) if (resume and newest) else 1
         _driver_t0 = time.time()
+        # Arm identity rides the RUN, not just the directory name: a folder
+        # called "B1" is not evidence of which switches were active. Only
+        # NON-DEFAULT ablation values are recorded (the table is mostly
+        # False/"parent"), and B1 lives outside ablation.* -- so it is folded
+        # in explicitly. `cfg_overrides` is dumped verbatim, which makes a
+        # `--set`/`--ablation` experiment reproducible from events.jsonl alone.
+        _ablation_active = {
+            k: v for k, v in (cfg.get("ablation") or {}).items()
+            if v not in (False, None, "", "parent")
+        }
+        if bool(cfg.get("source_access.deny_deep", False)):
+            _ablation_active["deny_deep"] = True
         _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
                                 "outer_generations": G,
                                 "domain": domain,
                                 "domains": list(domains),
                                 "resume": resume, "force": force,
                                 "latest_completed_outer": (newest["index"] if newest else None),
-                                "start_outer": start})
+                                "start_outer": start,
+                                "ablation": _ablation_active,
+                                "cfg_overrides": cfg_overrides or {},
+                                "num_samples": num_samples,
+                                "subset": subset})
 
         if resume:
             if start > G:
