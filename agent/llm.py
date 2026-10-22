@@ -18,12 +18,11 @@ if (os.environ.get("GAN_SECURE_MODE") != "1" and
 MAX_TOKENS = 32768
 
 # Per-call client budget, EXPLICIT (litellm's implicit default is silent and
-# untuned). Ordering contract with the other layers: client <= proxy upstream
-# timeout (gan/framework/loop.yaml llm_proxy_timeout_s, parent-side) < the
-# per-question wall budget -- the outer wall must be the ONLY thing that can
-# cut a healthy in-flight call (observed: an implicit-600s client waiting on a
-# 120s proxy that already replied 502, burning the whole question budget on
-# doomed retries).
+# untuned). Ordering contract with the other layers: proxy upstream timeout
+# (gan/framework/loop.yaml llm_proxy_timeout_s, parent-side) < client timeout <
+# per-question wall budget. The proxy must finish first; otherwise a client
+# retry overlaps the still-running upstream request and its eventual response
+# hits a closed socket.
 LLM_TIMEOUT_S = float(os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
 
 # Thinking-intensity knob for reasoning models, forwarded to the gateway as the

@@ -37,11 +37,11 @@ loop:
                                    # not a hung session). Task child uses its own constant.
   llm_client_timeout_s: 600       # per-LLM-call client budget (agent/llm.py via GAN_LLM_TIMEOUT_S;
                                    # explicit: litellm's implicit default is silent). MUST stay
-                                   # <= llm_proxy_timeout_s so the proxy is never the first to
-                                   # cut a healthy in-flight call.
-  llm_proxy_timeout_s: 700        # proxy upstream budget (gan/framework/llm_proxy ParentLLMProxy;
+                                   # above llm_proxy_timeout_s so the proxy returns before the
+                                   # client retries and leaves an overlapping orphan request.
+  llm_proxy_timeout_s: 550        # proxy upstream budget (gan/framework/llm_proxy ParentLLMProxy;
                                    # consumer: gan/driver.py). Reasoning models take 150-350s per
-                                   # long call (observed), so this must sit above the client.
+                                   # healthy long call (observed); 50s remains for proxy delivery.
   task_llm_max_calls_per_question: 64  # hard per-question task proxy call budget;
                                    # failed upstream attempts consume budget too.
   question_timeout_s: 300         # DEFAULT per-question wall budget (domains/harness.py
