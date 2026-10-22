@@ -98,9 +98,6 @@ _DOCKERFILE_INSTANCE = r"""FROM --platform={platform} {env_image_name}
 COPY ./setup_repo.sh /root/
 COPY ./domains/polyglot /domains/polyglot
 
-#mirror proxy replacement
-RUN git config --global url."https://ghproxy.cc/https://github.com/".insteadOf "https://github.com/"
-
 RUN /bin/bash /root/setup_repo.sh
 
 WORKDIR /testbed/
