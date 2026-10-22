@@ -768,7 +768,7 @@ def run_gan_driver(
         "llm_client_timeout_s": float(cfg.get("loop.llm_client_timeout_s", 600)),
         "python": python_executable,
         "python_prefix": python_prefix,
-        "timeout": harness_timeout,
+        "timeout": int(domain_cfg.get("harness_timeout_s") or harness_timeout),
         "task_brief": (domain_cfg.get("task_brief") or ""),
         "parent_scored": task_execution.uses_parent_scoring(domain),
         # Question-sampling scheme (loop.yaml sampling.*). The broker reads the

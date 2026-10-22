@@ -57,5 +57,25 @@ def curate_subsets_gradingbench():
     test_df_subset.to_csv(f"{base}_test.csv", index=False)
 
 
+def curate_subsets_proofbench():
+    # ProofBench has no reward column, so use a deterministic shuffled subset.
+    csv_path = "./domains/imo/proofbench.csv"
+    df = pd.read_csv(csv_path)
+    df_shuffled = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    base = csv_path.replace(".csv", "_filtered")
+    df_shuffled.to_csv(f"{base}.csv", index=False)
+
+    target_size = 100
+    train_df_subset = df_shuffled.iloc[:target_size].reset_index(drop=True)
+    base = csv_path.replace(".csv", f"_filtered_{target_size}")
+    train_df_subset.to_csv(f"{base}_train.csv", index=False)
+    print(
+        "proofbench train subset written: "
+        f"{len(train_df_subset)}/{target_size} "
+        f"(source rows: {len(df_shuffled)})"
+    )
+
+
 if __name__ == "__main__":
     curate_subsets_gradingbench()
+    curate_subsets_proofbench()

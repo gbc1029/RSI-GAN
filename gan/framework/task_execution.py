@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -61,6 +62,10 @@ _HARNESS_FILES = [
 ]
 _PARENT_SCORED_DOMAINS = {
     "paper_review", "search_arena", "imo_grading", "polyglot",
+}
+_SANDBOXED_BALROG_DOMAINS = {"balrog_babyai", "balrog_babaisai"}
+_SANDBOXED_HARNESS_DOMAINS = _SANDBOXED_BALROG_DOMAINS | {
+    "imo_proof", "imo_proof_grading",
 }
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
 _SANDBOX_PROFILE_KEYS = {
@@ -778,7 +783,10 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(run_dir, name), ignore=_PY_IGNORE)
     if domain:
-        dom = domain.split("_")[0] if "imo_" in domain else domain
+        if domain in _SANDBOXED_BALROG_DOMAINS:
+            dom = "balrog"
+        else:
+            dom = domain.split("_")[0] if "imo_" in domain else domain
         src = os.path.join(source_root, "domains", dom)
         if os.path.isdir(src):
             shutil.copytree(src, os.path.join(run_dir, "domains", dom), ignore=_DOMAIN_IGNORE)
@@ -818,7 +826,6 @@ def prepare_polyglot_questions(
 
 def run_polyglot_eval(
     predictions_path: str,
-    domain_cfg: Dict[str, Any],
     dataset_root: str,
     output_path: str,
 ) -> Dict[str, Any]:
@@ -835,7 +842,7 @@ def run_polyglot_eval(
         pred = row.get("prediction")
         if isinstance(pred, str) and pred.strip():
             patches[str(row["question_id"])] = pred
-    task_list = domain_cfg.get("eval_task_list") or None
+    task_list = [str(value) for value in df["question_id"].tolist()]
     from domains.polyglot.harness import harness as polyglot_harness
     run_id = "gan_polyglot"
     polyglot_harness(
@@ -973,7 +980,10 @@ def ensure_sampling_seed(
         base_seed = int.from_bytes(os.urandom(8), "big")
     anchor_ids: List[str] = []
     try:
-        pool = load_dataset_ids(dataset_root, domain, subset)
+        pool = (
+            [] if domain == "polyglot" or domain in _SANDBOXED_BALROG_DOMAINS
+            else load_dataset_ids(dataset_root, domain, subset)
+        )
         k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
         if pool and k > 0:
             rng = random.Random(f"{int(base_seed)}:anchor")
@@ -1732,6 +1742,8 @@ def _run_harness_and_report_local(
     python_prefix: Optional[str] = None,
     sandbox_etc_dir: Optional[str] = None,
     sandbox_profile: Optional[Dict[str, Any]] = None,
+    agent_path: str = "./task_agent.py",
+    proofs_dname: Optional[str] = None,
 ) -> Tuple[int, str]:
     """Run a fixed harness command; the privileged broker is its only secure caller.
 
@@ -1750,6 +1762,7 @@ def _run_harness_and_report_local(
     """
     harness_args = [
         "-m", "domains.harness",
+        "--agent_path", agent_path,
         "--domain", domain,
         "--model", model,
         "--run_id", run_id,
@@ -1769,15 +1782,33 @@ def _run_harness_and_report_local(
         from gan.framework.llm_proxy import request_task_token
         proxy_token = request_task_token(
             proxy_socket, control_token, str(scope_id), model)
+    needs_sandbox_identity = questions_path is not None or (
+        domain in _SANDBOXED_HARNESS_DOMAINS and dataset_root is not None
+    )
+    if needs_sandbox_identity:
+        harness_args.extend(["--output_dir", "/proc/self/cwd/outputs"])
+
+    def child_path(path: str) -> str:
+        absolute = os.path.realpath(os.path.abspath(path))
+        run_root = os.path.realpath(run_dir)
+        # The broker enters run_dir before setpriv. Keep private ancestors
+        # closed while letting the sandbox resolve its authorized run copy.
+        if (needs_sandbox_identity and
+                os.path.commonpath([run_root, absolute]) == run_root):
+            return os.path.join("/proc/self/cwd", os.path.relpath(absolute, run_root))
+        return absolute
+
     if questions_path:
-        harness_args.extend(["--questions_path", os.path.abspath(questions_path)])
+        harness_args.extend(["--questions_path", child_path(questions_path)])
     elif dataset_root:
         # Compatibility path for domains with their own evaluator/harness.
-        harness_args.extend(["--dataset_root", os.path.abspath(dataset_root)])
+        harness_args.extend(["--dataset_root", child_path(dataset_root)])
         if sample_seed is not None:
             harness_args.extend(["--sample_seed", str(int(sample_seed))])
             if anchor_ids:
                 harness_args.extend(["--anchor_ids", ",".join(str(a) for a in anchor_ids)])
+    if proofs_dname:
+        harness_args.extend(["--proofs_dname", child_path(proofs_dname)])
     if proxy_token_fd is not None:
         harness_args.extend([
             "--proxy_socket", os.path.abspath(proxy_socket),
@@ -1790,23 +1821,29 @@ def _run_harness_and_report_local(
         ])
 
     broker_launch = expected_owner_uid is not None
-    secure_launch = questions_path is not None or broker_launch
+    secure_launch = needs_sandbox_identity or broker_launch
     child_env = _task_safe_env(env)
+    if needs_sandbox_identity and not broker_launch:
+        child_env["PYTHONPATH"] = "/proc/self/cwd"
     lease = None
     primary_error: Optional[BaseException] = None
     try:
         if secure_launch:
             if (os.name == "posix" and hasattr(os, "geteuid") and
-                    os.geteuid() == 0 and not broker_launch):
+                    os.geteuid() == 0 and not broker_launch and
+                    domain not in _SANDBOXED_HARNESS_DOMAINS):
                 raise RuntimeError(
                     "refusing to launch a domain harness as root outside the secure task broker"
                 )
             if broker_launch and proxy_token_fd is None:
                 raise RuntimeError(
                     "secure task broker launch requires a sealed proxy token descriptor")
+            identity_kwargs = (
+                {"setpriv_path": setpriv_path} if setpriv_path is not None else {}
+            )
             setpriv, uid, gid = _sandbox_identity(
                 run_dir, run_id, expected_owner_uid=expected_owner_uid,
-                setpriv_path=setpriv_path,
+                **identity_kwargs,
             )
             python_executable = python if os.path.isabs(python) else shutil.which(python)
             if not python_executable:
@@ -1834,7 +1871,22 @@ def _run_harness_and_report_local(
                     proxy_token_fd=proxy_token_fd,
                     run_fd=lease.run_fd, output_fd=lease.output_fd,
                 )
-            harness_cmd = _sandbox_setpriv_command(setpriv, uid, gid, harness_child)
+            if broker_launch or questions_path is not None:
+                harness_cmd = _sandbox_setpriv_command(
+                    setpriv, uid, gid, harness_child,
+                )
+            else:
+                # These domains already isolate their worker internally; keep
+                # their established non-broker identity-launch contract.
+                harness_cmd = [
+                    setpriv,
+                    "--reuid", str(uid),
+                    "--regid", str(gid),
+                    "--clear-groups",
+                    "--no-new-privs",
+                    "--",
+                    *harness_child,
+                ]
             username = os.environ.get(_SANDBOX_USER_ENV, "").strip()
             _sandbox_runtime_preflight(
                 setpriv, uid, gid, username, python_executable,
@@ -1857,6 +1909,10 @@ def _run_harness_and_report_local(
 
         inherited_fds = []
         if proxy_token_fd is not None:
+            # bwrap --ro-bind-data reads from the descriptor's current offset.
+            # A generation and its imo_proof grading pass intentionally reuse
+            # one sealed memfd, so rewind it before every harness launch.
+            os.lseek(int(proxy_token_fd), 0, os.SEEK_SET)
             inherited_fds.append(int(proxy_token_fd))
         if lease is not None:
             inherited_fds.extend([lease.run_fd, lease.output_fd])
@@ -1890,6 +1946,322 @@ def _run_harness_and_report_local(
 
 
 
+def _prepare_harness_output_dir(
+    run_dir: str,
+    run_id: str,
+    expected_owner_uid: Optional[int] = None,
+    expected_owner_gid: Optional[int] = None,
+) -> str:
+    """Create one harness output directory without following task-owned links."""
+    output_dir = os.path.join(run_dir, "outputs", run_id)
+    if expected_owner_uid is None:
+        os.makedirs(output_dir, exist_ok=True)
+        return output_dir
+    if expected_owner_gid is None:
+        raise RuntimeError("secure harness output creation requires the owner gid")
+    if not run_id or os.path.basename(run_id) != run_id:
+        raise RuntimeError(f"invalid harness run id: {run_id!r}")
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    run_fd = os.open(run_dir, flags)
+    outputs_fd = -1
+    child_fd = -1
+    try:
+        run_info = os.fstat(run_fd)
+        if run_info.st_uid != int(expected_owner_uid):
+            raise RuntimeError("secure harness run directory has an unexpected owner")
+        outputs_fd = os.open("outputs", flags, dir_fd=run_fd)
+        outputs_info = os.fstat(outputs_fd)
+        if outputs_info.st_uid != int(expected_owner_uid):
+            raise RuntimeError("secure harness outputs directory has an unexpected owner")
+        try:
+            os.mkdir(run_id, mode=0o700, dir_fd=outputs_fd)
+            created = True
+        except FileExistsError:
+            created = False
+        child_fd = os.open(run_id, flags, dir_fd=outputs_fd)
+        child_info = os.fstat(child_fd)
+        allowed_uids = {int(expected_owner_uid)}
+        if created:
+            allowed_uids.add(0)
+        if child_info.st_uid not in allowed_uids:
+            raise RuntimeError("secure harness output directory has an unexpected owner")
+        if created:
+            os.fchown(child_fd, int(expected_owner_uid), int(expected_owner_gid))
+            os.fchmod(child_fd, 0o700)
+    finally:
+        for fd in (child_fd, outputs_fd, run_fd):
+            if fd >= 0:
+                os.close(fd)
+    return output_dir
+
+
+def _write_proofgrader_shim(
+    run_dir: str,
+    expected_owner_uid: Optional[int] = None,
+    expected_owner_gid: Optional[int] = None,
+) -> str:
+    """Create a framework-owned grader entry point inside the run copy."""
+    runtime_dir = os.path.join(run_dir, ".gan_runtime")
+    shim_path = os.path.join(runtime_dir, "proofgrader_task_agent.py")
+    if expected_owner_uid is None:
+        os.makedirs(runtime_dir, exist_ok=True)
+        with open(shim_path, "w", encoding="utf-8") as stream:
+            stream.write("from proofgrader.task_agent import TaskAgent\n")
+        os.chmod(shim_path, 0o644)
+        return "./.gan_runtime/proofgrader_task_agent.py"
+    if expected_owner_gid is None:
+        raise RuntimeError("secure proofgrader shim creation requires the owner gid")
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    runtime_fd = os.open(runtime_dir, flags)
+    shim_fd = -1
+    try:
+        runtime_info = os.fstat(runtime_fd)
+        if runtime_info.st_uid != int(expected_owner_uid):
+            raise RuntimeError("proofgrader runtime directory has an unexpected owner")
+        try:
+            shim_fd = os.open(
+                "proofgrader_task_agent.py",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=runtime_fd,
+            )
+        except FileExistsError as exc:
+            raise RuntimeError("proofgrader shim path already exists") from exc
+        shim_info = os.fstat(shim_fd)
+        if not stat.S_ISREG(shim_info.st_mode) or shim_info.st_nlink != 1:
+            raise RuntimeError("proofgrader shim has an unexpected type or link count")
+        if shim_info.st_uid not in {0, int(expected_owner_uid)}:
+            raise RuntimeError("proofgrader shim has an unexpected owner")
+        payload = b"from proofgrader.task_agent import TaskAgent\n"
+        offset = 0
+        while offset < len(payload):
+            written = os.write(shim_fd, payload[offset:])
+            if written <= 0:
+                raise OSError("short write while creating proofgrader shim")
+            offset += written
+        os.fchown(shim_fd, int(expected_owner_uid), int(expected_owner_gid))
+        os.fchmod(shim_fd, 0o644)
+    finally:
+        if shim_fd >= 0:
+            os.close(shim_fd)
+        os.close(runtime_fd)
+    return "./.gan_runtime/proofgrader_task_agent.py"
+
+
+def _require_sandboxable_proofgrader() -> None:
+    """Require proofgrader to live inside the trusted Python prefix."""
+    try:
+        spec = importlib.util.find_spec("proofgrader.task_agent")
+    except (ImportError, ModuleNotFoundError, ValueError) as exc:
+        raise RuntimeError("proofgrader.task_agent is not importable") from exc
+    origin = os.path.realpath(str(spec.origin or "")) if spec else ""
+    prefix = os.path.realpath(sys.prefix)
+    if not origin or not (
+        origin == prefix
+        or origin.startswith(prefix + os.sep)
+        or origin.startswith(os.path.realpath("/usr") + os.sep)
+    ):
+        raise RuntimeError(
+            "proofgrader.task_agent must be installed inside the trusted Python "
+            "environment; editable source outside the sandbox is refused"
+        )
+
+
+def _open_grading_output(path: str, expected_owner_uid: Optional[int]) -> int:
+    """Open one reclaimed grading output without following task-owned links."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RuntimeError(f"grading output has an unexpected type: {path}")
+        if expected_owner_uid is not None and info.st_uid != int(expected_owner_uid):
+            raise RuntimeError(f"grading output has an unexpected owner: {path}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _imo_proof_grading_output_error(
+    grading_dir: str,
+    expected_owner_uid: Optional[int],
+) -> Optional[str]:
+    """Reject isolated grader failures and labels outside the scoring contract."""
+    failures_path = os.path.join(grading_dir, "agent_evals", "eval_failures.jsonl")
+    if os.path.lexists(failures_path):
+        failure_fd = _open_grading_output(failures_path, expected_owner_uid)
+        try:
+            if os.fstat(failure_fd).st_size > 0:
+                return "proof grader recorded one or more per-question failures"
+        finally:
+            os.close(failure_fd)
+
+    predictions_path = os.path.join(grading_dir, "predictions.csv")
+    try:
+        predictions_fd = _open_grading_output(predictions_path, expected_owner_uid)
+    except FileNotFoundError:
+        return "proof grader did not produce predictions.csv"
+    try:
+        with os.fdopen(predictions_fd, "r", encoding="utf-8", newline="") as stream:
+            predictions_fd = -1
+            grades = pd.read_csv(stream, dtype=str, keep_default_na=False)
+    finally:
+        if predictions_fd >= 0:
+            os.close(predictions_fd)
+    if "prediction" not in grades.columns or len(grades) == 0:
+        return "proof grader produced no grading labels"
+    allowed = {"incorrect", "partial", "almost", "correct"}
+    invalid = sorted({str(value) for value in grades["prediction"] if value not in allowed})
+    if invalid:
+        return f"proof grader produced invalid or blank labels: {invalid[:3]}"
+    return None
+
+
+def _imo_proof_generation_output_error(
+    predictions_dir: str,
+    expected_owner_uid: Optional[int],
+) -> Optional[str]:
+    """Reject missing task proofs before they can be graded as incorrect."""
+    failures_path = os.path.join(
+        predictions_dir, "agent_evals", "eval_failures.jsonl",
+    )
+    if os.path.lexists(failures_path):
+        failure_fd = _open_grading_output(failures_path, expected_owner_uid)
+        try:
+            if os.fstat(failure_fd).st_size > 0:
+                return "proof generation recorded one or more per-question failures"
+        finally:
+            os.close(failure_fd)
+
+    predictions_path = os.path.join(predictions_dir, "predictions.csv")
+    try:
+        predictions_fd = _open_grading_output(
+            predictions_path, expected_owner_uid,
+        )
+    except FileNotFoundError:
+        return "proof generation did not produce predictions.csv"
+    try:
+        with os.fdopen(predictions_fd, "r", encoding="utf-8", newline="") as stream:
+            predictions_fd = -1
+            predictions = pd.read_csv(stream, dtype=str, keep_default_na=False)
+    finally:
+        if predictions_fd >= 0:
+            os.close(predictions_fd)
+    if "prediction" not in predictions.columns or len(predictions) == 0:
+        return "proof generation produced no predictions"
+    blank_count = sum(
+        1 for value in predictions["prediction"]
+        if not isinstance(value, str) or not value.strip()
+    )
+    if blank_count:
+        return f"proof generation produced {blank_count} blank prediction(s)"
+    return None
+
+
+def run_imo_proof_grading(
+    python: str,
+    run_dir: str,
+    run_id: str,
+    num_samples: int,
+    model: str,
+    env: Dict[str, str],
+    timeout: int,
+    proxy_socket: str,
+    proxy_token: Optional[str] = None,
+    log_path: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    proxy_token_fd: Optional[int] = None,
+    expected_owner_uid: Optional[int] = None,
+    expected_owner_gid: Optional[int] = None,
+    setpriv_path: Optional[str] = None,
+    setfacl_path: Optional[str] = None,
+    bwrap_path: Optional[str] = None,
+    python_prefix: Optional[str] = None,
+    sandbox_etc_dir: Optional[str] = None,
+    sandbox_profile: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, str]:
+    """Grade generated proofs through the same scoped, sandboxed task path."""
+    predictions_dir = os.path.join(run_dir, "outputs", run_id)
+    generation_error = _imo_proof_generation_output_error(
+        predictions_dir, expected_owner_uid,
+    )
+    if generation_error:
+        return 1, f"[imo_proof_generation_error] {generation_error}"
+    _require_sandboxable_proofgrader()
+    grading_run_id = f"{run_id}_proof_grading"
+    _prepare_harness_output_dir(
+        run_dir, grading_run_id,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+    )
+    agent_path = _write_proofgrader_shim(
+        run_dir,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+    )
+    grading_env = dict(env)
+    grading_env.pop("GAN_TASK_BRIEF", None)
+    rc, output = _run_harness_and_report_local(
+        python,
+        run_dir,
+        "imo_proof_grading",
+        grading_run_id,
+        "",
+        num_samples,
+        model,
+        grading_env,
+        timeout,
+        # ``proofs_dname`` supplies the rows; dataset_root deliberately selects
+        # the sandboxed-agent path, where task_worker provides the scoped relay.
+        dataset_root=run_dir,
+        proxy_socket=proxy_socket,
+        proxy_token=proxy_token,
+        proxy_token_fd=proxy_token_fd,
+        log_path=log_path,
+        reasoning_effort=reasoning_effort,
+        expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid,
+        setpriv_path=setpriv_path,
+        setfacl_path=setfacl_path,
+        bwrap_path=bwrap_path,
+        python_prefix=python_prefix,
+        sandbox_etc_dir=sandbox_etc_dir,
+        sandbox_profile=sandbox_profile,
+        agent_path=agent_path,
+        proofs_dname=predictions_dir,
+    )
+    if rc != 0:
+        return rc, output
+
+    grading_dir = os.path.join(run_dir, "outputs", grading_run_id)
+    grading_error = _imo_proof_grading_output_error(
+        grading_dir, expected_owner_uid,
+    )
+    if grading_error:
+        return 1, f"{output}\n[imo_proof_grading_error] {grading_error}"
+    src = os.path.join(grading_dir, "report.json")
+    if os.path.lexists(src):
+        raise RuntimeError(f"imo_proof grading report path already exists: {src}")
+    from domains.imo.proof_eval import report_proof_grading
+    report_proof_grading(grading_dir)
+    dst = os.path.join(predictions_dir, "report.json")
+    if not os.path.isfile(src):
+        raise RuntimeError(f"imo_proof grading report is missing: {src}")
+    src_info = os.lstat(src)
+    if not stat.S_ISREG(src_info.st_mode) or src_info.st_nlink != 1:
+        raise RuntimeError("imo_proof grading report has an unexpected type or link count")
+    if expected_owner_uid is not None:
+        os.chown(
+            src, int(expected_owner_uid), int(expected_owner_gid),
+            follow_symlinks=False,
+        )
+    os.chmod(src, 0o644)
+    os.replace(src, dst)
+    return rc, output
+
+
 def write_parent_report(
     predictions_path: str,
     report_path: str,
@@ -1911,8 +2283,9 @@ def write_parent_report(
 def run_existing_domain_report(domain: str, dname: str, model: str) -> Optional[Dict[str, Any]]:
     """Call the existing independent-domain report entry point in this parent."""
     if domain == "imo_proof":
-        from domains.report import report_imo_proof
-        report_imo_proof(dname=dname, model=model)
+        # GAN mode completes proof grading inside the privileged task broker;
+        # never fall back to the legacy in-process proofgrader path here.
+        return read_report(os.path.join(dname, "report.json"))
     elif "balrog" in domain:
         from domains.balrog.eval import report_balrog
         report_balrog(output_dir=dname)
@@ -1932,8 +2305,9 @@ def read_report(report_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def extract_score(report: Optional[Dict[str, Any]], score_key: str) -> Optional[float]:
-    """Numeric objective score, or None when absent/NaN (score standard unchanged)."""
+def extract_score(report: Optional[Dict[str, Any]], score_key: str,
+                  domain: Optional[str] = None) -> Optional[float]:
+    """Numeric objective score, or None when absent/NaN."""
     if not isinstance(report, dict) or not score_key:
         return None
     val = report.get(score_key)
@@ -1945,6 +2319,8 @@ def extract_score(report: Optional[Dict[str, Any]], score_key: str) -> Optional[
         return None
     if math.isnan(f) or math.isinf(f):
         return None
+    if domain in _SANDBOXED_BALROG_DOMAINS:
+        f /= 100.0
     return f
 
 

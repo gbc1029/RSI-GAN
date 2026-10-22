@@ -237,11 +237,17 @@ class _TaskBrokerState:
         from gan.framework import llm_proxy
         from gan.framework import task_execution as tx
 
+        domain = str(self.config["domain"])
         model = str(self.config["model"])
+
         parent_scored = bool(self.config["parent_scored"])
         questions_path = os.path.join(run_dir, "input", "questions.csv")
         if parent_scored and not os.path.isfile(questions_path):
             raise RuntimeError(f"task questions file is missing: {questions_path}")
+
+        total_timeout = int(self.config["timeout"])
+        stage_timeout = max(1, total_timeout // 2) if domain == "imo_proof" else total_timeout
+
         proxy_token = llm_proxy.request_task_token(
             str(self.config["proxy_socket"]),
             str(self.config["proxy_control_token"]),
@@ -324,11 +330,16 @@ class _TaskBrokerState:
                     anchor_ids = list(seed_info.get("anchor_ids") or [])
                 except (OSError, ValueError, KeyError):
                     sample_seed = None  # fall back to the legacy prefix slice
-            return tx._run_harness_and_report_local(
-                str(self.config["python"]), run_dir, str(self.config["domain"]),
-                f"gan_{scope_id}", str(self.config["subset"]),
-                int(self.config["num_samples"]), model, env,
-                int(self.config["timeout"]),
+            rc, output = tx._run_harness_and_report_local(
+                str(self.config["python"]),
+                run_dir,
+                domain,
+                f"gan_{scope_id}",
+                str(self.config["subset"]),
+                int(self.config["num_samples"]),
+                model,
+                env,
+                stage_timeout,
                 questions_path=questions_path if parent_scored else None,
                 dataset_root=None if parent_scored else str(self.config["repo_root"]),
                 proxy_socket=str(self.config["proxy_socket"]),
@@ -347,6 +358,39 @@ class _TaskBrokerState:
                 sandbox_etc_dir=str(self.config["sandbox_etc_dir"]),
                 sandbox_profile=dict(self.config["sandbox_profile"]),
             )
+            if domain == "imo_proof" and rc == 0:
+                grading_rc, grading_output = tx.run_imo_proof_grading(
+                    str(self.config["python"]),
+                    run_dir,
+                    f"gan_{scope_id}",
+                    int(self.config["num_samples"]),
+                    model,
+                    env,
+                    stage_timeout,
+                    str(self.config["proxy_socket"]),
+                    proxy_token_fd=proxy_token_fd,
+                    reasoning_effort=self.config.get("reasoning_effort"),
+                    expected_owner_uid=int(self.config["owner_uid"]),
+                    expected_owner_gid=int(self.config["owner_gid"]),
+                    setpriv_path=str(self.config["setpriv"]),
+                    setfacl_path=str(self.config["setfacl"]),
+                    bwrap_path=str(self.config["bwrap"]),
+                    python_prefix=str(self.config["python_prefix"]),
+                    sandbox_etc_dir=str(self.config["sandbox_etc_dir"]),
+                    sandbox_profile=dict(self.config["sandbox_profile"]),
+                )
+                output = f"{output}\n[imo_proof_grading]\n{grading_output}"
+                rc = grading_rc
+            elif domain == "polyglot" and rc == 0:
+                # Docker stays in this root-only broker; neither the outer
+                # worker nor the TaskAgent receives the host socket.
+                output_path = os.path.join(run_dir, "outputs", f"gan_{scope_id}")
+                tx.run_polyglot_eval(
+                    os.path.join(output_path, "predictions.csv"),
+                    str(self.config["repo_root"]),
+                    output_path,
+                )
+            return rc, output
         finally:
             os.close(proxy_token_fd)
             llm_proxy.revoke_token(

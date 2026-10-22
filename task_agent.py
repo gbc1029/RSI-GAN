@@ -54,6 +54,25 @@ class TaskAgent(AgentSystem):
         # (pre-D behaviour). Forwarding only -- no policy lives in the artifact.
         self.cm = cm
 
+    def _extract_prediction(self, msg_history):
+        if not msg_history or not isinstance(msg_history[-1], dict):
+            return "", "missing final assistant message"
+        text = msg_history[-1].get("text")
+        if not isinstance(text, str):
+            return "", "final assistant message has no text"
+        extracted_jsons = extract_jsons(text, logging=self.log)
+        if not extracted_jsons:
+            return "", "no parseable JSON response"
+        obj = extracted_jsons[-1]
+        if not isinstance(obj, dict) or "response" not in obj:
+            keys = list(obj)[:8] if isinstance(obj, dict) else "-"
+            return "", ("missing key 'response' "
+                        f"(got {type(obj).__name__}, keys={keys})")
+        prediction = obj["response"]
+        if not isinstance(prediction, str) or not prediction.strip():
+            return "", "response must be a non-blank string"
+        return prediction, None
+
     def forward(self, inputs):
         """
         A design-driven agent that solves a given task.
@@ -116,24 +135,40 @@ Respond in JSON format with the following schema (wrap the object in <json>...</
             **({"cm": self.cm} if self.cm is not None else {}),
         )
 
-        # Extract the response. A BLANK prediction (not the string "None") marks
-        # extraction failure: the harness resume path retries blank predictions
-        # and the report drops them, so the sentinel can never pass as an
-        # answer; the reason rides the trajectory log instead of vanishing.
-        prediction = ""
+        # A final format slip should not discard otherwise useful work. Give
+        # the model one no-tools repair turn, then keep the blank sentinel if
+        # it still cannot produce the required response contract.
         try:
-            extracted_jsons = extract_jsons(new_msg_history[-1]['text'], logging=self.log)
-            if extracted_jsons is None:
-                self.log("prediction_extract failed: no parseable JSON (see json_extract log above)")
-            elif "response" not in extracted_jsons[-1]:
-                obj = extracted_jsons[-1]
-                keys = list(obj)[:8] if isinstance(obj, dict) else "-"
-                self.log(f"prediction_extract failed: missing key 'response' "
-                         f"(got {type(obj).__name__}, keys={keys})")
-            else:
-                prediction = extracted_jsons[-1]['response']
+            prediction, extraction_error = self._extract_prediction(new_msg_history)
         except Exception as e:
-            self.log(f"Error extracting prediction: {e}")
-            prediction = ""
+            prediction, extraction_error = "", f"extraction error: {e}"
+        if extraction_error:
+            self.log(f"prediction_extract failed: {extraction_error}; "
+                     "requesting one format-repair turn")
+            repair_instruction = f"""Your previous final output could not be accepted: {extraction_error}.
+
+Do not call any tool. Return the COMPLETE final answer from your prior work as exactly one tagged JSON object, with no markdown fences and no text outside the tags. The response value must be a non-empty JSON string; write math in plain text without LaTeX backslash escapes.
+<json>
+{{
+    "response": "complete final answer"
+}}
+</json>"""
+            try:
+                new_msg_history = chat_with_agent(
+                    repair_instruction,
+                    model=self.model,
+                    msg_history=new_msg_history,
+                    logging=self.log,
+                    tools_available=[],
+                    trajectory_file=getattr(self, "trajectory_file", None),
+                    reasoning_effort=self.reasoning_effort,
+                    max_tool_calls=0,
+                    **({"cm": self.cm} if self.cm is not None else {}),
+                )
+                prediction, extraction_error = self._extract_prediction(new_msg_history)
+            except Exception as e:
+                prediction, extraction_error = "", f"format-repair turn failed: {e}"
+            if extraction_error:
+                self.log(f"prediction_extract repair failed: {extraction_error}")
 
         return prediction, new_msg_history

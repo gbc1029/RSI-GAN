@@ -114,6 +114,7 @@ class DomainTaskRunner:
 
         reg = load_registry()
         self.domain_cfg = resolve_domain(reg, domain)
+        self.timeout = int(self.domain_cfg.get("harness_timeout_s") or timeout)
         self.score_key = self.domain_cfg.get("score_key")
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
@@ -381,25 +382,10 @@ class DomainTaskRunner:
                         duration_s=round(time.time() - _t_harness, 1),
                         question_timeout_s=question_timeout_s,
                         harness_timeout_s=harness_timeout)
-            predictions_path = os.path.join(output_path, "predictions.csv")
-            report = None
-            if os.path.exists(predictions_path):
-                try:
-                    _t_eval = time.time()
-                    report = tx.run_polyglot_eval(
-                        predictions_path, self.domain_cfg, self.repo_root,
-                        output_path)
-                    self._event("task_eval_done", genid=str(genid),
-                                duration_s=round(time.time() - _t_eval, 1),
-                                eval_kind="docker")
-                except Exception as e:
-                    # A docker/eval failure must not degrade silently;
-                    # score reads None -> score_status="failed".
-                    report = None
-                    from utils.soft_fail import soft_fail
-                    soft_fail(f"polyglot eval failed for genid {genid}: {e}",
-                              event_path=paths.events_path(self.output_dir),
-                              event_type="polyglot_eval_failed", genid=str(genid))
+            report = tx.read_report(report_path) if rc == 0 else None
+            if report is not None:
+                self._event("task_eval_done", genid=str(genid),
+                            eval_kind="docker_broker")
         elif tx.uses_parent_scoring(self.domain):
             per_gen_seed = (
                 tx.derive_sample_seed(self.sample_seed_base, str(genid))
@@ -452,37 +438,53 @@ class DomainTaskRunner:
                 dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
                 reasoning_effort=self.reasoning_effort,
             )
-            try:
-                report = tx.run_existing_domain_report(self.domain, output_path, model)
-            except Exception as e:
-                # Same visibility contract as the parent-scoring path.
-                report = None
-                from utils.soft_fail import soft_fail
-                soft_fail(f"existing-domain report failed for genid {genid}: {e}",
-                          event_path=paths.events_path(self.output_dir),
-                          event_type="existing_domain_report_failed", genid=str(genid))
+            if self.domain == "imo_proof":
+                self._event("task_harness_done", genid=str(genid), rc=rc,
+                            question_timeout_s=question_timeout_s,
+                            harness_timeout_s=self.timeout)
+            report = None
+            if self.domain == "imo_proof":
+                # Proof grading is completed inside the privileged broker with
+                # the same scoped proxy token; never run the legacy in-process
+                # report path from the outer worker.
+                report = tx.read_report(report_path) if rc == 0 else None
+            elif rc == 0 or self.domain not in {"balrog_babyai", "balrog_babaisai"}:
+                try:
+                    report = tx.run_existing_domain_report(self.domain, output_path, model)
+                except Exception as e:
+                    # Same visibility contract as the parent-scoring path.
+                    from utils.soft_fail import soft_fail
+                    soft_fail(f"existing-domain report failed for genid {genid}: {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="existing_domain_report_failed", genid=str(genid))
         # Context-management audit exit (docs/10 §11.5): fold the child's
         # seam events into events.jsonl on EVERY post-harness path (the child
         # may have run a seam session even when scoring later failed).
         self._ingest_cm_events(run_dir, genid)
         # Persist per-question failure diagnostics into runs/<genid>/: the work
-        # dir is pruned at generation end, so anything left only under
-        # run_dir/outputs/<run_id>/agent_evals dies before it can be read
-        # (observed: trajectory_archive_failed with the actual cause sealed
-        # inside a pruned eval_failures.jsonl).
-        evals_dir = os.path.join(output_path, "agent_evals")
+        # dir is pruned at generation end, so anything left only under an
+        # outputs/<run_id>/agent_evals directory dies before it can be read.
         evidence_dir = paths.runs_dir(self.output_dir, genid)
         # runs/<genid>/ may not exist yet at this point (the pre-existing
         # report/predictions copy below is what creates it) -- create it here
         # or the copy2 below dies with FileNotFoundError, silently swallowed.
         os.makedirs(evidence_dir, exist_ok=True)
-        if os.path.isdir(evals_dir):
+        eval_sources = [(os.path.join(output_path, "agent_evals"), evidence_dir)]
+        if self.domain == "imo_proof":
+            eval_sources.append((
+                os.path.join(run_dir, "outputs", f"{run_id}_proof_grading", "agent_evals"),
+                os.path.join(evidence_dir, "proof_grading"),
+            ))
+        for evals_dir, archive_dir in eval_sources:
+            if not os.path.isdir(evals_dir):
+                continue
             for name in sorted(os.listdir(evals_dir)):
                 if name == "eval_failures.jsonl" or (name.startswith("failure_")
                                                      and name.endswith(".log")):
                     try:
+                        os.makedirs(archive_dir, exist_ok=True)
                         shutil.copy2(os.path.join(evals_dir, name),
-                                     os.path.join(evidence_dir, name))
+                                     os.path.join(archive_dir, name))
                     except OSError:
                         pass  # evidence is best-effort; never fail the run
         # Merge the CHILD-reported load outcome into the toolset report (the
@@ -523,7 +525,7 @@ class DomainTaskRunner:
             from utils.soft_fail import soft_fail
             soft_fail(f"report.json exists but is unparseable for genid {genid} "
                       f"(score will read None/failed): {report_path}")
-        score = tx.extract_score(report, self.score_key)
+        score = tx.extract_score(report, self.score_key, self.domain)
         report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
 
         report_sha = scores.sha256_file(report_path)

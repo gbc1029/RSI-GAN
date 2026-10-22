@@ -26,6 +26,11 @@ from utils.common import summarize_error
 # 150-350s on ONE long call, so hard domains override upward.
 QUESTION_TIMEOUT = int(os.environ.get("GAN_QUESTION_TIMEOUT_S", "300"))
 
+_SANDBOXED_BALROG_MODULES = {
+    "balrog_babyai": "domains.balrog.environments.babyai_text.babyai_env",
+    "balrog_babaisai": "domains.balrog.environments.babaisai.babaisai_env",
+}
+
 _TASK_ENV_NAMES = {
     "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
@@ -183,6 +188,67 @@ def _accepted_kwargs(cls, kwargs):
     return {k: v for k, v in kwargs.items() if k in params}
 
 
+class _SandboxedBalrogAgent:
+    def __init__(self, model, chat_history_file, proxy_socket, proxy_token,
+                 reasoning_effort=None, cost_overrides=None):
+        self.model = model
+        self.chat_history_file = chat_history_file
+        self.proxy_socket = proxy_socket
+        self.proxy_token = proxy_token
+        self.reasoning_effort = reasoning_effort
+        self.cost_overrides = cost_overrides
+
+    def forward(self, inputs):
+        prediction = _run_sandboxed_agent(
+            self.model,
+            inputs,
+            "./task_agent.py",
+            self.chat_history_file,
+            self.proxy_socket,
+            self.proxy_token,
+            self.reasoning_effort,
+            self.cost_overrides,
+        )
+        return prediction, []
+
+
+class _SandboxedBalrogAgentFactory:
+    def __init__(self, model, proxy_socket, proxy_token, reasoning_effort=None):
+        if not proxy_socket or not proxy_token:
+            raise RuntimeError("GAN Balrog evaluation requires a scoped task proxy")
+        if not shutil.which("bwrap"):
+            raise RuntimeError(
+                "GAN Balrog evaluation requires bwrap; refusing an unsandboxed run"
+            )
+        proxy_socket = os.path.realpath(proxy_socket)
+        if (not os.path.exists(proxy_socket)
+                or not stat.S_ISSOCK(os.stat(proxy_socket).st_mode)):
+            raise RuntimeError("GAN Balrog task proxy socket is missing or invalid")
+        self.model = model
+        self.proxy_socket = proxy_socket
+        self.proxy_token = proxy_token
+        self.reasoning_effort = reasoning_effort
+        self.cost_overrides = _design_cost_overrides()
+
+    def create_agent(self, chat_history_file):
+        return _SandboxedBalrogAgent(
+            self.model,
+            chat_history_file,
+            self.proxy_socket,
+            self.proxy_token,
+            self.reasoning_effort,
+            self.cost_overrides,
+        )
+
+
+def _require_sandboxed_balrog_runtime(domain):
+    try:
+        importlib.import_module(_SANDBOXED_BALROG_MODULES[domain])
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"{domain} dependency is missing: {exc.name or exc}"
+        ) from exc
+
 
 def get_dataset(domain, subset="", dataset_root=None):
     # Only the parent harness receives this path. It is never placed in the
@@ -234,7 +300,7 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
         )
     _require_projected_etc()
 
-    agent_host = os.path.realpath(os.path.join(run_root, agent_path))
+    agent_host = os.path.normpath(os.path.join(run_root, agent_path))
     _sandbox_path(run_root, agent_host)  # validates containment
 
     required_binds = (
@@ -353,8 +419,11 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
 
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
                          reasoning_effort=None, cost_overrides=None):
-    run_root = os.path.realpath(os.getcwd())
-    trajectory_path = os.path.realpath(trajectory_path)
+    # Private run ancestors deliberately remain non-traversable to the
+    # sandbox uid. Bubblewrap also cannot reliably open bind sources through
+    # /proc/self/fd, so stage only the allowlisted inputs in a private /tmp
+    # directory owned by this uid and bind from there.
+    trajectory_path = os.path.abspath(trajectory_path)
     os.makedirs(os.path.dirname(trajectory_path), exist_ok=True)
     # A file bind must exist before Bubblewrap constructs the namespace. The
     # trajectory may live outside run_root when resuming from an external
@@ -387,25 +456,72 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
     # The result channel is an anonymous temporary file. Only the trusted
     # task_worker receives its fd; the TaskAgent child is spawned later with
     # close_fds=True and a different, worker-local result fd.
-    with tempfile.TemporaryFile(mode="w+b") as result_file:
-        result_fd = result_file.fileno()
-        payload["result_fd"] = result_fd
-        proc = subprocess.run(
-            _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket),
-            input=json.dumps(payload, ensure_ascii=False, default=str),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            timeout=QUESTION_TIMEOUT,
-            pass_fds=(result_fd,),
+    run_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    run_root = f"/proc/self/fd/{run_fd}"
+    stage_root = tempfile.mkdtemp(prefix="rsi-gan-task-", dir="/tmp")
+    try:
+        run_real = os.path.realpath(run_root)
+        trajectory_real = os.path.realpath(trajectory_path)
+        try:
+            in_run = os.path.commonpath([run_real, trajectory_real]) == run_real
+        except ValueError:
+            in_run = False
+        trajectory_source = (
+            os.path.join(run_root, os.path.relpath(trajectory_real, run_real))
+            if in_run else trajectory_path
         )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
-            raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
 
-        result_file.seek(0)
-        raw_result = result_file.read()
+        # Copy only the files needed by the task worker. The source paths use
+        # the inherited directory fd, while bwrap sees ordinary /tmp paths.
+        agent_source = (
+            agent_path if os.path.isabs(agent_path)
+            else os.path.join(run_root, agent_path)
+        )
+        _sandbox_path(run_root, agent_source)
+        if not os.path.isfile(agent_source):
+            raise RuntimeError(
+                f"Sandboxed TaskAgent file is missing: {agent_source}"
+            )
+        shutil.copy2(agent_source, os.path.join(stage_root, "task_agent.py"))
+        for name in ("agent", "utils"):
+            shutil.copytree(os.path.join(run_root, name),
+                            os.path.join(stage_root, name), symlinks=False)
+        os.makedirs(os.path.join(stage_root, "domains"), exist_ok=True)
+        for name in ("__init__.py", "task_worker.py"):
+            shutil.copy2(os.path.join(run_root, "domains", name),
+                         os.path.join(stage_root, "domains", name))
+        runtime_source = os.path.join(run_root, ".gan_runtime")
+        if os.path.isdir(runtime_source):
+            shutil.copytree(runtime_source,
+                            os.path.join(stage_root, ".gan_runtime"),
+                            symlinks=False)
+        staged_trajectory = os.path.join(stage_root, "trajectory.jsonl")
+        shutil.copy2(trajectory_source, staged_trajectory)
+
+        with tempfile.TemporaryFile(mode="w+b") as result_file:
+            result_fd = result_file.fileno()
+            payload["result_fd"] = result_fd
+            proc = subprocess.run(
+                _sandbox_command(stage_root, "./task_agent.py", staged_trajectory,
+                                 proxy_socket),
+                input=json.dumps(payload, ensure_ascii=False, default=str),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                timeout=QUESTION_TIMEOUT,
+                pass_fds=(result_fd,),
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
+                raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
+
+            result_file.seek(0)
+            raw_result = result_file.read()
+            shutil.copyfile(staged_trajectory, trajectory_source)
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        os.close(run_fd)
 
     if not raw_result:
         raise RuntimeError("Trusted TaskAgent worker returned no result")
@@ -643,6 +759,7 @@ def harness(
             dataset, question_id_col, num_samples,
             sample_seed=sample_seed, anchor_ids=anchor_ids,
         )
+        dataset = dataset.reset_index(drop=True)
         if _sample_info.get("mode") == "seeded":
             print(f"[sample] mode=seeded seed={_sample_info['sample_seed']} "
                   f"anchor={_sample_info['anchor_ids']} "
@@ -914,16 +1031,25 @@ if __name__ == "__main__":
 
     # Balrog game domains
     elif "balrog" in domain:
+        env_name = domain.split("_")[-1]
+        agent_factory = None
+        if domain in _SANDBOXED_BALROG_MODULES and args.dataset_root is not None:
+            _require_sandboxed_balrog_runtime(domain)
+            agent_factory = _SandboxedBalrogAgentFactory(
+                args.model,
+                args.proxy_socket,
+                args.proxy_token,
+                args.reasoning_effort,
+            )
         from domains.balrog.eval import harness_balrog
 
-        env_name = domain.split("_")[-1]
         config_dir = os.path.join(os.getcwd(), "./domains/balrog/config")
         with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
             cfg = compose(
                 config_name="config",
                 overrides=[
                     f"eval.output_dir={args.output_dir}",
-                    f"eval.num_workers={args.num_workers}",
+                    f"eval.num_workers={1 if agent_factory is not None else args.num_workers}",
                     f"envs.names={env_name}",
                     f"eval.run_id={args.run_id if args.run_id is not None else 'null'}",
                     f"model={args.model}",
@@ -939,7 +1065,7 @@ if __name__ == "__main__":
                     else []
                 ),
             )
-            output_folder = harness_balrog(cfg)
+            output_folder = harness_balrog(cfg, agent_factory=agent_factory)
             # Save cfg in output folder
             from omegaconf import OmegaConf
             OmegaConf.save(config=cfg, f=os.path.join(output_folder, "config.yaml"))

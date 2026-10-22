@@ -82,7 +82,9 @@ RUN /bin/bash -c "source ~/.bashrc && /root/setup_env.sh"
 # harness.process_entry via the label below (old env images without the
 # label keep the runtime install path).
 COPY ./requirements.txt /hyperagents_meta/requirements.txt
-RUN python -m pip install --no-cache-dir -r /hyperagents_meta/requirements.txt
+#RUN python -m pip install --no-cache-dir -r /hyperagents_meta/requirements.txt
+RUN python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /hyperagents_meta/requirements.txt
+
 LABEL {req_bake_label}="1"
 
 WORKDIR /testbed/
@@ -95,6 +97,10 @@ _DOCKERFILE_INSTANCE = r"""FROM --platform={platform} {env_image_name}
 
 COPY ./setup_repo.sh /root/
 COPY ./domains/polyglot /domains/polyglot
+
+#mirror proxy replacement
+RUN git config --global url."https://ghproxy.cc/https://github.com/".insteadOf "https://github.com/"
+
 RUN /bin/bash /root/setup_repo.sh
 
 WORKDIR /testbed/

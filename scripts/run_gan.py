@@ -1,4 +1,4 @@
-"""CLI entry for the GAN dual-loop.
+"""CLI entry for the GAN dual-loop.(see the new version in README.md)
 
 Example (paper_review, minimal):
     python scripts/run_gan.py --repo_root . --output_dir ../runs/gan_paper_review \

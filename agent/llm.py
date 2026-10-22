@@ -27,10 +27,10 @@ MAX_TOKENS = 32768
 LLM_TIMEOUT_S = float(os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
 
 # Thinking-intensity knob for reasoning models, forwarded to the gateway as the
-# OpenAI-compatible ``reasoning_effort`` body field (verified: litellm forwards
-# it verbatim under drop_params=True; the GAN proxy forwards the body verbatim;
-# the gateway accepts low | high | max). Values are the GATEWAY contract, not
-# the OpenAI enum -- unknown values fail loudly here instead of mid-run.
+# OpenAI-compatible ``reasoning_effort`` body field through ``extra_body`` so
+# LiteLLM does not drop it under drop_params=True. Values are the GATEWAY
+# contract, not the OpenAI enum -- unknown values fail loudly here instead of
+# mid-run.
 # Transport is EXPLICIT ONLY (function argument threaded from
 # gan/framework/models.yaml through the roles / the task harness payload);
 # there is deliberately no environment fallback.
@@ -159,7 +159,7 @@ def _completion_kwargs(model, messages, temperature, max_tokens,
         kw["max_tokens"] = max_tokens
     effort = _reasoning_effort(reasoning_effort)
     if effort is not None:
-        kw["reasoning_effort"] = effort
+        kw["extra_body"] = {"reasoning_effort": effort}
     return kw
 
 
