@@ -544,11 +544,11 @@ def _dispatch_broker(
         "grant", "src_dir", "granted_paths", "covers", "grant_records",
         "log_event", "check_patch", "read_trajectory",
         "read_session_trajectory", "session_trajectory_index", "build_patch",
-        "editable_paths",
+        "editable_paths", "repo_dir",
     }
     if method not in allowed:
         raise PermissionError(f"broker method is not exposed: {method}")
-    if method not in {"log_event", "check_patch"}:
+    if method not in {"log_event", "check_patch", "repo_dir"}:
         role_arg = args[0] if args else kwargs.get("role")
         node_arg = args[1] if len(args) > 1 else kwargs.get("node_id")
         if role_arg != expected_role:
@@ -573,6 +573,22 @@ def _dispatch_broker(
         node = (f"{args[1]}__{expected_seat}" if expected_node is not None
                 else args[1])
         return broker.build_patch(str(args[0]), node, seat=expected_seat)
+    if method == "repo_dir":
+        if len(args) != 1 or kwargs:
+            raise TypeError("repo_dir expects a single rel path")
+        # Information guard: answer only for paths the seat already holds a
+        # modify grant over — the same truth source build_patch_from_workspace
+        # reads, so "patch-visible" implies "repo_dir-answerable". Without this
+        # the RPC would leak repo layout for arbitrary paths.
+        seat_node = (f"{expected_node}__{expected_seat}"
+                     if expected_node is not None else expected_node)
+        granted = set(broker.granted_paths(expected_role, seat_node,
+                                           intent="modify"))
+        rel = str(args[0])
+        if rel not in granted and not any(
+                g and rel.startswith(g.rstrip("/") + "/") for g in granted):
+            raise PermissionError("repo_dir is only exposed for granted paths")
+        return str(broker.repo_dir(rel))
     seat_node = (f"{expected_node}__{expected_seat}"
                  if expected_node is not None else None)
     if method not in {"log_event", "check_patch"} and seat_node is not None:
@@ -695,6 +711,11 @@ class _RemoteBroker:
 
     def covers(self, *args: Any, **kwargs: Any) -> bool:
         return self._rpc("covers", list(args), kwargs)
+
+    def repo_dir(self, rel: str) -> str:
+        # Owning repo root for a granted rel path (P4a/P4b multi-repo
+        # routing); the outer-worker side answers only for granted paths.
+        return str(self._rpc("repo_dir", [rel], {}))
 
     def check_patch(self, patch: str, *, role: str, seat: str) -> Any:
         return tuple(self._rpc("check_patch", [patch], {"role": role, "seat": seat}))

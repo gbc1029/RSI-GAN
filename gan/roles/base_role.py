@@ -527,8 +527,17 @@ class Role(AgentSystem):
                 if not patch_str or not self.code_root:
                     rejected = None
                     break
-                ok, reason = code_repo.check_patch(self.code_root, patch_str,
-                                                   role=self.role, seat="self_improve")
+                # Seat mode: the projected code view has no git metadata by
+                # design (the authoritative per-run tree stays parent-only),
+                # so validation must ride the role-broker RPC to the real
+                # tree — same dispatch as the planner plan seat.
+                if broker is not None and hasattr(broker, "check_patch"):
+                    ok, reason = broker.check_patch(patch_str, role=self.role,
+                                                    seat="self_improve")
+                else:
+                    ok, reason = code_repo.check_patch(self.code_root, patch_str,
+                                                       role=self.role,
+                                                       seat="self_improve")
                 if ok:
                     rejected = None
                     break
