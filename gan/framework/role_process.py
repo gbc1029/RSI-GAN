@@ -544,11 +544,13 @@ def _dispatch_broker(
         "grant", "src_dir", "granted_paths", "covers", "grant_records",
         "log_event", "check_patch", "read_trajectory",
         "read_session_trajectory", "session_trajectory_index", "build_patch",
-        "editable_paths",
+        "editable_paths", "repo_dir",
     }
     if method not in allowed:
         raise PermissionError(f"broker method is not exposed: {method}")
-    if method not in {"log_event", "check_patch"}:
+    # These carry no role/node identity in args[0]/args[1] -- they are checked
+    # by their own branch below instead of the generic identity test.
+    if method not in {"log_event", "check_patch", "repo_dir"}:
         role_arg = args[0] if args else kwargs.get("role")
         node_arg = args[1] if len(args) > 1 else kwargs.get("node_id")
         if role_arg != expected_role:
@@ -573,6 +575,12 @@ def _dispatch_broker(
         node = (f"{args[1]}__{expected_seat}" if expected_node is not None
                 else args[1])
         return broker.build_patch(str(args[0]), node, seat=expected_seat)
+    if method == "repo_dir":
+        # Pure path mapping (which repo owns this relative path). The child
+        # already knows repo_root; this only answers "which of the split roots".
+        if len(args) != 1 or kwargs:
+            raise TypeError("repo_dir expects one relative path")
+        return broker.repo_dir(str(args[0]))
     seat_node = (f"{expected_node}__{expected_seat}"
                  if expected_node is not None else None)
     if method not in {"log_event", "check_patch"} and seat_node is not None:
@@ -689,6 +697,10 @@ class _RemoteBroker:
 
     def src_dir(self, *args: Any, **kwargs: Any) -> str:
         return self._rpc("src_dir", list(args), kwargs)
+
+    def repo_dir(self, rel: str) -> str:
+        """Split-repo owner of ``rel`` (patch building needs it)."""
+        return str(self._rpc("repo_dir", [str(rel)], {}))
 
     def granted_paths(self, *args: Any, **kwargs: Any) -> list[str]:
         return self._rpc("granted_paths", list(args), kwargs)
