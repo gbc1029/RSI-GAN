@@ -13,6 +13,7 @@ failure; events ``self_improve_commit`` / ``self_improve_apply_failed``).
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from functools import wraps
 import json
 import multiprocessing
@@ -976,10 +977,20 @@ def run_gan_driver(
                     cmd.extend(["--sample-seed-base", str(sample_seed_base)])
                     if anchor_ids:
                         cmd.extend(["--anchor-ids", ",".join(anchor_ids)])
-                # Ablation switches (docs/11) must reach the per-outer worker: the
-                # worker rebuilds its own loop config from loop.yaml + overrides, so
-                # the driver's merged ablation section rides an explicit JSON arg.
-                worker_overrides: Dict[str, Any] = {}
+                # Overrides must reach the per-outer worker: it rebuilds its own
+                # loop config from loop.yaml + these overrides. Forwarding ONLY
+                # `ablation` silently reverted every other section (outer_select.*,
+                # fitness.*, mome.*, eval.*) to loop.yaml on the worker side —
+                # observed as `--set outer_select.enabled=false` being ignored
+                # while the working-tree YAML said true.
+                worker_overrides: Dict[str, Any] = deepcopy(cfg_overrides or {})
+                loop_ov = worker_overrides.get("loop")
+                if isinstance(loop_ov, dict):
+                    # The worker gets these as explicit args; drop the duplicates.
+                    loop_ov.pop("outer_generations", None)
+                    loop_ov.pop("inner_max", None)
+                    if not loop_ov:
+                        worker_overrides.pop("loop", None)
                 ab = cfg.get("ablation") or {}
                 if ab:
                     worker_overrides["ablation"] = dict(ab)
