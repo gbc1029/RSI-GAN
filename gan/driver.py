@@ -13,6 +13,7 @@ failure; events ``self_improve_commit`` / ``self_improve_apply_failed``).
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from functools import wraps
 import json
 import multiprocessing
@@ -748,6 +749,9 @@ def run_gan_driver(
     safe_broker_env["PYTHON_DOTENV_DISABLED"] = "1"
     question_timeout_s = int(domain_config.get("question_timeout_s") or 300)
     harness_timeout = int(num_samples) * question_timeout_s + 900
+    harness_num_workers = int(domain_cfg.get("harness_num_workers", 5))
+    if harness_num_workers < 1:
+        raise ValueError(f"domain {domain!r} harness_num_workers must be positive")
     broker_config = {
         "output_dir": output_dir,
         "repo_root": repo_root,
@@ -766,6 +770,7 @@ def run_gan_driver(
         "question_timeout_s": int(domain_cfg.get("question_timeout_s")
                                   or cfg.get("loop.question_timeout_s", 300)),
         "llm_client_timeout_s": float(cfg.get("loop.llm_client_timeout_s", 600)),
+        "harness_num_workers": harness_num_workers,
         "python": python_executable,
         "python_prefix": python_prefix,
         "timeout": int(domain_cfg.get("harness_timeout_s") or harness_timeout),
@@ -958,6 +963,16 @@ def run_gan_driver(
                     for seat in ("evaluate", "self_improve")
                 },
             }
+            # Fixed-root evaluation (docs/14 §5.5) needs a SECOND planner
+            # instance per outer: the loop builds ``outer_<N>_eval``. Give the
+            # planner's plan seat a second proxy token; the role broker registers
+            # it as a separate launchable scope (outer_<N>_eval).
+            role_proxy_tokens["planner"]["plan"] = [
+                role_proxy_tokens["planner"]["plan"],
+                proxy.issue_scope(
+                    "planner", str(outer), models["planner"], seat="plan",
+                    peer_uid=int(role_accounts["planner"]["uid"])),
+            ]
             role_broker.register_outer(outer, role_proxy_tokens)
             proc = None
             try:
@@ -972,10 +987,20 @@ def run_gan_driver(
                     cmd.extend(["--sample-seed-base", str(sample_seed_base)])
                     if anchor_ids:
                         cmd.extend(["--anchor-ids", ",".join(anchor_ids)])
-                # Ablation switches (docs/11) must reach the per-outer worker: the
-                # worker rebuilds its own loop config from loop.yaml + overrides, so
-                # the driver's merged ablation section rides an explicit JSON arg.
-                worker_overrides: Dict[str, Any] = {}
+                # Overrides must reach the per-outer worker: it rebuilds its own
+                # loop config from loop.yaml + these overrides. Forwarding ONLY
+                # `ablation` silently reverted every other section (outer_select.*,
+                # fitness.*, mome.*, eval.*) to loop.yaml on the worker side —
+                # observed as `--set outer_select.enabled=false` being ignored
+                # while the working-tree YAML said true.
+                worker_overrides: Dict[str, Any] = deepcopy(cfg_overrides or {})
+                loop_ov = worker_overrides.get("loop")
+                if isinstance(loop_ov, dict):
+                    # The worker gets these as explicit args; drop the duplicates.
+                    loop_ov.pop("outer_generations", None)
+                    loop_ov.pop("inner_max", None)
+                    if not loop_ov:
+                        worker_overrides.pop("loop", None)
                 ab = cfg.get("ablation") or {}
                 if ab:
                     worker_overrides["ablation"] = dict(ab)

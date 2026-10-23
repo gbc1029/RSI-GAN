@@ -124,6 +124,36 @@ except Exception as _openai_err:
 else:
     _BACKOFF_EXCEPTIONS = tuple(_BACKOFF_EXCEPTIONS)
 
+
+class TransientUpstreamError(RuntimeError):
+    """A RETRYABLE 5xx from the gateway.
+
+    litellm maps unknown upstream 5xx (e.g. "upstream proxy failure" from the
+    local proxy when the TLS handshake to the provider times out) to the
+    catch-all ``APIError``, which is deliberately NOT retried (it is the parent
+    of deterministic config errors). This wrapper re-classifies ONLY the
+    genuinely transient ones so a single blip does not kill a whole role
+    session (observed: one 502 lost an entire self-improve session).
+    """
+
+
+def _is_transient_upstream(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    # Deterministic gateway answers: retrying can never change the outcome.
+    if ("no available channel" in text or "model_not_found" in text
+            or "authentication" in text or "invalid api key" in text):
+        return False
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int) and 500 <= code <= 599:
+        return True
+    return any(marker in text for marker in (
+        "upstream proxy failure", "bad gateway", "gateway timeout",
+        "internal server error", "connection reset", "handshake operation timed out",
+    ))
+
+
+_BACKOFF_EXCEPTIONS = tuple(_BACKOFF_EXCEPTIONS) + (TransientUpstreamError,)
+
 litellm.drop_params = True
 
 
@@ -189,10 +219,15 @@ def get_response_from_llm(
 
     new_msg_history = msg_history + [{"role": "user", "content": msg}]
 
-    response = litellm.completion(
-        **_completion_kwargs(model, new_msg_history, temperature, max_tokens,
-                             reasoning_effort=reasoning_effort, api_key=api_key)
-    )
+    try:
+        response = litellm.completion(
+            **_completion_kwargs(model, new_msg_history, temperature, max_tokens,
+                                 reasoning_effort=reasoning_effort, api_key=api_key)
+        )
+    except BaseException as _exc:  # noqa: BLE001 -- re-raise unchanged by default
+        if _is_transient_upstream(_exc):
+            raise TransientUpstreamError(str(_exc)[:300]) from _exc
+        raise
     _run_usage_hooks(model, response)
     _choice = response['choices'][0]
     _msg = _choice['message']

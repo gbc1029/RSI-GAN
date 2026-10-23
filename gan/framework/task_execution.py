@@ -1752,6 +1752,7 @@ def _run_harness_and_report_local(
     sandbox_profile: Optional[Dict[str, Any]] = None,
     agent_path: str = "./task_agent.py",
     proofs_dname: Optional[str] = None,
+    num_workers: int = 5,
 ) -> Tuple[int, str]:
     """Run a fixed harness command; the privileged broker is its only secure caller.
 
@@ -1776,6 +1777,7 @@ def _run_harness_and_report_local(
         "--run_id", run_id,
         "--subset", subset,
         "--num_samples", str(num_samples),
+        "--num_workers", str(num_workers),
     ]
     if reasoning_effort:
         # Explicit CLI transport (mirrors --model); never an env variable.
@@ -2189,6 +2191,7 @@ def run_imo_proof_grading(
     python_prefix: Optional[str] = None,
     sandbox_etc_dir: Optional[str] = None,
     sandbox_profile: Optional[Dict[str, Any]] = None,
+    num_workers: int = 5,
 ) -> Tuple[int, str]:
     """Grade generated proofs through the same scoped, sandboxed task path."""
     predictions_dir = os.path.join(run_dir, "outputs", run_id)
@@ -2239,6 +2242,7 @@ def run_imo_proof_grading(
         sandbox_profile=sandbox_profile,
         agent_path=agent_path,
         proofs_dname=predictions_dir,
+        num_workers=num_workers,
     )
     if rc != 0:
         return rc, output
