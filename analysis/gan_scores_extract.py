@@ -220,6 +220,25 @@ def attach_truth(run, truth):
         r["lenient_correct"] = int(bool(v and tlab and v == tlab.split("_")[-1]))
 
 
+def attach_polyglot_truth(run):
+    """Polyglot has no dataset*.csv: the broker-side docker eval IS the ground
+    truth. Derive per-question correctness from runs/<genid>/report.json's
+    resolved list (container-verified), which extract_run already loaded as
+    per_gen[genid]["report"]. Lenient verdict parsing does not apply — the
+    prediction is a unified diff, not a verdict text."""
+    n = 0
+    for r in run["rows"]:
+        rep = (run["per_gen"].get(r["genid"]) or {}).get("report") or {}
+        hit = r["question_id"] in set(rep.get("resolved") or [])
+        r["truth"] = "resolved" if hit else "unresolved"
+        r["strict_correct"] = int(hit)
+        r["lenient"] = None
+        r["method"] = "docker_resolved"
+        r["lenient_correct"] = None
+        n += int(hit)
+    return n
+
+
 def report_crosscheck(run):
     """Compare recomputed strict correctness with the harness report.json.
 
@@ -279,6 +298,9 @@ def write_report(run, truth_path, outdir, cross=None):
     L.append(f"- 规模：{len(gens)} generations（outer_done ×{len(outer_done)}），"
              f"domain=`{run['domain']}`")
     L.append(f"- ground truth：`{os.path.relpath(truth_path, REPO) if truth_path else 'N/A'}`")
+    if run.get("score_mode") == "docker_resolved":
+        L.append("- 打分模式：broker docker 评测（strict = 容器验证的 resolved；"
+                 "lenient 不适用于 diff 预测）")
     if run["brief_missing"]:
         L.append(f"- ⚠ `task_brief_missing` ×{run['brief_missing']}（task_brief 注入缺失）")
     if run["stagnation"]:
@@ -291,7 +313,7 @@ def write_report(run, truth_path, outdir, cross=None):
     L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for g in gens:
         r = run["per_gen"][g]
-        lk = sum(x["lenient_correct"] for x in run["rows"] if x["genid"] == g)
+        lk = sum((x["lenient_correct"] or 0) for x in run["rows"] if x["genid"] == g)
         lt = sum(1 for x in run["rows"] if x["genid"] == g)
         nokey = "同report_sha" if r["same_report_as_prev"] else ""
         L.append(f"| {g} | {r['score']} | {r['coverage']} | {r['predicted_score']} "
@@ -327,9 +349,10 @@ def write_report(run, truth_path, outdir, cross=None):
         k = int(vec.sum())
         bt = stats.binomtest(k, ns, 0.5, alternative="greater") if ns else None
         p = f"{bt.pvalue:.4f}" if bt else "—"
-        L.append(f"| {label} | {k}/{ns} | {ns} | {k / ns:.3f} | — | {p} |")
+        acc = f"{k / ns:.3f}" if ns else "—"
+        L.append(f"| {label} | {k}/{ns} | {ns} | {acc} | — | {p} |")
     # bootstrap CI on per-generation accuracies (reused compute_bootstrap_ci)
-    gen_accs = np.array([np.mean([x["lenient_correct"] for x in run["rows"] if x["genid"] == g])
+    gen_accs = np.array([np.mean([(x["lenient_correct"] or 0) for x in run["rows"] if x["genid"] == g])
                          for g in gens], dtype=float)
     if len(gen_accs) >= 2:
         L.append(f"- 每 gen 宽松准确率：{', '.join(f'{g}:{a:.2f}' for g, a in zip(gens, gen_accs))}；"
@@ -386,21 +409,33 @@ def write_report(run, truth_path, outdir, cross=None):
 
     # auto conclusion
     L.append("## 结论（自动摘要）\n")
+    docker_mode = run.get("score_mode") == "docker_resolved"
+    verdict_key = "strict_correct" if docker_mode else "lenient_correct"
     qs = {}
     for r in run["rows"]:
-        qs.setdefault(r["question_id"], []).append(r["lenient_correct"])
+        qs.setdefault(r["question_id"], []).append(r[verdict_key] or 0)
     all_wrong = sorted(q for q, v in qs.items() if sum(v) == 0)
     all_right = sorted(q for q, v in qs.items() if sum(v) == len(v))
     k, n = int(lenient.sum()), len(lenient)
-    bt = stats.binomtest(k, n, 0.5, alternative="greater")
-    L.append(f"- 严格 {int(strict.sum())}/{n} vs 宽松 {k}/{n}（{k / n:.1%}）："
-             + ("输出格式失败而非判断失败（strict 被答案接口钉死）。" if strict.sum() == 0 and k > 0
-                else "两口径差距见上表。"))
+    bt = stats.binomtest(k, n, 0.5, alternative="greater") if n else None
+    pct = f"{k / n:.1%}" if n else "n/a"
+    if docker_mode:
+        L.append(f"- 严格（容器 resolved）{int(strict.sum())}/{len(strict)}；"
+                 "宽松 verdict 重判不适用于 diff 预测。")
+    else:
+        L.append(f"- 严格 {int(strict.sum())}/{n} vs 宽松 {k}/{n}（{pct}）："
+                 + ("输出格式失败而非判断失败（strict 被答案接口钉死）。" if strict.sum() == 0 and k > 0
+                    else "两口径差距见上表。"))
     if all_wrong:
         L.append(f"- 系统性错误（全部 gen 判错）：question {all_wrong} —— 单题集中，非均匀噪声。")
     if all_right:
         L.append(f"- 全对题：{all_right}。")
-    L.append(f"- 宽松口径 vs 随机(0.5) 二项检验（greater）：p={bt.pvalue:.4f}。")
+    if docker_mode:
+        L.append("- 宽松口径不适用，跳过二项检验；strict 即 broker 容器评测结论。")
+    elif bt is not None:
+        L.append(f"- 宽松口径 vs 随机(0.5) 二项检验（greater）：p={bt.pvalue:.4f}。")
+    else:
+        L.append("- 宽松口径无有效样本（polyglot 的 diff 预测不适用 verdict 重判），跳过二项检验。")
     noop = [g for g in gens if run["per_gen"][g]["same_report_as_prev"]]
     if noop:
         L.append(f"- 无效子代：gen {noop}（与前代同 report_sha，patch 未产生有效变化）。")
@@ -413,7 +448,7 @@ def write_report(run, truth_path, outdir, cross=None):
     coincide = [g for g in gens
                 if run["per_gen"][g]["score"] is not None
                 and abs((run["per_gen"][g]["score"]
-                         - float(np.mean([r["lenient_correct"] for r in run["rows"]
+                         - float(np.mean([(r["lenient_correct"] or 0) for r in run["rows"]
                                           if r["genid"] == g]) or 0))) < 1e-9]
     if coincide:
         L.append(f"- 注：gen {','.join(coincide)} 的 strict 与 lenient 完全重合"
@@ -430,13 +465,13 @@ def write_plot(run, outdir):
     gens = run["gens"]
     x = np.arange(1, len(gens) + 1)
     strict_g = [run["per_gen"][g]["score"] for g in gens]
-    lenient_g = [np.mean([r["lenient_correct"] for r in run["rows"] if r["genid"] == g]) for g in gens]
+    lenient_g = [np.mean([(r["lenient_correct"] or 0) for r in run["rows"] if r["genid"] == g]) for g in gens]
     pred_g = [run["per_gen"][g]["predicted_score"] if run["per_gen"][g]["predicted_score"] is not None else np.nan
               for g in gens]
     best = np.maximum.accumulate([0.0] + lenient_g)[1:]
 
     qids = sorted({r["question_id"] for r in run["rows"]})
-    q_ok = [sum(r["lenient_correct"] for r in run["rows"] if r["question_id"] == q) for q in qids]
+    q_ok = [sum((r["lenient_correct"] or 0) for r in run["rows"] if r["question_id"] == q) for q in qids]
     q_truth = [next(r["truth"] for r in run["rows"] if r["question_id"] == q) for q in qids]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
@@ -481,6 +516,16 @@ def main():
     for run in runs:
         qids = {r["question_id"] for r in run["rows"]}
         tp, truth = detect_dataset(run["dir"], run["domain"] or "search_arena", qids)
+        if truth is None and run["domain"] == "polyglot":
+            # No dataset CSV exists for polyglot by design; the broker docker
+            # eval is the authority. Skip the strict crosscheck — both sides
+            # would derive from the same resolved list.
+            n = attach_polyglot_truth(run)
+            run["truth_path"] = None
+            run["score_mode"] = "docker_resolved"
+            print(f"[NOTE] {run['name']}: polyglot — ground truth from broker "
+                  f"report.json ({n} resolved)")
+            continue
         if truth is None:
             print(f"[ERROR] {run['name']}: no dataset file covers question ids {sorted(qids)}")
             return 2
