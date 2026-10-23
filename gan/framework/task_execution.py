@@ -959,6 +959,24 @@ def load_dataset_ids(dataset_root: str, domain: str, subset: str) -> List[str]:
     return [str(v) for v in dataset[question_id_col].tolist()]
 
 
+def load_pool_ids(domain: str, dataset_root: str, subset: str) -> List[str]:
+    """Candidate id pool for ANY domain (ids only; no starter/label files).
+
+    THE pool-resolution source, shared by the anchor drawing
+    (:func:`ensure_sampling_seed`) and the startup pool-size fail-fast
+    (``task_runner.pool_check``): polyglot reads the metadata id list
+    (``eval_task_list`` filters the eval side downstream, never this pool),
+    balrog domains have no question-pool semantics (episodes), every other
+    domain reads its dataset CSV via :func:`load_dataset_ids`.
+    """
+    if domain == "polyglot":
+        from domains.polyglot import gan_utils as _pgu
+        return _pgu.load_instance_ids(dataset_root)
+    if domain in _SANDBOXED_BALROG_DOMAINS:
+        return []
+    return load_dataset_ids(dataset_root, domain, subset)
+
+
 def select_seeded_positions(
     ids: List[str],
     num_samples: int,
@@ -1055,17 +1073,11 @@ def ensure_sampling_seed(
         base_seed = int.from_bytes(os.urandom(8), "big")
     anchor_ids: List[str] = []
     try:
-        if domain == "polyglot":
-            # polyglot has no dataset CSV: its candidate pool is the metadata
-            # id list (FULL pool; a pinned eval_task_list filters only the
-            # eval side, so anchors are drawn from the full pool and simply
-            # find no row when a pinned pool excludes them).
-            from domains.polyglot import gan_utils as _pgu
-            pool = _pgu.load_instance_ids(dataset_root)
-        elif domain in _SANDBOXED_BALROG_DOMAINS:
-            pool = []
-        else:
-            pool = load_dataset_ids(dataset_root, domain, subset)
+        # polyglot: anchors come from the FULL metadata pool (a pinned
+        # eval_task_list filters only the eval side, so anchors simply find
+        # no row when a pinned pool excludes them); balrog has no pool;
+        # CSV domains read their dataset. One resolver for all of them.
+        pool = load_pool_ids(domain, dataset_root, subset)
         k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
         if pool and k > 0:
             rng = random.Random(f"{int(base_seed)}:anchor")
@@ -1743,6 +1755,46 @@ def _sandbox_runtime_preflight(
             f"Python executable={python_executable!r}, Python prefix={prefix!r}"
             f"): {reason[-2000:]}"
         )
+
+
+def harness_total_timeout(domain_cfg: Dict[str, Any], num_samples: int) -> int:
+    """Total harness wall budget for one task run -- THE single formula.
+
+    Precedence: an explicit domains.yaml ``harness_timeout_s`` (independent
+    harness domains: imo_*/balrog) wins; otherwise the worst-case serial
+    bound -- every question running its full per-question wall budget
+    (``question_timeout_s``, 300s default) plus a fixed 900s slack for model
+    warm-up / first call / report writing.
+
+    Shared by BOTH launch sites -- the broker registration (driver, once per
+    run) and the outer worker's per-generation harness wait (task_runner) --
+    so the two processes can never disagree about the subprocess budget (the
+    formula used to live as two hand-copied copies that agreed only by
+    coincidence of config: no parent-scored domain declared
+    ``harness_timeout_s``).
+    """
+    declared = domain_cfg.get("harness_timeout_s")
+    if declared:
+        return int(declared)
+    question_timeout_s = int(domain_cfg.get("question_timeout_s") or 300)
+    return int(num_samples) * question_timeout_s + 900
+
+
+def effective_token_budget_per_gen(domain_cfg: Dict[str, Any],
+                                   cfg: Any) -> Optional[int]:
+    """Per-generation token-budget line, resolved per domain (docs/10 §10).
+
+    ``domains.yaml`` ``token_budget_per_gen`` overrides the loop.yaml global
+    (``cost.token_budget_per_gen``) when the domain declares one. Resolved
+    ONCE in build_gan_loop (which knows the single domain) and threaded
+    explicitly to both consumers: the runner's reserved-key clamp ceiling and
+    the loop's cost-statement reference line.
+    """
+    domain_value = domain_cfg.get("token_budget_per_gen")
+    if domain_value:
+        return int(domain_value)
+    global_value = cfg.get("cost.token_budget_per_gen") if cfg is not None else None
+    return int(global_value) if global_value else None
 
 
 def run_harness_and_report(

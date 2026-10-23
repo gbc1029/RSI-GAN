@@ -47,45 +47,80 @@ def _modify_depth(records: List[Dict[str, Any]]) -> int:
 TASK_PATCH_REJECTED_NO_COMMIT = "no new code commit (patch rejected or absent)"
 
 
-def polyglot_pool_check(domain_cfg: Dict[str, Any], num_samples: int,
-                        dataset_root: Optional[str] = None) -> None:
-    """Fail fast when the polyglot candidate pool cannot satisfy --num_samples.
+def pool_check(domain: str, domain_cfg: Dict[str, Any], num_samples: int,
+               dataset_root: Optional[str] = None, subset: str = "") -> None:
+    """Fail fast when a domain's candidate pool cannot satisfy --num_samples.
 
-    Pool resolution mirrors prepare_polyglot_questions: a non-empty
-    ``eval_task_list`` pins the pool (Arch 2 smoke runs); an absent/empty one
-    means the FULL metadata pool (all languages). smoke_1022_222630 lesson:
-    a pool smaller than the requested sample count silently collapses the
-    score denominator (resolved/2 surfaced as 0.5/1.0 with coverage 0.4 under
-    --num_samples 5, every row score_status="partial") -- refuse at startup
-    instead. An unreadable pool defers to the loud error at question-prep
-    time (this check must never become the fragile part of startup).
+    smoke_1022_222630 lesson: a pool smaller than the requested sample count
+    silently collapses the score denominator (resolved/2 surfaced as 0.5/1.0
+    with coverage 0.4 under --num_samples 5, every row score_status="partial")
+    -- refuse at startup instead. The same silent-shrink class exists for EVERY
+    pool-based domain, so this check is domain-generic: polyglot resolves its
+    pinned eval_task_list / full metadata pool; every other domain resolves its
+    dataset CSV pool via ``tx.load_pool_ids`` (balrog has no pool semantics and
+    is skipped by the empty-pool guard). An unreadable pool defers to the loud
+    error at question-prep time (this check must never become the fragile part
+    of startup).
     """
-    pinned = domain_cfg.get("eval_task_list") or []
     requested = int(num_samples or 0)
     if requested <= 0:
         return
-    if pinned:
-        if requested > len(pinned):
-            raise ValueError(
-                f"polyglot eval_task_list has {len(pinned)} tasks but "
-                f"--num_samples {requested}: the score denominator would "
-                f"silently shrink to {len(pinned)}. Extend "
-                f"gan/framework/domains.yaml eval_task_list to >= "
-                f"{requested} entries (per-task eval images build lazily "
-                f"on first eval) or lower --num_samples.")
-        return
-    if not dataset_root:
-        return
-    try:
-        from domains.polyglot import gan_utils as _pgu
-        full = len(_pgu.load_instance_ids(dataset_root))
-    except Exception:  # noqa: BLE001 -- question prep raises the real error
-        return
-    if full and requested > full:
+    label = f"{domain} candidate pool"
+    if domain == "polyglot":
+        pinned = domain_cfg.get("eval_task_list") or []
+        if pinned:
+            if requested > len(pinned):
+                raise ValueError(
+                    f"polyglot eval_task_list has {len(pinned)} tasks but "
+                    f"--num_samples {requested}: the score denominator would "
+                    f"silently shrink to {len(pinned)}. Extend "
+                    f"gan/framework/domains.yaml eval_task_list to >= "
+                    f"{requested} entries (per-task eval images build lazily "
+                    f"on first eval) or lower --num_samples.")
+            return
+        label = "polyglot full pool"
+    pool: Optional[List[str]] = None
+    if dataset_root:
+        try:
+            pool = tx.load_pool_ids(domain, dataset_root, subset)
+        except Exception:  # noqa: BLE001 -- question prep raises the real error
+            return
+    if pool and requested > len(pool):
         raise ValueError(
-            f"polyglot full pool has {full} instances but --num_samples "
+            f"{label} has {len(pool)} instances but --num_samples "
             f"{requested}: the score denominator would silently cap at "
-            f"{full}. Lower --num_samples.")
+            f"{len(pool)}. Lower --num_samples.")
+
+
+def apply_domain_token_budget(config: Dict[str, Any],
+                              domain_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Inject the domain-configured per-question token budget (docs/10 §10).
+
+    ``domains.yaml`` ``token_budget_per_question`` is the operator-side
+    enforcement value for the child's token SOFT STOP: it is written into the
+    task design's RESERVED cost slot (framework-owned, in place pre-persist --
+    the same pattern as the clamp below) so the persisted design.json stays
+    the single source the sandboxed harness extracts (the run dir has no
+    gan/). Precedence: min of the design-declared value (if any) and the
+    domain value -- the domain config is operator governance; the evolving
+    design may lower its own budget but never raise it above the operator's
+    line. The gen ceiling (``token_budget_per_gen``) is applied afterwards by
+    the frozen clamp (cost_keys.clamp_cost_config).
+
+    Returns the injection record for the cost_keys_applied event, or None.
+    """
+    domain_value = domain_cfg.get("token_budget_per_question")
+    if not domain_value:
+        return None
+    declared = (config.get("cost") or {}).get("per_question_token_budget")
+    effective = int(domain_value)
+    if type(declared) is int and declared > 0:
+        effective = min(effective, int(declared))
+    cost_slot = config.setdefault("cost", {})
+    if cost_slot.get("per_question_token_budget") != effective:
+        cost_slot["per_question_token_budget"] = effective
+    return {"domain_value": int(domain_value), "design_declared": declared,
+            "effective": effective}
 
 
 def task_patch_rejection(patch_str: str, task_code_commit: Optional[str],
@@ -160,14 +195,14 @@ class DomainTaskRunner:
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
 
-        # Fail fast (smoke_1022_222630 lesson, see polyglot_pool_check): the
-        # candidate pool is pinned by domains.yaml eval_task_list when that
-        # key is set, otherwise it is the FULL metadata pool; either way it
-        # is NOT expanded by --num_samples. Refuse at startup when the pool
-        # cannot satisfy the requested sample count.
-        if self.domain == "polyglot":
-            polyglot_pool_check(self.domain_cfg, self.num_samples,
-                                dataset_root=self.repo_root)
+        # Fail fast (smoke_1022_222630 lesson, see pool_check): the candidate
+        # pool (a pinned eval_task_list, the full metadata pool for polyglot,
+        # or the dataset CSV pool for every other domain) is NOT expanded by
+        # --num_samples. Refuse at startup whenever the pool cannot satisfy
+        # the requested sample count -- domain-generic since the same silent
+        # denominator shrink exists for CSV domains.
+        pool_check(self.domain, self.domain_cfg, self.num_samples,
+                   dataset_root=self.repo_root, subset=self.subset)
 
         # B46 step-1 gate: the per-genid task design persist (persist_design)
         # writes through the run's WriterToken threaded from build_gan_loop.
@@ -344,6 +379,10 @@ class DomainTaskRunner:
         # design.json is canonical and the child-side extraction (harness — no
         # gan/ in the run dir) is a guarded pass-through that cannot drift from
         # this authority. Deviations are recorded (event + meta -> receipt).
+        # Pre-clamp, the domain-configured per-question budget (if any) is
+        # injected into the same reserved slot (operator governance: min with
+        # any design-declared value) -- see apply_domain_token_budget.
+        domain_budget = apply_domain_token_budget(config, self.domain_cfg)
         try:
             from gan.framework import cost_keys as _ck
             cost_clamps = _ck.clamp_cost_config(
@@ -357,7 +396,8 @@ class DomainTaskRunner:
                       event_type="cost_keys_apply_failed", genid=str(genid))
             cost_clamps, cost_effective = [], {}
         self._event("cost_keys_applied", genid=str(genid), role="task",
-                    keys=cost_effective, clamped=cost_clamps)
+                    keys=cost_effective, clamped=cost_clamps,
+                    domain_budget_injected=domain_budget)
 
         # Framework: persist the design, prepare the minimal code copy, then
         # assemble sandbox-visible design/skills inside that copy.
@@ -378,9 +418,12 @@ class DomainTaskRunner:
         # 300s when the env is absent) and the harness TOTAL budget scales
         # with it -- a fixed total silently breaks once the per-question
         # budget rises above total/N (observed: polyglot 2x1200s > 1800s).
+        # The total is THE shared formula (task_execution.harness_total_timeout)
+        # also used by the driver's broker registration -- the two launch
+        # sites cannot disagree (they were two hand-copied formulae).
         question_timeout_s = int(self.domain_cfg.get("question_timeout_s") or 300)
         env["GAN_QUESTION_TIMEOUT_S"] = str(question_timeout_s)
-        harness_timeout = self.num_samples * question_timeout_s + 900
+        harness_timeout = tx.harness_total_timeout(self.domain_cfg, self.num_samples)
         # NOTE: the thinking-intensity knob is NOT an env variable -- it is
         # threaded as reasoning_effort= into each run_harness_and_report call
         # below and travels --reasoning_effort -> payload -> TaskAgent.
