@@ -164,14 +164,16 @@ def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
     Never touches benchmark level (docs/14 §3). Both scalars are z-scored
     against the reference window (verdict_stability was raw in the pre-2026-10
     revision, which silently shrank its effective weight to ``w2 * sigma_vs``).
-    ``verdict_stability`` missing data stays neutral (term skipped, 0.0);
+    MISSING data stays neutral for BOTH scalars (term skipped, 0.0): a missing
+    calibration_error used to be read as 0.0 == perfect calibration, i.e. a
+    spurious reward (relevant for arms like A2 where the evaluator never runs).
     ``fitness_partial`` is stamped by the caller.
     """
     ev = sn.get("evaluator_stats") or {}
     ce = ev.get("calibration_error")
-    ce_val = float(ce) if isinstance(ce, (int, float)) else 0.0
+    ce_val = float(ce) if isinstance(ce, (int, float)) else None
     refs_ce = _ref_scalars(refs, ("evaluator_stats",), "calibration_error")
-    z_ce = z_ref(ce_val, refs_ce)
+    z_ce = z_ref(ce_val, refs_ce) if ce_val is not None else 0.0
     vs = ev.get("verdict_stability")
     vs_val = float(vs) if isinstance(vs, (int, float)) else None
     # verdict_stability is a [0,1] hit-rate; z-score it against the reference
