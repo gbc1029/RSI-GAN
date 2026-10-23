@@ -2346,6 +2346,21 @@ class GanLoop:
                     ucb_c=ucb_c, depth_penalty=depth_penalty, cost_penalty=cost_penalty,
                     outer_id=None if use_global else outer,
                 )
+                # Fallback (docs/13 §2.4, 2026-10 revision): every outer starts
+                # with an EMPTY current subtree, so "subtree only" starves every
+                # outer after the first. When the subtree has no candidate, fall
+                # back to the global pool ONCE (same metric, previous outers'
+                # real nodes) and record it. If cross_subtree_epsilon=1.0 the
+                # pool is already global and this never triggers.
+                if not parents and not use_global:
+                    parents = self.task_tree.select_parents(
+                        k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
+                        ucb_c=ucb_c, depth_penalty=depth_penalty,
+                        cost_penalty=cost_penalty, outer_id=None,
+                    )
+                    if parents:
+                        self.log_event({"type": "inner_pool_fallback",
+                                        "outer": outer, "inner": inner})
                 if not parents:
                     self.log_event({"type": "inner_skip", "reason": "no_candidate", "outer": outer, "inner": inner})
                     break
@@ -2365,12 +2380,26 @@ class GanLoop:
                 parent_meta = parent.meta or {}
                 parent_feedback = parent_meta.get("feedback")
                 parent_receipt = parent_meta.get("receipt")
+                parent_outer = parent_meta.get("outer_id")
+                cross_outer = parent_outer is not None and parent_outer != outer
+                # Cross-outer lineage (docs/13 §2.4): the evaluator's issue
+                # round-trip is per-outer session state (fresh instance each
+                # outer; issue_id resets to i-1...). A parent selected from a
+                # DIFFERENT outer carries stale issues -- forcing respond_issue/
+                # judge_fix on them wastes budget and collides ids with this
+                # outer's fresh issues. Strip issues (keep diff_summary/scores/
+                # calibration); the planner and evaluator both read THIS
+                # parent_feedback, so one scrub covers both.
+                if cross_outer:
+                    if parent_feedback and parent_feedback.get("issues"):
+                        parent_feedback = {**parent_feedback, "issues": []}
                 # Mirrors carry parent-child semantics; the per-round
                 # record lands on the child meta at settle (feedback /
                 # feedback_digest / receipt) and the next selection reads it.
                 self._parent_feedback = parent_feedback
                 self._parent_receipt = parent_receipt
-                self._parent_digest = parent_meta.get("feedback_digest")
+                self._parent_digest = (
+                    None if cross_outer else parent_meta.get("feedback_digest"))
                 parent_predicted_score = parent_meta.get("predicted_score")
                 parent_benchmark_score = parent_meta.get("benchmark_score")
                 evaluator_issues = (parent_feedback or {}).get("issues")

@@ -77,11 +77,13 @@ tree:
   ucb_c: 1.0                    # exploration constant
   depth_penalty: 0.05           # penalty per unit depth
   cost_penalty: 0.0             # penalty on normalized cost (0 disables)
-  cross_subtree: false          # docs/13 §2.4: true allows the parent pool to span
-                                # outers (with probability cross_subtree_epsilon);
-                                # false keeps selection inside the current outer's
-                                # subtree (meta.outer_id == current outer; initial
-                                # and pre-migration nodes stay eligible).
+  cross_subtree: false          # docs/13 §2.4: 子树优先。true = 以 cross_subtree_epsilon
+                                # 的概率把候选池扩大到全局；false = 候选池限定在当前 outer
+                                # 子树（meta.outer_id == 当前 outer；initial/迁移节点仍可参与）。
+                                # false 时若子树为空（每届刚开始必然如此）→ 回落全局一次
+                                # （同一 metric，记 inner_pool_fallback 事件）；epsilon=1.0
+                                # 时本就全程全局，回落永不触发。跨届父代携带的旧 issues
+                                # 在选父处清空（task 谱系与 P/E 谱系解耦，见 docs/13 §2.4）。
   cross_subtree_epsilon: 0.1    # probability of a global-pool draw when cross_subtree=true
 
 # ---------------------------------------------------------------------------
