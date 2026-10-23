@@ -13,8 +13,10 @@ loop:
                                 # default only; consumer: gan/build.py build_gan_loop
                                 # (a resume auto-detects from the persisted code manifest,
                                 # which wins over this key).
-  outer_generations: 2          # G: number of meta-level (outer) generations
-  inner_max: 3                  # I_max: max inner iterations per outer generation
+  outer_generations: 10         # G: number of meta-level (outer) generations
+                                # (2026-10: raised 2 -> 10 so the outer_select axis can
+                                # actually engage -- selection needs a non-cold archive)
+  inner_max: 2                  # I_max: max inner iterations per outer generation
   stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
   stagnation_epsilon: 0.005     # delta score threshold
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
@@ -87,7 +89,7 @@ tree:
 #   enabled=false 时以下所有键短路，outer 保持单链（里程碑 A 行为）。
 # ---------------------------------------------------------------------------
 outer_select:
-  enabled: false                # 总开关；false = 现有单链行为（完全不变）
+  enabled: true                 # 总开关；false = 现有单链行为（完全不变）
   tournament_k: 3               # 锦标赛抽签数
   restore_max_tries: 3          # 恢复父代设计 + heal 的最大尝试数（全失败退回链式）
   heal_tool_overlap: 0.5        # heal 后 tools 与父代 tools 的 Jaccard 重叠阈值（低于则放弃该父代）
@@ -100,9 +102,11 @@ mome:
   x_buckets: 6                  # 默认内置：5 个具名 op + other
   y_buckets: 5                  # 默认内置边界 [0.0, 0.5, 1.0, 2.0]
   z_buckets: 3                  # 默认内置边界 [1.0, 2.0]
-  reference_window: 10          # 赛季 M（novelty 参考集 + z-score 基准）
-  novelty_k: 5
-  cold_start_min: 10            # 档案少于此数 → 完全链式（不选父）
+  reference_window: 6           # 赛季 M（novelty 参考集 + z-score 基准）
+  novelty_k: 2                  # 必须 <= cold_start_min-1，否则 kNN 参考不足（方案 B）
+  cold_start_min: 4             # 档案少于此数 → 完全链式（不选父）
+                                # 方案 B：10 -> 4，使 outer 5 起真正选父
+                                # （G=10 时约 6 届走选父）；偏离 docs/14 默认值，需在论文声明
   max_elites_per_cell: 3        # 每格 Pareto 前沿容量上限
 
 fitness:
@@ -113,7 +117,8 @@ fitness:
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
-  eval_samples: 3               # 每个 supernode 入档评估次数
+  eval_samples: 2               # 每个 supernode 入档评估次数（docs/14 允许 2–3；
+                                # 2 = 在 G=10 的固定 root 评估开销与 std 可用性间取平衡）
   eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 
 # ---------------------------------------------------------------------------

@@ -388,6 +388,12 @@ class GanLoop:
         parent = self.task_tree.get("initial")
         genid = self._gen_counter
         self._gen_counter += 1
+        # The regular loop pins ``outer_<O>_base`` at the top of each outer, but
+        # A6 returns BEFORE that loop -- yet ``_align_code_base`` resolves the
+        # initial parent to exactly that ref. Without this pin the checkout fails
+        # with ``pathspec 'outer_1_base' did not match`` (A6 died in 18s in the
+        # 2026-10-22 matrix). Pin the entry HEAD here, once, idempotently.
+        self._pin_outer_base(1)
         base = self._align_code_base(parent, 1, genid)
         plan_result = self._empty_plan_result(self._initial_task_config())
         try:
@@ -1468,6 +1474,17 @@ class GanLoop:
                 child = self.task_runner(plan=plan_result, parent=initial,
                                          genid=genid, base=eval_base)
                 if child is None:
+                    # A None child used to vanish: run_eval_rounds only counts
+                    # non-None scores, so the batch silently degraded to n_valid=0
+                    # (``supernode_eval_degraded``) with no evidence of WHY.
+                    self.log_event({"type": "eval_round_empty", "outer": outer,
+                                    "sample": sample, "genid": genid,
+                                    "eval_base": eval_base})
+                    return None
+                if child.value.score is None:
+                    self.log_event({"type": "eval_round_no_score", "outer": outer,
+                                    "sample": sample, "genid": genid,
+                                    "score_status": child.value.score_status})
                     return None
                 return child.value.score
 
@@ -1481,7 +1498,12 @@ class GanLoop:
                     main_head = None
 
             result = E.run_eval_rounds(run_once, self.eval_samples,
-                                       timeout_s=self.eval_timeout_s)
+                                       timeout_s=self.eval_timeout_s,
+                                       on_error=lambda s, exc: self.log_event({
+                                           "type": "eval_round_failed",
+                                           "outer": outer, "sample": s,
+                                           "error": f"{type(exc).__name__}: {exc}",
+                                           "genid": E.eval_genid(outer, s)}))
 
             # restore the main-line task HEAD (evaluation commits become orphans).
             # A SILENT failure here leaves the main line on an eval commit and
