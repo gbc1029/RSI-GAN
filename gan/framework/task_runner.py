@@ -47,6 +47,47 @@ def _modify_depth(records: List[Dict[str, Any]]) -> int:
 TASK_PATCH_REJECTED_NO_COMMIT = "no new code commit (patch rejected or absent)"
 
 
+def polyglot_pool_check(domain_cfg: Dict[str, Any], num_samples: int,
+                        dataset_root: Optional[str] = None) -> None:
+    """Fail fast when the polyglot candidate pool cannot satisfy --num_samples.
+
+    Pool resolution mirrors prepare_polyglot_questions: a non-empty
+    ``eval_task_list`` pins the pool (Arch 2 smoke runs); an absent/empty one
+    means the FULL metadata pool (all languages). smoke_1022_222630 lesson:
+    a pool smaller than the requested sample count silently collapses the
+    score denominator (resolved/2 surfaced as 0.5/1.0 with coverage 0.4 under
+    --num_samples 5, every row score_status="partial") -- refuse at startup
+    instead. An unreadable pool defers to the loud error at question-prep
+    time (this check must never become the fragile part of startup).
+    """
+    pinned = domain_cfg.get("eval_task_list") or []
+    requested = int(num_samples or 0)
+    if requested <= 0:
+        return
+    if pinned:
+        if requested > len(pinned):
+            raise ValueError(
+                f"polyglot eval_task_list has {len(pinned)} tasks but "
+                f"--num_samples {requested}: the score denominator would "
+                f"silently shrink to {len(pinned)}. Extend "
+                f"gan/framework/domains.yaml eval_task_list to >= "
+                f"{requested} entries (per-task eval images build lazily "
+                f"on first eval) or lower --num_samples.")
+        return
+    if not dataset_root:
+        return
+    try:
+        from domains.polyglot import gan_utils as _pgu
+        full = len(_pgu.load_instance_ids(dataset_root))
+    except Exception:  # noqa: BLE001 -- question prep raises the real error
+        return
+    if full and requested > full:
+        raise ValueError(
+            f"polyglot full pool has {full} instances but --num_samples "
+            f"{requested}: the score denominator would silently cap at "
+            f"{full}. Lower --num_samples.")
+
+
 def task_patch_rejection(patch_str: str, task_code_commit: Optional[str],
                          base_commit: Optional[str]) -> Optional[str]:
     """Classify the task-patch outcome: the rejection reason, or None.
@@ -118,6 +159,15 @@ class DomainTaskRunner:
         self.score_key = self.domain_cfg.get("score_key")
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
+
+        # Fail fast (smoke_1022_222630 lesson, see polyglot_pool_check): the
+        # candidate pool is pinned by domains.yaml eval_task_list when that
+        # key is set, otherwise it is the FULL metadata pool; either way it
+        # is NOT expanded by --num_samples. Refuse at startup when the pool
+        # cannot satisfy the requested sample count.
+        if self.domain == "polyglot":
+            polyglot_pool_check(self.domain_cfg, self.num_samples,
+                                dataset_root=self.repo_root)
 
         # B46 step-1 gate: the per-genid task design persist (persist_design)
         # writes through the run's WriterToken threaded from build_gan_loop.
@@ -368,8 +418,18 @@ class DomainTaskRunner:
         if self.domain == "polyglot":
             # Arch 2: the child's predictions are unified diffs; the parent
             # applies them inside the eval container and scores resolved/total.
-            questions_path = tx.prepare_polyglot_questions(
-                self.repo_root, run_dir, self.domain_cfg, self.num_samples)
+            # Sampling mirrors the parent-scored CSV branch below: a
+            # per-generation seed derived from the run-persistent base seed
+            # rotates the question draw every generation (deterministic per
+            # (base_seed, genid), so resume reproduces it); a None base seed
+            # keeps the legacy prefix slice (explicit A/B baseline).
+            per_gen_seed = (
+                tx.derive_sample_seed(self.sample_seed_base, str(genid))
+                if self.sample_seed_base is not None else None
+            )
+            questions_path, sample_info = tx.prepare_polyglot_questions(
+                self.repo_root, run_dir, self.domain_cfg, self.num_samples,
+                sample_seed=per_gen_seed, anchor_ids=self.anchor_ids)
             _t_harness = time.time()
             rc, _out = tx.run_harness_and_report(
                 self.python, run_dir, self.domain, run_id, self.subset,
@@ -381,7 +441,11 @@ class DomainTaskRunner:
             self._event("task_harness_done", genid=str(genid), rc=rc,
                         duration_s=round(time.time() - _t_harness, 1),
                         question_timeout_s=question_timeout_s,
-                        harness_timeout_s=harness_timeout)
+                        harness_timeout_s=harness_timeout,
+                        sample_mode=sample_info.get("mode"),
+                        sample_seed=sample_info.get("sample_seed"),
+                        sampled_ids=sample_info.get("sampled_ids"),
+                        anchor_ids=sample_info.get("anchor_ids"))
             report = tx.read_report(report_path) if rc == 0 else None
             if report is not None:
                 self._event("task_eval_done", genid=str(genid),

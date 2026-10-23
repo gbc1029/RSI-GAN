@@ -804,24 +804,70 @@ def prepare_polyglot_questions(
     run_dir: str,
     domain_cfg: Dict[str, Any],
     num_samples: int,
-) -> str:
+    sample_seed: Optional[int] = None,
+    anchor_ids: Optional[List[str]] = None,
+) -> Tuple[str, Dict[str, Any]]:
     """Polyglot (Arch 2): questions.csv straight from the metadata json.
 
     Each row embeds the exercise's starter files + the writable solution-path
     whitelist (see domains.polyglot.gan_utils). No label column exists: the
     objective outcome is produced by the parent-side eval container.
+
+    Candidate pool + selection (mirrors :func:`select_samples` for CSV
+    domains; the draw itself is the shared :func:`select_seeded_positions`):
+
+    - ``eval_task_list`` non-empty: PINNED pool -- candidates are filtered to
+      this list first (Arch 2 single-language smoke runs; per-task eval images
+      build lazily on first eval).
+    - ``eval_task_list`` absent/empty: FULL pool -- every metadata instance
+      (all 225, all 6 languages) is a candidate.
+
+    - ``sample_seed is None``: legacy metadata-order prefix slice of the pool
+      (deterministic A/B base).
+    - ``sample_seed is not None``: anchor rows first (from ``anchor_ids``,
+      capped at half the budget), then the remainder drawn without
+      replacement -- per-generation rotation, deterministic per
+      (base_seed, genid) so resume reproduces the exact draw. Starter files
+      are materialized only for the selected rows.
+
+    Returns ``(questions_path, sample_info)``; ``sample_info`` carries the
+    audit fields (mode / seed / anchor ids actually present / sampled ids in
+    metadata order) for the task_harness_done event.
     """
     from domains.polyglot import gan_utils as pgu
     task_list = domain_cfg.get("eval_task_list") or None
-    rows = pgu.load_instances(dataset_root, task_list=task_list,
-                              num_samples=num_samples)
+    if sample_seed is not None:
+        pool = [str(i) for i in pgu.load_instance_ids(dataset_root)
+                if not task_list or str(i) in set(task_list)]
+        if num_samples is None or num_samples <= 0:
+            rows = pgu.load_instances(dataset_root, task_list=task_list,
+                                      num_samples=0)
+            sample_info = {"mode": "all", "sample_seed": None,
+                           "anchor_ids": [],
+                           "sampled_ids": [str(r[pgu.QUESTION_ID]) for r in rows]}
+        else:
+            positions, sample_info = select_seeded_positions(
+                pool, int(num_samples), int(sample_seed), anchor_ids)
+            selected = sorted({pool[p] for p in positions})
+            rows = pgu.load_instances(dataset_root, task_list=selected,
+                                      num_samples=0)
+    else:
+        rows = pgu.load_instances(dataset_root, task_list=task_list,
+                                  num_samples=num_samples)
+        sample_info = {
+            "mode": "legacy_prefix" if num_samples and num_samples > 0 else "all",
+            "sample_seed": None,
+            "anchor_ids": [],
+            "sampled_ids": [str(r[pgu.QUESTION_ID]) for r in rows],
+        }
     if not rows:
-        raise ValueError("polyglot: no instances selected (check eval_task_list)")
+        raise ValueError("polyglot: no instances selected (check "
+                         "eval_task_list / sampling seed / metadata)")
     input_dir = os.path.join(run_dir, "input")
     os.makedirs(input_dir, exist_ok=True)
     questions_path = os.path.join(input_dir, "questions.csv")
     pd.DataFrame(rows).to_csv(questions_path, index=False)
-    return questions_path
+    return questions_path, sample_info
 
 
 def run_polyglot_eval(
@@ -913,6 +959,44 @@ def load_dataset_ids(dataset_root: str, domain: str, subset: str) -> List[str]:
     return [str(v) for v in dataset[question_id_col].tolist()]
 
 
+def select_seeded_positions(
+    ids: List[str],
+    num_samples: int,
+    sample_seed: int,
+    anchor_ids: Optional[List[str]] = None,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Position-level seeded draw -- the ONE sampling policy for every domain.
+
+    Anchor rows first (ids present in ``anchor_ids``, pool order,
+    deduplicated; capped at HALF the budget so the anchor core can never
+    consume it), then the remainder drawn WITHOUT replacement from the rest
+    of the pool with ``random.Random(sample_seed)``. Deterministic for a
+    given (seed, pool); returned positions are in pool order. ``select_samples``
+    (CSV domains) and :func:`prepare_polyglot_questions` (metadata domains)
+    both delegate here so the two selection modes can never drift apart.
+    """
+    anchor_req = [str(a) for a in (anchor_ids or [])]
+    anchor_set: Dict[str, int] = {}
+    for pos, qid in enumerate(ids):
+        if qid in anchor_req and qid not in anchor_set:
+            anchor_set[qid] = pos
+    anchor_positions = sorted(anchor_set.values())
+    # Anchor core must never consume the whole budget: cap at half.
+    anchor_positions = anchor_positions[: max(0, num_samples // 2)]
+    n_anchor = len(anchor_positions)
+    pool_positions = [p for p in range(len(ids)) if p not in set(anchor_positions)]
+    n_rest = min(num_samples - n_anchor, len(pool_positions))
+    rng = random.Random(int(sample_seed))
+    drawn = sorted(rng.sample(pool_positions, n_rest)) if n_rest > 0 else []
+    positions = sorted(anchor_positions + drawn)
+    return positions, {
+        "mode": "seeded",
+        "sample_seed": int(sample_seed),
+        "anchor_ids": [ids[p] for p in anchor_positions],
+        "sampled_ids": [str(ids[p]) for p in positions],
+    }
+
+
 def select_samples(
     dataset: pd.DataFrame,
     question_id_col: str,
@@ -942,27 +1026,10 @@ def select_samples(
                           "anchor_ids": [],
                           "sampled_ids": [str(v) for v in selected[question_id_col].tolist()]}
     ids = [str(v) for v in dataset[question_id_col].tolist()]
-    anchor_req = [str(a) for a in (anchor_ids or [])]
-    anchor_set: Dict[str, int] = {}
-    for pos, qid in enumerate(ids):
-        if qid in anchor_req and qid not in anchor_set:
-            anchor_set[qid] = pos
-    anchor_positions = sorted(anchor_set.values())
-    # Anchor core must never consume the whole budget: cap at half.
-    anchor_positions = anchor_positions[: max(0, num_samples // 2)]
-    n_anchor = len(anchor_positions)
-    pool_positions = [p for p in range(len(ids)) if p not in set(anchor_positions)]
-    n_rest = min(num_samples - n_anchor, len(pool_positions))
-    rng = random.Random(int(sample_seed))
-    drawn = sorted(rng.sample(pool_positions, n_rest)) if n_rest > 0 else []
-    positions = sorted(anchor_positions + drawn)
+    positions, info = select_seeded_positions(
+        ids, int(num_samples), int(sample_seed), anchor_ids)
     selected = dataset.iloc[positions]
-    return selected, {
-        "mode": "seeded",
-        "sample_seed": int(sample_seed),
-        "anchor_ids": [ids[p] for p in anchor_positions],
-        "sampled_ids": [str(v) for v in selected[question_id_col].tolist()],
-    }
+    return selected, info
 
 
 def ensure_sampling_seed(
@@ -988,10 +1055,17 @@ def ensure_sampling_seed(
         base_seed = int.from_bytes(os.urandom(8), "big")
     anchor_ids: List[str] = []
     try:
-        pool = (
-            [] if domain == "polyglot" or domain in _SANDBOXED_BALROG_DOMAINS
-            else load_dataset_ids(dataset_root, domain, subset)
-        )
+        if domain == "polyglot":
+            # polyglot has no dataset CSV: its candidate pool is the metadata
+            # id list (FULL pool; a pinned eval_task_list filters only the
+            # eval side, so anchors are drawn from the full pool and simply
+            # find no row when a pinned pool excludes them).
+            from domains.polyglot import gan_utils as _pgu
+            pool = _pgu.load_instance_ids(dataset_root)
+        elif domain in _SANDBOXED_BALROG_DOMAINS:
+            pool = []
+        else:
+            pool = load_dataset_ids(dataset_root, domain, subset)
         k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
         if pool and k > 0:
             rng = random.Random(f"{int(base_seed)}:anchor")
