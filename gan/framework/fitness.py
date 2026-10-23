@@ -161,8 +161,11 @@ def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
               x_ops: Optional[Tuple[str, ...]] = None) -> float:
     """Evaluator fitness: negated calibration error + verdict stability + novelty.
 
-    Never touches benchmark level (docs/14 §3). ``verdict_stability`` missing
-    data degrades to 0 (``fitness_partial`` is stamped by the caller).
+    Never touches benchmark level (docs/14 §3). Both scalars are z-scored
+    against the reference window (verdict_stability was raw in the pre-2026-10
+    revision, which silently shrank its effective weight to ``w2 * sigma_vs``).
+    ``verdict_stability`` missing data stays neutral (term skipped, 0.0);
+    ``fitness_partial`` is stamped by the caller.
     """
     ev = sn.get("evaluator_stats") or {}
     ce = ev.get("calibration_error")
@@ -170,5 +173,13 @@ def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
     refs_ce = _ref_scalars(refs, ("evaluator_stats",), "calibration_error")
     z_ce = z_ref(ce_val, refs_ce)
     vs = ev.get("verdict_stability")
-    vs_val = float(vs) if isinstance(vs, (int, float)) else 0.0
-    return -w1 * z_ce + w2 * vs_val + lambda_ * novelty(sn, refs, novelty_k, x_ops)
+    vs_val = float(vs) if isinstance(vs, (int, float)) else None
+    # verdict_stability is a [0,1] hit-rate; z-score it against the reference
+    # window so its contribution is commensurable with z_ce and novelty (the
+    # pre-normalization raw fraction had an effective weight of w2 * sigma_vs,
+    # i.e. a fraction of the nominal w2). Missing data stays NEUTRAL: the term
+    # is skipped (0.0), never scored as a below-average hit-rate.
+    z_vs = (z_ref(vs_val, _ref_scalars(refs, ("evaluator_stats",),
+                                       "verdict_stability"))
+            if vs_val is not None else 0.0)
+    return -w1 * z_ce + w2 * z_vs + lambda_ * novelty(sn, refs, novelty_k, x_ops)
