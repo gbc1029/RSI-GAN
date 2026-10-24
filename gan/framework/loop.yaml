@@ -119,8 +119,11 @@ fitness:
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
-  eval_samples: 3               # 每个 supernode 入档评估次数（docs/14 允许 2–3；
-                                # 3 = 保证 benchmark.std 有非零样本，否则 beta_variance 空转）
+  eval_samples: 1               # 每个 supernode 入档评估次数（docs/14 允许 2–3；
+                                # 1 = 显著性运行的成本取舍：固定 root 评估是每臂最大开销项，
+                                # 而消融显著性看的是主线最后一代分数、不用档案 fitness。
+                                # 代价：单轮评估使 benchmark.std 恒为 0 → F_p 的
+                                # -beta*z_std 退化为中性（方差项不生效），需在论文声明
   eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 
 # ---------------------------------------------------------------------------
