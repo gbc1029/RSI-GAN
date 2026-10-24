@@ -12,6 +12,14 @@ def report_proof_grading(dname):
     path = os.path.join(dname, "predictions.csv")
     df = pd.read_csv(path, dtype=str)
 
+    # A grading timeout leaves an empty label for that question.  Keep the
+    # denominator aligned with the valid coverage reported by the GAN runner;
+    # missing labels are represented by coverage, not by a false "incorrect".
+    allowed = {"incorrect", "partial", "almost", "correct"}
+    if "prediction" in df.columns:
+        df["prediction"] = df["prediction"].astype(str).str.strip().str.lower()
+        df = df[df["prediction"].isin(allowed)].copy()
+
     total = len(df)
     if total == 0:
         report = {
