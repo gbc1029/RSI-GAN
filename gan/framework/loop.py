@@ -224,6 +224,12 @@ class GanLoop:
         self.heal_tool_overlap = float(cfg.get("outer_select.heal_tool_overlap", 0.5))
         self.cold_start_min = int(cfg.get("mome.cold_start_min", 10))
         self.reference_window = int(cfg.get("mome.reference_window", 10))
+        if self.reference_window < self.cold_start_min:
+            raise ValueError(
+                f"mome.reference_window ({self.reference_window}) must be >= "
+                f"mome.cold_start_min ({self.cold_start_min}); otherwise the "
+                f"rolling reference window can never reach the cold-start "
+                f"threshold and outer parent selection is permanently disabled")
         self.novelty_k = int(cfg.get("mome.novelty_k", 5))
         self.max_elites_per_cell = int(cfg.get("mome.max_elites_per_cell", 3))
         self.eval_samples = int(cfg.get("eval.eval_samples", 3))
@@ -2345,6 +2351,7 @@ class GanLoop:
                     k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                     ucb_c=ucb_c, depth_penalty=depth_penalty, cost_penalty=cost_penalty,
                     outer_id=None if use_global else outer,
+                    exclude={"initial"} if outer > 1 else None,
                 )
                 # Fallback (docs/13 §2.4, 2026-10 revision): every outer starts
                 # with an EMPTY current subtree, so "subtree only" starves every
@@ -2357,6 +2364,7 @@ class GanLoop:
                         k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                         ucb_c=ucb_c, depth_penalty=depth_penalty,
                         cost_penalty=cost_penalty, outer_id=None,
+                        exclude={"initial"} if outer > 1 else None,
                     )
                     if parents:
                         self.log_event({"type": "inner_pool_fallback",

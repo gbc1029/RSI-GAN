@@ -104,11 +104,11 @@ mome:
   x_buckets: 6                  # 默认内置：5 个具名 op + other
   y_buckets: 5                  # 默认内置边界 [0.0, 0.5, 1.0, 2.0]
   z_buckets: 3                  # 默认内置边界 [1.0, 2.0]
-  reference_window: 6           # 赛季 M（novelty 参考集 + z-score 基准）
-  novelty_k: 2                  # 必须 <= cold_start_min-1，否则 kNN 参考不足（方案 B）
-  cold_start_min: 4             # 档案少于此数 → 完全链式（不选父）
-                                # 方案 B：10 -> 4，使 outer 5 起真正选父
-                                # （G=10 时约 6 届走选父）；偏离 docs/14 默认值，需在论文声明
+  reference_window: 10          # 赛季 M（novelty 参考集 + z-score 基准）；必须 >= cold_start_min
+  novelty_k: 3                  # 必须 <= cold_start_min-1，否则 kNN 参考不足（方案 B）
+  cold_start_min: 3             # 档案少于此数 → 完全链式（不选父）
+                                # 方案 B：10 -> 3，使 outer 4 起真正选父
+                                # （G=10 时约 7 届走选父）；偏离 docs/14 默认值，需在论文声明
   max_elites_per_cell: 3        # 每格 Pareto 前沿容量上限
 
 fitness:
@@ -119,8 +119,8 @@ fitness:
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
-  eval_samples: 2               # 每个 supernode 入档评估次数（docs/14 允许 2–3；
-                                # 2 = 在 G=10 的固定 root 评估开销与 std 可用性间取平衡）
+  eval_samples: 3               # 每个 supernode 入档评估次数（docs/14 允许 2–3；
+                                # 3 = 保证 benchmark.std 有非零样本，否则 beta_variance 空转）
   eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 
 # ---------------------------------------------------------------------------
