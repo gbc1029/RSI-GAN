@@ -29,11 +29,18 @@ def eval_run_dir(output_dir: str, outer: int, sample: int) -> str:
 
 def run_eval_rounds(run_once: Callable[[int], Optional[float]],
                     samples: int,
-                    timeout_s: Optional[float] = None) -> Dict[str, Any]:
+                    timeout_s: Optional[float] = None,
+                    on_error: Optional[Callable[[int, BaseException], None]] = None,
+                    ) -> Dict[str, Any]:
     """Run ``samples`` independent rounds; aggregate mean/std/n_valid.
 
     ``run_once(sample)`` returns the round's benchmark score (or None on
     failure). A failed round shrinks ``n_valid`` but never aborts the batch.
+
+    ``on_error(sample, exc)`` is called for a round that RAISED, so the caller can
+    turn the failure into a durable event. Swallowing it silently made a broken
+    evaluation indistinguishable from "no data": every fixed-root batch degraded
+    to n_valid=0 with zero evidence of the cause.
 
     ``timeout_s`` (``eval.eval_timeout_s``) is a **batch** wall-clock budget,
     checked BETWEEN rounds: once spent, remaining rounds are skipped and
@@ -52,7 +59,12 @@ def run_eval_rounds(run_once: Callable[[int], Optional[float]],
             sc = run_once(s)
             if sc is not None:
                 scores.append(float(sc))
-        except Exception:  # noqa: BLE001 -- a failed round just shrinks n_valid
+        except Exception as e:  # noqa: BLE001 -- a failed round just shrinks n_valid
+            if on_error is not None:
+                try:
+                    on_error(s, e)
+                except Exception:  # noqa: BLE001 -- reporting never aborts a batch
+                    pass
             continue
     if not scores:
         return {"mean": None, "std": None, "n_valid": 0, "scores": [],

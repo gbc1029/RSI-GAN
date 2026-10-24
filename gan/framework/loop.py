@@ -224,6 +224,12 @@ class GanLoop:
         self.heal_tool_overlap = float(cfg.get("outer_select.heal_tool_overlap", 0.5))
         self.cold_start_min = int(cfg.get("mome.cold_start_min", 10))
         self.reference_window = int(cfg.get("mome.reference_window", 10))
+        if self.reference_window < self.cold_start_min:
+            raise ValueError(
+                f"mome.reference_window ({self.reference_window}) must be >= "
+                f"mome.cold_start_min ({self.cold_start_min}); otherwise the "
+                f"rolling reference window can never reach the cold-start "
+                f"threshold and outer parent selection is permanently disabled")
         self.novelty_k = int(cfg.get("mome.novelty_k", 5))
         self.max_elites_per_cell = int(cfg.get("mome.max_elites_per_cell", 3))
         self.eval_samples = int(cfg.get("eval.eval_samples", 3))
@@ -388,6 +394,12 @@ class GanLoop:
         parent = self.task_tree.get("initial")
         genid = self._gen_counter
         self._gen_counter += 1
+        # The regular loop pins ``outer_<O>_base`` at the top of each outer, but
+        # A6 returns BEFORE that loop -- yet ``_align_code_base`` resolves the
+        # initial parent to exactly that ref. Without this pin the checkout fails
+        # with ``pathspec 'outer_1_base' did not match`` (A6 died in 18s in the
+        # 2026-10-22 matrix). Pin the entry HEAD here, once, idempotently.
+        self._pin_outer_base(1)
         base = self._align_code_base(parent, 1, genid)
         plan_result = self._empty_plan_result(self._initial_task_config())
         try:
@@ -1468,6 +1480,17 @@ class GanLoop:
                 child = self.task_runner(plan=plan_result, parent=initial,
                                          genid=genid, base=eval_base)
                 if child is None:
+                    # A None child used to vanish: run_eval_rounds only counts
+                    # non-None scores, so the batch silently degraded to n_valid=0
+                    # (``supernode_eval_degraded``) with no evidence of WHY.
+                    self.log_event({"type": "eval_round_empty", "outer": outer,
+                                    "sample": sample, "genid": genid,
+                                    "eval_base": eval_base})
+                    return None
+                if child.value.score is None:
+                    self.log_event({"type": "eval_round_no_score", "outer": outer,
+                                    "sample": sample, "genid": genid,
+                                    "score_status": child.value.score_status})
                     return None
                 return child.value.score
 
@@ -1481,7 +1504,12 @@ class GanLoop:
                     main_head = None
 
             result = E.run_eval_rounds(run_once, self.eval_samples,
-                                       timeout_s=self.eval_timeout_s)
+                                       timeout_s=self.eval_timeout_s,
+                                       on_error=lambda s, exc: self.log_event({
+                                           "type": "eval_round_failed",
+                                           "outer": outer, "sample": s,
+                                           "error": f"{type(exc).__name__}: {exc}",
+                                           "genid": E.eval_genid(outer, s)}))
 
             # restore the main-line task HEAD (evaluation commits become orphans).
             # A SILENT failure here leaves the main line on an eval commit and
@@ -2323,7 +2351,24 @@ class GanLoop:
                     k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                     ucb_c=ucb_c, depth_penalty=depth_penalty, cost_penalty=cost_penalty,
                     outer_id=None if use_global else outer,
+                    exclude={"initial"} if outer > 1 else None,
                 )
+                # Fallback (docs/13 §2.4, 2026-10 revision): every outer starts
+                # with an EMPTY current subtree, so "subtree only" starves every
+                # outer after the first. When the subtree has no candidate, fall
+                # back to the global pool ONCE (same metric, previous outers'
+                # real nodes) and record it. If cross_subtree_epsilon=1.0 the
+                # pool is already global and this never triggers.
+                if not parents and not use_global:
+                    parents = self.task_tree.select_parents(
+                        k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
+                        ucb_c=ucb_c, depth_penalty=depth_penalty,
+                        cost_penalty=cost_penalty, outer_id=None,
+                        exclude={"initial"} if outer > 1 else None,
+                    )
+                    if parents:
+                        self.log_event({"type": "inner_pool_fallback",
+                                        "outer": outer, "inner": inner})
                 if not parents:
                     self.log_event({"type": "inner_skip", "reason": "no_candidate", "outer": outer, "inner": inner})
                     break
@@ -2343,12 +2388,26 @@ class GanLoop:
                 parent_meta = parent.meta or {}
                 parent_feedback = parent_meta.get("feedback")
                 parent_receipt = parent_meta.get("receipt")
+                parent_outer = parent_meta.get("outer_id")
+                cross_outer = parent_outer is not None and parent_outer != outer
+                # Cross-outer lineage (docs/13 §2.4): the evaluator's issue
+                # round-trip is per-outer session state (fresh instance each
+                # outer; issue_id resets to i-1...). A parent selected from a
+                # DIFFERENT outer carries stale issues -- forcing respond_issue/
+                # judge_fix on them wastes budget and collides ids with this
+                # outer's fresh issues. Strip issues (keep diff_summary/scores/
+                # calibration); the planner and evaluator both read THIS
+                # parent_feedback, so one scrub covers both.
+                if cross_outer:
+                    if parent_feedback and parent_feedback.get("issues"):
+                        parent_feedback = {**parent_feedback, "issues": []}
                 # Mirrors carry parent-child semantics; the per-round
                 # record lands on the child meta at settle (feedback /
                 # feedback_digest / receipt) and the next selection reads it.
                 self._parent_feedback = parent_feedback
                 self._parent_receipt = parent_receipt
-                self._parent_digest = parent_meta.get("feedback_digest")
+                self._parent_digest = (
+                    None if cross_outer else parent_meta.get("feedback_digest"))
                 parent_predicted_score = parent_meta.get("predicted_score")
                 parent_benchmark_score = parent_meta.get("benchmark_score")
                 evaluator_issues = (parent_feedback or {}).get("issues")

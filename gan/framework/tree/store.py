@@ -169,9 +169,12 @@ class TreeStore:
 
     # -- selection ---------------------------------------------------------
     def _candidates(self, branch_limit: int, depth_limit: int,
-                    outer_id: Optional[int] = None) -> List[Node]:
+                    outer_id: Optional[int] = None,
+                    exclude: Optional[set] = None) -> List[Node]:
         out = []
         for k in self.order:
+            if exclude is not None and k in exclude:
+                continue
             n = self.nodes[k]
             if not n.valid_parent or n.status != "alive":
                 continue
@@ -208,14 +211,18 @@ class TreeStore:
         depth_penalty: float = 0.05,
         cost_penalty: float = 0.0,
         outer_id: Optional[int] = None,
+        exclude: Optional[set] = None,
     ) -> List[Node]:
         """Return up to ``k`` parents (``k>1`` used by crossover).
 
         ``outer_id`` restricts the candidate pool to that outer's subtree
         (nodes with a different ``meta.outer_id`` are excluded; nodes without
         an ``outer_id`` — ``initial`` and pre-migration nodes — stay eligible).
+        ``exclude`` drops genids from the pool (e.g. keeping ``initial``
+        root-only for the first outer).
         """
-        cands = self._candidates(branch_limit, depth_limit, outer_id=outer_id)
+        cands = self._candidates(branch_limit, depth_limit, outer_id=outer_id,
+                                 exclude=exclude)
         if not cands:
             return []
         if method == "latest":
@@ -238,9 +245,11 @@ class TreeStore:
         depth_penalty: float = 0.05,
         cost_penalty: float = 0.0,
         outer_id: Optional[int] = None,
+        exclude: Optional[set] = None,
     ) -> Optional[Node]:
         ps = self.select_parents(1, branch_limit, depth_limit, method, ucb_c,
-                                 depth_penalty, cost_penalty, outer_id=outer_id)
+                                 depth_penalty, cost_penalty, outer_id=outer_id,
+                                 exclude=exclude)
         return ps[0] if ps else None
 
     # -- import from DGM-H -------------------------------------------------

@@ -908,6 +908,17 @@ def run_gan_driver(
         }
         if bool(cfg.get("source_access.deny_deep", False)):
             _ablation_active["deny_deep"] = True
+        # EFFECTIVE regime. When a switch is no longer pinned per arm (the ablation
+        # driver stopped forcing --set outer_select.enabled), cfg_overrides no
+        # longer proves which outer-level regime a run used. Record the resolved
+        # values here so every arm stays auditable from events.jsonl alone.
+        _effective = {
+            "outer_select.enabled": bool(cfg.get("outer_select.enabled", False)),
+            "mome.cold_start_min": int(cfg.get("mome.cold_start_min", 10)),
+            "mome.novelty_k": int(cfg.get("mome.novelty_k", 5)),
+            "eval.eval_samples": int(cfg.get("eval.eval_samples", 3)),
+            "loop.inner_max": int(cfg.get("loop.inner_max", 3)),
+        }
         _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
                                 "outer_generations": G,
                                 "domain": domain,
@@ -917,6 +928,7 @@ def run_gan_driver(
                                 "start_outer": start,
                                 "ablation": _ablation_active,
                                 "cfg_overrides": cfg_overrides or {},
+                                "effective": _effective,
                                 "num_samples": num_samples,
                                 "subset": subset})
 
