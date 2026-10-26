@@ -29,7 +29,14 @@ from domains.polyglot.utils import (
 
 
 def get_eval_script(commands):
-    return "\n".join(["#!/bin/bash", "set -uxo pipefail"] + commands) + "\n"
+    # F1 (stage-1 sanity finding): language packages installed in the conda
+    # env (python's pytest et al.) are NOT on the container's default PATH --
+    # without activation the eval exits 127 and EVERY python task is silently
+    # unresolved even with a perfect solution. System-path tools
+    # (go/node/cargo/cmake/java) are unaffected by the extra activation.
+    # Same activation pattern as setup_repo.sh; env_name = testbed (test_spec).
+    prefix = ["source /opt/miniconda3/bin/activate", "conda activate testbed"]
+    return "\n".join(["#!/bin/bash", "set -uxo pipefail"] + prefix + commands) + "\n"
 
 def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_dir, model=None,
                   external_patch=None, eval_only=False):

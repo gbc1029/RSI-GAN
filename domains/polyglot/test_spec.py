@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Union, cast
 
 from domains.polyglot.constants import (
+    GRADLE_ENV_EXTRA_DOCKERFILE,
     MAP_REPO_TO_INSTALL,
     MAP_REPO_VERSION_TO_SPECS,
     USE_X86,
@@ -130,6 +131,12 @@ class TestSpec:
         """
         hash_object = hashlib.sha256()
         hash_object.update(str(self.env_script_list).encode("utf-8"))
+        # F2: The Gradle offline support lives in the env image Dockerfile
+        # (GRADLE_ENV_EXTRA_DOCKERFILE), not in the env script list.  Fold it
+        # into the content-addressed key so editing the Dockerfile fragment
+        # (e.g. adding a chmod for the Gradle launcher) triggers a rebuild of
+        # java env images instead of silently reusing stale ones.
+        hash_object.update(b"|dockerfile:" + str(self.env_dockerfile).encode("utf-8"))
         try:
             req_path = Path(__file__).resolve().parents[2] / "requirements.txt"
             hash_object.update(b"|req:" + req_path.read_bytes())
@@ -154,7 +161,13 @@ class TestSpec:
 
     @property
     def env_dockerfile(self):
-        return get_dockerfile_env(self.platform, self.arch)
+        # F2: java's env image bakes the Gradle distribution + seed project
+        # (offline wrapper cache + maven dependency warm-up); other languages
+        # get an empty extras block (byte-identical dockerfile, same hash).
+        language = self.instance_id.split("__")[0]
+        gradle_env = GRADLE_ENV_EXTRA_DOCKERFILE if language == "java" else ""
+        return get_dockerfile_env(self.platform, self.arch,
+                                  gradle_env=gradle_env)
 
     @property
     def instance_dockerfile(self):
@@ -294,6 +307,12 @@ def make_env_script_list(instance: dict, specs: dict, env_name: str) -> list[str
         pip_packages = " ".join(specs["pip_packages"])
         cmd = f"python -m pip install {pip_packages}"
         reqs_commands.append(cmd)
+
+    # F2: language-specific env extras. Appended LAST so they run with the
+    # conda env active; the extra lines feed the env image hash, so changing
+    # them rebuilds exactly the Java env image while other languages keep
+    # their existing images (content-addressed).
+    reqs_commands.extend(specs.get("env_extras") or [])
     return reqs_commands
 
 
