@@ -175,7 +175,13 @@ class TreeStore:
             n = self.nodes[k]
             if not n.valid_parent or n.status != "alive":
                 continue
-            if n.children >= branch_limit:
+            if n.children >= branch_limit and n.meta.get("outer_id") is not None:
+                # The shared root / legacy anchor nodes (no outer_id) are the
+                # only starting point for a new outer's first generation.
+                # Their parent capacity must not be exhausted by the branch
+                # limit, otherwise a new outer cannot begin once the root has
+                # spawned branch_limit outer-seeds. Regular nodes that belong
+                # to a specific outer still respect the limit.
                 continue
             if n.depth >= depth_limit:
                 continue

@@ -87,7 +87,7 @@ tree:
 #   enabled=false 时以下所有键短路，outer 保持单链（里程碑 A 行为）。
 # ---------------------------------------------------------------------------
 outer_select:
-  enabled: false                # 总开关；false = 现有单链行为（完全不变）
+  enabled: true                # 总开关；false = 现有单链行为（完全不变）
   tournament_k: 3               # 锦标赛抽签数
   restore_max_tries: 3          # 恢复父代设计 + heal 的最大尝试数（全失败退回链式）
   heal_tool_overlap: 0.5        # heal 后 tools 与父代 tools 的 Jaccard 重叠阈值（低于则放弃该父代）
