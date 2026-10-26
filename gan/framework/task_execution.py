@@ -899,17 +899,29 @@ def derive_sample_seed(base_seed: int, genid: str) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
-def load_dataset_ids(dataset_root: str, domain: str, subset: str) -> List[str]:
-    """Pool of question ids for the domain/subset (parent side only)."""
+def load_dataset_frame(dataset_root: str, domain: str, subset: str):
+    """Load a domain/subset dataset plus its (id column, ground-truth column).
+
+    Single place that knows the on-disk dataset layout and the domain utils
+    column names, so the sampling entries below cannot drift apart (the id
+    column used to be re-derived in three separate functions).
+    """
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
     domain_folder = domain.split("_")[0] if "imo_" in domain else domain
     utils_module = importlib.import_module(f"domains.{domain_folder}.{utils_prefix}utils")
-    question_id_col = utils_module.QUESTION_ID
+    question_id_col = str(utils_module.QUESTION_ID)
+    ground_truth_key = str(utils_module.GROUND_TRUTH_KEY)
     if "imo_" in domain:
         rel = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
     else:
         rel = f"domains/{domain}/dataset{subset}.csv"
     dataset = pd.read_csv(os.path.join(os.path.abspath(dataset_root), rel), dtype=str)
+    return dataset, question_id_col, ground_truth_key
+
+
+def load_dataset_ids(dataset_root: str, domain: str, subset: str) -> List[str]:
+    """Pool of question ids for the domain/subset (parent side only)."""
+    dataset, question_id_col, _gt = load_dataset_frame(dataset_root, domain, subset)
     return [str(v) for v in dataset[question_id_col].tolist()]
 
 
@@ -973,12 +985,20 @@ def ensure_sampling_seed(
     num_samples: int,
     anchor_k: int = 2,
     base_seed: Optional[int] = None,
+    eval_subset: Optional[str] = None,
+    eval_anchor_k: int = 0,
 ) -> Dict[str, Any]:
     """Create (or reload) the run-persistent sampling seed + anchor core.
 
     Idempotent: the seed file lives at ``<output_dir>/ckpt/sample_seed.json``
     and survives resume -- a re-run with the same output_dir reuses the exact
     base seed and anchor ids (comparability with already-scored generations).
+
+    ``eval_subset`` / ``eval_anchor_k`` add the run-persistent EVALUATION
+    anchor core (``eval_anchor_ids``), a second, independent fixed question set
+    used only by the fixed-root evaluation. Because the loader is
+    skip-if-exists, both fields only materialize for a NEW run dir -- an old
+    dir keeps its historical sampling and its historical (no-val) supernodes.
     """
     seed_path = os.path.join(output_dir, "ckpt", "sample_seed.json")
     if os.path.isfile(seed_path):
@@ -999,8 +1019,37 @@ def ensure_sampling_seed(
     except Exception as exc:  # noqa: BLE001 -- anchor drawing must never kill a run
         anchor_ids = []
         _log_soft_sample_note(f"anchor drawing failed ({exc}); continuing without anchors")
+    # Evaluation anchor core (docs/14 section 5.5): the fixed-root evaluation
+    # runs on its OWN question set, drawn ONCE per run and identical in every
+    # outer, so a supernode is measured on the same questions as its siblings.
+    # It is deliberately independent of the main chain's ``anchor_k`` and NOT
+    # subject to the ``num_samples // 2`` cap above -- that cap protects the
+    # main line's PAIRING (half anchor, half fresh draw), whereas an evaluation
+    # set wants to be entirely fixed. Measured: a k=2 evaluation core has zero
+    # discriminating power (one always-right plus one always-wrong question; the
+    # constant-policy arm A1 scored exactly 0.5000 over 36 generations).
+    eval_ids: List[str] = []
+    eval_subset_used = str(eval_subset or "")
+    eval_k_used = max(0, int(eval_anchor_k or 0))
+    if eval_subset_used and eval_k_used > 0:
+        try:
+            eval_pool = (
+                [] if domain == "polyglot" or domain in _SANDBOXED_BALROG_DOMAINS
+                else load_dataset_ids(dataset_root, domain, eval_subset_used)
+            )
+            if eval_pool:
+                erng = random.Random(f"{int(base_seed)}:eval_anchor")
+                eval_ids = sorted(erng.sample(eval_pool, min(eval_k_used, len(eval_pool))))
+        except Exception as exc:  # noqa: BLE001 -- evaluation may fall back
+            eval_ids = []
+            _log_soft_sample_note(
+                f"eval anchor drawing failed ({exc}); the fixed-root evaluation "
+                f"will fall back to a seeded draw over the main subset")
     info = {"base_seed": int(base_seed), "anchor_ids": anchor_ids,
-            "domain": domain, "subset": subset}
+            "domain": domain, "subset": subset,
+            "eval_anchor_ids": eval_ids,
+            "eval_subset": eval_subset_used,
+            "eval_anchor_k": eval_k_used}
     os.makedirs(os.path.dirname(seed_path), exist_ok=True)
     tmp = seed_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1027,24 +1076,68 @@ def prepare_questions(
     Returns ``(questions_path, ground_truth_by_id, sample_info)``; ``sample_info``
     is the audit record from :func:`select_samples` (mode/seed/ids).
     """
-    utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
-    domain_folder = domain.split("_")[0] if "imo_" in domain else domain
-    utils_module = importlib.import_module(
-        f"domains.{domain_folder}.{utils_prefix}utils"
-    )
-    question_id_col = utils_module.QUESTION_ID
-    ground_truth_key = utils_module.GROUND_TRUTH_KEY
-
-    if "imo_" in domain:
-        rel = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
-    else:
-        rel = f"domains/{domain}/dataset{subset}.csv"
-    dataset = pd.read_csv(os.path.join(os.path.abspath(dataset_root), rel), dtype=str)
+    dataset, question_id_col, ground_truth_key = load_dataset_frame(
+        dataset_root, domain, subset)
     dataset, sample_info = select_samples(
         dataset, question_id_col, num_samples,
         sample_seed=sample_seed, anchor_ids=anchor_ids,
     )
+    return _write_questions(dataset, question_id_col, ground_truth_key, run_dir, sample_info)
 
+
+def prepare_questions_by_ids(
+    dataset_root: str,
+    run_dir: str,
+    domain: str,
+    subset: str,
+    question_ids: List[str],
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Write questions-only input for an EXPLICIT question-id list.
+
+    The fixed-root evaluation needs a question set no sampling rule can change.
+    :func:`select_samples` cannot express that: it always mixes an anchor core
+    with a fresh per-genid draw, and it caps the anchor core at
+    ``num_samples // 2`` (so 30 anchors silently become 15). This entry point
+    pins the set instead -- dataset order, deduplicated, with ids that are
+    absent from the pool reported in ``sample_info["missing_ids"]`` rather than
+    silently dropped (a silently shorter set would corrupt the comparison it
+    exists to enable).
+
+    Returns ``(questions_path, ground_truth_by_id, sample_info)`` with
+    ``sample_info["mode"] == "fixed_ids"``.
+    """
+    dataset, question_id_col, ground_truth_key = load_dataset_frame(
+        dataset_root, domain, subset)
+    requested = [str(q) for q in (question_ids or [])]
+    wanted = set(requested)
+    positions: List[int] = []
+    seen: Dict[str, int] = {}
+    for pos, qid in enumerate(str(v) for v in dataset[question_id_col].tolist()):
+        if qid in wanted and qid not in seen:
+            seen[qid] = pos
+            positions.append(pos)
+    selected = dataset.iloc[positions]
+    sampled_ids = [str(v) for v in selected[question_id_col].tolist()]
+    sample_info = {
+        "mode": "fixed_ids",
+        "sample_seed": None,
+        "anchor_ids": list(sampled_ids),
+        "sampled_ids": sampled_ids,
+        "requested_ids": requested,
+        "missing_ids": [q for q in requested if q not in seen],
+    }
+    return _write_questions(selected, question_id_col, ground_truth_key,
+                            run_dir, sample_info)
+
+
+def _write_questions(
+    dataset,
+    question_id_col: str,
+    ground_truth_key: str,
+    run_dir: str,
+    sample_info: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Persist the questions-only CSV; ground truth stays in parent memory."""
     ground_truth_by_id = dict(
         zip(dataset[question_id_col].tolist(), dataset[ground_truth_key].tolist())
     )

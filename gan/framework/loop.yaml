@@ -122,9 +122,36 @@ eval:
   eval_samples: 1               # 每个 supernode 入档评估次数（docs/14 允许 2–3；
                                 # 1 = 显著性运行的成本取舍：固定 root 评估是每臂最大开销项，
                                 # 而消融显著性看的是主线最后一代分数、不用档案 fitness。
-                                # 代价：单轮评估使 benchmark.std 恒为 0 → F_p 的
+                                # 代价：单轮评估使 benchmark.val_std 恒为 0 → F_p 的
                                 # -beta*z_std 退化为中性（方差项不生效），需在论文声明
+  # 评测题集（docs/14 §5.5 修订）：评估不再"每轮换一套题"，而是在一个 run 内
+  # 固定不变。eval.subset 指向 held-out val 子集，eval.anchor_k 是其中的锚点题数，
+  # 由 ckpt/sample_seed.json 的 eval_anchor_ids 落地（每个 run 只抽一次，跨 outer
+  # 完全相同）。判分结果写 benchmark.val_mean，fitness_p 优先读它。
+  # 为什么不用主链的 sampling.anchor_k：实测 k=2 的锚点核没有区分度（一题人人对 +
+  # 一题人人错，A1 恒定策略在 36 代上恰好 0.5000）。评估集要"全固定"，因此不受
+  # select_samples 的 num_samples//2 上限约束（该上限保护的是主链的锚点+抽签配平）。
+  subset: _filtered_100_val     # 空 = 沿用主链子集（旧行为，题集每代变化）
+  anchor_k: 30                  # 0 = 不做固定锚点评估；建议 >= 20 才有区分度
   eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
+
+# ---------------------------------------------------------------------------
+# 设计写入限制（非消融开关；消费者：gan/build.py -> AccessBroker ->
+# role_process broker_info -> gan/framework/context.py design_limits() ->
+# gan/tools/design/set_prompt.py prompt_rewrite_error，两条 prompt 写入口共用）
+#
+# R2：set_prompt / set_config(key="prompt") 原先只做 shape 校验，于是 planner 最
+# 省力、最无约束的"改进"就是把整段 task prompt 换掉。Stage-A 实测：385 -> 998 ->
+# 1351 字符（行级 similarity 0.24 / 0.18），task agent 从"一个词"变成"写完整
+# 评审"；即使事后把标签从评审里捞回来，该臂仍然垫底——说明改坏的不只是格式，
+# 还有判定本身。此键把"整段重写"变成被拒绝的操作。
+#
+# 判据用**字符级**相似度（行级那个对单行 prompt 的任何编辑都算 0.0，分不清改错字
+# 和整段替换）。始终允许：空 prompt 的首次写入、与 seed 完全相同的写入（回退到
+# generation-0 是合法的恢复路径）。0 = 关闭闸门（供试验/回退场景）。
+# ---------------------------------------------------------------------------
+design:
+  prompt_rewrite_min_similarity: 0.5   # 保留不足 50% 原文即视为整段重写并拒绝
 
 # ---------------------------------------------------------------------------
 # 修改深度 / 源码门控（v1.1 修订）

@@ -123,6 +123,7 @@ class GanLoop:
         planner: Any = None,
         evaluator: Any = None,
         task_runner: Callable[..., Node] = None,
+        eval_runner: Optional[Callable[..., Node]] = None,
         broker: Any = None,
         resume: bool = False,
         enable_checkpoint: bool = True,
@@ -144,6 +145,12 @@ class GanLoop:
         self.planner = planner
         self.evaluator = evaluator
         self.task_runner = task_runner
+        # Separate runner for the fixed-root evaluation (docs/14 §5.5). It is
+        # pinned to the run-persistent EVALUATION question set (held-out val
+        # split, fixed ids, never re-sampled), so every supernode of the run is
+        # measured on exactly the same questions. Falling back to the main-line
+        # runner keeps offline smokes / legacy constructions working.
+        self.eval_runner = eval_runner or task_runner
         self.broker = broker
         self.resume = bool(resume)
         self.enable_checkpoint = bool(enable_checkpoint)
@@ -234,6 +241,12 @@ class GanLoop:
         self.max_elites_per_cell = int(cfg.get("mome.max_elites_per_cell", 3))
         self.eval_samples = int(cfg.get("eval.eval_samples", 3))
         self.eval_base_ref = str(cfg.get("eval.eval_base", "eval_base"))
+        # The evaluation question set (docs/14 §5.5): a held-out subset with a
+        # run-persistent anchor core, resolved by ``build.py`` from
+        # ``ckpt/sample_seed.json``. Empty = no dedicated set (legacy behaviour:
+        # the evaluation reuses the main-line runner's sampling).
+        self.eval_subset = str(cfg.get("eval.subset", "") or "")
+        self.eval_anchor_k = int(cfg.get("eval.anchor_k", 0) or 0)
         # Per-batch wall-clock budget for the fixed-root evaluation (s). 0/None =
         # unbounded. Checked BETWEEN rounds (a single in-flight round cannot be
         # interrupted in-process, so a hung round still overruns).
@@ -1261,6 +1274,23 @@ class GanLoop:
                     "coverage": coverage,
                     "n_valid": len(scores),
                     "mae": mae,
+                    # Fixed-root evaluation (docs/14 §5.5). ``mean`` above stays
+                    # the MAIN-LINE train score -- its question set changes every
+                    # generation, so it is a diagnostic, not a comparable level.
+                    # ``val_mean`` is the score on the run-persistent held-out
+                    # evaluation set, identical for every supernode -> that is
+                    # what ``fitness_p`` compares and what the selection orders by.
+                    "val_mean": None,
+                    "val_std": None,
+                    "val_n_valid": 0,
+                    # Honest FACT, not configuration intent: only a dedicated
+                    # evaluation runner (fixed question set) makes this a val
+                    # measurement. With the main-line fallback nothing has been
+                    # measured yet, so the field stays None.
+                    "val_subset": (getattr(self.eval_runner, "subset", None)
+                                   if self.eval_runner is not self.task_runner
+                                   else None),
+                    "val_anchor_ids": [],
                     "eval_baseline": None,   # filled by evaluate_on_root (B4)
                     "reevaluated": False,    # -> true after evaluate_on_root (B4)
                 },
@@ -1358,10 +1388,17 @@ class GanLoop:
             # An entry with no benchmark at all has NO comparable F_p: it would
             # never be pruned (_dominates returns False on None), would occupy a
             # per-cell capacity slot, and could win a tournament draw when its
-            # cell holds only such entries. Keep it out of the archive.
+            # cell holds only such entries. Keep it out of the archive. The same
+            # holds when the entry's score was measured with a different
+            # yardstick than the window (val vs main-line mean) -- that is the
+            # mixed-baseline defect, so the reason distinguishes them.
             if fp is None:
-                self.log_event({"type": "supernode_not_archived", "outer": outer,
-                                "reason": "no_benchmark"})
+                conflict = F.scale_conflict(sn, refs)
+                self.log_event({
+                    "type": "supernode_not_archived", "outer": outer,
+                    "reason": "scale_mismatch" if conflict else "no_benchmark",
+                    "detail": conflict,
+                })
                 return
             key = arch.upsert({
                 "outer": outer,
@@ -1414,6 +1451,17 @@ class GanLoop:
         on the fixed eval base; the task tree / scores are NOT written, and the
         main-line task HEAD is restored afterwards (evaluation commits become
         orphans).
+
+        The question set is fixed per RUN, not per round: ``self.eval_runner``
+        carries an explicit id list (``fixed_question_ids``), drawn once from the
+        held-out evaluation subset and identical for every supernode. Without
+        that list the eval genid changes per round and ``derive_sample_seed``
+        turns it into a FRESH question draw -- which is what made sibling
+        supernodes incomparable (same code base, different exam).
+
+        The result lands in ``benchmark.val_mean`` (NOT ``benchmark.mean``):
+        ``mean`` remains the main-line train score, whose question set changes
+        every generation. ``fitness_p`` compares ``val_mean``.
         """
         if not self.outer_select_enabled:
             return
@@ -1425,6 +1473,29 @@ class GanLoop:
 
             sn = load_supernode(self.output_dir, outer)
             if not sn:
+                return
+            # Defect-1 guard (docs/14 §5.5): the evaluation is only comparable
+            # when the QUESTION SET IS FIXED. Without ``eval_anchor_ids`` -- an
+            # old run dir that predates the val evaluation (the seed file is
+            # skip-if-exists), or a failed anchor draw -- ``eval_runner`` falls
+            # back to the main-line runner, whose per-genid seed draws a
+            # DIFFERENT question set for every round. That is exactly the
+            # unpaired measurement the val evaluation replaced: refuse to stamp
+            # a score for it instead of publishing an incomparable number that
+            # ``fitness_p`` would then PREFER over the honest main-line mean.
+            fixed_ids = list(getattr(self.eval_runner, "fixed_question_ids", None) or [])
+            if self.eval_runner is self.task_runner or not fixed_ids:
+                self.log_event({
+                    "type": "eval_question_set_missing", "outer": outer,
+                    "eval_runner_is_main": self.eval_runner is self.task_runner,
+                    "fixed_ids": len(fixed_ids),
+                    "eval_subset": self.eval_subset or None,
+                    "eval_anchor_k": self.eval_anchor_k,
+                    "skipped_note": "no benchmark.val_mean written for this outer",
+                    "hint": ("ckpt/sample_seed.json has no eval_anchor_ids "
+                             "(the loader is skip-if-exists, so a NEW run dir is "
+                             "required for the val evaluation)"),
+                })
                 return
             eval_base = self._resolve_eval_base()
             if eval_base is None:
@@ -1477,7 +1548,7 @@ class GanLoop:
                         max_tool_calls=self.plan_max_tool_calls,
                         tool_repeat_limit=self.tool_repeat_limit,
                     ) or {}
-                child = self.task_runner(plan=plan_result, parent=initial,
+                child = self.eval_runner(plan=plan_result, parent=initial,
                                          genid=genid, base=eval_base)
                 if child is None:
                     # A None child used to vanish: run_eval_rounds only counts
@@ -1530,22 +1601,35 @@ class GanLoop:
                           event_path=paths.events_path(self.output_dir),
                           event_type="eval_head_restore_unavailable", outer=outer)
 
-            # Only a batch with at least one VALID round may overwrite the
-            # benchmark. Assigning a None mean on total failure would ERASE the
-            # main-line score -- the degradation must keep the old value.
+            # Only a batch with at least one VALID round may stamp the val score.
+            # Assigning a None mean on total failure would ERASE a previous good
+            # estimate -- the degradation must keep the old values.
             if result["n_valid"] > 0:
-                sn["benchmark"]["mean"] = result["mean"]
-                sn["benchmark"]["std"] = result["std"]
-                sn["benchmark"]["n_valid"] = result["n_valid"]
+                # Deliberately NOT written into ``benchmark.mean``: that field is
+                # the main-line train score and overwriting it silently replaced
+                # an in-run measurement with an out-of-run one (and made the
+                # pre/post-evaluation numbers incomparable).
+                sn["benchmark"]["val_mean"] = result["mean"]
+                sn["benchmark"]["val_std"] = result["std"]
+                sn["benchmark"]["val_n_valid"] = result["n_valid"]
+                sn["benchmark"]["val_subset"] = (
+                    getattr(self.eval_runner, "subset", None)
+                    or self.eval_subset or None)
+                sn["benchmark"]["val_anchor_ids"] = list(
+                    getattr(self.eval_runner, "fixed_question_ids", None) or [])
                 sn["benchmark"]["eval_baseline"] = self.eval_base_ref
                 sn["benchmark"]["reevaluated"] = True
             else:
                 sn["benchmark"]["reevaluated"] = False
                 self.log_event({"type": "supernode_eval_degraded", "outer": outer,
-                                "keep_mean": (sn.get("benchmark") or {}).get("mean")})
+                                "keep_mean": (sn.get("benchmark") or {}).get("mean"),
+                                "keep_val_mean": (sn.get("benchmark") or {}).get("val_mean")})
             update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
             self.log_event({"type": "supernode_evaluated", "outer": outer,
-                            "mean": result["mean"], "n_valid": result["n_valid"],
+                            "val_mean": result["mean"], "n_valid": result["n_valid"],
+                            "eval_subset": (getattr(self.eval_runner, "subset", None)
+                                            or self.eval_subset or None),
+                            "eval_anchor_k": self.eval_anchor_k,
                             "timed_out": result.get("timed_out", False),
                             "reevaluated": bool(result["n_valid"])})
         except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
