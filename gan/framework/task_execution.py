@@ -1916,8 +1916,23 @@ def _run_harness_and_report_local(
         if not control_token:
             raise RuntimeError("LLM proxy task scope requires framework control capability")
         from gan.framework.llm_proxy import request_task_token
+        # Local non-broker transport (taskchain / developer paths, no broker
+        # config): scope the token exactly like the broker issues it --
+        # wall budget + per-question call budget (the same loop.yaml key the
+        # driver reads for the broker) + the uid the sandboxed child will
+        # drop to (it is the peer that presents the token to the proxy).
+        import pwd as _pwd
+        _sandbox_name = os.environ.get(_SANDBOX_USER_ENV, "").strip()
+        _peer_uid = (_pwd.getpwnam(_sandbox_name).pw_uid
+                     if _sandbox_name else os.getuid())
+        from gan.framework.loader import load_gan_loop_config as _load_cfg
+        _calls_per_q = int(_load_cfg().get(
+            "loop.task_llm_max_calls_per_question", 64))
         proxy_token = request_task_token(
-            proxy_socket, control_token, str(scope_id), model)
+            proxy_socket, control_token, str(scope_id), model,
+            ttl_s=float(timeout) + 60.0,
+            max_calls=max(1, _calls_per_q) * max(1, int(num_samples or 1)),
+            peer_uid=int(_peer_uid))
     needs_sandbox_identity = questions_path is not None or (
         domain in _SANDBOXED_HARNESS_DOMAINS and dataset_root is not None
     )
