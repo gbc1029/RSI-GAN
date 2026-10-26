@@ -987,7 +987,12 @@ def run_gan_driver(
             # two runs' inner-loop stopping behaviour incomparable -- the regime
             # guard must see it.
             "sampling.anchor_k": int((cfg.get("sampling") or {}).get("anchor_k", 0) or 0),
-            "loop.inner_max": int(cfg.get("loop.inner_max", 3)),
+            # Resolve exactly like _launch_budget: --inner OVERRIDES the yaml value
+            # inside the worker, so recording the yaml 2 while the worker runs 3
+            # would make the audit trail (and the collector's regime guard) lie
+            # about how many inner generations the run actually did.
+            "loop.inner_max": (int(inner) if inner is not None
+                               else int(cfg.get("loop.inner_max", 3))),
         }
         _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
                                 "outer_generations": G,
