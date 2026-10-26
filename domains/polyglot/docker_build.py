@@ -15,6 +15,8 @@ import shutil
 from domains.polyglot.constants import (
     BASE_IMAGE_BUILD_DIR,
     ENV_IMAGE_BUILD_DIR,
+    GRADLE_ARTIFACTS_DIR,
+    GRADLE_DIST_ZIP_NAME,
     INSTANCE_IMAGE_BUILD_DIR,
     MAP_REPO_VERSION_TO_SPECS,
 )
@@ -267,6 +269,7 @@ def get_env_configs_to_build(
                 "setup_script": test_spec.setup_env_script,
                 "dockerfile": test_spec.env_dockerfile,
                 "platform": test_spec.platform,
+                "language": test_spec.instance_id.split("__")[0],
             }
     return image_scripts
 
@@ -309,7 +312,22 @@ def build_env_images(
         total=len(configs_to_build), smoothing=0, desc="Building environment images"
     ) as pbar:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Create a future for each image to build
+            # F2: stage the offline Gradle distribution + seed project into
+            # the Java env build contexts before submitting (the dockerfile
+            # bakes them into the env image so `gradle` runs fully offline).
+            for image_name, config in configs_to_build.items():
+                build_dir = ENV_IMAGE_BUILD_DIR / image_name.replace(":", "__")
+                if config.get("language") == "java":
+                    build_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(
+                        GRADLE_ARTIFACTS_DIR / GRADLE_DIST_ZIP_NAME,
+                        build_dir / GRADLE_DIST_ZIP_NAME,
+                    )
+                    shutil.copytree(
+                        GRADLE_ARTIFACTS_DIR / "gradle_seed",
+                        build_dir / "gradle_seed",
+                        dirs_exist_ok=True,
+                    )
             futures = {
                 executor.submit(
                     build_image,
@@ -356,7 +374,8 @@ def build_instance_images(
         client: docker.DockerClient,
         dataset: list,
         force_rebuild: bool = False,
-        max_workers: int = 4
+        max_workers: int = 4,
+        only_languages: set[str] | None = None
     ):
     """
     Builds the instance images required for the dataset if they do not already exist.
@@ -369,6 +388,11 @@ def build_instance_images(
     """
     # Build environment images (and base images as needed) first
     test_specs = list(map(make_test_spec, dataset))
+    if only_languages:
+        test_specs = [
+            s for s in test_specs
+            if s.instance_id.split("__")[0] in only_languages
+        ]
     if force_rebuild:
         for spec in test_specs:
             remove_image(client, spec.instance_image_key, "quiet")

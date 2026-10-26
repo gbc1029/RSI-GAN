@@ -190,6 +190,18 @@ def build_gan_loop(
         raise ValueError(f"domains parses to an empty domain (got {domains!r})")
     repo_root = os.path.abspath(repo_root)
 
+    # Per-domain token budgets (docs/10 §10): domains.yaml token_budget_per_gen
+    # overrides the loop.yaml global (cost.token_budget_per_gen) -- resolved
+    # ONCE here (build knows the single domain) and threaded explicitly to the
+    # two consumers: the runner's reserved-key clamp ceiling and the loop's
+    # cost-statement reference line. Per-question enforcement travels via the
+    # runner's apply_domain_token_budget (domain_cfg is re-resolved there).
+    from gan.framework.loader import load_registry as _load_registry
+    from gan.framework.loader import resolve_domain as _resolve_domain
+    from gan.framework.task_execution import effective_token_budget_per_gen
+    _domain_cfg = _resolve_domain(_load_registry(), domain)
+    token_budget_per_gen = effective_token_budget_per_gen(_domain_cfg, cfg)
+
     # Single source: gan/framework/models.yaml (no env, no fallback, no overrides).
     # resolve_entry() validates the call parameters at STARTUP (unknown
     # reasoning_effort values fail here, not as a mid-run gateway 400).
@@ -284,8 +296,9 @@ def build_gan_loop(
         anchor_ids=anchor_ids,
         # Reserved cost-key ceiling (docs/10 §10): bounds the task design's
         # per-question token budget (clamped into the design snapshot by
-        # DomainTaskRunner before persist; cost.token_budget_per_gen).
-        token_budget_per_gen=cfg.get("cost.token_budget_per_gen"),
+        # DomainTaskRunner before persist; cost.token_budget_per_gen --
+        # per-domain override resolved above).
+        token_budget_per_gen=token_budget_per_gen,
         ledger_writer=ledger_writer,
     )
     # Dedicated runner for the fixed-root evaluation (docs/14 §5.5). It runs the
@@ -353,6 +366,7 @@ def build_gan_loop(
         code_root=code_root,
         ledger_writer=ledger_writer,
         roots=roots,
+        token_budget_per_gen=token_budget_per_gen,
     )
     loop_holder["loop"] = loop
     # explicit runtime record of the model configuration actually used

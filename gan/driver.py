@@ -790,13 +790,20 @@ def run_gan_driver(
     domain_cfg = resolve_domain(reg, domain)
     safe_broker_env["GAN_SECURE_MODE"] = "1"
     safe_broker_env["PYTHON_DOTENV_DISABLED"] = "1"
-    question_timeout_s = int(domain_config.get("question_timeout_s") or 300)
     # Per-outer budgets must cover the LARGER of the main-line and evaluation
     # question sets -- otherwise every evaluation launch is refused ("task
     # launch budget exhausted") or killed by a too-short wall clock. The
     # evaluation set itself was resolved + bounded above, before any side effect.
     questions_per_run = max(int(num_samples), eval_questions)
-    harness_timeout = questions_per_run * question_timeout_s + 900
+    # Harness wall budget: THE shared formula (task_execution.harness_total_timeout)
+    # -- the broker registration and the outer worker's per-generation harness
+    # wait must never disagree (they were two hand-copied formulae that agreed
+    # only by coincidence of config; drift lesson). The helper applies the
+    # ``harness_timeout_s`` precedence itself. Fed with ``questions_per_run``
+    # rather than ``num_samples`` so the fixed-root evaluation rounds, which may
+    # run a LARGER question set, fit in the same budget.
+    harness_timeout = task_execution.harness_total_timeout(
+        domain_cfg, int(questions_per_run))
     harness_num_workers = int(domain_cfg.get("harness_num_workers", 5))
     if harness_num_workers < 1:
         raise ValueError(f"domain {domain!r} harness_num_workers must be positive")
@@ -821,7 +828,7 @@ def run_gan_driver(
         "harness_num_workers": harness_num_workers,
         "python": python_executable,
         "python_prefix": python_prefix,
-        "timeout": int(domain_cfg.get("harness_timeout_s") or harness_timeout),
+        "timeout": harness_timeout,
         "task_brief": (domain_cfg.get("task_brief") or ""),
         "parent_scored": task_execution.uses_parent_scoring(domain),
         # Question-sampling scheme (loop.yaml sampling.*). The broker reads the

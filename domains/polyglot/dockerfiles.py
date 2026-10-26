@@ -87,6 +87,8 @@ RUN python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/si
 
 LABEL {req_bake_label}="1"
 
+{gradle_env}
+
 WORKDIR /testbed/
 
 # Automatically activate the testbed environment
@@ -117,9 +119,10 @@ def get_dockerfile_base(platform, arch):
 REQ_BAKE_LABEL = "com.hyperagents.polyglot.req_baked"
 
 
-def get_dockerfile_env(platform, arch):
+def get_dockerfile_env(platform, arch, gradle_env=""):
     return _DOCKERFILE_ENV.format(platform=platform, arch=arch,
-                                  req_bake_label=REQ_BAKE_LABEL)
+                                  req_bake_label=REQ_BAKE_LABEL,
+                                  gradle_env=gradle_env)
 
 
 def get_dockerfile_instance(platform, env_image_name):

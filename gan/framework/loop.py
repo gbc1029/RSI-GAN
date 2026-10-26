@@ -132,6 +132,7 @@ class GanLoop:
         code_root: Optional[str] = None,
         ledger_writer: Optional[Any] = None,
         roots: Optional[Any] = None,
+        token_budget_per_gen: Optional[int] = None,
     ):
         self.output_dir = os.path.abspath(output_dir)
         # B46 step-1 gate: the per-run WriterToken guards every decision-grade
@@ -163,7 +164,14 @@ class GanLoop:
         # ``cost.token_budget_per_gen`` is the statements' reference line here;
         # its clamp consumer arrives with the reserved-key phase (C).
         self.record_usage = bool(cfg.get("cost.record_usage", True))
-        self.token_budget_per_gen = cfg.get("cost.token_budget_per_gen")
+        # Per-generation reference line for the plan/evaluate cost statements
+        # AND the clamp ceiling threaded to _task_budget_keys. build_gan_loop
+        # resolves the per-domain override (domains.yaml token_budget_per_gen
+        # > loop.yaml cost.token_budget_per_gen) and passes it explicitly;
+        # None keeps the loop.yaml global (legacy constructions).
+        self.token_budget_per_gen = (
+            token_budget_per_gen if token_budget_per_gen is not None
+            else cfg.get("cost.token_budget_per_gen"))
         # Session cost records settled by THIS loop (outer summary + audit).
         self._session_costs: List[Dict[str, Any]] = []
         self.self_improve_max_tool_calls = int(cfg.get("loop.self_improve_max_tool_calls", 30))

@@ -51,3 +51,7 @@ domains/*/predictions/
 # ---------------------------------------------------------------------------
 baselines/rqgm_bridge/data/
 .env
+
+# F2: java 离线 gradle 构建输入(zip 可由宿主机按 GRADLE_WRAPPER_URL 重新下载;
+# gradle_seed/ 亦在此目录——换机时需重新植入,见 docs/15 §7)
+domains/polyglot/gradle_artifacts/
