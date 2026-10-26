@@ -114,6 +114,29 @@ from utils.soft_fail import soft_fail
 _MEASURED = ("ok", "partial")
 
 
+def stagnation_metric(anchor_child: Optional[int], anchor_parent: Optional[int],
+                      score_child: Optional[float],
+                      score_parent: Optional[float]) -> Tuple[str, Any, Any]:
+    """Pick the (metric, current, previous) triple for the stagnation verdict.
+
+    R4 (docs/11 §3.0 sibling rationale): ``benchmark.mean`` is measured on a
+    per-generation question draw, so a ``(child - parent)`` on it compares two
+    different exams -- 30 questions give SE ~0.16, which is the same order as the
+    effects being chased. The anchor core (``sampling.anchor_k``) is the only
+    part of the sample held identical across generations, so its correct COUNT
+    is cross-generation comparable: coarse but noise-free, and it costs nothing
+    because those questions were already answered.
+
+    Falls back to the score comparison whenever the anchor core cannot be
+    compared (no anchors configured -- e.g. ``sampling.anchor_k: 0``, a
+    non-parent-scored domain, or a parent generation with no report), so the
+    legacy behaviour stays reachable by turning anchors off.
+    """
+    if anchor_child is not None and anchor_parent is not None:
+        return "anchor_correct", anchor_child, anchor_parent
+    return "benchmark_mean", score_child, score_parent
+
+
 class GanLoop:
     def __init__(
         self,
@@ -124,6 +147,7 @@ class GanLoop:
         evaluator: Any = None,
         task_runner: Callable[..., Node] = None,
         eval_runner: Optional[Callable[..., Node]] = None,
+        anchor_ids: Optional[List[str]] = None,
         broker: Any = None,
         resume: bool = False,
         enable_checkpoint: bool = True,
@@ -255,6 +279,13 @@ class GanLoop:
         # the evaluation reuses the main-line runner's sampling).
         self.eval_subset = str(cfg.get("eval.subset", "") or "")
         self.eval_anchor_k = int(cfg.get("eval.anchor_k", 0) or 0)
+        # MAIN-LINE anchor core (``sampling.anchor_k``: ckpt/sample_seed.json
+        # ``anchor_ids``). It is the ONLY part of a generation's question sample
+        # that is identical across generations, so the inner-stagnation verdict
+        # is judged on its correct COUNT (R4) instead of ``benchmark.mean``
+        # (whose question set is re-drawn per generation). Empty when anchors are
+        # off -- the verdict then falls back to the score comparison.
+        self.anchor_ids = [str(a) for a in (anchor_ids or [])]
         # Per-batch wall-clock budget for the fixed-root evaluation (s). 0/None =
         # unbounded. Checked BETWEEN rounds (a single in-flight round cannot be
         # interrupted in-process, so a hung round still overruns).
@@ -1099,6 +1130,29 @@ class GanLoop:
         )
 
     # -- supernode (docs/13 §2.3) -----------------------------------------
+    def _anchor_correct(self, genid: Any) -> Optional[int]:
+        """Correct answers on the run-persistent anchor core, or ``None``.
+
+        R4: ``benchmark.mean`` re-draws its question set every generation
+        (``derive_sample_seed``), so comparing two generations on it compares two
+        different exams -- at 30 questions the standard error is ~0.16, i.e. a
+        "no improvement" verdict on it is mostly question-set noise. The anchor
+        core is the only part of the sample held identical across generations,
+        so its correct COUNT is a cross-generation comparable signal: coarse
+        (k=2 gives 0/1/2) but noise-free, and free -- the main line has already
+        answered those questions.
+
+        An anchor the generation did not answer counts as WRONG (a missing answer
+        is a miss, not an incomparable observation); ``None`` means there is
+        nothing to compare at all (no anchor core, or no report).
+        """
+        if not self.anchor_ids:
+            return None
+        per_q = self._read_per_question(genid)
+        if not per_q:
+            return None
+        return int(sum(per_q.get(q, 0.0) for q in self.anchor_ids))
+
     def _read_per_question(self, genid: Any) -> Dict[str, float]:
         """Reconstruct per-question 0/1 from report.json question_ids_{passed,failed}."""
         try:
@@ -2851,7 +2905,15 @@ class GanLoop:
                 # stagnation + advantage (only measured scores count as improvement)
                 ps, cs = parent.value.score, child.value.score
                 measured = child.value.score_status in _MEASURED
-                improved = measured and (cs is not None) and (ps is None or (cs - ps) > eps)
+                # R4: judge improvement on a CROSS-GENERATION COMPARABLE metric.
+                # The anchor core is identical every generation; benchmark.mean
+                # is a different exam each time. Coarse but noise-free beats
+                # precise but incomparable for a "did it move?" verdict.
+                anc_child = self._anchor_correct(child.genid) if measured else None
+                anc_parent = self._anchor_correct(parent.genid) if measured else None
+                metric, cur, prev = stagnation_metric(anc_child, anc_parent, cs, ps)
+                improved = (measured and (cur is not None)
+                            and (prev is None or (cur - prev) > eps))
                 outer_improved = outer_improved or improved
                 no_improve = 0 if improved else no_improve + 1
                 if cs is not None and ps is not None:
@@ -2861,6 +2923,9 @@ class GanLoop:
                     "type": "inner_done", "outer": outer, "inner": inner,
                     "genid": genid, "parent_genid": parent.genid, "parents": child.parents,
                     "score": cs, "parent_score": ps, "improved": improved,
+                    "improved_metric": metric,
+                    "anchor_correct": anc_child,
+                    "anchor_parent_correct": anc_parent,
                     "score_status": child.value.score_status, "coverage": child.value.coverage,
                     "imputed": bool(child.meta.get("imputed")),
                     "valid_parent": child.valid_parent,
@@ -2896,7 +2961,11 @@ class GanLoop:
                 self._save_checkpoint("inner", outer, inner)
 
                 if no_improve >= patience:
-                    self.log_event({"type": "stagnation_break", "outer": outer, "inner": inner})
+                    self.log_event({"type": "stagnation_break", "outer": outer,
+                                    "inner": inner, "metric": metric,
+                                    "no_improve": no_improve,
+                                    "anchor_correct": anc_child,
+                                    "anchor_parent_correct": anc_parent})
                     break
 
             # ---------------- outer self-improvement ----------------

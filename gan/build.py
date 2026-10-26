@@ -360,6 +360,9 @@ def build_gan_loop(
         output_dir, domains, cfg,
         task_runner=runner,
         eval_runner=eval_runner,
+        # Main-line anchor core (R4 stagnation metric): the only part of the
+        # per-generation question sample that is identical across generations.
+        anchor_ids=list(anchor_ids or []),
         broker=broker,
         planner_factory=_planner_factory,
         evaluator_factory=_evaluator_factory,

@@ -982,6 +982,11 @@ def run_gan_driver(
             # scores measured on a different exam incomparable.
             "eval.subset": eval_subset,
             "eval.anchor_k": eval_anchor_k,
+            # Main-line anchor core size. It decides the resolution of the R4
+            # stagnation metric (anchor correct-count), so a change here makes
+            # two runs' inner-loop stopping behaviour incomparable -- the regime
+            # guard must see it.
+            "sampling.anchor_k": int((cfg.get("sampling") or {}).get("anchor_k", 0) or 0),
             "loop.inner_max": int(cfg.get("loop.inner_max", 3)),
         }
         _log_event(output_dir, {"type": "driver_start", "code_root": code_root,

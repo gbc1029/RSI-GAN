@@ -17,8 +17,12 @@ loop:
                                 # (2026-10: raised 2 -> 10 so the outer_select axis can
                                 # actually engage -- selection needs a non-cold archive)
   inner_max: 2                  # I_max: max inner iterations per outer generation
-  stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
-  stagnation_epsilon: 0.005     # delta score threshold
+  stagnation_patience: 3        # S_in: consecutive non-improving inner iters -> break
+                                # 3 > inner_max(2)：在 outer 内部永远不会触发（要它生效
+                                # 得把 inner_max 提到 >=3）。判据是锚点答对数（R4）
+                                # 不是 benchmark.mean，见 docs/11 §3.0b。
+  stagnation_epsilon: 0.005     # delta threshold；锚点口径下每次变化是 1 个整题，
+                                # 所以任何 +1 都算改进（eps 实际退化为 0）
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
   self_improve_max_tool_calls: 5  # tool-call budget for role self-improvement
   plan_max_tool_calls: 6          # tool-call budget for the PLAN seat (planner only;
@@ -226,7 +230,12 @@ sampling:
   # 0 = 每次 run 随机抽题（默认，行为不变）。消融矩阵必须给一个 FIXED 值，
   # 否则各臂抽到不同题目，跨臂只能做非配对比较。
   base_seed: 0
-  anchor_k: 2
+  # 主链锚点核：每代共用、也是 R4 停滞判据的唯一数据源（runs/<genid>/report.json
+  # 里这些题的答对数）。10 道 ⇒ 0..10 共 11 个取值，比 k=2 的 0/1/2 好用得多；
+  # 仍受 num_samples // 2 封顶（num_samples=30 ⇒ 上限 15）。锚点不额外花成本
+  # （它们是同一批 30 题的前 k 道），但 k 越大，每代随机题越少（30-k）。
+  # 注意：seed 文件 skip-if-exists，改这个值只对**新建**的 run 目录生效。
+  anchor_k: 10
 
 # ---------------------------------------------------------------------------
 # 消融实验开关（A/B/C/D/E 组；权威映射表 + 实验矩阵见 docs/11_消融实验设计.md）
