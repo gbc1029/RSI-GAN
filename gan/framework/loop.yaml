@@ -13,8 +13,10 @@ loop:
                                 # default only; consumer: gan/build.py build_gan_loop
                                 # (a resume auto-detects from the persisted code manifest,
                                 # which wins over this key).
-  outer_generations: 2          # G: number of meta-level (outer) generations
-  inner_max: 3                  # I_max: max inner iterations per outer generation
+  outer_generations: 10         # G: number of meta-level (outer) generations
+                                # (2026-10: raised 2 -> 10 so the outer_select axis can
+                                # actually engage -- selection needs a non-cold archive)
+  inner_max: 2                  # I_max: max inner iterations per outer generation
   stagnation_patience: 2        # S_in: consecutive non-improving inner iters -> break
   stagnation_epsilon: 0.005     # delta score threshold
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
@@ -75,11 +77,13 @@ tree:
   ucb_c: 1.0                    # exploration constant
   depth_penalty: 0.05           # penalty per unit depth
   cost_penalty: 0.0             # penalty on normalized cost (0 disables)
-  cross_subtree: false          # docs/13 §2.4: true allows the parent pool to span
-                                # outers (with probability cross_subtree_epsilon);
-                                # false keeps selection inside the current outer's
-                                # subtree (meta.outer_id == current outer; initial
-                                # and pre-migration nodes stay eligible).
+  cross_subtree: false          # docs/13 §2.4: 子树优先。true = 以 cross_subtree_epsilon
+                                # 的概率把候选池扩大到全局；false = 候选池限定在当前 outer
+                                # 子树（meta.outer_id == 当前 outer；initial/迁移节点仍可参与）。
+                                # false 时若子树为空（每届刚开始必然如此）→ 回落全局一次
+                                # （同一 metric，记 inner_pool_fallback 事件）；epsilon=1.0
+                                # 时本就全程全局，回落永不触发。跨届父代携带的旧 issues
+                                # 在选父处清空（task 谱系与 P/E 谱系解耦，见 docs/13 §2.4）。
   cross_subtree_epsilon: 0.1    # probability of a global-pool draw when cross_subtree=true
 
 # ---------------------------------------------------------------------------
@@ -87,7 +91,7 @@ tree:
 #   enabled=false 时以下所有键短路，outer 保持单链（里程碑 A 行为）。
 # ---------------------------------------------------------------------------
 outer_select:
-  enabled: true                # 总开关；false = 现有单链行为（完全不变）
+  enabled: true                 # 总开关；false = 现有单链行为（完全不变）
   tournament_k: 3               # 锦标赛抽签数
   restore_max_tries: 3          # 恢复父代设计 + heal 的最大尝试数（全失败退回链式）
   heal_tool_overlap: 0.5        # heal 后 tools 与父代 tools 的 Jaccard 重叠阈值（低于则放弃该父代）
@@ -100,9 +104,11 @@ mome:
   x_buckets: 6                  # 默认内置：5 个具名 op + other
   y_buckets: 5                  # 默认内置边界 [0.0, 0.5, 1.0, 2.0]
   z_buckets: 3                  # 默认内置边界 [1.0, 2.0]
-  reference_window: 10          # 赛季 M（novelty 参考集 + z-score 基准）
-  novelty_k: 5
-  cold_start_min: 10            # 档案少于此数 → 完全链式（不选父）
+  reference_window: 10          # 赛季 M（novelty 参考集 + z-score 基准）；必须 >= cold_start_min
+  novelty_k: 3                  # 必须 <= cold_start_min-1，否则 kNN 参考不足（方案 B）
+  cold_start_min: 3             # 档案少于此数 → 完全链式（不选父）
+                                # 方案 B：10 -> 3，使 outer 4 起真正选父
+                                # （G=10 时约 7 届走选父）；偏离 docs/14 默认值，需在论文声明
   max_elites_per_cell: 3        # 每格 Pareto 前沿容量上限
 
 fitness:
@@ -113,7 +119,11 @@ fitness:
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
-  eval_samples: 3               # 每个 supernode 入档评估次数
+  eval_samples: 1               # 每个 supernode 入档评估次数（docs/14 允许 2–3；
+                                # 1 = 显著性运行的成本取舍：固定 root 评估是每臂最大开销项，
+                                # 而消融显著性看的是主线最后一代分数、不用档案 fitness。
+                                # 代价：单轮评估使 benchmark.std 恒为 0 → F_p 的
+                                # -beta*z_std 退化为中性（方差项不生效），需在论文声明
   eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 
 # ---------------------------------------------------------------------------

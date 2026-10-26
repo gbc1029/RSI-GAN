@@ -61,14 +61,21 @@ evaluator_commit      # evaluator 代码 commit（拆仓库后，角色侧）
 
 ### 2.4 inner 父代候选池与 `cross_subtree` 开关
 
-inner 父代选择的候选池由两个配置键控制（`loop.yaml` 的 `tree.*`，consumer 在 P6 落地）：
+inner 父代选择的候选池由两个配置键控制（`loop.yaml` 的 `tree.*`）：
 
 - `tree.cross_subtree: bool`（默认 `false`）
-  - `false`：候选池 = 当前 outer 子树（`meta.outer_id == 当前 outer` 的 task 节点）；
-  - `true`：以 `cross_subtree_epsilon` 的概率把候选池扩大到全局（所有 outer 的有效节点，仍受 valid_parent / branch / depth 约束）；
+  - `false`：**子树优先**——候选池 = 当前 outer 子树（`meta.outer_id == 当前 outer` 的 task 节点）；**子树为空时回落全局一次**（2026-10-23 修订：每个 outer 刚开始时子树必然为空，只在本届子树内选会在 outer 3+ 之后饿死；回落时用同一个 UCB/best/latest metric 从全局池选上一届的真实节点，并记 `inner_pool_fallback` 事件）。初始/迁移节点（无 `outer_id`）在两种池里都仍可参与。
+  - `true`：以 `cross_subtree_epsilon` 的概率把候选池扩大到全局（所有 outer 的有效节点，仍受 valid_parent / branch / depth 约束）；**`epsilon = 1.0` 时每轮都全局，回落分支永不触发**。
 - `tree.cross_subtree_epsilon: float`（默认 `0.1`）：触发全局采样的概率；其余轮次仍在当前子树内选。
 
-UCB / best / latest 等排序方法不变，只改变候选池构成。跨子树被选中的节点记录 `source_pool=global`（血缘/审计）。
+UCB / best / latest 等排序方法不变，只改变候选池构成。
+
+**跨届选父的三个连带语义（2026-10-23 修订）：**
+
+1. **议题往返按届清洗**：`respond_issue` / `judge_fix` 的 `issue_id` 是每届 evaluator 会话内的命名空间（每届刷新实例，id 重新从 `i-1` 开始）。跨届父代携带的旧 issues 在选父处被清空（保留 `diff_summary` / 分数 / 校准），`_parent_digest` 置空，使 planner 不再被强制回应旧议题、evaluator 不再被要求对旧议题 `judge_fix`，也避免旧 `i-1` 与本局新 `i-1` 的 id 撞车。
+2. **task 谱系与 P/E 谱系解耦**：inner 回落决定的是 **task 节点的 config+code 血缘**；外层选择（docs/14）恢复的是 **P/E 设计**。两者独立、可能来自不同届，报告/论文中必须声明二者不是同一条线，避免读者误读。
+3. **depth_penalty 暂不特判（TODO，未解决）**：全局 UCB 的 `depth_penalty`（0.05/层）会系统偏向早期浅节点（深度差 4 ≈ 0.2 分，对 0~1 的分数不可忽略）。是否在回落时去掉该惩罚、或改用 `latest`，留待观察 `inner_pool_fallback` 选出的父代谱系后再决定。
+
 
 ---
 

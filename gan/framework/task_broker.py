@@ -21,7 +21,15 @@ from multiprocessing.connection import Connection
 from typing import Any, Dict, Tuple
 
 
-_SCOPE_RE = re.compile(r"(?:0|[1-9][0-9]{0,11})\Z")
+# Scope ids are generation ids. The main loop uses plain integers ("0","1",...);
+# the fixed-root evaluation (docs/14 §5.5, eval_on_root.eval_genid) uses the
+# isolated namespace "eval_outer<N>_s<M>" so its task rounds never collide with
+# a tree node. Both are alphanumeric + underscore only, so they are also safe as
+# a single path component under work/ (no '/', no '..').
+_SCOPE_RE = re.compile(
+    r"(?:0|[1-9][0-9]{0,11}"
+    r"|eval_outer(?:0|[1-9][0-9]{0,11})_s(?:0|[1-9][0-9]{0,11})"
+    r")\Z")
 _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
