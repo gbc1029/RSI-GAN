@@ -320,6 +320,22 @@ def check_for_tool_uses(response):
         try:
             tool_use = json.loads(match)
             if not isinstance(tool_use, dict) or 'tool_name' not in tool_use:
+                # Format-slip tolerance (first real hit: A6 polyglot task
+                # round 2026-10-27): some models nest the tool call INSIDE
+                # the answer contract -- <json>{"response": {"tool_name":
+                # ..., "tool_input": ...}}</json>. That used to fall through
+                # to the answer-payload branch below: the loop ended as a
+                # "final answer", prediction extraction failed (response is
+                # a dict, not a string), the one no-tools format-repair turn
+                # was burned re-asking for text, and the model's real work
+                # (the files it tried to write) never landed. Unwrap ONE
+                # level and execute the call; string answers are untouched.
+                resp = (tool_use.get('response')
+                        if isinstance(tool_use, dict) else None)
+                if (isinstance(resp, dict) and 'tool_name' in resp
+                        and 'tool_input' in resp):
+                    tool_uses.append(resp)
+                    continue
                 # A JSON block that parses but carries no tool_name is NOT a
                 # malformed tool call -- it is the agent's ANSWER payload (the
                 # task template answers as <json>{"response": ...}</json>).

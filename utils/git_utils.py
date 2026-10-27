@@ -38,8 +38,20 @@ def diff_versus_commit(git_dname, commit):
     Take a diff of `git_dname` current contents versus the `commit`, including untracked files,
     without modifying the repository state.
     """
+    # .gan_runtime/ is the agent RUNTIME (toolset / knowledge / cm snapshots
+    # plus tools_load_report.json), not the child's work product. Excluding it
+    # on BOTH legs keeps the prediction patch = solution changes only (first
+    # real hit: A6 polyglot task round 2026-10-27 -- the 402-byte runtime load
+    # report leaked into every patch, and patches without solution-file
+    # changes then tripped the eval-side empty-stash false error).
+    _RUNTIME_EXCLUDES = [
+        ":(exclude).gan_runtime",
+        ":(exclude).gan_runtime/**",
+    ]
+
     # Get diff of tracked files
-    diff_cmd = ["git", "-C", git_dname, "diff", commit]
+    diff_cmd = (["git", "-C", git_dname, "diff", commit, "--", "."]
+                + _RUNTIME_EXCLUDES)
     result = subprocess.run(diff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     diff_output = result.stdout.decode()
 
@@ -47,6 +59,10 @@ def diff_versus_commit(git_dname, commit):
     untracked_files_cmd = ["git", "-C", git_dname, "ls-files", "--others", "--exclude-standard"]
     result = subprocess.run(untracked_files_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     untracked_files = result.stdout.decode().splitlines()
+    untracked_files = [
+        f for f in untracked_files
+        if f != '.gan_runtime' and not f.startswith('.gan_runtime/')
+    ]
 
     # Generate diffs for untracked files
     for file in untracked_files:
