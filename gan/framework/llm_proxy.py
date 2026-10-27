@@ -124,14 +124,18 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         _peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
         return int(peer_uid)
 
-    def _reply(self, status: int, payload: Dict[str, Any]) -> None:
+    def _reply(self, status: int, payload: Dict[str, Any]) -> bool:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            return False
+        return True
 
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/__gan__/issue-task":
@@ -446,6 +450,7 @@ class ParentLLMProxy:
         gw_request_id: Optional[str] = None
         gw_error_code: Optional[str] = None
         gw_error_type: Optional[str] = None
+        delivered = True
         try:
             if not self.upstream_base or not self.upstream_key:
                 raise RuntimeError("trusted upstream base/key is not configured")
@@ -469,7 +474,8 @@ class ParentLLMProxy:
                 # response header, which this reply path does not forward)
                 rid = decoded.get("id")
                 gw_request_id = str(rid)[:64] if rid else None
-            handler._reply(status, decoded if isinstance(decoded, dict) else {"data": decoded})
+            delivered = handler._reply(
+                status, decoded if isinstance(decoded, dict) else {"data": decoded})
         except urllib.error.HTTPError as exc:
             status = int(exc.code)
             raw = exc.read(self.max_request_bytes)
@@ -480,10 +486,11 @@ class ParentLLMProxy:
             if isinstance(decoded, dict) and isinstance(decoded.get("error"), dict):
                 gw_error_code = decoded["error"].get("code")
                 gw_error_type = decoded["error"].get("type")
-            handler._reply(status if status >= 500 else 502, decoded)
+            delivered = handler._reply(status if status >= 500 else 502, decoded)
         except Exception:
-            handler._reply(502, {"error": {"message": "upstream proxy failure"}})
             status = 502
+            delivered = handler._reply(
+                502, {"error": {"message": "upstream proxy failure"}})
         finally:
             with self._token_lock:
                 current = self._inflight.get(token, 1)
@@ -491,8 +498,10 @@ class ParentLLMProxy:
                     self._inflight.pop(token, None)
                 else:
                     self._inflight[token] = current - 1
+            reason = ("client_disconnected" if not delivered else
+                      ("allowed" if status < 400 else "upstream failure"))
             self._audit({**scope, "status": status, "allow": status < 400,
-                         "reason": "allowed" if status < 400 else "upstream failure",
+                         "reason": reason, "delivered": delivered,
                          "call_id": call_id,
                          "gw_request_id": gw_request_id,
                          "gw_error_code": gw_error_code,

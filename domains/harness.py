@@ -750,6 +750,13 @@ def harness(
         dataset = pd.read_csv(os.path.join(proofs_dname, "predictions.csv"), dtype=str)
         dataset["Response"] = dataset["prediction"].copy()
         dataset.drop(columns=["prediction"], inplace=True)
+        if domain == "imo_proof_grading":
+            # Grade only proofs that the generation stage actually produced.
+            # Blank rows are per-question timeout evidence, not incorrect proofs.
+            dataset = dataset[
+                dataset["Response"].notna()
+                & (dataset["Response"].astype(str).str.strip() != "")
+            ].copy()
     else:
         dataset = get_dataset(
             domain=domain, subset=subset, dataset_root=dataset_root,

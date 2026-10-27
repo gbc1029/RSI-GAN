@@ -2435,16 +2435,7 @@ def _imo_proof_grading_output_error(
     grading_dir: str,
     expected_owner_uid: Optional[int],
 ) -> Optional[str]:
-    """Reject isolated grader failures and labels outside the scoring contract."""
-    failures_path = os.path.join(grading_dir, "agent_evals", "eval_failures.jsonl")
-    if os.path.lexists(failures_path):
-        failure_fd = _open_grading_output(failures_path, expected_owner_uid)
-        try:
-            if os.fstat(failure_fd).st_size > 0:
-                return "proof grader recorded one or more per-question failures"
-        finally:
-            os.close(failure_fd)
-
+    """Reject missing grading output and invalid labels, but allow partial runs."""
     predictions_path = os.path.join(grading_dir, "predictions.csv")
     try:
         predictions_fd = _open_grading_output(predictions_path, expected_owner_uid)
@@ -2459,10 +2450,14 @@ def _imo_proof_grading_output_error(
             os.close(predictions_fd)
     if "prediction" not in grades.columns or len(grades) == 0:
         return "proof grader produced no grading labels"
+    grades["prediction"] = grades["prediction"].astype(str).str.strip().str.lower()
     allowed = {"incorrect", "partial", "almost", "correct"}
-    invalid = sorted({str(value) for value in grades["prediction"] if value not in allowed})
+    observed = [value for value in grades["prediction"] if value]
+    if not observed:
+        return "proof grader produced no grading labels"
+    invalid = sorted({value for value in observed if value not in allowed})
     if invalid:
-        return f"proof grader produced invalid or blank labels: {invalid[:3]}"
+        return f"proof grader produced invalid labels: {invalid[:3]}"
     return None
 
 
@@ -2470,18 +2465,7 @@ def _imo_proof_generation_output_error(
     predictions_dir: str,
     expected_owner_uid: Optional[int],
 ) -> Optional[str]:
-    """Reject missing task proofs before they can be graded as incorrect."""
-    failures_path = os.path.join(
-        predictions_dir, "agent_evals", "eval_failures.jsonl",
-    )
-    if os.path.lexists(failures_path):
-        failure_fd = _open_grading_output(failures_path, expected_owner_uid)
-        try:
-            if os.fstat(failure_fd).st_size > 0:
-                return "proof generation recorded one or more per-question failures"
-        finally:
-            os.close(failure_fd)
-
+    """Reject an empty batch, while preserving non-empty partial proof batches."""
     predictions_path = os.path.join(predictions_dir, "predictions.csv")
     try:
         predictions_fd = _open_grading_output(
@@ -2502,8 +2486,8 @@ def _imo_proof_generation_output_error(
         1 for value in predictions["prediction"]
         if not isinstance(value, str) or not value.strip()
     )
-    if blank_count:
-        return f"proof generation produced {blank_count} blank prediction(s)"
+    if blank_count == len(predictions):
+        return "proof generation produced no non-blank predictions"
     return None
 
 

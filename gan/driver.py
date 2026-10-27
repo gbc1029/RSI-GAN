@@ -263,8 +263,8 @@ def _outer_env(base: Dict[str, str], *, task_broker_socket: str, outer: int,
     env["GAN_SECURE_MODE"] = "1"
     env["PYTHON_DOTENV_DISABLED"] = "1"
     # Per-LLM-call client budget consumed by agent/llm.py (roles +, via the
-    # task env allowlist, the task child). Must stay <= the proxy upstream
-    # timeout so the proxy is never the first to cut a healthy call.
+    # task env allowlist, the task child). Must exceed the proxy upstream
+    # timeout so a retry cannot overlap an orphaned upstream call.
     env["GAN_LLM_TIMEOUT_S"] = str(
         os.environ.get("GAN_LLM_TIMEOUT_S", "600"))
     env["GAN_TASK_BROKER_UNIX"] = task_broker_socket
@@ -766,14 +766,20 @@ def run_gan_driver(
     task_broker_socket = os.path.join(proxy_dir, "task.sock")
     role_broker_socket = os.path.join(proxy_dir, "role.sock")
     env_mask_file = os.path.join(proxy_dir, "empty.env")
+    llm_client_timeout_s = float(cfg.get("loop.llm_client_timeout_s", 600))
+    llm_proxy_timeout_s = float(cfg.get("loop.llm_proxy_timeout_s", 550))
+    if (llm_proxy_timeout_s <= 0 or llm_client_timeout_s <= 0
+            or llm_proxy_timeout_s >= llm_client_timeout_s):
+        raise ValueError(
+            "LLM timeouts must satisfy 0 < loop.llm_proxy_timeout_s "
+            "< loop.llm_client_timeout_s")
     proxy = ParentLLMProxy(
         output_dir, proxy_socket,
         models=models,
-        # Must exceed the client per-call budget (GAN_LLM_TIMEOUT_S, default
-        # 600s) so the proxy is never the first to cut a healthy call
-        # (observed: default 120s cut thinking calls at 121s -> 502 -> the
-        # question budget burned on doomed retries).
-        timeout=float(cfg.get("loop.llm_proxy_timeout_s", 700)),
+        # Must stay below the client per-call budget (GAN_LLM_TIMEOUT_S,
+        # default 600s). Otherwise the client retries while the old upstream
+        # request is still running, creating overlap and a late broken pipe.
+        timeout=llm_proxy_timeout_s,
         socket_uids=[
             int(sandbox_account.pw_uid),
             int(role_accounts["planner"]["uid"]),
@@ -824,7 +830,7 @@ def run_gan_driver(
         # were being cut to 300 despite the parent-side total budget).
         "question_timeout_s": int(domain_cfg.get("question_timeout_s")
                                   or cfg.get("loop.question_timeout_s", 300)),
-        "llm_client_timeout_s": float(cfg.get("loop.llm_client_timeout_s", 600)),
+        "llm_client_timeout_s": llm_client_timeout_s,
         "harness_num_workers": harness_num_workers,
         "python": python_executable,
         "python_prefix": python_prefix,
@@ -987,7 +993,12 @@ def run_gan_driver(
             # two runs' inner-loop stopping behaviour incomparable -- the regime
             # guard must see it.
             "sampling.anchor_k": int((cfg.get("sampling") or {}).get("anchor_k", 0) or 0),
-            "loop.inner_max": int(cfg.get("loop.inner_max", 3)),
+            # Resolve exactly like _launch_budget: --inner OVERRIDES the yaml value
+            # inside the worker, so recording the yaml 2 while the worker runs 3
+            # would make the audit trail (and the collector's regime guard) lie
+            # about how many inner generations the run actually did.
+            "loop.inner_max": (int(inner) if inner is not None
+                               else int(cfg.get("loop.inner_max", 3))),
         }
         _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
                                 "outer_generations": G,

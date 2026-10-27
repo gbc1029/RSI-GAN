@@ -16,8 +16,9 @@ Outputs (per run, into <run>/score_analysis/):
   progress.png         per-gen curves + per-question correctness
   REPORT.md            the analysis report
 
-Ground truth: auto-detected among domains/<domain>/dataset*.csv — the first
-file containing EVERY observed question_id (subset disambiguation).
+Ground truth: auto-detected from each domain's dataset catalogue.  For
+imo_proof, proofbench identifies the questions while report.json supplies the
+proof score; proof text is never parsed as an A/B verdict.
 """
 import argparse
 import csv
@@ -100,14 +101,44 @@ def load_json(path):
         return json.load(f)
 
 
+def _dataset_spec(domain):
+    """Return (directory, candidate files, id column, label columns)."""
+    if domain == "imo_grading":
+        return (
+            "imo",
+            ["gradingbench_filtered_100_train.csv",
+             "gradingbench_filtered_100_test.csv",
+             "gradingbench_filtered_100_val.csv", "gradingbench_filtered.csv",
+             "gradingbench.csv"],
+            "Grading ID",
+            "Reward",
+        )
+    if domain == "imo_proof":
+        return (
+            "imo",
+            ["proofbench_filtered_100_train.csv",
+             "proofbench_filtered_100_test.csv",
+             "proofbench_filtered_100_val.csv", "proofbench_filtered.csv",
+             "proofbench.csv"],
+            "Problem ID",
+            None,
+        )
+    return (
+        domain,
+        ["dataset_filtered_100_train.csv", "dataset_filtered_100_test.csv",
+         "dataset_filtered_100_val.csv", "dataset_filtered.csv", "dataset.csv"],
+        "question_id",
+        ("winner", "outcome"),
+    )
+
+
 def detect_dataset(run_dir, domain, question_ids):
-    """Pick the dataset file that contains every observed question_id."""
-    ddir = os.path.join(REPO, "domains", domain)
+    """Pick the domain dataset that contains every observed question id."""
+    folder, cands, id_col, label_col = _dataset_spec(domain)
+    ddir = os.path.join(REPO, "domains", folder)
     if not os.path.isdir(ddir):
         return None, None
     wanted = set(question_ids)
-    cands = ["dataset_filtered_100_train.csv", "dataset_filtered_100_test.csv",
-             "dataset_filtered_100_val.csv", "dataset_filtered.csv", "dataset.csv"]
     for name in cands:
         path = os.path.join(ddir, name)
         if not os.path.exists(path):
@@ -115,14 +146,23 @@ def detect_dataset(run_dir, domain, question_ids):
         try:
             truth = {}
             for r in csv.DictReader(open(path)):
-                # Label column varies by domain: search_analysis uses "winner",
-                # paper_review-style datasets use "outcome".
-                lab = (r.get("winner") or r.get("outcome") or "").strip().lower()
-                if lab:
-                    truth[r["question_id"]] = lab
+                qid = (r.get(id_col) or r.get("question_id") or "").strip()
+                if not qid:
+                    continue
+                if label_col is None:
+                    truth[qid] = None
+                else:
+                    label_cols = (label_col,) if isinstance(label_col, str) else label_col
+                    lab = next(
+                        ((r.get(col) or "").strip().lower() for col in label_cols
+                         if (r.get(col) or "").strip()),
+                        "",
+                    )
+                    if lab:
+                        truth[qid] = lab
         except Exception:
             continue
-        if wanted and wanted.issubset(truth):
+        if (wanted and wanted.issubset(truth)) or (domain == "imo_proof" and not wanted):
             return path, truth
     return None, None
 
@@ -133,6 +173,8 @@ def extract_run(run_dir):
     scores = load_jsonl(os.path.join(run_dir, "scores", "scores.jsonl"))
     events = load_jsonl(os.path.join(run_dir, "logs", "events.jsonl"))
     gens = [str(s["genid"]) for s in scores]
+    domain = (scores or [{}])[0].get("domain")
+    _, _, native_id_col, _ = _dataset_spec(domain or "search_arena")
 
     # events
     inner_done, harness_done = {}, {}
@@ -167,8 +209,10 @@ def extract_run(run_dir):
         ppath = os.path.join(run_dir, "runs", g, "predictions.csv")
         if os.path.exists(ppath):
             try:
-                preds = {r["question_id"]: r.get("prediction") or ""
-                         for r in csv.DictReader(open(ppath))}
+                for row in csv.DictReader(open(ppath)):
+                    qid = (row.get("question_id") or row.get(native_id_col) or "").strip()
+                    if qid:
+                        preds[qid] = row.get("prediction") or ""
             except Exception as exc:
                 pred_err = str(exc)
         issues = ev.get("issues") or []
@@ -205,7 +249,7 @@ def extract_run(run_dir):
                 model_cfg=model_cfg, stagnation=stagnation, brief_missing=brief_missing,
                 llm_calls=llm_calls, self_receipts=self_receipts,
                 sessions=cost_ledger.read_session_costs(run_dir),
-                domain=(scores or [{}])[0].get("domain"),
+                domain=domain,
                 events=events)
 
 
@@ -215,7 +259,12 @@ def attach_truth(run, truth):
         tlab = truth.get(r["question_id"])
         r["truth"] = tlab
         r["strict_correct"] = int(bool(tlab) and (raw or "").strip().lower() == tlab)
-        v, method = lenient_verdict(raw)
+        if run.get("domain") == "imo_grading":
+            candidate = (raw or "").strip().lower()
+            allowed = {"incorrect", "partial", "almost", "correct"}
+            v, method = (candidate, "label_exact") if candidate in allowed else (None, "unparsed")
+        else:
+            v, method = lenient_verdict(raw)
         r["lenient"], r["method"] = v, method
         r["lenient_correct"] = int(bool(v and tlab and v == tlab.split("_")[-1]))
 
@@ -262,6 +311,10 @@ def report_crosscheck(run):
 
 # ---------------------------------------------------------------- stats
 def run_vectors(run):
+    if run.get("domain") == "imo_proof":
+        values = [run["per_gen"][g].get("score") for g in run["gens"]]
+        finite = [float(v) for v in values if v is not None]
+        return np.asarray(finite, dtype=float), np.asarray(finite, dtype=float)
     strict = np.array([r["strict_correct"] or 0 for r in run["rows"]], dtype=float)
     lenient = np.array([r["lenient_correct"] or 0 for r in run["rows"]], dtype=float)
     return strict, lenient
@@ -461,6 +514,29 @@ def write_report(run, truth_path, outdir, cross=None):
     return path
 
 
+def write_proof_report(run, truth_path, outdir):
+    """Write a proof-domain report without verdict re-parsing."""
+    lines = [f"# 成绩分析：`{run['name']}`\n",
+             f"- domain=`{run['domain']}`；评分字段=`points_percentage`",
+             "- proof 文本不具备 winner/outcome 标签；曲线直接使用框架分数和 coverage。",
+             "",
+             "| gen | score | coverage | score_status | harness_s | inner_s |",
+             "|---|---|---|---|---|---|"]
+    for g in run["gens"]:
+        rec = run["per_gen"][g]
+        lines.append(
+            f"| {g} | {rec['score']} | {rec['coverage']} | {rec['score_status']} "
+            f"| {rec['harness_s']} | {rec['inner_s']} |"
+        )
+    if truth_path:
+        lines.append(f"\n- 题目目录：`{os.path.relpath(truth_path, REPO)}`")
+    lines.append("\n- 产物：scores_extract.csv / significance.txt / progress.png（本目录）。")
+    path = os.path.join(outdir, "REPORT.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
 def write_plot(run, outdir):
     gens = run["gens"]
     x = np.arange(1, len(gens) + 1)
@@ -505,6 +581,33 @@ def write_plot(run, outdir):
     return path
 
 
+def write_proof_plot(run, outdir):
+    """Plot proof score and coverage; never interpret proof prose as verdicts."""
+    x = np.arange(1, len(run["gens"]) + 1)
+    scores = [run["per_gen"][g]["score"] for g in run["gens"]]
+    coverage = [run["per_gen"][g]["coverage"] for g in run["gens"]]
+    scores = [float(v) if v is not None else np.nan for v in scores]
+    coverage = [float(v) if v is not None else np.nan for v in coverage]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
+    ax1.plot(x, scores, "o-", label="points score")
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.set_xlabel("generation")
+    ax1.set_title(f"{run['name']} proof score")
+    ax1.grid(alpha=0.3)
+    ax1.legend(fontsize=8)
+    ax2.plot(x, coverage, "s-", color="#4C72B0", label="coverage")
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.set_xlabel("generation")
+    ax2.set_title("graded proof coverage")
+    ax2.grid(alpha=0.3)
+    ax2.legend(fontsize=8)
+    fig.tight_layout()
+    path = os.path.join(outdir, "progress.png")
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    return path
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -516,6 +619,12 @@ def main():
     for run in runs:
         qids = {r["question_id"] for r in run["rows"]}
         tp, truth = detect_dataset(run["dir"], run["domain"] or "search_arena", qids)
+        if run["domain"] == "imo_proof":
+            # proofbench is a question catalogue, not a winner/outcome truth
+            # table.  Proof correctness is already summarized by report.json.
+            run["truth_path"] = tp
+            run["score_mode"] = "proof_points"
+            continue
         if truth is None and run["domain"] == "polyglot":
             # No dataset CSV exists for polyglot by design; the broker docker
             # eval is the authority. Skip the strict crosscheck — both sides
@@ -575,11 +684,19 @@ def main():
         outdir = os.path.join(run["dir"], "score_analysis")
         os.makedirs(outdir, exist_ok=True)
         csv_path = write_extract_csv(run, outdir)
-        rep_path = write_report(run, run["truth_path"], outdir, cross=cross if run is runs[0] else None)
-        plot_path = None if args.skip_plots else write_plot(run, outdir)
+        if run.get("score_mode") == "proof_points":
+            rep_path = write_proof_report(run, run["truth_path"], outdir)
+            plot_path = None if args.skip_plots else write_proof_plot(run, outdir)
+        else:
+            rep_path = write_report(run, run["truth_path"], outdir, cross=cross if run is runs[0] else None)
+            plot_path = None if args.skip_plots else write_plot(run, outdir)
         s, l = run_vectors(run)
-        print(f"[OK] {run['name']}: strict {int(s.sum())}/{len(s)}, "
-              f"lenient {int(l.sum())}/{len(l)} ({l.mean():.1%})")
+        if run.get("score_mode") == "proof_points":
+            print(f"[OK] {run['name']}: proof score mean "
+                  f"{(float(s.mean()) if len(s) else float('nan')):.3f} ({len(s)} scored generations)")
+        else:
+            print(f"[OK] {run['name']}: strict {int(s.sum())}/{len(s)}, "
+                  f"lenient {int(l.sum())}/{len(l)} ({l.mean():.1%})")
         for p in (csv_path, rep_path, plot_path):
             if p:
                 print(f"     {p}")
