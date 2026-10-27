@@ -227,12 +227,29 @@ def process_entry(entry, out_dname, model_name_or_path, model_patch_paths, root_
 
         exec_result = container.exec_run("git -C /testbed stash push " + " ".join(entry['files']['solution']), workdir='/')
         log_container_output(exec_result)
+        # Empty-stash tolerance (docs/15 §9 false-error class; first real hit
+        # in the 2026-10-27 A6 polyglot task round): a patch with NO
+        # solution-file changes makes `stash push` create no entry ("No local
+        # changes to save"), so the unconditional `stash pop` below exited 1
+        # and log_container_output raised BEFORE eval.sh ran -- the whole
+        # entry was reported as a processing failure instead of an eval
+        # outcome. Semantics: non-solution edits are deliberately discarded
+        # by the reset --hard (anti-tamper design), so with an empty solution
+        # stash the eval proceeds at the pristine HEAD and records the honest
+        # resolved/unresolved result. A REAL pop conflict still raises.
+        _stash_out = (exec_result.output.decode(errors='replace')
+                      if isinstance(exec_result.output, bytes) else '')
+        stash_created = (exec_result.exit_code == 0
+                         and 'No local changes to save' not in _stash_out)
         exec_result = container.exec_run(f"git -C /testbed reset --hard {entry['test_commit']}", workdir='/')
         log_container_output(exec_result)
         exec_result = container.exec_run(f"git -C /testbed clean -fd", workdir='/')
         log_container_output(exec_result)
-        exec_result = container.exec_run("git -C /testbed stash pop", workdir='/')
-        log_container_output(exec_result)
+        if stash_created:
+            exec_result = container.exec_run("git -C /testbed stash pop", workdir='/')
+            log_container_output(exec_result)
+        else:
+            safe_log("Empty solution stash: nothing to restore; eval proceeds at pristine HEAD")
         
         safe_log("Running the eval")
         language = entry['language']

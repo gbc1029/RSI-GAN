@@ -483,9 +483,17 @@ class DomainTaskRunner:
                 tx.derive_sample_seed(self.sample_seed_base, str(genid))
                 if self.sample_seed_base is not None else None
             )
-            questions_path, sample_info = tx.prepare_polyglot_questions(
-                self.repo_root, run_dir, self.domain_cfg, self.num_samples,
-                sample_seed=per_gen_seed, anchor_ids=self.anchor_ids)
+            if self.fixed_question_ids:
+                # Fixed-root evaluation (docs/15 §12.5-d): the eval runner pins
+                # the held-out id list -- exactly the same questions every
+                # outer, no draw (mirror of the CSV branch's
+                # prepare_questions_by_ids).
+                questions_path, sample_info = tx.prepare_polyglot_questions_by_ids(
+                    self.repo_root, run_dir, self.fixed_question_ids)
+            else:
+                questions_path, sample_info = tx.prepare_polyglot_questions(
+                    self.repo_root, run_dir, self.domain_cfg, self.num_samples,
+                    sample_seed=per_gen_seed, anchor_ids=self.anchor_ids)
             _t_harness = time.time()
             rc, _out = tx.run_harness_and_report(
                 self.python, run_dir, self.domain, run_id, self.subset,

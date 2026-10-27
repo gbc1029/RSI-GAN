@@ -9,7 +9,8 @@ import json
 import time
 from functools import partial
 
-from agent.llm import get_response_from_llm
+from agent.llm import (get_response_from_llm, reset_llm_call_sink,
+                       set_llm_call_sink)
 from agent.tools import load_tools
 from utils import trajectory_log
 
@@ -320,6 +321,22 @@ def check_for_tool_uses(response):
         try:
             tool_use = json.loads(match)
             if not isinstance(tool_use, dict) or 'tool_name' not in tool_use:
+                # Format-slip tolerance (first real hit: A6 polyglot task
+                # round 2026-10-27): some models nest the tool call INSIDE
+                # the answer contract -- <json>{"response": {"tool_name":
+                # ..., "tool_input": ...}}</json>. That used to fall through
+                # to the answer-payload branch below: the loop ended as a
+                # "final answer", prediction extraction failed (response is
+                # a dict, not a string), the one no-tools format-repair turn
+                # was burned re-asking for text, and the model's real work
+                # (the files it tried to write) never landed. Unwrap ONE
+                # level and execute the call; string answers are untouched.
+                resp = (tool_use.get('response')
+                        if isinstance(tool_use, dict) else None)
+                if (isinstance(resp, dict) and 'tool_name' in resp
+                        and 'tool_input' in resp):
+                    tool_uses.append(resp)
+                    continue
                 # A JSON block that parses but carries no tool_name is NOT a
                 # malformed tool call -- it is the agent's ANSWER payload (the
                 # task template answers as <json>{"response": ...}</json>).
@@ -421,6 +438,26 @@ def chat_with_agent(
     # config, identical on every turn.
     get_response_fn = partial(get_response_from_llm,
                               reasoning_effort=reasoning_effort, api_key=api_key)
+
+    # Per-call LLM records (agent/llm.py `llm_call` rows) go to a SIDECAR next
+    # to this session's trajectory — never into the trajectory itself (agent
+    # read surfaces resolve only the trajectory name; capability-by-existence
+    # keeps the sidecar invisible). Same directory => same write root. Redaction
+    # is best-effort framework-side: task sandboxes ship without gan/, and the
+    # records are content-free by construction, so a missing import is fine.
+    llm_sink_token = None
+    if trajectory_file:
+        _sidecar_path = trajectory_log.llm_calls_sidecar(trajectory_file)
+
+        def _llm_call_sidecar_sink(record):
+            try:
+                from gan.framework.trajectory import redact_record
+                record = redact_record(record)
+            except Exception:  # noqa: BLE001 -- content-free rows; never fatal
+                pass
+            trajectory_log.append(_sidecar_path, record)
+
+        llm_sink_token = set_llm_call_sink(_llm_call_sidecar_sink)
     # Reserved cost keys (docs/10 §10): per-SESSION token accumulator over the
     # usage counters every `output` row already carries (phase A). The soft
     # stop mirrors the tool-budget stop: the call that CROSSES the budget still
@@ -721,9 +758,11 @@ def chat_with_agent(
         logging(f"Error: {str(e)}")
         raise e
     finally:
-        # Reset the contextvar binding: the session object must not leak into
-        # whatever runs later on this thread (parallel role sessions reuse
-        # threads through the dispatch executor).
+        # Reset the contextvar bindings: neither the cm session object nor the
+        # llm_call sink may leak into whatever runs later on this thread
+        # (parallel role sessions reuse threads through the dispatch executor).
+        if llm_sink_token is not None:
+            reset_llm_call_sink(llm_sink_token)
         if cm_token is not None:
             try:
                 cm.deactivate(cm_token)

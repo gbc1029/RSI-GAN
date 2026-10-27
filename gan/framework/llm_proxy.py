@@ -465,6 +465,11 @@ class ParentLLMProxy:
             self.audit_denied(scope, denied, handler.path)
             handler._reply(403, {"error": {"message": "invalid proxy capability"}})
             return
+        # Client-side correlation id (agent/llm.py generates one per call and
+        # sends it as the X-Gan-Call-Id header; both relay implementations
+        # forward unknown headers untouched). Audit-only: it never influences
+        # authorization, and it is NOT forwarded upstream.
+        call_id = (handler.headers.get("X-Gan-Call-Id") or "").strip()[:64] or None
         body = handler._read_json()
         if not body or not isinstance(body.get("model"), str) or not isinstance(body.get("messages"), list):
             self.audit_denied(scope, "malformed chat completion request", handler.path)
@@ -489,6 +494,9 @@ class ParentLLMProxy:
         started = time.monotonic()
         status = 502
         usage: Dict[str, Any] = {}
+        gw_request_id: Optional[str] = None
+        gw_error_code: Optional[str] = None
+        gw_error_type: Optional[str] = None
         delivered = True
         try:
             if not self.upstream_base or not self.upstream_key:
@@ -508,6 +516,11 @@ class ParentLLMProxy:
                 status = int(response.status)
             decoded = json.loads(raw.decode("utf-8"))
             usage = (decoded.get("usage") or {}) if isinstance(decoded, dict) else {}
+            if isinstance(decoded, dict):
+                # gateway correlation id (probe-verified: == the X-Request-Id
+                # response header, which this reply path does not forward)
+                rid = decoded.get("id")
+                gw_request_id = str(rid)[:64] if rid else None
             delivered = handler._reply(
                 status, decoded if isinstance(decoded, dict) else {"data": decoded})
         except urllib.error.HTTPError as exc:
@@ -517,7 +530,14 @@ class ParentLLMProxy:
                 decoded = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 decoded = {"error": {"message": f"upstream HTTP {status}"}}
+
+
+
+            if isinstance(decoded, dict) and isinstance(decoded.get("error"), dict):
+                gw_error_code = decoded["error"].get("code")
+                gw_error_type = decoded["error"].get("type")
             delivered = handler._reply(status, decoded)
+
         except Exception:
             status = 502
             delivered = handler._reply(
@@ -533,6 +553,10 @@ class ParentLLMProxy:
                       ("allowed" if status < 400 else "upstream failure"))
             self._audit({**scope, "status": status, "allow": status < 400,
                          "reason": reason, "delivered": delivered,
+                         "call_id": call_id,
+                         "gw_request_id": gw_request_id,
+                         "gw_error_code": gw_error_code,
+                         "gw_error_type": gw_error_type,
                          "prompt_tokens": usage.get("prompt_tokens"),
                          "completion_tokens": usage.get("completion_tokens"),
                          "total_tokens": usage.get("total_tokens"),

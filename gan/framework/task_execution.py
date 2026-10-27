@@ -837,8 +837,14 @@ def prepare_polyglot_questions(
     from domains.polyglot import gan_utils as pgu
     task_list = domain_cfg.get("eval_task_list") or None
     if sample_seed is not None:
+        # Held-out exclusion (docs/15 §12.4-3): the rotating MAIN LINE never
+        # draws a val question, in pinned or full-pool mode. The legacy_prefix
+        # and "all" branches below are explicit baselines / full evaluations
+        # and keep the whole pool (declared exemption, docs/15 §12.5-e).
+        heldout = set(_polyglot_heldout_ids(dataset_root))
         pool = [str(i) for i in pgu.load_instance_ids(dataset_root)
-                if not task_list or str(i) in set(task_list)]
+                if (not task_list or str(i) in set(task_list))
+                and str(i) not in heldout]
         if num_samples is None or num_samples <= 0:
             rows = pgu.load_instances(dataset_root, task_list=task_list,
                                       num_samples=0)
@@ -867,6 +873,49 @@ def prepare_polyglot_questions(
     os.makedirs(input_dir, exist_ok=True)
     questions_path = os.path.join(input_dir, "questions.csv")
     pd.DataFrame(rows).to_csv(questions_path, index=False)
+    return questions_path, sample_info
+
+
+def prepare_polyglot_questions_by_ids(
+    dataset_root: str,
+    run_dir: str,
+    question_ids: List[str],
+) -> Tuple[str, Dict[str, Any]]:
+    """Pin the polyglot question set to an explicit id list (fixed_ids mode).
+
+    Mirror of :func:`prepare_questions_by_ids` for the metadata domain: the
+    fixed-root evaluation must measure every supernode on exactly the same
+    questions, so the set is pinned instead of sampled. Requested ids absent
+    from the metadata are reported in ``sample_info["missing_ids"]`` rather
+    than silently dropped (a silently shorter set would corrupt the comparison
+    this exists to enable). Rows keep metadata order. NOTE: the pinned set
+    deliberately BYPASSES the main-line held-out exclusion -- these ids ARE
+    the evaluation set (docs/15 §12.5-c).
+    """
+    from domains.polyglot import gan_utils as pgu
+    requested = [str(q) for q in (question_ids or [])]
+    if not requested:
+        raise ValueError("polyglot fixed_ids: empty question id list")
+    rows = pgu.load_instances(dataset_root, task_list=sorted(set(requested)),
+                              num_samples=0)
+    found = {str(r[pgu.QUESTION_ID]) for r in rows}
+    missing = [q for q in requested if q not in found]
+    if not rows:
+        raise ValueError(
+            f"polyglot fixed_ids: none of the {len(requested)} requested ids "
+            f"resolve in the metadata (first: {missing[:3]})")
+    input_dir = os.path.join(run_dir, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    questions_path = os.path.join(input_dir, "questions.csv")
+    pd.DataFrame(rows).to_csv(questions_path, index=False)
+    sample_info = {
+        "mode": "fixed_ids",
+        "sample_seed": None,
+        "anchor_ids": [str(r[pgu.QUESTION_ID]) for r in rows],
+        "sampled_ids": [str(r[pgu.QUESTION_ID]) for r in rows],
+        "requested_ids": requested,
+        "missing_ids": missing,
+    }
     return questions_path, sample_info
 
 
@@ -983,10 +1032,57 @@ def load_pool_ids(domain: str, dataset_root: str, subset: str) -> List[str]:
     """
     if domain == "polyglot":
         from domains.polyglot import gan_utils as _pgu
-        return _pgu.load_instance_ids(dataset_root)
+        pool = [str(i) for i in _pgu.load_instance_ids(dataset_root)]
+        # Held-out exclusion (docs/15 §12.4-3 / §12.5-e): the val subset never
+        # enters the main-line pool. This source feeds BOTH the main-line
+        # anchor drawing (an anchor that is a val question would be answered
+        # by the main line every generation, contaminating the evaluation)
+        # and the startup pool check (which must report the post-exclusion
+        # size honestly). The exclusion covers the WHOLE val file, not only
+        # the ids drawn as eval anchors, so changing eval.anchor_k in a later
+        # run cannot leak held-out questions into the main line.
+        heldout = set(_polyglot_heldout_ids(dataset_root))
+        return [i for i in pool if i not in heldout]
     if domain in _SANDBOXED_BALROG_DOMAINS:
         return []
     return load_dataset_ids(dataset_root, domain, subset)
+
+
+def _polyglot_subset_ids(dataset_root: str, subset_name: str) -> List[str]:
+    """Id list of a polyglot subset file (``subsets/<name>.json``).
+
+    The polyglot ``eval.subset`` semantics: the value names a JSON id list
+    under ``domains/polyglot/subsets/`` (the small/medium files are the same
+    shape, consumed by the DGM-H native CLI). A blank name is the caller's
+    "no evaluation set" -> ``[]``; a NAMED-but-missing file also returns
+    ``[]`` with a soft note, because the Defect-1 guard will then refuse the
+    fixed-root evaluation and the run should say why (docs/15 §12.5-b).
+    """
+    name = str(subset_name or "").strip()
+    if not name:
+        return []
+    path = os.path.join(dataset_root, "domains", "polyglot", "subsets",
+                        f"{name}.json")
+    if not os.path.isfile(path):
+        _log_soft_sample_note(
+            f"polyglot subset file missing: {path}; the fixed-root evaluation "
+            f"will be refused by the Defect-1 guard (eval_question_set_missing)")
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        ids = json.load(f)
+    return sorted({str(i) for i in ids})
+
+
+def _polyglot_heldout_ids(dataset_root: str) -> List[str]:
+    """The held-out evaluation ids (``subsets/val.json``), for main exclusion.
+
+    Excluded from the MAIN-LINE sampling pool so the planner's feedback
+    channel never sees a val question (docs/15 §12.4-3). Explicit baseline
+    modes are exempt: ``legacy_prefix`` and the full (``num_samples<=0``)
+    runs keep the whole pool -- they are declared A/B baselines / full
+    evaluations, not the rotating main line.
+    """
+    return _polyglot_subset_ids(dataset_root, "val")
 
 
 def select_seeded_positions(
@@ -1119,10 +1215,17 @@ def ensure_sampling_seed(
     eval_k_used = max(0, int(eval_anchor_k or 0))
     if eval_subset_used and eval_k_used > 0:
         try:
-            eval_pool = (
-                [] if domain == "polyglot" or domain in _SANDBOXED_BALROG_DOMAINS
-                else load_dataset_ids(dataset_root, domain, eval_subset_used)
-            )
+            if domain == "polyglot":
+                # eval.subset names a polyglot subset file (subsets/<name>.json
+                # id list; small/medium precedent) -- the held-out evaluation
+                # candidate pool (docs/15 §12.5-b). Missing/blank -> [] and the
+                # Defect-1 guard then refuses val_mean instead of publishing an
+                # incomparable number.
+                eval_pool = _polyglot_subset_ids(dataset_root, eval_subset_used)
+            elif domain in _SANDBOXED_BALROG_DOMAINS:
+                eval_pool = []
+            else:
+                eval_pool = load_dataset_ids(dataset_root, domain, eval_subset_used)
             if eval_pool:
                 erng = random.Random(f"{int(base_seed)}:eval_anchor")
                 eval_ids = sorted(erng.sample(eval_pool, min(eval_k_used, len(eval_pool))))
@@ -2009,8 +2112,23 @@ def _run_harness_and_report_local(
         if not control_token:
             raise RuntimeError("LLM proxy task scope requires framework control capability")
         from gan.framework.llm_proxy import request_task_token
+        # Local non-broker transport (taskchain / developer paths, no broker
+        # config): scope the token exactly like the broker issues it --
+        # wall budget + per-question call budget (the same loop.yaml key the
+        # driver reads for the broker) + the uid the sandboxed child will
+        # drop to (it is the peer that presents the token to the proxy).
+        import pwd as _pwd
+        _sandbox_name = os.environ.get(_SANDBOX_USER_ENV, "").strip()
+        _peer_uid = (_pwd.getpwnam(_sandbox_name).pw_uid
+                     if _sandbox_name else os.getuid())
+        from gan.framework.loader import load_gan_loop_config as _load_cfg
+        _calls_per_q = int(_load_cfg().get(
+            "loop.task_llm_max_calls_per_question", 64))
         proxy_token = request_task_token(
-            proxy_socket, control_token, str(scope_id), model)
+            proxy_socket, control_token, str(scope_id), model,
+            ttl_s=float(timeout) + 60.0,
+            max_calls=max(1, _calls_per_q) * max(1, int(num_samples or 1)),
+            peer_uid=int(_peer_uid))
     needs_sandbox_identity = questions_path is not None or (
         domain in _SANDBOXED_HARNESS_DOMAINS and dataset_root is not None
     )

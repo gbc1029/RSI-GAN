@@ -219,14 +219,24 @@ def _polyglot_workspace_patch(inputs: dict) -> str:
     files = inputs.get("files") or {}
     cwd = os.getcwd()
     current: dict = {}
-    for base, _dirs, names in os.walk(cwd):
+    for base, dirs, names in os.walk(cwd):
+        # .gan_runtime/ is the agent RUNTIME (toolset/cm snapshot plus
+        # tools_load_report.json), not the child's work product (first real
+        # hit: A6 polyglot task round 2026-10-27 -- the load report leaked
+        # into every prediction diff). Prune the descent AND the union so
+        # runtime files can never enter the patch on either side.
+        dirs[:] = [d for d in dirs if d != ".gan_runtime"]
         for name in names:
             full = os.path.join(base, name)
             rel = os.path.relpath(full, cwd).replace(os.sep, "/")
+            if rel == ".gan_runtime" or rel.startswith(".gan_runtime/"):
+                continue
             with open(full, "r", encoding="utf-8", errors="replace") as f:
                 current[rel] = f.read()
     diffs: list = []
     for rel in sorted(set(files) | set(current)):
+        if rel == ".gan_runtime" or rel.startswith(".gan_runtime/"):
+            continue
         old = files.get(rel)
         new = current.get(rel)
         if old == new:

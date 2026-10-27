@@ -663,7 +663,8 @@ class GanLoop:
                                ("role", "seat", "outer", "genid", "attempt", "records",
                                 "llm_calls", "tool_calls", "tool_outputs", "prompt_tokens",
                                 "completion_tokens", "reasoning_tokens", "total_tokens",
-                                "wallclock_s")}})
+                                "wallclock_s", "llm_calls_failed", "llm_retry_total",
+                                "llm_time_s")}})
             return rec
         except Exception as e:  # noqa: BLE001 -- audit-only, never fatal
             soft_fail(f"cost_session record failed ({role}/{seat}, outer {outer}): {e}",

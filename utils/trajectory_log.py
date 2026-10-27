@@ -14,6 +14,7 @@ Record shapes (superset; all records carry ``ts`` and ``kind``):
     {"kind": "output",      "text": ...}
     {"kind": "tool_call",   "tool": ..., "input": {...}}
     {"kind": "tool_output", "tool": ..., "output": "..."}
+    {"kind": "llm_call",    ...}  (SIDEcar only, see llm_calls_sidecar)
 """
 from __future__ import annotations
 
@@ -26,6 +27,18 @@ from typing import Any, Dict, List, Optional
 
 _LOCK = threading.Lock()
 DEFAULT_MAX_BYTES = 8 * 1024 * 1024
+
+# Per-call LLM records (agent/llm.py ``llm_call`` rows) live in a SIDECAR next
+# to the trajectory, never inside it: agent read surfaces resolve only the
+# trajectory name, so the sidecar is physically unreachable by every agent
+# channel (capability-by-existence). Same directory => same write root; no new
+# grant is needed anywhere.
+LLM_CALLS_SIDECAR_SUFFIX = ".llm_calls.jsonl"
+
+
+def llm_calls_sidecar(path: str) -> str:
+    """Sidecar path holding the per-call LLM records of trajectory ``path``."""
+    return f"{path}{LLM_CALLS_SIDECAR_SUFFIX}"
 
 
 def _parts(path: str) -> List[str]:
