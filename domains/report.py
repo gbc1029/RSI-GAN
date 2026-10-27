@@ -21,6 +21,45 @@ def _report_columns(domain):
     return utils_module.GROUND_TRUTH_KEY, utils_module.QUESTION_ID
 
 
+# -- scoring rule: strict string equality vs verdict parsing ----------------
+# paper_review's label is accept/reject, but the task agent is free to answer
+# with a full review, so exact lowercase matching measured FORMATTING rather
+# than judgement: on the 2026-10-24 matrix a pure offline re-parse lifted every
+# arm that wrote prose by +0.06~0.10, while the two arms whose predictions were
+# already the bare label moved by exactly 0.0000. For this domain only, the
+# PREDICTION IS the parsed verdict. Every other domain keeps the legacy rule
+# untouched -- `score_mode` in report.json states which rule produced the
+# numbers, so a report is never ambiguous about its own yardstick.
+_LENIENT_VERDICT_DOMAINS = frozenset({"paper_review"})
+_LENIENT_LABELS = ("accept", "reject")
+
+
+def _lenient_verdicts(values, labels=_LENIENT_LABELS):
+    """Map free-form answers onto ``labels``; returns ``(labels|None, facts)``.
+
+    ``None`` means the parser is unavailable (the module also ships into the
+    task sandbox, where ``gan`` is not on the path): the caller then keeps the
+    strict score rather than crashing. ``facts`` is an audit trail only --
+    decided/undecided counts plus the parse-method histogram -- and never feeds
+    the score itself.
+    """
+    try:
+        from gan.framework.verdict import parse_verdict
+    except Exception as exc:  # pragma: no cover - standalone/child fallback
+        return None, {"error": f"{type(exc).__name__}: {exc}"[:160]}
+    out = []
+    methods = {}
+    for raw in values:
+        verdict = parse_verdict(str(raw), labels=labels)
+        out.append(verdict.label)
+        methods[verdict.method] = methods.get(verdict.method, 0) + 1
+    return out, {
+        "decided": sum(1 for x in out if x),
+        "undecided": sum(1 for x in out if not x),
+        "methods": methods,
+    }
+
+
 def compute_report(df, domain, ground_truth_key, question_id_col):
     """Compute the legacy label report from an in-memory dataframe."""
     df = df.copy()
@@ -33,6 +72,21 @@ def compute_report(df, domain, ground_truth_key, question_id_col):
     df["prediction"] = df["prediction"].str.strip().str.lower()
     df[ground_truth_key] = df[ground_truth_key].str.strip().str.lower()
     df["match"] = df[ground_truth_key] == df["prediction"]
+
+    # paper_review: replace the strict match with the parsed verdict. An
+    # undecided parse becomes "" -- a WRONG answer, never a dropped row -- so
+    # the denominator (`total`) and `coverage` do not move with the rule.
+    score_mode = "strict"
+    strict_accuracy = None
+    verdict_facts = None
+    if domain in _LENIENT_VERDICT_DOMAINS:
+        parsed, verdict_facts = _lenient_verdicts(df["prediction"])
+        if parsed is not None:
+            strict_accuracy = float(df["match"].mean()) if len(df) else None
+            df["prediction"] = pd.Series(parsed, index=df.index,
+                                          dtype=object).fillna("")
+            df["match"] = df[ground_truth_key] == df["prediction"]
+            score_mode = "lenient"
 
     # Calculate overall accuracy
     accuracy = df["match"].mean()
@@ -106,6 +160,7 @@ def compute_report(df, domain, ground_truth_key, question_id_col):
             imo_extra["normalized_mean_absolute_error_error"] = mae_error
     report = {
         "overall_accuracy": float(accuracy),
+        "score_mode": score_mode,
         **imo_extra,
         "total_correct": total_correct,
         "total": total,
@@ -122,6 +177,12 @@ def compute_report(df, domain, ground_truth_key, question_id_col):
             row[question_id_col] for _, row in df[df["match"] == True].iterrows()
         ],
     }
+    # Diagnostics for the lenient rule: the strict number is kept so a switch of
+    # yardstick is always visible (and auditable) inside the same report.
+    if strict_accuracy is not None:
+        report["overall_accuracy_strict"] = strict_accuracy
+    if verdict_facts is not None:
+        report["verdict_parse"] = verdict_facts
     return report
 
 
