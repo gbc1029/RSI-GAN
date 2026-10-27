@@ -169,7 +169,7 @@ def _validated_result(method: str, value: Any) -> Any:
     return value
 
 
-def _raise_remote(error: Dict[str, Any]) -> None:
+def _remote_exception(error: Dict[str, Any]) -> BaseException:
     _exact_keys(error, {"module", "name", "message"}, "remote error")
     module = error["module"]
     name = error["name"]
@@ -178,8 +178,12 @@ def _raise_remote(error: Dict[str, Any]) -> None:
         raise RoleProcessError("remote error fields must be strings")
     if module == "gan.framework.code_repo" and name == "RepoIntegrityError":
         from gan.framework.code_repo import RepoIntegrityError
-        raise RepoIntegrityError(message)
-    raise RoleProcessError(f"role worker {name}: {message}")
+        return RepoIntegrityError(message)
+    return RoleProcessError(f"role worker {name}: {message}")
+
+
+def _raise_remote(error: Dict[str, Any]) -> None:
+    raise _remote_exception(error)
 
 
 class RoleProcess:
@@ -249,7 +253,7 @@ class RoleProcess:
                 raise RoleProcessError("role broker launch capability is missing")
             channel = None
             auth_reader = None
-            for attempt in range(51):
+            for attempt in range(151):
                 channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
                     channel.connect(broker_socket)
@@ -267,7 +271,7 @@ class RoleProcess:
                     auth_reader = None
                     channel.close()
                     channel = None
-                    if retry and attempt < 50:
+                    if retry and attempt < 150:
                         time.sleep(0.1)
                         continue
                     raise RoleProcessError(
@@ -389,7 +393,18 @@ class RoleProcess:
                 raise RoleProcessError("role worker is not running")
             seat = _METHOD_SEAT[method]
             if self._seat != seat:
-                self._start_worker(seat)
+                restarting = self._seat is None and self._call_id > 0
+                try:
+                    self._start_worker(seat)
+                except Exception as exc:
+                    if restarting:
+                        self._log_worker_event(
+                            "role_worker_restart_denied", seat=seat,
+                            detail=str(exc)[:300],
+                        )
+                    raise
+                if restarting:
+                    self._log_worker_event("role_worker_restart", seat=seat)
             if self._reader is None or self._writer is None:
                 raise RoleProcessError("role worker channel is not running")
             self._call_id += 1
@@ -397,6 +412,7 @@ class RoleProcess:
             session_node = f"{self.instance}__{seat}"
             session_started = False
             call_succeeded = False
+            worker_healthy = False
             try:
                 if broker is not None and hasattr(broker, "begin_session"):
                     broker.begin_session(self.role, session_node)
@@ -451,7 +467,13 @@ class RoleProcess:
                         _exact_keys(reply, {"v", "type", "id", "error"}, "call error")
                         if reply["id"] != call_id:
                             raise RoleProcessError("role IPC call id mismatch")
-                        _raise_remote(reply["error"])
+                        remote_error = _remote_exception(reply["error"])
+                        worker_healthy = True
+                        self._log_worker_event(
+                            "role_worker_preserved", seat=seat, method=method,
+                            error=type(remote_error).__name__,
+                        )
+                        raise remote_error
                     _exact_keys(
                         reply, {"v", "type", "id", "result", "assembly_report"},
                         "call reply",
@@ -467,10 +489,23 @@ class RoleProcess:
                     call_succeeded = True
                     return result
             finally:
-                if not call_succeeded:
+                if not call_succeeded and not worker_healthy:
                     self._stop_worker()
                 if session_started:
                     broker.end_session(self.role, session_node)
+
+    def _log_worker_event(self, event_type: str, **fields: Any) -> None:
+        try:
+            from gan.framework import paths
+            from utils import trajectory_log
+            trajectory_log.append(paths.events_path(self.output_dir), {
+                "type": event_type,
+                "role": self.role,
+                "instance": self.instance,
+                **fields,
+            })
+        except Exception:
+            pass
 
     def _handle_event(self, request: Dict[str, Any]) -> None:
         _exact_keys(request, {"v", "type", "event"}, "role event")

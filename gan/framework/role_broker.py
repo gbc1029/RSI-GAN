@@ -32,6 +32,10 @@ class _OuterNotActive(RuntimeError):
     pass
 
 
+class _RoleCleanupPending(RuntimeError):
+    pass
+
+
 def _set_parent_death_signal() -> None:
     try:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -461,10 +465,11 @@ class _RoleBrokerState:
         self._lock = threading.Lock()
         self._acl_lock = threading.Lock()
         self._active: Dict[str, int] = {}
-        self._scopes: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+        self._scopes: Dict[Tuple[int, str, str, str], Dict[str, Any]] = {}
         self._outers: Dict[int, Dict[str, int]] = {}
         self._runtime_dirs: Dict[int, str] = {}
         self._proxy_tokens_by_pid: Dict[int, str] = {}
+        self._scope_by_pid: Dict[int, Tuple[int, str, str, str]] = {}
         self._traverse_refs: Dict[Tuple[int, int, int], int] = {}
         self._traverse_by_pid: Dict[int, List[Tuple[int, Tuple[int, int, int]]]] = {}
 
@@ -576,7 +581,10 @@ class _RoleBrokerState:
                         "outer": int(outer),
                         "instance": instance,
                         "proxy_token": token,
-                        "consumed": False,
+                        "launch_count": 0,
+                        "state": "idle",
+                        "active_pid": None,
+                        "cleanup_error": None,
                     }
         with self._lock:
             if any(key in self._scopes for key in normalized) or outer in self._outers:
@@ -618,6 +626,13 @@ class _RoleBrokerState:
             str(self.config["proxy_control_token"]), token,
         )
 
+    def _rotate_proxy(self, token: str) -> str:
+        from gan.framework.llm_proxy import rotate_role_token
+        return rotate_role_token(
+            str(self.config["proxy_socket"]),
+            str(self.config["proxy_control_token"]), token,
+        )
+
     def reserve(self, role: str, seat: str, instance: str, *,
                 peer_pid: int, peer_uid: int, peer_gid: int) -> Dict[str, Any]:
         match = _INSTANCE_RE.fullmatch(instance)
@@ -628,20 +643,95 @@ class _RoleBrokerState:
         owner_gid = int(self.config["owner_gid"])
         if peer_uid != owner_uid or peer_gid != owner_gid:
             raise PermissionError("role broker peer has an unexpected identity")
+        key = (outer, role, seat, instance)
         with self._lock:
             active = dict(self._outers.get(outer) or {})
-            scope = self._scopes.get((outer, role, seat, instance))
+            scope = self._scopes.get(key)
             if not active:
                 raise _OuterNotActive("role broker outer is not active")
             if scope is None:
                 raise PermissionError("invalid role launch capability descriptor")
-            if scope["consumed"]:
-                raise PermissionError("role seat was already launched")
             if not _is_descendant(
                     peer_pid, int(active["pid"]), int(active["starttime"])):
                 raise PermissionError("role broker peer is outside the active outer process tree")
-            scope["consumed"] = True
-            return dict(scope)
+            state = str(scope.get("state", "idle"))
+            if state in {"launching", "active", "cleanup"}:
+                raise _RoleCleanupPending("role seat cleanup is still pending")
+            if state == "failed":
+                raise PermissionError(
+                    f"role seat cleanup failed: {scope.get('cleanup_error') or 'unknown error'}")
+            launch_count = int(scope.get("launch_count", 0))
+            if launch_count >= 2:
+                raise PermissionError("role seat restart budget exhausted")
+            scope["state"] = "launching"
+            scope["launch_count"] = launch_count + 1
+            token = str(scope["proxy_token"])
+            restart = launch_count == 1
+        if restart:
+            try:
+                token = self._rotate_proxy(token)
+            except Exception as exc:
+                with self._lock:
+                    current = self._scopes.get(key)
+                    if current is not None and current.get("state") == "launching":
+                        current["state"] = "idle"
+                        current["launch_count"] = launch_count
+                raise _RoleCleanupPending(
+                    f"role proxy capability rotation is not ready: {exc}") from exc
+            with self._lock:
+                current = self._scopes.get(key)
+                if current is None or current.get("state") != "launching":
+                    self._revoke_proxy(token)
+                    raise PermissionError("role launch scope was released during restart")
+                current["proxy_token"] = token
+                scope = current
+        return dict(scope)
+
+    @staticmethod
+    def _scope_key(scope: Dict[str, Any]) -> Tuple[int, str, str, str]:
+        return (int(scope["outer"]), str(scope["role"]),
+                str(scope["seat"]), str(scope["instance"]))
+
+    def _mark_active(self, scope: Dict[str, Any], pid: int) -> None:
+        key = self._scope_key(scope)
+        with self._lock:
+            current = self._scopes.get(key)
+            if current is None or current.get("state") != "launching":
+                raise RuntimeError("role launch scope is no longer active")
+            current["state"] = "active"
+            current["active_pid"] = int(pid)
+            self._scope_by_pid[int(pid)] = key
+
+    def _begin_reclaim(self, pid: int) -> None:
+        with self._lock:
+            key = self._scope_by_pid.get(int(pid))
+            scope = self._scopes.get(key) if key is not None else None
+            if scope is not None:
+                scope["state"] = "cleanup"
+
+    def _finish_reclaim(self, pid: int, errors: List[str]) -> None:
+        with self._lock:
+            key = self._scope_by_pid.pop(int(pid), None)
+            scope = self._scopes.get(key) if key is not None else None
+            if scope is None:
+                return
+            scope["active_pid"] = None
+            scope["cleanup_error"] = "; ".join(errors[:5]) if errors else None
+            scope["state"] = "failed" if errors else "idle"
+
+    def _finish_failed_launch(self, scope: Dict[str, Any], errors: List[str], *,
+                              launched: bool) -> None:
+        key = self._scope_key(scope)
+        with self._lock:
+            current = self._scopes.get(key)
+            if current is None:
+                return
+            if not launched:
+                current["launch_count"] = max(
+                    0, int(current.get("launch_count", 1)) - 1)
+            current["active_pid"] = None
+            current["cleanup_error"] = "; ".join(errors[:5]) if errors else None
+            current["state"] = "failed" if errors else "idle"
 
     def launch(self, role: str, seat: str, instance: str, *,
                peer_pid: int, peer_uid: int,
@@ -655,7 +745,11 @@ class _RoleBrokerState:
         account = dict(cfg["accounts"])[role]
         role_uid, role_gid = int(account["uid"]), int(account["gid"])
         output_dir, code_root = str(cfg["output_dir"]), str(cfg["code_root"])
-        runtime_root = _copy_runtime_projection(code_root, role)
+        try:
+            runtime_root = _copy_runtime_projection(code_root, role)
+        except Exception:
+            self._finish_failed_launch(scope, [], launched=False)
+            raise
         outer = int(scope["outer"])
         writable = [
             os.path.join("toolsets", role, instance, seat),
@@ -667,18 +761,25 @@ class _RoleBrokerState:
         if seat == "self_improve":
             writable.append(os.path.join("ckpt", "design", role))
 
-        output_fd = _open_dir(output_dir)
+        try:
+            output_fd = _open_dir(output_dir)
+        except Exception:
+            shutil.rmtree(runtime_root, ignore_errors=True)
+            self._finish_failed_launch(scope, [], launched=False)
+            raise
         try:
             runtime_fd = _open_dir(runtime_root)
         except Exception:
             os.close(output_fd)
             shutil.rmtree(runtime_root, ignore_errors=True)
+            self._finish_failed_launch(scope, [], launched=False)
             raise
         if (os.fstat(output_fd).st_uid != owner_uid
                 or os.fstat(runtime_fd).st_uid != os.geteuid()):
             os.close(runtime_fd)
             os.close(output_fd)
             shutil.rmtree(runtime_root, ignore_errors=True)
+            self._finish_failed_launch(scope, [], launched=False)
             raise RuntimeError("role sandbox roots have an unexpected owner")
         # The projection is created by the root broker with tempfile's 0700
         # default. bwrap resolves its /proc/self/fd source after setpriv has
@@ -814,6 +915,7 @@ class _RoleBrokerState:
             self._runtime_dirs[process.pid] = runtime_root
             self._proxy_tokens_by_pid[process.pid] = str(scope["proxy_token"])
             self._traverse_by_pid[process.pid] = traverse_entries
+            self._mark_active(scope, process.pid)
             traverse_entries = []
             return process, [output_fd, runtime_fd, *writable_fds]
         except Exception as launch_error:
@@ -845,6 +947,13 @@ class _RoleBrokerState:
                 self._release_traverse(traverse_entries, str(cfg["setfacl"]), role_uid)
             )
             shutil.rmtree(runtime_root, ignore_errors=True)
+            if process is not None:
+                try:
+                    self._revoke_proxy(str(scope["proxy_token"]))
+                except Exception as exc:
+                    reclaim_errors.append(f"role proxy revoke failed: {exc}")
+            self._finish_failed_launch(
+                scope, reclaim_errors, launched=process is not None)
             if reclaim_errors:
                 raise RuntimeError(
                     "role sandbox launch failed and ACL reclaim also failed: "
@@ -857,6 +966,8 @@ class _RoleBrokerState:
         cfg = self.config
         role_uid = int(dict(cfg["accounts"])[role]["uid"])
         errors = []
+        if pid is not None:
+            self._begin_reclaim(pid)
         try:
             for fd in fds[2:]:
                 try:
@@ -886,6 +997,7 @@ class _RoleBrokerState:
                 runtime_root = self._runtime_dirs.pop(pid, None)
                 if runtime_root:
                     shutil.rmtree(runtime_root, ignore_errors=True)
+                self._finish_reclaim(pid, errors)
         if errors:
             raise RuntimeError("; ".join(errors[:5]))
 
@@ -947,6 +1059,8 @@ class _RoleRequestHandler(socketserver.StreamRequestHandler):
             authenticated = True
             _relay(self.request, process)
         except _OuterNotActive as exc:
+            _reply(self, {"ok": False, "error": str(exc), "retry": True})
+        except _RoleCleanupPending as exc:
             _reply(self, {"ok": False, "error": str(exc), "retry": True})
         except PermissionError as exc:
             _reply(self, {"ok": False, "error": str(exc), "denied": True})

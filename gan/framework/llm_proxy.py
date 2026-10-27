@@ -144,6 +144,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/__gan__/revoke":
             self._revoke()
             return
+        if self.path == "/__gan__/rotate-role":
+            self._rotate_role()
+            return
         if self.path != "/v1/chat/completions":
             self.proxy.audit_denied(None, "unknown endpoint", self.path)
             self._reply(404, {"error": {"message": "unknown endpoint"}})
@@ -219,6 +222,30 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         self.proxy.revoke_scope(token)
         self._reply(200, {"revoked": True})
 
+    def _rotate_role(self) -> None:
+        if not self.is_unix:
+            self._reply(403, {"error": {"message":
+                        "framework role rotation requires Unix transport"}})
+            return
+        control = self.proxy._bearer(self.headers.get("Authorization"))
+        scope = self.proxy.scope_for(control)
+        if (not scope or scope.get("role") != "framework"
+                or int(scope.get("peer_uid", -1)) != self.peer_uid):
+            self.proxy.audit_denied(scope, "role scope rotation denied", self.path)
+            self._reply(403, {"error": {"message": "rotation capability denied"}})
+            return
+        body = self._read_json()
+        token = body.get("token") if body else None
+        if not isinstance(token, str) or not token:
+            self._reply(400, {"error": {"message": "token is required"}})
+            return
+        try:
+            issued = self.proxy.rotate_role_scope(token)
+        except ValueError as exc:
+            self._reply(400, {"error": {"message": str(exc)}})
+            return
+        self._reply(200, {"token": issued})
+
 
 class ParentLLMProxy:
     """Per-run proxy serving only an ACL-restricted Unix socket."""
@@ -240,6 +267,7 @@ class ParentLLMProxy:
         self.setfacl_path = setfacl_path
         self.max_request_bytes = 8 * 1024 * 1024
         self._tokens: Dict[str, Dict[str, Any]] = {}
+        self._role_replacements: Dict[str, str] = {}
         self._token_lock = threading.Lock()
         self._audit_lock = threading.Lock()
         self._server: Optional[_UnixHTTPServer] = None
@@ -321,6 +349,25 @@ class ParentLLMProxy:
             scope = self._tokens.get(token)
             if scope is not None:
                 scope["revoked"] = True
+
+    def rotate_role_scope(self, token: str) -> str:
+        """Revoke one role capability and return its idempotent replacement."""
+        with self._token_lock:
+            existing = self._role_replacements.get(token)
+            if existing is not None:
+                return existing
+            scope = self._tokens.get(token)
+            if scope is None or scope.get("role") not in {"planner", "evaluator"}:
+                raise ValueError("token is not a role capability")
+            scope["revoked"] = True
+            replacement = "sk-gan-" + secrets.token_urlsafe(32)
+            while replacement in self._tokens:
+                replacement = "sk-gan-" + secrets.token_urlsafe(32)
+            replacement_scope = dict(scope)
+            replacement_scope["revoked"] = False
+            self._tokens[replacement] = replacement_scope
+            self._role_replacements[token] = replacement
+            return replacement
 
     def _authorize_completion(self, token: Optional[str], peer_uid: int
                               ) -> tuple[Optional[Dict[str, Any]], str]:
@@ -470,7 +517,7 @@ class ParentLLMProxy:
                 decoded = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 decoded = {"error": {"message": f"upstream HTTP {status}"}}
-            delivered = handler._reply(status if status >= 500 else 502, decoded)
+            delivered = handler._reply(status, decoded)
         except Exception:
             status = 502
             delivered = handler._reply(
@@ -540,3 +587,13 @@ def request_task_token(socket_path: str, control_token: str, scope_id: str,
 def revoke_token(socket_path: str, control_token: str, token: str) -> None:
     """Revoke an issued agent capability through the framework-only channel."""
     _control_request(socket_path, control_token, "/__gan__/revoke", {"token": token})
+
+
+def rotate_role_token(socket_path: str, control_token: str, token: str) -> str:
+    """Replace one revoked planner/evaluator capability through framework control."""
+    payload = _control_request(
+        socket_path, control_token, "/__gan__/rotate-role", {"token": token})
+    issued = payload.get("token")
+    if not isinstance(issued, str) or not issued:
+        raise RuntimeError("proxy role scope rotation returned no token")
+    return issued

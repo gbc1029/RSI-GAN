@@ -93,7 +93,28 @@ class TreeStore:
                     continue
                 evt = json.loads(line)
                 self._apply(evt)
+        self._recompute_children()
         return self
+
+    @staticmethod
+    def _counts_as_child(node: Node) -> bool:
+        return bool(
+            node.valid_parent
+            and node.status != "invalid"
+            and node.value.score_status != "invalid"
+            and not node.meta.get("invalid")
+        )
+
+    def _recompute_children(self) -> None:
+        for node in self.nodes.values():
+            node.children = 0
+        for child in self.nodes.values():
+            if not self._counts_as_child(child):
+                continue
+            for parent_id in child.parents:
+                parent = self.nodes.get(_key(parent_id))
+                if parent is not None:
+                    parent.children += 1
 
     def _apply(self, evt: Dict[str, Any]) -> None:
         op = evt.get("op")
@@ -135,11 +156,13 @@ class TreeStore:
         for p in node.parents:
             if _key(p) in self.nodes:
                 parent = self.nodes[_key(p)]
-                parent.children += 1
                 depths.append(parent.depth)
-                self._append(
-                    {"op": "update", "genid": parent.genid, "fields": {"children": parent.children}}
-                )
+                if self._counts_as_child(node):
+                    parent.children += 1
+                    self._append(
+                        {"op": "update", "genid": parent.genid,
+                         "fields": {"children": parent.children}}
+                    )
         node.depth = (max(depths) + 1) if depths else 0
         self.nodes[_key(node.genid)] = node
         if _key(node.genid) not in self.order:
