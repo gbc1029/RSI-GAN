@@ -595,6 +595,31 @@ def _materialize_run_roots(repo_root: str, output_dir: str, layout: str):
     return code_root, roots
 
 
+def _launch_budget(cfg: Any, inner: Optional[int]) -> tuple[int, int, int]:
+    """Per-outer TASK LAUNCH budget: ``(inner_generations, eval_rounds, total)``.
+
+    The privileged broker refills a launch counter per outer (``register_outer``)
+    and EVERY task run of that outer consumes one: the main generations PLUS the
+    fixed-root evaluation rounds (``loop._evaluate_supernode`` runs
+    ``eval.eval_samples`` rounds on top of the inner loop, and only when outer
+    selection is enabled). Sizing this to the inner count alone starved every
+    evaluation launch with "task launch budget exhausted" -- observed as 108/108
+    eval rounds failing across a 6-outer x 3-rep matrix while the main line
+    looked perfectly healthy.
+
+    ``--inner`` OVERRIDES ``loop.inner_max`` inside the worker (outer_worker sets
+    ``cfg_overrides["loop"]["inner_max"]`` from it), so the budget must follow the
+    value the worker will actually use: ``--inner 4`` against a yaml of 2 would
+    otherwise allocate 3 launches and kill the 4th main generation with the very
+    error this budget exists to prevent.
+    """
+    inner_generations = (int(inner) if inner is not None
+                         else int(cfg.get("loop.inner_max", 3)))
+    eval_rounds = (max(0, int(cfg.get("eval.eval_samples", 3)))
+                   if bool(cfg.get("outer_select.enabled", False)) else 0)
+    return inner_generations, eval_rounds, inner_generations + eval_rounds
+
+
 @_private_driver_umask
 def run_gan_driver(
     repo_root: str,
@@ -620,7 +645,9 @@ def run_gan_driver(
     cfg = load_gan_loop_config(cfg_overrides)
     layout = str(cfg.get("loop.code_layout", "single"))
     G = int(cfg.get("loop.outer_generations", 2))
-    I_max = int(cfg.get("loop.inner_max", 3))
+    # Per-outer launch budget (main generations + evaluation rounds); see
+    # _launch_budget for why both terms and the --inner override matter.
+    I_max, eval_rounds, task_launch_budget = _launch_budget(cfg, inner)
     task_llm_calls_per_question = int(
         cfg.get("loop.task_llm_max_calls_per_question", 64))
     if task_llm_calls_per_question < 1:
@@ -659,6 +686,22 @@ def run_gan_driver(
     sandbox_profile = task_execution.validate_domain_sandbox_profile(
         domain, domain_config.get("sandbox"), repo_root,
     )
+    # Evaluation question set (loop.yaml eval.subset / eval.anchor_k). Read and
+    # validated HERE, before any proxy / code-root / broker side effect, because
+    # the fixed-root evaluation runs a question set that is INDEPENDENT of the
+    # main line and the root-side broker pins ``num_samples`` for every harness
+    # launch: an over-sized evaluation set would be silently truncated by the
+    # harness re-slice, so it is refused instead.
+    eval_section = cfg.get("eval") or {}
+    eval_subset = str(eval_section.get("subset") or "")
+    eval_anchor_k = max(0, int(eval_section.get("anchor_k") or 0))
+    eval_questions = eval_anchor_k if (eval_subset and eval_anchor_k) else 0
+    if eval_questions > int(num_samples):
+        raise ValueError(
+            f"eval.anchor_k ({eval_questions}) exceeds --num_samples "
+            f"({int(num_samples)}): the root-side task broker pins num_samples for "
+            f"every harness launch and would truncate the evaluation set silently. "
+            f"Raise --num_samples or lower eval.anchor_k.")
 
     owner_uid, owner_gid, owner_username = _sudo_invoking_identity()
     sandbox_username = os.environ.get("GAN_TASK_SANDBOX_USER", "").strip()
@@ -753,8 +796,20 @@ def run_gan_driver(
     domain_cfg = resolve_domain(reg, domain)
     safe_broker_env["GAN_SECURE_MODE"] = "1"
     safe_broker_env["PYTHON_DOTENV_DISABLED"] = "1"
-    question_timeout_s = int(domain_config.get("question_timeout_s") or 300)
-    harness_timeout = int(num_samples) * question_timeout_s + 900
+    # Per-outer budgets must cover the LARGER of the main-line and evaluation
+    # question sets -- otherwise every evaluation launch is refused ("task
+    # launch budget exhausted") or killed by a too-short wall clock. The
+    # evaluation set itself was resolved + bounded above, before any side effect.
+    questions_per_run = max(int(num_samples), eval_questions)
+    # Harness wall budget: THE shared formula (task_execution.harness_total_timeout)
+    # -- the broker registration and the outer worker's per-generation harness
+    # wait must never disagree (they were two hand-copied formulae that agreed
+    # only by coincidence of config; drift lesson). The helper applies the
+    # ``harness_timeout_s`` precedence itself. Fed with ``questions_per_run``
+    # rather than ``num_samples`` so the fixed-root evaluation rounds, which may
+    # run a LARGER question set, fit in the same budget.
+    harness_timeout = task_execution.harness_total_timeout(
+        domain_cfg, int(questions_per_run))
     harness_num_workers = int(domain_cfg.get("harness_num_workers", 5))
     if harness_num_workers < 1:
         raise ValueError(f"domain {domain!r} harness_num_workers must be positive")
@@ -779,7 +834,7 @@ def run_gan_driver(
         "harness_num_workers": harness_num_workers,
         "python": python_executable,
         "python_prefix": python_prefix,
-        "timeout": int(domain_cfg.get("harness_timeout_s") or harness_timeout),
+        "timeout": harness_timeout,
         "task_brief": (domain_cfg.get("task_brief") or ""),
         "parent_scored": task_execution.uses_parent_scoring(domain),
         # Question-sampling scheme (loop.yaml sampling.*). The broker reads the
@@ -798,7 +853,7 @@ def run_gan_driver(
         "proxy_control_token": proxy_control_token,
         "sandbox_etc_dir": sandbox_etc_dir,
         "task_llm_max_calls": (
-            max(1, int(num_samples)) *
+            max(1, int(questions_per_run)) *
             task_llm_calls_per_question
         ),
         "base_env": safe_broker_env,
@@ -873,6 +928,7 @@ def run_gan_driver(
         sampling_mode = str(sampling_cfg.get("mode", "seeded"))
         sample_seed_base: Optional[int] = None
         anchor_ids: list = []
+        eval_anchor_ids: list = []
         if sampling_mode == "seeded":
             # A FIXED base seed makes every ARM of an ablation matrix sample the
             # SAME questions (pairing / fairness); 0/absent keeps the old
@@ -882,14 +938,24 @@ def run_gan_driver(
                 output_dir, domain, subset, repo_root, int(num_samples),
                 anchor_k=int(sampling_cfg.get("anchor_k", 2)),
                 base_seed=fixed_seed or None,
+                # The evaluation anchor core is drawn from the held-out eval
+                # subset and is NOT capped by num_samples // 2 (select_samples'
+                # anchoring rule does not apply: the evaluation set is entirely
+                # fixed, never mixed with a fresh draw).
+                eval_subset=eval_subset or None,
+                eval_anchor_k=eval_anchor_k,
             )
             sample_seed_base = int(seed_info["base_seed"])
             anchor_ids = list(seed_info.get("anchor_ids") or [])
+            eval_anchor_ids = list(seed_info.get("eval_anchor_ids") or [])
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": "seeded",
                                     "base_seed": sample_seed_base,
                                     "fixed_by_config": bool(fixed_seed),
-                                    "anchor_ids": anchor_ids})
+                                    "anchor_ids": anchor_ids,
+                                    "eval_subset": seed_info.get("eval_subset"),
+                                    "eval_anchor_k": seed_info.get("eval_anchor_k"),
+                                    "eval_anchor_ids": eval_anchor_ids})
         else:
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": sampling_mode})
@@ -917,7 +983,22 @@ def run_gan_driver(
             "mome.cold_start_min": int(cfg.get("mome.cold_start_min", 10)),
             "mome.novelty_k": int(cfg.get("mome.novelty_k", 5)),
             "eval.eval_samples": int(cfg.get("eval.eval_samples", 3)),
-            "loop.inner_max": int(cfg.get("loop.inner_max", 3)),
+            # Which question set the fixed-root evaluation runs on -- the
+            # collector's regime guard must see a change here, because it makes
+            # scores measured on a different exam incomparable.
+            "eval.subset": eval_subset,
+            "eval.anchor_k": eval_anchor_k,
+            # Main-line anchor core size. It decides the resolution of the R4
+            # stagnation metric (anchor correct-count), so a change here makes
+            # two runs' inner-loop stopping behaviour incomparable -- the regime
+            # guard must see it.
+            "sampling.anchor_k": int((cfg.get("sampling") or {}).get("anchor_k", 0) or 0),
+            # Resolve exactly like _launch_budget: --inner OVERRIDES the yaml value
+            # inside the worker, so recording the yaml 2 while the worker runs 3
+            # would make the audit trail (and the collector's regime guard) lie
+            # about how many inner generations the run actually did.
+            "loop.inner_max": (int(inner) if inner is not None
+                               else int(cfg.get("loop.inner_max", 3))),
         }
         _log_event(output_dir, {"type": "driver_start", "code_root": code_root,
                                 "outer_generations": G,
@@ -929,6 +1010,7 @@ def run_gan_driver(
                                 "ablation": _ablation_active,
                                 "cfg_overrides": cfg_overrides or {},
                                 "effective": _effective,
+                                "task_launch_budget": int(task_launch_budget),
                                 "num_samples": num_samples,
                                 "subset": subset})
 
@@ -994,7 +1076,7 @@ def run_gan_driver(
             role_broker.register_outer(outer, role_proxy_tokens)
             proc = None
             try:
-                task_broker.register_outer(outer, I_max)
+                task_broker.register_outer(outer, task_launch_budget)
                 cmd = [
                     python_executable, "-m", "gan.outer_worker",
                     "--repo_root", repo_root, "--output_dir", output_dir,
@@ -1005,6 +1087,8 @@ def run_gan_driver(
                     cmd.extend(["--sample-seed-base", str(sample_seed_base)])
                     if anchor_ids:
                         cmd.extend(["--anchor-ids", ",".join(anchor_ids)])
+                    if eval_anchor_ids:
+                        cmd.extend(["--eval-anchor-ids", ",".join(eval_anchor_ids)])
                 # Overrides must reach the per-outer worker: it rebuilds its own
                 # loop config from loop.yaml + these overrides. Forwarding ONLY
                 # `ablation` silently reverted every other section (outer_select.*,

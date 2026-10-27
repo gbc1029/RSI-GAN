@@ -135,7 +135,13 @@ with a GAN-native data layer.
   (`report.json.total` excludes invalid samples when `coverage<1` — crosscheck
   counts, not denominators); **lenient** = offline verdict re-parse from the
   raw prediction text with a per-row parse-method audit trail
-  (dict_verdict/verdict_line/response_better/bare/model_exact/…); ground truth
+  (dict_verdict/verdict_line/response_better/bare/model_exact/…). NOTE since
+  2026-10-27: the ONLINE score of `paper_review` is itself the lenient verdict
+  (`domains/report.py:_LENIENT_VERDICT_DOMAINS`; `report.json.score_mode` says
+  which rule ran, `overall_accuracy_strict` keeps the strict echo), so the
+  offline "strict" column no longer equals `report.json.overall_accuracy` for
+  that domain — it is now the "what strict matching would have said" diagnostic;
+  ground truth
   is auto-disambiguated by matching every observed `question_id` against the
   `domains/<domain>/dataset*.csv` files. Per-generation AND per-question tables
   (systematic-error localization), evaluator `predicted_score` calibration, and

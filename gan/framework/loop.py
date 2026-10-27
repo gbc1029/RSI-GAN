@@ -114,6 +114,29 @@ from utils.soft_fail import soft_fail
 _MEASURED = ("ok", "partial")
 
 
+def stagnation_metric(anchor_child: Optional[int], anchor_parent: Optional[int],
+                      score_child: Optional[float],
+                      score_parent: Optional[float]) -> Tuple[str, Any, Any]:
+    """Pick the (metric, current, previous) triple for the stagnation verdict.
+
+    R4 (docs/11 §3.0 sibling rationale): ``benchmark.mean`` is measured on a
+    per-generation question draw, so a ``(child - parent)`` on it compares two
+    different exams -- 30 questions give SE ~0.16, which is the same order as the
+    effects being chased. The anchor core (``sampling.anchor_k``) is the only
+    part of the sample held identical across generations, so its correct COUNT
+    is cross-generation comparable: coarse but noise-free, and it costs nothing
+    because those questions were already answered.
+
+    Falls back to the score comparison whenever the anchor core cannot be
+    compared (no anchors configured -- e.g. ``sampling.anchor_k: 0``, a
+    non-parent-scored domain, or a parent generation with no report), so the
+    legacy behaviour stays reachable by turning anchors off.
+    """
+    if anchor_child is not None and anchor_parent is not None:
+        return "anchor_correct", anchor_child, anchor_parent
+    return "benchmark_mean", score_child, score_parent
+
+
 class GanLoop:
     def __init__(
         self,
@@ -123,6 +146,8 @@ class GanLoop:
         planner: Any = None,
         evaluator: Any = None,
         task_runner: Callable[..., Node] = None,
+        eval_runner: Optional[Callable[..., Node]] = None,
+        anchor_ids: Optional[List[str]] = None,
         broker: Any = None,
         resume: bool = False,
         enable_checkpoint: bool = True,
@@ -131,6 +156,7 @@ class GanLoop:
         code_root: Optional[str] = None,
         ledger_writer: Optional[Any] = None,
         roots: Optional[Any] = None,
+        token_budget_per_gen: Optional[int] = None,
     ):
         self.output_dir = os.path.abspath(output_dir)
         # B46 step-1 gate: the per-run WriterToken guards every decision-grade
@@ -144,6 +170,12 @@ class GanLoop:
         self.planner = planner
         self.evaluator = evaluator
         self.task_runner = task_runner
+        # Separate runner for the fixed-root evaluation (docs/14 §5.5). It is
+        # pinned to the run-persistent EVALUATION question set (held-out val
+        # split, fixed ids, never re-sampled), so every supernode of the run is
+        # measured on exactly the same questions. Falling back to the main-line
+        # runner keeps offline smokes / legacy constructions working.
+        self.eval_runner = eval_runner or task_runner
         self.broker = broker
         self.resume = bool(resume)
         self.enable_checkpoint = bool(enable_checkpoint)
@@ -156,7 +188,14 @@ class GanLoop:
         # ``cost.token_budget_per_gen`` is the statements' reference line here;
         # its clamp consumer arrives with the reserved-key phase (C).
         self.record_usage = bool(cfg.get("cost.record_usage", True))
-        self.token_budget_per_gen = cfg.get("cost.token_budget_per_gen")
+        # Per-generation reference line for the plan/evaluate cost statements
+        # AND the clamp ceiling threaded to _task_budget_keys. build_gan_loop
+        # resolves the per-domain override (domains.yaml token_budget_per_gen
+        # > loop.yaml cost.token_budget_per_gen) and passes it explicitly;
+        # None keeps the loop.yaml global (legacy constructions).
+        self.token_budget_per_gen = (
+            token_budget_per_gen if token_budget_per_gen is not None
+            else cfg.get("cost.token_budget_per_gen"))
         # Session cost records settled by THIS loop (outer summary + audit).
         self._session_costs: List[Dict[str, Any]] = []
         self.self_improve_max_tool_calls = int(cfg.get("loop.self_improve_max_tool_calls", 30))
@@ -234,6 +273,19 @@ class GanLoop:
         self.max_elites_per_cell = int(cfg.get("mome.max_elites_per_cell", 3))
         self.eval_samples = int(cfg.get("eval.eval_samples", 3))
         self.eval_base_ref = str(cfg.get("eval.eval_base", "eval_base"))
+        # The evaluation question set (docs/14 §5.5): a held-out subset with a
+        # run-persistent anchor core, resolved by ``build.py`` from
+        # ``ckpt/sample_seed.json``. Empty = no dedicated set (legacy behaviour:
+        # the evaluation reuses the main-line runner's sampling).
+        self.eval_subset = str(cfg.get("eval.subset", "") or "")
+        self.eval_anchor_k = int(cfg.get("eval.anchor_k", 0) or 0)
+        # MAIN-LINE anchor core (``sampling.anchor_k``: ckpt/sample_seed.json
+        # ``anchor_ids``). It is the ONLY part of a generation's question sample
+        # that is identical across generations, so the inner-stagnation verdict
+        # is judged on its correct COUNT (R4) instead of ``benchmark.mean``
+        # (whose question set is re-drawn per generation). Empty when anchors are
+        # off -- the verdict then falls back to the score comparison.
+        self.anchor_ids = [str(a) for a in (anchor_ids or [])]
         # Per-batch wall-clock budget for the fixed-root evaluation (s). 0/None =
         # unbounded. Checked BETWEEN rounds (a single in-flight round cannot be
         # interrupted in-process, so a hung round still overruns).
@@ -1078,6 +1130,29 @@ class GanLoop:
         )
 
     # -- supernode (docs/13 §2.3) -----------------------------------------
+    def _anchor_correct(self, genid: Any) -> Optional[int]:
+        """Correct answers on the run-persistent anchor core, or ``None``.
+
+        R4: ``benchmark.mean`` re-draws its question set every generation
+        (``derive_sample_seed``), so comparing two generations on it compares two
+        different exams -- at 30 questions the standard error is ~0.16, i.e. a
+        "no improvement" verdict on it is mostly question-set noise. The anchor
+        core is the only part of the sample held identical across generations,
+        so its correct COUNT is a cross-generation comparable signal: coarse
+        (k=2 gives 0/1/2) but noise-free, and free -- the main line has already
+        answered those questions.
+
+        An anchor the generation did not answer counts as WRONG (a missing answer
+        is a miss, not an incomparable observation); ``None`` means there is
+        nothing to compare at all (no anchor core, or no report).
+        """
+        if not self.anchor_ids:
+            return None
+        per_q = self._read_per_question(genid)
+        if not per_q:
+            return None
+        return int(sum(per_q.get(q, 0.0) for q in self.anchor_ids))
+
     def _read_per_question(self, genid: Any) -> Dict[str, float]:
         """Reconstruct per-question 0/1 from report.json question_ids_{passed,failed}."""
         try:
@@ -1261,6 +1336,23 @@ class GanLoop:
                     "coverage": coverage,
                     "n_valid": len(scores),
                     "mae": mae,
+                    # Fixed-root evaluation (docs/14 §5.5). ``mean`` above stays
+                    # the MAIN-LINE train score -- its question set changes every
+                    # generation, so it is a diagnostic, not a comparable level.
+                    # ``val_mean`` is the score on the run-persistent held-out
+                    # evaluation set, identical for every supernode -> that is
+                    # what ``fitness_p`` compares and what the selection orders by.
+                    "val_mean": None,
+                    "val_std": None,
+                    "val_n_valid": 0,
+                    # Honest FACT, not configuration intent: only a dedicated
+                    # evaluation runner (fixed question set) makes this a val
+                    # measurement. With the main-line fallback nothing has been
+                    # measured yet, so the field stays None.
+                    "val_subset": (getattr(self.eval_runner, "subset", None)
+                                   if self.eval_runner is not self.task_runner
+                                   else None),
+                    "val_anchor_ids": [],
                     "eval_baseline": None,   # filled by evaluate_on_root (B4)
                     "reevaluated": False,    # -> true after evaluate_on_root (B4)
                 },
@@ -1358,10 +1450,17 @@ class GanLoop:
             # An entry with no benchmark at all has NO comparable F_p: it would
             # never be pruned (_dominates returns False on None), would occupy a
             # per-cell capacity slot, and could win a tournament draw when its
-            # cell holds only such entries. Keep it out of the archive.
+            # cell holds only such entries. Keep it out of the archive. The same
+            # holds when the entry's score was measured with a different
+            # yardstick than the window (val vs main-line mean) -- that is the
+            # mixed-baseline defect, so the reason distinguishes them.
             if fp is None:
-                self.log_event({"type": "supernode_not_archived", "outer": outer,
-                                "reason": "no_benchmark"})
+                conflict = F.scale_conflict(sn, refs)
+                self.log_event({
+                    "type": "supernode_not_archived", "outer": outer,
+                    "reason": "scale_mismatch" if conflict else "no_benchmark",
+                    "detail": conflict,
+                })
                 return
             key = arch.upsert({
                 "outer": outer,
@@ -1414,6 +1513,17 @@ class GanLoop:
         on the fixed eval base; the task tree / scores are NOT written, and the
         main-line task HEAD is restored afterwards (evaluation commits become
         orphans).
+
+        The question set is fixed per RUN, not per round: ``self.eval_runner``
+        carries an explicit id list (``fixed_question_ids``), drawn once from the
+        held-out evaluation subset and identical for every supernode. Without
+        that list the eval genid changes per round and ``derive_sample_seed``
+        turns it into a FRESH question draw -- which is what made sibling
+        supernodes incomparable (same code base, different exam).
+
+        The result lands in ``benchmark.val_mean`` (NOT ``benchmark.mean``):
+        ``mean`` remains the main-line train score, whose question set changes
+        every generation. ``fitness_p`` compares ``val_mean``.
         """
         if not self.outer_select_enabled:
             return
@@ -1425,6 +1535,29 @@ class GanLoop:
 
             sn = load_supernode(self.output_dir, outer)
             if not sn:
+                return
+            # Defect-1 guard (docs/14 §5.5): the evaluation is only comparable
+            # when the QUESTION SET IS FIXED. Without ``eval_anchor_ids`` -- an
+            # old run dir that predates the val evaluation (the seed file is
+            # skip-if-exists), or a failed anchor draw -- ``eval_runner`` falls
+            # back to the main-line runner, whose per-genid seed draws a
+            # DIFFERENT question set for every round. That is exactly the
+            # unpaired measurement the val evaluation replaced: refuse to stamp
+            # a score for it instead of publishing an incomparable number that
+            # ``fitness_p`` would then PREFER over the honest main-line mean.
+            fixed_ids = list(getattr(self.eval_runner, "fixed_question_ids", None) or [])
+            if self.eval_runner is self.task_runner or not fixed_ids:
+                self.log_event({
+                    "type": "eval_question_set_missing", "outer": outer,
+                    "eval_runner_is_main": self.eval_runner is self.task_runner,
+                    "fixed_ids": len(fixed_ids),
+                    "eval_subset": self.eval_subset or None,
+                    "eval_anchor_k": self.eval_anchor_k,
+                    "skipped_note": "no benchmark.val_mean written for this outer",
+                    "hint": ("ckpt/sample_seed.json has no eval_anchor_ids "
+                             "(the loader is skip-if-exists, so a NEW run dir is "
+                             "required for the val evaluation)"),
+                })
                 return
             eval_base = self._resolve_eval_base()
             if eval_base is None:
@@ -1477,7 +1610,7 @@ class GanLoop:
                         max_tool_calls=self.plan_max_tool_calls,
                         tool_repeat_limit=self.tool_repeat_limit,
                     ) or {}
-                child = self.task_runner(plan=plan_result, parent=initial,
+                child = self.eval_runner(plan=plan_result, parent=initial,
                                          genid=genid, base=eval_base)
                 if child is None:
                     # A None child used to vanish: run_eval_rounds only counts
@@ -1530,22 +1663,35 @@ class GanLoop:
                           event_path=paths.events_path(self.output_dir),
                           event_type="eval_head_restore_unavailable", outer=outer)
 
-            # Only a batch with at least one VALID round may overwrite the
-            # benchmark. Assigning a None mean on total failure would ERASE the
-            # main-line score -- the degradation must keep the old value.
+            # Only a batch with at least one VALID round may stamp the val score.
+            # Assigning a None mean on total failure would ERASE a previous good
+            # estimate -- the degradation must keep the old values.
             if result["n_valid"] > 0:
-                sn["benchmark"]["mean"] = result["mean"]
-                sn["benchmark"]["std"] = result["std"]
-                sn["benchmark"]["n_valid"] = result["n_valid"]
+                # Deliberately NOT written into ``benchmark.mean``: that field is
+                # the main-line train score and overwriting it silently replaced
+                # an in-run measurement with an out-of-run one (and made the
+                # pre/post-evaluation numbers incomparable).
+                sn["benchmark"]["val_mean"] = result["mean"]
+                sn["benchmark"]["val_std"] = result["std"]
+                sn["benchmark"]["val_n_valid"] = result["n_valid"]
+                sn["benchmark"]["val_subset"] = (
+                    getattr(self.eval_runner, "subset", None)
+                    or self.eval_subset or None)
+                sn["benchmark"]["val_anchor_ids"] = list(
+                    getattr(self.eval_runner, "fixed_question_ids", None) or [])
                 sn["benchmark"]["eval_baseline"] = self.eval_base_ref
                 sn["benchmark"]["reevaluated"] = True
             else:
                 sn["benchmark"]["reevaluated"] = False
                 self.log_event({"type": "supernode_eval_degraded", "outer": outer,
-                                "keep_mean": (sn.get("benchmark") or {}).get("mean")})
+                                "keep_mean": (sn.get("benchmark") or {}).get("mean"),
+                                "keep_val_mean": (sn.get("benchmark") or {}).get("val_mean")})
             update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
             self.log_event({"type": "supernode_evaluated", "outer": outer,
-                            "mean": result["mean"], "n_valid": result["n_valid"],
+                            "val_mean": result["mean"], "n_valid": result["n_valid"],
+                            "eval_subset": (getattr(self.eval_runner, "subset", None)
+                                            or self.eval_subset or None),
+                            "eval_anchor_k": self.eval_anchor_k,
                             "timed_out": result.get("timed_out", False),
                             "reevaluated": bool(result["n_valid"])})
         except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
@@ -2759,7 +2905,15 @@ class GanLoop:
                 # stagnation + advantage (only measured scores count as improvement)
                 ps, cs = parent.value.score, child.value.score
                 measured = child.value.score_status in _MEASURED
-                improved = measured and (cs is not None) and (ps is None or (cs - ps) > eps)
+                # R4: judge improvement on a CROSS-GENERATION COMPARABLE metric.
+                # The anchor core is identical every generation; benchmark.mean
+                # is a different exam each time. Coarse but noise-free beats
+                # precise but incomparable for a "did it move?" verdict.
+                anc_child = self._anchor_correct(child.genid) if measured else None
+                anc_parent = self._anchor_correct(parent.genid) if measured else None
+                metric, cur, prev = stagnation_metric(anc_child, anc_parent, cs, ps)
+                improved = (measured and (cur is not None)
+                            and (prev is None or (cur - prev) > eps))
                 outer_improved = outer_improved or improved
                 no_improve = 0 if improved else no_improve + 1
                 if cs is not None and ps is not None:
@@ -2769,6 +2923,9 @@ class GanLoop:
                     "type": "inner_done", "outer": outer, "inner": inner,
                     "genid": genid, "parent_genid": parent.genid, "parents": child.parents,
                     "score": cs, "parent_score": ps, "improved": improved,
+                    "improved_metric": metric,
+                    "anchor_correct": anc_child,
+                    "anchor_parent_correct": anc_parent,
                     "score_status": child.value.score_status, "coverage": child.value.coverage,
                     "imputed": bool(child.meta.get("imputed")),
                     "valid_parent": child.valid_parent,
@@ -2804,7 +2961,11 @@ class GanLoop:
                 self._save_checkpoint("inner", outer, inner)
 
                 if no_improve >= patience:
-                    self.log_event({"type": "stagnation_break", "outer": outer, "inner": inner})
+                    self.log_event({"type": "stagnation_break", "outer": outer,
+                                    "inner": inner, "metric": metric,
+                                    "no_improve": no_improve,
+                                    "anchor_correct": anc_child,
+                                    "anchor_parent_correct": anc_parent})
                     break
 
             # ---------------- outer self-improvement ----------------

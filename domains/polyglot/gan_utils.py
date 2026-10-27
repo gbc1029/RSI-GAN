@@ -33,6 +33,31 @@ def _repo_rel(exercise_dir: str) -> str:
     return norm[len(_REPO_PREFIX):] if norm.startswith(_REPO_PREFIX) else norm
 
 
+def _metadata_path(dataset_root: str) -> str:
+    return os.path.normpath(os.path.join(
+        os.path.abspath(dataset_root), BENCH_ROOT, "..",
+        "polyglot_benchmark_metadata.json"))
+
+
+def _load_metadata(dataset_root: str) -> List[Dict[str, Any]]:
+    with open(_metadata_path(dataset_root), "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    return metadata
+
+
+def load_instance_ids(dataset_root: str) -> List[str]:
+    """Full candidate pool in metadata order (instance ids ONLY).
+
+    Used by the GAN sampling layer (task_execution): the startup pool check
+    and the run-persistent anchor drawing must account the whole pool without
+    opening any starter file, so pool accounting stays cheap and independent
+    of per-exercise file state. ``eval_task_list`` (when pinned) filters the
+    eval side downstream; this list is always the FULL pool.
+    """
+    return [str(entry["instance_id"]) for entry in _load_metadata(dataset_root)
+            if entry.get("instance_id")]
+
+
 def load_instances(
     dataset_root: str,
     task_list: Optional[List[str]] = None,
@@ -44,16 +69,18 @@ def load_instances(
     invalidator files such as go.mod) inline as a JSON string, so the sandboxed
     child can rebuild the exercise workspace from the questions.csv alone.
 
+    Selection lives with the CALLER (gan/framework/task_execution.py):
+    ``task_list`` may be the pinned eval_task_list, a dynamically drawn
+    seeded selection, or None (full pool); ``num_samples`` then truncates the
+    metadata-order prefix (legacy mode; seeded selection passes the drawn ids
+    as ``task_list`` with ``num_samples=0``).
+
     Path convention: EXERCISE-RELATIVE (e.g. ``bottle_song.go``) -- the eval
     container checks the exercise out at ``/testbed`` root and applies the
     child's patch there with `git apply`; the instance's `repo`/`exercise_dir`
     stay informational.
     """
-    meta_path = os.path.normpath(os.path.join(
-        os.path.abspath(dataset_root), BENCH_ROOT, "..",
-        "polyglot_benchmark_metadata.json"))
-    with open(meta_path, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+    metadata = _load_metadata(dataset_root)
 
     rows: List[Dict[str, Any]] = []
     for entry in metadata:

@@ -32,6 +32,10 @@ def main() -> None:
     p.add_argument("--anchor-ids", dest="anchor_ids", default="",
                    help="Comma-separated anchor question ids evaluated every "
                         "generation (paired core); empty = none.")
+    p.add_argument("--eval-anchor-ids", dest="eval_anchor_ids", default="",
+                   help="Comma-separated FIXED evaluation question ids (held-out "
+                        "val subset) used by every fixed-root evaluation of this "
+                        "run; empty = fall back to the main-line sampling.")
     p.add_argument("--cfg-overrides", dest="cfg_overrides", default="",
                    help="JSON-encoded loop.yaml overrides (ablation.* + "
                         "source_access.deny_deep) passed from the driver; "
@@ -69,6 +73,7 @@ def main() -> None:
         code_repo=True,
         sample_seed_base=args.sample_seed_base,
         anchor_ids=[a for a in (args.anchor_ids or "").split(",") if a.strip()],
+        eval_anchor_ids=[a for a in (args.eval_anchor_ids or "").split(",") if a.strip()],
     )
     loop.resume = True  # load trees/state produced by previous outers
     loop.resume_boundary = args.resume_boundary

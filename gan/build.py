@@ -173,6 +173,7 @@ def build_gan_loop(
     layout: Optional[str] = None,
     sample_seed_base: Optional[int] = None,
     anchor_ids: Optional[list] = None,
+    eval_anchor_ids: Optional[list] = None,
 ) -> GanLoop:
     cfg = load_gan_loop_config(cfg_overrides)
     # Domain shape checks: `domains` is required input with NO default (the only
@@ -188,6 +189,18 @@ def build_gan_loop(
     if not domain:
         raise ValueError(f"domains parses to an empty domain (got {domains!r})")
     repo_root = os.path.abspath(repo_root)
+
+    # Per-domain token budgets (docs/10 §10): domains.yaml token_budget_per_gen
+    # overrides the loop.yaml global (cost.token_budget_per_gen) -- resolved
+    # ONCE here (build knows the single domain) and threaded explicitly to the
+    # two consumers: the runner's reserved-key clamp ceiling and the loop's
+    # cost-statement reference line. Per-question enforcement travels via the
+    # runner's apply_domain_token_budget (domain_cfg is re-resolved there).
+    from gan.framework.loader import load_registry as _load_registry
+    from gan.framework.loader import resolve_domain as _resolve_domain
+    from gan.framework.task_execution import effective_token_budget_per_gen
+    _domain_cfg = _resolve_domain(_load_registry(), domain)
+    token_budget_per_gen = effective_token_budget_per_gen(_domain_cfg, cfg)
 
     # Single source: gan/framework/models.yaml (no env, no fallback, no overrides).
     # resolve_entry() validates the call parameters at STARTUP (unknown
@@ -283,10 +296,48 @@ def build_gan_loop(
         anchor_ids=anchor_ids,
         # Reserved cost-key ceiling (docs/10 §10): bounds the task design's
         # per-question token budget (clamped into the design snapshot by
-        # DomainTaskRunner before persist; cost.token_budget_per_gen).
-        token_budget_per_gen=cfg.get("cost.token_budget_per_gen"),
+        # DomainTaskRunner before persist; cost.token_budget_per_gen --
+        # per-domain override resolved above).
+        token_budget_per_gen=token_budget_per_gen,
         ledger_writer=ledger_writer,
     )
+    # Dedicated runner for the fixed-root evaluation (docs/14 §5.5). It runs the
+    # run-persistent EVALUATION question set: a held-out subset, fixed ids,
+    # never re-sampled -- so every supernode's ``benchmark.val_mean`` is measured
+    # on exactly the same questions and ``fitness_p`` compares like with like.
+    # Without this set the evaluation falls back to the main-line runner, whose
+    # question draw changes per eval genid (i.e. per outer, incomparable).
+    eval_runner = None
+    eval_ids = [str(q) for q in (eval_anchor_ids or [])]
+    eval_subset = str(cfg.get("eval.subset") or "") or subset
+    if eval_ids:
+        if len(eval_ids) > int(num_samples):
+            # The root-side task broker pins ``num_samples`` for every harness
+            # launch and the harness re-slices a provided questions.csv by it,
+            # so an over-sized evaluation set would be silently truncated.
+            raise ValueError(
+                f"evaluation question set ({len(eval_ids)}) is larger than "
+                f"num_samples ({num_samples}): the harness would silently "
+                f"truncate it. Raise num_samples or lower eval.anchor_k.")
+        eval_runner = DomainTaskRunner(
+            repo_root=repo_root,
+            output_dir=output_dir,
+            domain=domain,
+            subset=eval_subset,
+            num_samples=len(eval_ids),
+            default_model=t_model,
+            reasoning_effort=t_effort,
+            code_root=code_root,
+            task_repo=roots.task if (roots is not None and layout == "split") else None,
+            rebuild_view=_rebuild_view,
+            # No per-genid seed and no main-line anchors: the fixed id list IS
+            # the selection rule (prepare_questions_by_ids bypasses sampling).
+            sample_seed_base=None,
+            anchor_ids=[],
+            fixed_question_ids=eval_ids,
+            token_budget_per_gen=cfg.get("cost.token_budget_per_gen"),
+            ledger_writer=ledger_writer,
+        )
     # Grants/diffs are against the per-run code baseline when code_repo is on;
     # only the parent harness receives repo_root for loading benchmark labels.
     broker = AccessBroker(
@@ -296,6 +347,11 @@ def build_gan_loop(
         deep_view_only=bool(cfg.get("ablation.deep_view_only", False)),
         shallow_prompt_only=bool(cfg.get("ablation.shallow_prompt_only", False)),
         disable_shallow=bool(cfg.get("ablation.disable_shallow", False)),
+        # R2 (design-write limit, not an ablation arm): a prompt write below this
+        # character-level similarity to the text it replaces is a wholesale
+        # rewrite and is refused. 0.0 = gate off.
+        prompt_rewrite_min_similarity=float(
+            cfg.get("design.prompt_rewrite_min_similarity", 0.0) or 0.0),
         max_files=int(cfg.get("source_access.max_files_per_grant", 500)),
         max_bytes=int(cfg.get("source_access.max_bytes_per_grant", 50 * 1024 * 1024)),
         roots=roots,
@@ -303,12 +359,17 @@ def build_gan_loop(
     loop = GanLoop(
         output_dir, domains, cfg,
         task_runner=runner,
+        eval_runner=eval_runner,
+        # Main-line anchor core (R4 stagnation metric): the only part of the
+        # per-generation question sample that is identical across generations.
+        anchor_ids=list(anchor_ids or []),
         broker=broker,
         planner_factory=_planner_factory,
         evaluator_factory=_evaluator_factory,
         code_root=code_root,
         ledger_writer=ledger_writer,
         roots=roots,
+        token_budget_per_gen=token_budget_per_gen,
     )
     loop_holder["loop"] = loop
     # explicit runtime record of the model configuration actually used

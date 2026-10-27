@@ -276,6 +276,28 @@ def ablation_flags() -> Dict[str, bool]:
     }
 
 
+def design_limits() -> Dict[str, Any]:
+    """Non-ablation DESIGN-WRITE limits carried by the access context's broker.
+
+    ``prompt_rewrite_min_similarity`` (R2): below this CHARACTER-level similarity
+    a prompt write replaces the whole text and is refused by
+    ``set_prompt.prompt_rewrite_error``. ``0.0`` disables the gate.
+
+    Read from the broker for the same reason as the ablation flags: a role
+    session runs in a CHILD process and its design tools call back over IPC, so
+    the value is mirrored onto ``_RemoteBroker`` (role_process broker_info). A
+    flag that is not mirrored silently reads as its default in the child. Absent
+    context/broker => 0.0 (gate off: framework plumbing, offline tests).
+    """
+    actx = get_access_context()
+    broker = getattr(actx, "broker", None) if actx is not None else None
+    try:
+        limit = float(getattr(broker, "prompt_rewrite_min_similarity", 0.0) or 0.0)
+    except (TypeError, ValueError):  # noqa: BLE001 -- a bad value must not break a tool
+        limit = 0.0
+    return {"prompt_rewrite_min_similarity": max(0.0, min(1.0, limit))}
+
+
 def shallow_op_error(op_name: str, key: Optional[str] = None) -> Optional[str]:
     """Return an error string when a B-group ablation forbids this shallow op.
 

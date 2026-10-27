@@ -134,9 +134,35 @@ domains:
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
     question_timeout_s: 1200  # solve = 2-3 long calls (144-350s each observed)
-    eval_task_list:
-    - go__bottle-song
-    - go__react
+    # Token budgets (docs/10 §10) -- polyglot values from the 2-question smoke
+    # calibration (runs/<gen>/cost.json, glm-5.3-flash): per-question median
+    # ~140k, max 440k observed -> 300k clips only the outlier; gen line =
+    # 5 samples x 300k. token_budget_per_question is the child's token SOFT
+    # STOP (injected into the reserved design cost slot pre-persist, min with
+    # any design-declared value, clamped by the gen ceiling); token_budget_per_gen
+    # overrides the loop.yaml global (cost.token_budget_per_gen) as the
+    # cost-statement reference line AND the clamp ceiling. Re-calibrate after
+    # the first full-pool run (the smoke measured ONE pinned question pair).
+    token_budget_per_question: 300000
+    token_budget_per_gen: 1500000
+    # Candidate pool (Arch 2), two modes -- selected by prepare_polyglot_questions:
+    # - FULL pool (default: eval_task_list absent/empty): all metadata
+    #   instances (225, across go/rust/cpp/java/javascript/python) are
+    #   candidates. With gan/framework/loop.yaml sampling.mode=seeded the
+    #   runner draws --num_samples of them uniformly at random PER GENERATION
+    #   (per-gen seed derived from ckpt/sample_seed.json: every generation
+    #   rotates questions, resume reproduces the exact draw; loop.yaml
+    #   sampling.base_seed fixes the draw across ablation arms). Legacy
+    #   sampling (mode != seeded) keeps the metadata-order prefix of the pool
+    #   -- react + bottle-song, the historical 2-task pair.
+    # - PINNED pool (eval_task_list non-empty): candidates are filtered to
+    #   THIS list first; use it for single-language smoke runs so the first
+    #   eval reuses the already-built pb.env.x86_64.<hash> env image
+    #   (per-task pb.eval.x86_64.<task> images build lazily on first eval).
+    #   INVARIANT: len >= --num_samples, enforced fail-fast at DomainTaskRunner
+    #   init (full-pool mode is checked against the metadata size likewise).
+    # eval_task_list: [go__bottle-song, go__react, go__dominoes,
+    #                  go__crypto-square, go__book-store]
     task_brief: >-
 
       You get a programming exercise: its description plus skeleton files that
