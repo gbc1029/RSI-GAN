@@ -1,6 +1,9 @@
 import backoff
 import json
 import os
+import time
+import uuid
+from contextvars import ContextVar
 from typing import Tuple
 
 import requests
@@ -50,6 +53,63 @@ def register_usage_hook(fn):
     USAGE_HOOKS.append(fn)
 
 
+# --- per-call LLM records (llm_call rows) ------------------------------------
+# Every get_response_from_llm call — success AND failure — produces ONE
+# content-free record (call_id / timing / attempts / retries / usage /
+# finish_reason / gateway request id). Routing is a ContextVar SINK set by the
+# session layer (agent/llm_withtools registers one pointing at the trajectory's
+# .llm_calls.jsonl SIDECAR — never the main trajectory, so no agent read
+# surface can resolve it). A ContextVar (not a global hook list) is required
+# because parallel role sessions share the process: a broadcast list would
+# misroute records into other sessions' sidecars. No sink (e.g. preflight)
+# records nothing.
+class _CallContext:
+    """Mutable per-call recording state (thread/task local via ContextVar)."""
+
+    __slots__ = ("call_id", "t_start", "t_start_mono", "model", "reasoning_effort",
+                 "timeout_s", "retries", "pending_failure")
+
+    def __init__(self, model, reasoning_effort, timeout_s):
+        self.call_id = uuid.uuid4().hex[:12]
+        self.t_start = time.time()
+        self.t_start_mono = time.monotonic()
+        self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.timeout_s = timeout_s
+        self.retries = []            # one entry per failed attempt
+        self.pending_failure = None  # {error_class, error} of the latest failure
+
+
+_LLM_CALL_SINK: ContextVar = ContextVar("gan_llm_call_sink", default=None)
+_LLM_CALL_CTX: ContextVar = ContextVar("gan_llm_call_ctx", default=None)
+
+_SINK_WARNED: set = set()
+
+
+def set_llm_call_sink(fn):
+    """Register the session's llm_call sink; returns a reset token."""
+    return _LLM_CALL_SINK.set(fn)
+
+
+def reset_llm_call_sink(token):
+    """Reset the sink binding (must accompany every set, see chat_with_agent)."""
+    _LLM_CALL_SINK.reset(token)
+
+
+def _emit_llm_call_record(record: dict) -> None:
+    """Hand one record to the session sink. Fail-open, warn once per sink."""
+    sink = _LLM_CALL_SINK.get()
+    if sink is None:
+        return
+    try:
+        sink(record)
+    except Exception as e:  # noqa: BLE001 -- a broken sink must never fail the call
+        if id(sink) not in _SINK_WARNED:
+            _SINK_WARNED.add(id(sink))
+            print(f"[WARN] llm_call sink failed ({type(e).__name__}: {str(e)[:120]}); "
+                  f"this session's per-call LLM records will not be written")
+
+
 def _run_usage_hooks(model, response):
     usage = getattr(response, "usage", None)
     if usage is None and isinstance(response, dict):
@@ -91,6 +151,72 @@ def _usage_dict(response) -> dict:
     return {"prompt_tokens": _get("prompt_tokens"),
             "completion_tokens": _get("completion_tokens"),
             "total_tokens": _get("total_tokens")}
+
+
+def _detail_get(details, key):
+    """Read one key from a usage-details object (dict or attribute style)."""
+    if isinstance(details, dict):
+        return details.get(key)
+    return getattr(details, key, None)
+
+
+def _usage_full(response) -> dict:
+    """Whitelisted usage counters for the `llm_call` record.
+
+    Superset of `_usage_dict`: adds the gateway-provided details counters
+    (probe-verified: prompt_tokens_details.cached_tokens and
+    completion_tokens_details.reasoning_tokens). Absent counters stay ABSENT,
+    never 0.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return {}
+    if hasattr(usage, "model_dump"):
+        try:
+            usage = usage.model_dump()
+        except Exception:  # noqa: BLE001
+            usage = None
+    if not isinstance(usage, dict):
+        return {}
+
+    def _num(val):
+        return val if isinstance(val, (int, float)) and val == val else None
+
+    out = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        val = _num(usage.get(key))
+        if val is not None:
+            out[key] = val
+    prompt_details = usage.get("prompt_tokens_details")
+    cached = _num(_detail_get(prompt_details, "cached_tokens")) if prompt_details else None
+    if cached is not None:
+        out["cached_tokens"] = cached
+    completion_details = usage.get("completion_tokens_details")
+    reasoning = _num(_detail_get(completion_details, "reasoning_tokens")) if completion_details else None
+    if reasoning is not None:
+        out["reasoning_tokens"] = reasoning
+    return out
+
+
+def _finish_reason(response):
+    """Top-choice finish_reason of a raw response (None when unavailable)."""
+    try:
+        choice = response["choices"][0]
+    except (TypeError, KeyError, IndexError):
+        return None
+    if hasattr(choice, "get"):
+        return choice.get("finish_reason")
+    return getattr(choice, "finish_reason", None)
+
+
+def _gateway_request_id(response):
+    """Gateway correlation id (= X-Request-Id response header, probe-verified)."""
+    rid = getattr(response, "id", None)
+    if rid is None and isinstance(response, dict):
+        rid = response.get("id")
+    return str(rid)[:64] if rid else None
 
 
 # Retry on TRANSIENT provider failures only (rate limit / timeout / conn drops).
@@ -154,6 +280,50 @@ def _is_transient_upstream(exc: BaseException) -> bool:
 
 _BACKOFF_EXCEPTIONS = tuple(_BACKOFF_EXCEPTIONS) + (TransientUpstreamError,)
 
+
+def _backoff_record_failure(exc: BaseException) -> None:
+    """Stash the latest attempt failure into the call context.
+
+    backoff's ``on_backoff`` handler does NOT receive the exception object
+    (only tries/wait), so the attempt function itself records the failure
+    here; the handlers below attach the try number / wait and move it into
+    ``ctx.retries``.
+    """
+    ctx = _LLM_CALL_CTX.get()
+    if ctx is not None:
+        ctx.pending_failure = {"error_class": type(exc).__name__,
+                               "error": str(exc)[:300]}
+
+
+def _on_backoff(details: dict) -> None:
+    """One failed attempt that WILL be retried."""
+    ctx = _LLM_CALL_CTX.get()
+    if ctx is None:
+        return
+    entry = dict(ctx.pending_failure or {"error_class": "Unknown", "error": ""})
+    entry["try"] = details.get("tries")
+    entry["waited_s"] = details.get("wait")
+    ctx.retries.append(entry)
+    ctx.pending_failure = None
+
+
+def _on_giveup(details: dict, exception=None) -> None:
+    """The FINAL failed attempt (no further retry; raise_on_giveup follows)."""
+    ctx = _LLM_CALL_CTX.get()
+    if ctx is None:
+        return
+    if ctx.pending_failure is not None:
+        entry = dict(ctx.pending_failure)
+    elif exception is not None:
+        entry = {"error_class": type(exception).__name__, "error": str(exception)[:300]}
+    else:
+        entry = {"error_class": "Unknown", "error": ""}
+    entry["try"] = details.get("tries")
+    entry["waited_s"] = None
+    entry["gave_up"] = True
+    ctx.retries.append(entry)
+    ctx.pending_failure = None
+
 litellm.drop_params = True
 
 
@@ -169,7 +339,7 @@ def _reasoning_effort(explicit):
 
 
 def _completion_kwargs(model, messages, temperature, max_tokens,
-                       reasoning_effort=None, api_key=None):
+                       reasoning_effort=None, api_key=None, call_id=None):
     """Model-specific completion kwargs (GPT-5 / Claude-Haiku quirks)."""
     kw = {"model": model, "messages": messages, "timeout": LLM_TIMEOUT_S}
     # Explicit per-caller credential (GAN roles under the shared proxy: each
@@ -177,6 +347,12 @@ def _completion_kwargs(model, messages, temperature, max_tokens,
     # process-global OPENAI_API_KEY, which a concurrent session could swap).
     if api_key:
         kw["api_key"] = api_key
+    # Correlation id for the parent-side proxy audit (litellm forwards
+    # extra_headers to the transport; both relay implementations only rewrite
+    # Authorization, so the header reaches ParentLLMProxy untouched. A direct
+    # gateway simply ignores the unknown header.)
+    if call_id:
+        kw["extra_headers"] = {"X-Gan-Call-Id": str(call_id)[:64]}
     # GPT-5 and GPT-5-mini only support default temperature (1); GPT-5.2 does.
     if model not in ["openai/gpt-5", "openai/gpt-5-mini"]:
         kw["temperature"] = temperature
@@ -193,12 +369,67 @@ def _completion_kwargs(model, messages, temperature, max_tokens,
     return kw
 
 
-@backoff.on_exception(
+def _attempt_completion(model, messages, temperature, max_tokens,
+                        reasoning_effort=None, api_key=None, call_id=None):
+    """One network attempt (transient 5xx re-classified, then backoff retries)."""
+    try:
+        return litellm.completion(
+            **_completion_kwargs(model, messages, temperature, max_tokens,
+                                 reasoning_effort=reasoning_effort, api_key=api_key,
+                                 call_id=call_id)
+        )
+    except BaseException as _exc:  # noqa: BLE001 -- re-raise unchanged by default
+        _backoff_record_failure(_exc)
+        if _is_transient_upstream(_exc):
+            raise TransientUpstreamError(str(_exc)[:300]) from _exc
+        raise
+
+
+_completion_with_backoff = backoff.on_exception(
     backoff.expo,
     _BACKOFF_EXCEPTIONS,
     max_time=120,
     max_value=60,
-)
+    on_backoff=_on_backoff,
+    on_giveup=_on_giveup,
+)(_attempt_completion)
+
+
+def _llm_call_record(ctx: _CallContext, outcome: str, *,
+                     response=None, exc: BaseException | None = None) -> dict:
+    """Build one content-free `llm_call` record (sidecar row)."""
+    rec = {"kind": "llm_call", "call_id": ctx.call_id, "model": ctx.model,
+           "reasoning_effort": ctx.reasoning_effort, "timeout_s": ctx.timeout_s,
+           "t_start": round(ctx.t_start, 3),
+           "duration_s": round(time.monotonic() - ctx.t_start_mono, 3),
+           "outcome": outcome}
+    if outcome == "ok":
+        rec["attempts"] = len(ctx.retries) + 1
+        rec["finish_reason"] = _finish_reason(response)
+        gw = _gateway_request_id(response)
+        if gw:
+            rec["gateway_request_id"] = gw
+        usage = _usage_full(response)
+        if usage:
+            rec["usage"] = usage
+    else:
+        # attempts = the try number recorded by the giveup handler (falls back
+        # to the retry count when no giveup entry exists, e.g. re-raise paths)
+        last_try = ctx.retries[-1].get("try") if ctx.retries else None
+        rec["attempts"] = last_try if isinstance(last_try, int) and last_try > 0 \
+            else len(ctx.retries) + 1
+        rec["error_class"] = type(exc).__name__ if exc is not None else "Unknown"
+        cause = getattr(exc, "__cause__", None) if exc is not None else None
+        if isinstance(exc, TransientUpstreamError) and cause is not None:
+            # the backoff-visible error is the re-classified wrapper; keep the
+            # ORIGINAL transport exception class for forensics
+            rec["original_error_class"] = type(cause).__name__
+        rec["error"] = str(exc)[:300] if exc is not None else ""
+    if ctx.retries:
+        rec["retries"] = [dict(r) for r in ctx.retries]
+    return rec
+
+
 def get_response_from_llm(
     msg: str,
     model: str,
@@ -219,15 +450,23 @@ def get_response_from_llm(
 
     new_msg_history = msg_history + [{"role": "user", "content": msg}]
 
+    # Recording lifecycle: one `llm_call` record per call, success AND failure
+    # (finally semantics — a timeout/dead gateway still leaves its record).
+    ctx = _CallContext(model, reasoning_effort, LLM_TIMEOUT_S)
+    ctx_tok = _LLM_CALL_CTX.set(ctx)
     try:
-        response = litellm.completion(
-            **_completion_kwargs(model, new_msg_history, temperature, max_tokens,
-                                 reasoning_effort=reasoning_effort, api_key=api_key)
-        )
-    except BaseException as _exc:  # noqa: BLE001 -- re-raise unchanged by default
-        if _is_transient_upstream(_exc):
-            raise TransientUpstreamError(str(_exc)[:300]) from _exc
-        raise
+        try:
+            response = _completion_with_backoff(
+                model, new_msg_history, temperature, max_tokens,
+                reasoning_effort=reasoning_effort, api_key=api_key,
+                call_id=ctx.call_id)
+        except BaseException as _exc:
+            _emit_llm_call_record(_llm_call_record(ctx, "error", exc=_exc))
+            raise
+        _emit_llm_call_record(_llm_call_record(ctx, "ok", response=response))
+    finally:
+        _LLM_CALL_CTX.reset(ctx_tok)
+
     _run_usage_hooks(model, response)
     _choice = response['choices'][0]
     _msg = _choice['message']
@@ -259,4 +498,9 @@ def get_response_from_llm(
 
     return response_text, new_msg_history, {"reasoning": reasoning, "finish_reason": finish_reason,
                                             "reasoning_tokens": reasoning_tokens,
-                                            "usage": _usage_dict(response)}
+                                            "usage": _usage_dict(response),
+                                            # per-call record join keys (agent/llm.py
+                                            # recording lifecycle; consumers optional)
+                                            "call_id": ctx.call_id,
+                                            "duration_s": round(time.monotonic() - ctx.t_start_mono, 3),
+                                            "gateway_request_id": _gateway_request_id(response)}

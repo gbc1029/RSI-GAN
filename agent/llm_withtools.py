@@ -9,7 +9,8 @@ import json
 import time
 from functools import partial
 
-from agent.llm import get_response_from_llm
+from agent.llm import (get_response_from_llm, reset_llm_call_sink,
+                       set_llm_call_sink)
 from agent.tools import load_tools
 from utils import trajectory_log
 
@@ -437,6 +438,26 @@ def chat_with_agent(
     # config, identical on every turn.
     get_response_fn = partial(get_response_from_llm,
                               reasoning_effort=reasoning_effort, api_key=api_key)
+
+    # Per-call LLM records (agent/llm.py `llm_call` rows) go to a SIDECAR next
+    # to this session's trajectory — never into the trajectory itself (agent
+    # read surfaces resolve only the trajectory name; capability-by-existence
+    # keeps the sidecar invisible). Same directory => same write root. Redaction
+    # is best-effort framework-side: task sandboxes ship without gan/, and the
+    # records are content-free by construction, so a missing import is fine.
+    llm_sink_token = None
+    if trajectory_file:
+        _sidecar_path = trajectory_log.llm_calls_sidecar(trajectory_file)
+
+        def _llm_call_sidecar_sink(record):
+            try:
+                from gan.framework.trajectory import redact_record
+                record = redact_record(record)
+            except Exception:  # noqa: BLE001 -- content-free rows; never fatal
+                pass
+            trajectory_log.append(_sidecar_path, record)
+
+        llm_sink_token = set_llm_call_sink(_llm_call_sidecar_sink)
     # Reserved cost keys (docs/10 §10): per-SESSION token accumulator over the
     # usage counters every `output` row already carries (phase A). The soft
     # stop mirrors the tool-budget stop: the call that CROSSES the budget still
@@ -737,9 +758,11 @@ def chat_with_agent(
         logging(f"Error: {str(e)}")
         raise e
     finally:
-        # Reset the contextvar binding: the session object must not leak into
-        # whatever runs later on this thread (parallel role sessions reuse
-        # threads through the dispatch executor).
+        # Reset the contextvar bindings: neither the cm session object nor the
+        # llm_call sink may leak into whatever runs later on this thread
+        # (parallel role sessions reuse threads through the dispatch executor).
+        if llm_sink_token is not None:
+            reset_llm_call_sink(llm_sink_token)
         if cm_token is not None:
             try:
                 cm.deactivate(cm_token)

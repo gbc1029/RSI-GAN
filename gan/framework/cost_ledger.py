@@ -85,6 +85,34 @@ def _count(rows: List[Dict[str, Any]], kind: str) -> int:
     return sum(1 for r in rows if r.get("kind") == kind)
 
 
+def _llm_sidecar_metrics(path: str) -> Optional[Dict[str, Any]]:
+    """Per-call LLM metrics from the trajectory's SIDEcar (agent/llm.py rows).
+
+    Returns ``None`` when the sidecar does not exist or carries no ``llm_call``
+    rows (None ≠ 0 — a session recorded before this mechanism must not read as
+    a zero-failure one). Token totals deliberately stay with the ``output``-row
+    sums above (实付口径); these metrics add the FAILURE/latency dimension the
+    main trajectory cannot see (failed calls write no output row).
+    """
+    if not path:
+        return None
+    sidecar = trajectory_log.llm_calls_sidecar(path)
+    if not os.path.isfile(sidecar):
+        return None
+    calls = [r for r in _read_rows(sidecar) if r.get("kind") == "llm_call"]
+    if not calls:
+        return None
+    total_s = 0.0
+    for r in calls:
+        d = r.get("duration_s")
+        if isinstance(d, (int, float)):
+            total_s += float(d)
+    return {"llm_calls_failed": sum(1 for r in calls if r.get("outcome") == "error"),
+            "llm_retry_total": sum(len(r["retries"]) for r in calls
+                                   if isinstance(r.get("retries"), list)),
+            "llm_time_s": round(total_s, 3)}
+
+
 def _cm_summary(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Aggregate the session's ``cm_*`` trajectory rows (docs/10 §11 D12).
 
@@ -199,6 +227,9 @@ def session_cost_from_file(path: str, *, role: str, seat: str, outer: Any,
         # the ESTIMATED chars saved — a derived indicator, never billing; the
         # ledger's tokens stay 实付 (proxy usage sums above).
         rec["cm"] = cm_summary
+    llm_metrics = _llm_sidecar_metrics(path)
+    if llm_metrics is not None:
+        rec.update(llm_metrics)
     if output_dir:
         try:
             rec["path"] = os.path.relpath(path, output_dir).replace(os.sep, "/")
@@ -338,7 +369,8 @@ def compact(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         return None
     keys = ("role", "seat", "outer", "genid", "attempt", "llm_calls",
             "tool_calls", "tool_outputs", "prompt_tokens", "completion_tokens",
-            "reasoning_tokens", "total_tokens", "wallclock_s")
+            "reasoning_tokens", "total_tokens", "wallclock_s",
+            "llm_calls_failed", "llm_retry_total", "llm_time_s")
     out = {k: record.get(k) for k in keys if record.get(k) is not None}
     return out or None
 

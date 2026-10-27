@@ -121,7 +121,62 @@ def collect(run_dir: str, run_id: str, output_dir: str, outer: Any, genid: Any) 
         except OSError:
             pass
         raise
+
+    # Sidecar archive: the per-call LLM records (agent/llm.py `llm_call` rows)
+    # live NEXT TO each chat_history file inside the EPHEMERAL run dir
+    # (work/<genid>/...), so without this step they would be pruned. They are
+    # folded into `<dest>.llm_calls.jsonl` — a file NO agent read surface
+    # resolves (same capability-by-existence argument as the seat sidecars).
+    # Advisory-only: a sidecar failure must never fail the main archive, but
+    # it must SPEAK (soft_fail event), never vanish silently.
+    try:
+        _collect_llm_calls_sidecar(evals, dest)
+    except Exception as e:  # noqa: BLE001 -- audited, never fatal
+        from utils.soft_fail import soft_fail
+        soft_fail(f"task llm_calls sidecar archive failed for genid {genid}: {e}",
+                  event_path=paths.events_path(output_dir),
+                  event_type="task_llm_calls_sidecar_archive_failed",
+                  genid=str(genid))
     return dest
+
+
+def _collect_llm_calls_sidecar(evals: str, dest: str) -> None:
+    """Fold the run dir's per-question llm_call sidecars into one archived file."""
+    suffix = trajectory_log.LLM_CALLS_SIDECAR_SUFFIX
+    sidecar_rows: List[Dict[str, Any]] = []
+    if os.path.isdir(evals):
+        for path in sorted(glob.glob(os.path.join(evals, f"*{suffix}"))):
+            stem = os.path.basename(path)[:-len(suffix)]
+            qid = stem[len("chat_history_"):].rsplit(".", 1)[0] \
+                if stem.startswith("chat_history_") else stem
+            for line in trajectory_log.read_all(path).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # a torn tail line must not poison the archive
+                rec = redact_record(rec)
+                rec["qid"] = qid
+                sidecar_rows.append(rec)
+    if not sidecar_rows:
+        return
+    sidecar_rows.sort(key=lambda r: (r.get("ts") is None, r.get("ts") or 0.0))
+    side_dest = f"{dest}{suffix}"
+    tmp = f"{side_dest}.collect-tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for rec in sidecar_rows:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        os.replace(tmp, side_dest)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _session_file(output_dir: str, genid: Any, role: str) -> str:
