@@ -17,8 +17,9 @@ gan:
   # away from the wall. planner/evaluator are bound by the per-call client
   # budget instead, so they take the higher-effort thinking mode.
   task:
-    model: openai/glm-5.3-flash
-    reasoning_effort: low
+#    model: openai/gpt-4o-mini
+     model: openai/glm-5.3-flash
+     reasoning_effort: low
   planner:
     model: openai/glm-5.3-flash
     reasoning_effort: high
