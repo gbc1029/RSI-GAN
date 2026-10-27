@@ -425,7 +425,9 @@ class RoleProcess:
                                      "deny_deep": bool(getattr(broker, "deny_deep", False)),
                                      "deep_view_only": bool(getattr(broker, "deep_view_only", False)),
                                      "shallow_prompt_only": bool(getattr(broker, "shallow_prompt_only", False)),
-                                     "disable_shallow": bool(getattr(broker, "disable_shallow", False))}
+                                     "disable_shallow": bool(getattr(broker, "disable_shallow", False)),
+                                     "prompt_rewrite_min_similarity": float(
+                                         getattr(broker, "prompt_rewrite_min_similarity", 0.0) or 0.0)}
                                     if broker is not None else None),
                     "role_state": {
                         "attempt_id": self.attempt_id,
@@ -628,7 +630,8 @@ class _RemoteBroker:
     def __init__(self, reader: TextIO, writer: TextIO, call_id: int,
                  repo_root: str, output_dir: str,
                  deny_deep: bool = False, deep_view_only: bool = False,
-                 shallow_prompt_only: bool = False, disable_shallow: bool = False):
+                 shallow_prompt_only: bool = False, disable_shallow: bool = False,
+                 prompt_rewrite_min_similarity: float = 0.0):
         self._reader = reader
         self._writer = writer
         self._call_id = call_id
@@ -639,6 +642,10 @@ class _RemoteBroker:
         self.deep_view_only = deep_view_only
         self.shallow_prompt_only = shallow_prompt_only
         self.disable_shallow = disable_shallow
+        # R2: mirrors AccessBroker so the child's design tools see the run's
+        # prompt-rewrite limit instead of a local default (a flag that is not
+        # mirrored silently reads as 0.0 = gate off in the child).
+        self.prompt_rewrite_min_similarity = float(prompt_rewrite_min_similarity or 0.0)
         self.last_result: Dict[str, Any] = {}
         self.grants = _RemoteGrants(self)
 
@@ -895,7 +902,8 @@ def _worker_main() -> None:
                 info = request["broker_info"]
                 if not isinstance(info, dict) or set(info) != {
                         "repo_root", "output_dir", "deny_deep", "deep_view_only",
-                        "shallow_prompt_only", "disable_shallow"}:
+                        "shallow_prompt_only", "disable_shallow",
+                        "prompt_rewrite_min_similarity"}:
                     raise RoleProcessError("invalid broker info")
                 remote = _RemoteBroker(
                     reader, protocol_writer, call_id,
@@ -903,7 +911,9 @@ def _worker_main() -> None:
                     deny_deep=bool(info.get("deny_deep", False)),
                     deep_view_only=bool(info.get("deep_view_only", False)),
                     shallow_prompt_only=bool(info.get("shallow_prompt_only", False)),
-                    disable_shallow=bool(info.get("disable_shallow", False)))
+                    disable_shallow=bool(info.get("disable_shallow", False)),
+                    prompt_rewrite_min_similarity=float(
+                        info.get("prompt_rewrite_min_similarity", 0.0) or 0.0))
                 index = _BROKER_POSITION[method]
                 if len(args) > index:
                     args[index] = remote

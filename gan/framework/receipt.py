@@ -18,8 +18,9 @@ from typing import Any, Dict, List, Optional
 # relaxed by this list.
 PROMPT_FACT_KEYS = (
     "target_role", "changed", "chars", "prev_chars", "lines", "prev_lines",
-    "added_lines", "removed_lines", "similarity", "changed_from", "changed_to",
-    "sha256_12", "prev_sha256_12", "empty", "equals_seed",
+    "added_lines", "removed_lines", "similarity", "char_similarity",
+    "changed_from", "changed_to", "sha256_12", "prev_sha256_12", "empty",
+    "equals_seed",
 )
 
 
@@ -50,6 +51,12 @@ def prompt_change_facts(prev: Any, new: Any, seed: Any = None) -> Dict[str, Any]
     a_s, b_s = str(prev or ""), str(new or "")
     a, b = a_s.splitlines(), b_s.splitlines()
     sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    # CHARACTER-level ratio alongside the line-level one. The line-level measure
+    # is blind to the case that matters most here: a seed prompt written as ONE
+    # long line scores ratio 0.0 for ANY edit (1 line vs 1 different line), so it
+    # cannot distinguish "fixed a typo" from "replaced the whole prompt". The
+    # prompt-rewrite gate (set_prompt.prompt_rewrite_error) reads this one.
+    char_sm = difflib.SequenceMatcher(a=a_s, b=b_s, autojunk=False)
     added = removed = 0
     first = last = 0
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -69,6 +76,7 @@ def prompt_change_facts(prev: Any, new: Any, seed: Any = None) -> Dict[str, Any]
         "lines": len(b), "prev_lines": len(a),
         "added_lines": added, "removed_lines": removed,
         "similarity": (round(sm.ratio(), 2) if (a or b) else 1.0),
+        "char_similarity": (round(char_sm.ratio(), 2) if (a_s or b_s) else 1.0),
         "changed_from": first, "changed_to": last,
         "sha256_12": _sha12(b_s), "prev_sha256_12": _sha12(a_s),
         "empty": not b_s.strip(),

@@ -154,6 +154,7 @@ class DomainTaskRunner:
         reasoning_effort: Optional[str] = None,
         sample_seed_base: Optional[int] = None,
         anchor_ids: Optional[list] = None,
+        fixed_question_ids: Optional[list] = None,
         token_budget_per_gen: Optional[int] = None,
         ledger_writer: Optional[Any] = None,
         task_repo: Optional[str] = None,
@@ -176,6 +177,18 @@ class DomainTaskRunner:
         # None base seed -> legacy prefix slice (explicit A/B baseline).
         self.sample_seed_base = sample_seed_base
         self.anchor_ids = list(anchor_ids or [])
+        # Fixed evaluation question set (docs/14 section 5.5). When non-empty,
+        # the parent-scored path bypasses ``select_samples`` entirely and runs
+        # EXACTLY these ids -- the only way to hold the question set constant
+        # across outers (``select_samples`` always adds a per-genid draw and
+        # caps its anchor core at ``num_samples // 2``). Used by the separate
+        # evaluation runner; the main-line runner leaves it empty.
+        self.fixed_question_ids = [str(q) for q in (fixed_question_ids or [])]
+        if self.fixed_question_ids and int(num_samples) != len(self.fixed_question_ids):
+            # num_samples feeds the harness wall-clock budget, the coverage
+            # denominator and the broker call budget: it must match the set
+            # actually run, and the fixed set is the authority.
+            self.num_samples = len(self.fixed_question_ids)
         # Thinking-intensity knob for the task child's every LLM call; rides
         # the stdin payload (explicit transport, never an env — same chain as
         # the budget fields; the CLI --reasoning_effort argument feeds it).
@@ -498,10 +511,16 @@ class DomainTaskRunner:
                 tx.derive_sample_seed(self.sample_seed_base, str(genid))
                 if self.sample_seed_base is not None else None
             )
-            questions_path, ground_truth_by_id, sample_info = tx.prepare_questions(
-                self.repo_root, run_dir, self.domain, self.subset, self.num_samples,
-                sample_seed=per_gen_seed, anchor_ids=self.anchor_ids,
-            )
+            if self.fixed_question_ids:
+                questions_path, ground_truth_by_id, sample_info = (
+                    tx.prepare_questions_by_ids(
+                        self.repo_root, run_dir, self.domain, self.subset,
+                        self.fixed_question_ids))
+            else:
+                questions_path, ground_truth_by_id, sample_info = tx.prepare_questions(
+                    self.repo_root, run_dir, self.domain, self.subset, self.num_samples,
+                    sample_seed=per_gen_seed, anchor_ids=self.anchor_ids,
+                )
             # The child sees questions only; scoring remains in this parent.
             _t_harness = time.time()
             rc, _out = tx.run_harness_and_report(

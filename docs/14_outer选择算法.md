@@ -205,10 +205,16 @@ outer N 结束
 
 ### 5.5 固定 root 评估（漏洞 1 + 漏洞 9）
 
-- 每个 supernode 入档前，在**固定 root 基线**（`eval_base` ref，初始 = run 的 initial task commit）上跑 `eval_samples`（默认 3）次独立 **plan+task 轮次**（不含 evaluator 环节），取均值写入 `benchmark.mean/std`。
+- 每个 supernode 入档前，在**固定 root 基线**（`eval_base` ref，初始 = run 的 initial task commit）上跑 `eval_samples`（当前 = 1）次独立 **plan+task 轮次**（不含 evaluator 环节），取均值写入 **`benchmark.val_mean` / `val_std`**（**不再**写 `benchmark.mean`，见下）。
+- **题集固定在一个 run 内，而不是固定在这个 run 的每一轮**（2026-10 修订，B6b）：评估用一个**专属 runner**（`build.py` 里的 `eval_runner`），题集来自 `ckpt/sample_seed.json` 的 `eval_anchor_ids` —— 从 held-out 子集（`eval.subset`，默认 `_filtered_100_val`）里**每个 run 只抽一次**的 `eval.anchor_k`（默认 30）道固定题，`prepare_questions_by_ids` 直接按 id 出 `questions.csv`，**绕过** `select_samples`。
+  - 修订前：评估轮次的 genid 是 `eval_outer<N>_s<k>`，`derive_sample_seed` 会**为每一轮派生一个新的抽签**，于是同一 supernode 的多轮、以及不同 supernode 之间跑的是**不同的题**（同一套代码、不同的考卷）。这才是"评估可比性"的真正漏洞。
+  - 为什么不复用主链 `sampling.anchor_k`：实测 k=2 的锚点核**没有区分度**（一道人人对 + 一道人人错，恒定策略臂 A1 在 36 代上恰好 0.5000）。评估集要"全固定"，因此**不受** `select_samples` 的 `num_samples // 2` 上限约束；但它受 `--num_samples` 约束（broker 为每次 harness 启动钉死该值，超出会被 harness 静默截断），driver / `build_gan_loop` 都会 fail-fast 拒绝。
+- **为什么 `val_mean` 而不是覆盖 `mean`**：`mean` 是**主线**（每代换题）的打分，是诊断量；`val_mean` 是**同一张卷子**上的量，`fitness_p` 优先读它（`_ref_scalars` 用同一个 key，避免拿 val 分去和 train 分布做 z-score），缺 `val_mean` 的旧 supernode 回落到 `mean` 保持可评。这样 $z_{\text{ref}}$ 池里不会混尺度。
+- **val 题集只抑制"对题集的过拟合"，不抑制"对噪声的过拟合"**：30 题的量级下标准误仍在 0.08 左右，显著性结论必须靠多 rep 的 McNemar，不能靠单次 val 差。
 - **A1 一致性**：`ablation.disable_planner=true` 时评估轮次同样走空 `plan_result`（否则评估会偷偷把“被消融掉的 planner”装回来，A0 vs A1 不可比）。
 - 评估**旁路运行**：独立 run_dir；**不写 task tree**、**不写 `scores/scores.jsonl`**、不进角色可见轨迹；设 token/时间预算上限。
 - 主线 task 代码照常连续演化，评估与主线解耦。
+- 评估失败（`n_valid=0`）**保留**上一次的 `val_mean` 并置 `reevaluated=false`，绝不写入 None 覆盖既有估计（`supernode_eval_degraded` 事件）。
 
 ### 5.6 恢复设计 + heal 闭环（漏洞 2）
 
@@ -313,7 +319,10 @@ eval:
 | **evaluator 单方面淘汰** | `rule_violation` 由当届 evaluator 单方判定，误判即永久排除好 supernode（无第二意见/申诉） | 暂不解决，记为已知风险（§11） |
 | **$F_e$ 自评可刷分** | `calibration_error` / `verdict_stability` 均由当届 evaluator 产出，存在"保守预测/固定 verdict"刷分空间 | 暂不解决，记为已知风险（§11） |
 | **档案是派生索引** | 与 supernode 文件可能不一致 | `rebuild` 从 `ckpt/supernodes/*.json` 重建；启动时校验 |
-| **混合基准（未消除）** | `reevaluated=true` 条目用固定 root 分数，`false` 条目用主线 inner 分数，两者**尺度不同**却同进一个 $z_{\text{ref}}$ 池 | 每条自带 `eval_baseline` + `reevaluated` 可审计；如需严格可比，消融时固定 `eval_base` 并保证评估不降级（看 `supernode_eval_degraded`） |
+| **混合基准** | `reevaluated=true` 条目用固定 root 分数，`false` 条目用主线 inner 分数，两者**尺度不同**却同进一个 $z_{\text{ref}}$ 池 | **已改为硬拒绝**（2026-10）：①`fitness_p` 优先读 `val_mean`；②`fitness.py:scale_conflict()` 检测"候选的尺度 ≠ 参考窗口的主导尺度"时直接返回 `None`（不评分），`_archive_supernode` 记 `supernode_not_archived{reason:scale_mismatch}`——降级的 supernode 不再把 train 分混进 val 池，也进不了档案（就不会被选成父代）；③`scalar_vector`/`novelty` 显式传入同一个 `level_key`，特征列不会一半 val 一半 mean。全 mean 窗口（旧 run）仍然自洽可评，过度不拒绝 |
+| **val 题集缺失** | 旧 run dir 没有 `eval_anchor_ids`（seed 文件 skip-if-exists），或锚点抽样失败 → `eval_runner` 回落到主线 runner（每题集每轮重抽） | `_evaluate_supernode` 开跑前检查 `fixed_question_ids`，缺失就**跑都不跑**、不写 `val_mean`，并记 `eval_question_set_missing`（带 hint：需要新建 run dir）。这修的是"静默退化成不可比"——若不拦，`fitness_p` 会优先采用那个不可比的数 |
+| **启动预算少算评估轮** | `task_launch_budget` 只算 inner → 108/108 轮评估全失败（`task launch budget exhausted`） | 已抽成 `driver._launch_budget(cfg, inner)`：`inner + eval_rounds`（`outer_select.enabled` 为假时 0），且 **`--inner` 覆盖必须以覆盖值为准**（否则 `--inner 4` 配 yaml 2 会把第 4 代主线拉死）。回归：`check_three_defects.py` |
+| **val 题集规模** | 固定 30 题时二项标准误 ≈ 0.08，单次 val 差不足以判显著性 | val 只用于**档案内排序**；消融显著性结论一律走多 rep + McNemar，不得用单次 `val_mean` 差下结论 |
 | **固定 root 与主线解耦** | 评估基线与主线 task 代码不同 | 明确 `eval_base` 语义；审计记录两套代码 commit |
 
 ---
@@ -321,6 +330,9 @@ eval:
 ## 11. 待办 / 未决
 
 1. **固定 root 评估运行（B6b，已实现骨架）**：离线 stub 回归已绿，真实 LLM 运行待 Linux 部署环境验证。
+   - 2026-10 修订：已换成**固定题集的 val 评估**（`eval.subset` + `eval.anchor_k` → `benchmark.val_mean`，`fitness_p` 优先读），见 §5.5。离线回归：`scripts/local/test_val_eval.py`（21 条断言）+ `scripts/local/test_eval_runner_build.py`（12 条）。
+   - 遗留：旧 run dir 的 `ckpt/sample_seed.json` 没有 `eval_anchor_ids`（loader skip-if-exists），因此旧 run 不具备 val 评估；新 run 才有。已加护栏：这种 run 会记 `eval_question_set_missing` 并跳过评估，不会写入不可比的 `val_mean`。
+   - 三个原始缺陷（unpaired 题集 / 覆盖 `mean` / 预算不足）及它们的残留（静默退化、混合尺度、`--inner` 未计入）现由 `scripts/local/check_three_defects.py`（20 条断言）逐条盯住。
 2. `accepted_fixed_rate` 是否把 `acted_differently` 计为接受（当前按 `acted`）。
 3. 参考伙伴窗口"赛季"是滚动还是按 outer 编号分段（当前滚动）。
 4. `eval_base` ref 的命名与固定策略（当前 = initial task commit，永不移动）。

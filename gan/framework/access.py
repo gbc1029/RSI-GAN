@@ -56,6 +56,7 @@ class AccessBroker:
         deep_view_only: bool = False,
         shallow_prompt_only: bool = False,
         disable_shallow: bool = False,
+        prompt_rewrite_min_similarity: float = 0.0,
         max_files: int = 500,
         max_bytes: int = 50 * 1024 * 1024,
         roots: Optional[Any] = None,
@@ -81,6 +82,12 @@ class AccessBroker:
         self.deep_view_only = bool(deep_view_only)
         self.shallow_prompt_only = bool(shallow_prompt_only)
         self.disable_shallow = bool(disable_shallow)
+        # R2 design-write limit (NOT an ablation switch): a prompt write below
+        # this CHARACTER-level similarity to the text it replaces is a wholesale
+        # rewrite and is refused by set_prompt.prompt_rewrite_error. Enforced at
+        # the DESIGN tool layer (like B4), carried here so the role CHILD can
+        # read it through broker_info; 0.0 = gate off.
+        self.prompt_rewrite_min_similarity = float(prompt_rewrite_min_similarity or 0.0)
         self.max_files = int(max_files)
         self.max_bytes = int(max_bytes)
         self.grants: Dict[tuple, List[Dict[str, Any]]] = {}

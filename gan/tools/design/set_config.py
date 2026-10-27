@@ -94,14 +94,21 @@ def tool_function(key, value, **kwargs):
         value = {k: v for k, v in value.items() if k != "model"}
     if key == "prompt":
         # ``set_config(key="prompt")`` is the same act as set_prompt: the SAME
-        # P-a validation (shared chokepoint, cannot drift), then the same
-        # structural facts. Capture the replaced value BEFORE the assignment.
-        from gan.tools.design.set_prompt import _seed_prompt, prompt_write_error
+        # P-a validation and the SAME R2 rewrite gate (shared chokepoints, cannot
+        # drift), then the same structural facts. Capture the replaced value
+        # BEFORE the assignment -- it is the only place both sides exist.
+        from gan.tools.design.set_prompt import (_seed_prompt,
+                                                 prompt_rewrite_error,
+                                                 prompt_write_error)
         err = prompt_write_error(value)
         if err:
             return err
         prev = (ctx.config or {}).get("prompt") or ""
-        extra.update(prompt_change_facts(prev, value, seed=_seed_prompt(ctx.role)))
+        seed = _seed_prompt(ctx.role)
+        err = prompt_rewrite_error(prev, value, seed=seed)
+        if err:
+            return err
+        extra.update(prompt_change_facts(prev, value, seed=seed))
     ctx.config[key] = value
     ctx.record("set_config", key=key, **extra)
     return f"{ctx.role}.{key} updated"
