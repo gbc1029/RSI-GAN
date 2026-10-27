@@ -1,0 +1,20 @@
+[
+  "cpp__all-your-base",
+  "cpp__zebra-puzzle",
+  "go__alphametics",
+  "go__paasio",
+  "go__zebra-puzzle",
+  "java__affine-cipher",
+  "java__hangman",
+  "java__resistor-color-trio",
+  "java__zipper",
+  "javascript__affine-cipher",
+  "javascript__ledger",
+  "javascript__robot-name",
+  "javascript__zipper",
+  "python__affine-cipher",
+  "python__phone-number",
+  "python__zipper",
+  "rust__accumulate",
+  "rust__xorcism"
+]
