@@ -16,7 +16,6 @@
 
 default:
   score_key: null
-  splits: [train]
   ensembled: false
   eval_subset: ""
   test_subset: ""
@@ -47,7 +46,6 @@ default:
 domains:
   paper_review:
     score_key: overall_accuracy
-    splits: [train, val]
     ensembled: true
     eval_subset: _filtered_100_train
     test_subset: _filtered_100_test
@@ -84,7 +82,6 @@ domains:
       as messages_a and messages_b. Judge which response is better for the
       user and say why briefly. Your final answer must be exactly one
       identifier: model_a or model_b.
-    splits: [train, val]
     ensembled: true
     eval_subset: _filtered_100_train
     test_subset: _filtered_100_test
@@ -104,7 +101,6 @@ domains:
 
   imo_grading:
     score_key: overall_accuracy
-    splits: [train, val]
     ensembled: true
     eval_subset: _filtered_100_train
     test_subset: _filtered_100_test
@@ -129,7 +125,6 @@ domains:
 
   polyglot:
     score_key: resolved_rate
-    splits: [train]
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
@@ -183,7 +178,6 @@ domains:
 
   imo_proof:
     score_key: points_percentage
-    splits: [train]
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
@@ -202,7 +196,6 @@ domains:
 
   imo_proof_grading:
     score_key: overall_accuracy
-    splits: [train]
     ensembled: false
     stagedeval_samples: 10
     stagedeval_frac: 0.16666666666666666
@@ -239,7 +232,6 @@ domains:
 families:
   balrog:
     score_key: average_progress
-    splits: [train]
     ensembled: false
     stagedeval_samples: 1
     stagedeval_frac: 0.1            # default for babyai; minihack overrides below
@@ -261,7 +253,6 @@ families:
       read_only_assets: []
   genesis:
     score_key: average_fitness
-    splits: [train]
     ensembled: false
     stagedeval_samples: 3
     stagedeval_frac: 0.5

@@ -7,10 +7,15 @@
 1. **默认可用（浅层修改）**：
    - **配置层**：`set_prompt`（改提示词）、`set_config`（改已有键或已声明动态键）、`set_param`（改参数）。
    - **键扩展**：`add_config_key(key, value_type, consumer, description[, enum][, initial_value])`
-     为设计 config **声明新键**。硬约束：`consumer` 必须是**已注册且有效**的目标角色工具
-     （键没有真实消费者就没有意义，会被拒绝/被 heal 清除）；声明与消费者组件**同补丁**原子进退
-     （补丁被拒则两者一起回滚）；键名限 `^[a-z][a-z0-9_]{0,31}$`；每角色动态键 ≤16；
-     `description` ≤200 字符。`add_config_value(key, value)` 给已声明的 enum 键**追加一个可选值**
+     为设计 config **声明新键**。硬约束：`consumer` 必须写成 **`"<已注册且有效的目标角色工具>@<读取点>"`**——
+     读取点写明该键**实际被消费的位置**（哪个文件/哪段逻辑），没有真实读取者的键是死键，
+     声明会被当场拒绝（heal 只清注册失效的键，不验读取点——所以声明前自己先找到读者）；
+     **意图命中保留 cost 子键（`cm_mode`/`cm_window_k`/预算键等）时禁止声明**同名或
+     `cost_` 前缀影子键——那些键由框架经 design 的 `cost` 槽消费，用
+     `set_config(key="cost", value={…})` 设置即可；与保留子键 enum 高度重合会收到告警。
+     声明与消费者组件**同补丁**原子进退（补丁被拒则两者一起回滚）；键名限
+     `^[a-z][a-z0-9_]{0,31}$`；每角色动态键 ≤16；`description` 与 consumer 全长 ≤200 字符。
+     `add_config_value(key, value)` 给已声明的 enum 键**追加一个可选值**
      （value 是 ≤64 字符的结构化 token，enum ≤32 项，重复追加会被拒绝）。
    - **组件层**：`select_component`（把一个已注册组件选入配置）/ `deselect_component`（从配置移除）。
    - **原则**：能用配置/组件表达改进的，不要动源码。

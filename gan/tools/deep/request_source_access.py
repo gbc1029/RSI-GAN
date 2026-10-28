@@ -19,9 +19,11 @@ def tool_info():
             "when shallow design/config operators cannot express the change (e.g. adding a new "
             "config key, a new component implementation, or editing an implementation). "
             "Requesting a path you already hold KEEPS your local copy; pass refresh=true to "
-            "discard local edits and re-copy the pristine repo version. Files you CREATE need "
-            "a granted parent DIRECTORY (glob root) to ride the session patch — new files "
-            "outside every granted path are dropped at the outer boundary."
+            "discard local edits and re-copy the pristine repo version (the discarded files "
+            "are backed up, and edits made against an older baseline are three-way merged "
+            "at commit time instead of being rejected). Files you CREATE need a granted "
+            "parent DIRECTORY (glob root) to ride the session patch — new files outside "
+            "every granted path are dropped at the outer boundary."
         ),
         "input_schema": {
             "type": "object",
@@ -69,6 +71,7 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
                 "(source_access.deny_deep=true). Do not retry; continue with "
                 "shallow design/config operators only.")
     kept = list((getattr(actx.broker, "last_result", None) or {}).get("skipped") or [])
+    discarded = list((getattr(actx.broker, "last_result", None) or {}).get("discarded") or [])
     if dctx is not None:
         dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)
     # NOTE: denied/missing paths are audited (events.jsonl + broker.last_result) but are
@@ -83,13 +86,19 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
         where = f" (workspace src: {src_root})" if src_root else ""
         kept_note = (f" Already in your workspace and kept as-is (not overwritten): {kept}."
                      if kept else "")
+        # A refresh is destructive BY DESIGN (that is how a stale baseline is
+        # escaped). Say so: the discarded files are backed up for audit, and the
+        # edit has to be redone deliberately rather than silently vanishing.
+        disc_note = (f" Discarded your local version of: {discarded} (backed up by the "
+                     f"framework for audit). Redo those edits if you still need them."
+                     if discarded else "")
         if intent == "modify":
             return (f"Granted {intent} access to: {granted}{where}. "
                     f"Edit these copies with `edit_source`. New files you create "
                     f"reach the commit only when a granted path (a parent "
                     f"DIRECTORY) covers them; scratch elsewhere is dropped at "
-                    f"the outer boundary.{kept_note}")
-        return f"Granted {intent} access to: {granted}{where}.{kept_note}"
+                    f"the outer boundary.{kept_note}{disc_note}")
+        return f"Granted {intent} access to: {granted}{where}.{kept_note}{disc_note}"
     if paths:
         return ("No accessible paths (denied / not in your editable set). "
                 "Call `list_editable` to see which paths you may request.")

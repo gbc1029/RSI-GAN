@@ -752,6 +752,20 @@ class _RemoteBroker:
     def src_dir(self, *args: Any, **kwargs: Any) -> str:
         return self._rpc("src_dir", list(args), kwargs)
 
+    def base_dir(self, role: str, node_id: Any) -> str:
+        """Grant-time baseline snapshots, resolved LOCALLY from ``src_dir``.
+
+        ``build_patch_from_workspace`` runs in the child on the self-improve /
+        plan seats (the patch has to reach the authoritative tree through
+        ``check_patch``), so the three-way-merge baseline has to be reachable
+        here. Deliberately NOT a new RPC method: ``src_dir`` is already
+        mirrored and ``.gan_base`` is a sibling of ``src`` inside the seat's own
+        workspace. A path the seat cannot read just makes the snapshot probe
+        fail-safe (``os.path.isfile`` -> False), i.e. the old 2-way behaviour.
+        """
+        return os.path.join(os.path.dirname(str(self.src_dir(role, node_id))),
+                            ".gan_base")
+
     def repo_dir(self, rel: str) -> str:
         """Split-repo owner of ``rel`` (patch building needs it)."""
         return str(self._rpc("repo_dir", [str(rel)], {}))
