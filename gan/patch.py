@@ -236,6 +236,16 @@ _FALLBACK_SHALLOW = frozenset({
     "select_component", "deselect_component",
 })
 
+# Bookkeeping ops recorded through the same design-context channel that are
+# neither design operators nor source writes: the planner's structured
+# feedback-response stance (gan/tools/work/planner/respond_issue.py). Left
+# unlisted, has_deep_write's unknown->DEEP default labels every post-feedback
+# plan session a deep write and schedules a patch that can only come out
+# empty (observed: run small_1028_0046 labelled 6/9 generations deep-intent
+# with zero edit_source ops and view-only grants; the mislabel also fed the
+# session patch gate, which then found nothing to commit).
+_ALWAYS_SHALLOW = frozenset({"respond_issue"})
+
 # Design-directory operators that are deep BY NATURE: they write a CODE-TREE
 # file (``gan/design/schema_ext/<role>.json``), so their changes reach the
 # committed tree only through the patch channel. Left in the auto-derived
@@ -251,7 +261,8 @@ def _shallow_design_ops() -> frozenset:
         stems = {p.stem for p in _DESIGN_DIR.glob("*.py") if p.stem != "__init__"}
     except OSError:
         stems = set()
-    return (frozenset(stems) - _DEEP_BY_NATURE) or _FALLBACK_SHALLOW
+    shallow = (frozenset(stems) - _DEEP_BY_NATURE) or _FALLBACK_SHALLOW
+    return shallow | _ALWAYS_SHALLOW
 
 
 _SHALLOW_DESIGN_OPS = _shallow_design_ops()
@@ -266,6 +277,8 @@ def has_deep_write(records) -> bool:
     - a **shallow** design operator never triggers a patch by itself;
     - ``request_source_access`` counts only with ``intent == "modify"`` (a ``view``
       grant copies a read-only file and must not schedule a patch);
+    - **bookkeeping** ops recorded on the same channel but never writing source
+      (e.g. ``respond_issue``) are shallow by name via ``_ALWAYS_SHALLOW``;
     - **everything else** (``register_component`` / ``unregister_component`` /
       ``update_component`` / ``edit_source`` / future deep tools) counts.
 

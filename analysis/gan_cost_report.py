@@ -26,6 +26,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -33,6 +34,16 @@ from typing import Any, Dict, List, Optional
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+
+# Fixed-root evaluation rounds launch their own task harness under a
+# non-numeric scope id (a8ce2dd): eval_outer<N>_s<M>. scope_type is still
+# "genid", so the gen table must partition by scope-id shape, not by type.
+_EVAL_SCOPE_RE = re.compile(r"^eval_outer(\d+)_s(\d+)$")
+
+
+def _eval_scope(scope_id: Any) -> Optional[tuple]:
+    m = _EVAL_SCOPE_RE.match(str(scope_id or ""))
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def _load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -105,7 +116,10 @@ def analyze(run_dir: str, prices: Optional[dict]) -> Dict[str, Any]:
     for r in roles:
         roles[r]["usd"] = _cost_usd(by_role[r], prices)
 
-    # per-outer: outer-scoped by scope_id; task gens mapped via inner_done
+    # per-outer: outer-scoped by scope_id; task gens mapped via inner_done.
+    # Fixed-root eval scopes fold into their OWNING outer (both into the task
+    # bucket, so per-outer totals are complete, and a task_eval bucket so the
+    # eval share stays visible); without this they silently dropped out.
     gen_outer = {g: e.get("outer") for g, e in inner_done.items()}
     per_outer: Dict[int, Dict[str, Any]] = defaultdict(dict)
     for e in calls:
@@ -113,6 +127,11 @@ def analyze(run_dir: str, prices: Optional[dict]) -> Dict[str, Any]:
             per_outer[int(e.get("scope_id"))].setdefault(
                 _role_of(e), []).append(e)
         elif e.get("scope_type") == "genid":
+            ev = _eval_scope(e.get("scope_id"))
+            if ev is not None:
+                per_outer[ev[0]].setdefault("task", []).append(e)
+                per_outer[ev[0]].setdefault("task_eval", []).append(e)
+                continue
             o = gen_outer.get(str(e.get("scope_id")))
             if o is not None:
                 per_outer[int(o)].setdefault("task", []).append(e)
@@ -130,14 +149,20 @@ def analyze(run_dir: str, prices: Optional[dict]) -> Dict[str, Any]:
             a = _agg(cl)
             row[r] = {"calls": a["calls"], "total_tokens": a["total_tokens"],
                       "latency_s": a["latency_s"]}
+        eval_a = _agg(per_outer[o].get("task_eval", []))
+        row["task_eval"] = {"calls": eval_a["calls"],
+                            "total_tokens": eval_a["total_tokens"]}
         row["usd"] = _cost_usd([e for r in ("planner", "evaluator", "task")
                                 for e in per_outer[o].get(r, [])], prices)
         outer_table.append(row)
 
-    # per-task-gen
+    # per-task-gen (main chain only; eval rounds have their own table below)
+    main_gen_ids = {str(e.get("scope_id")) for e in calls
+                    if e.get("scope_type") == "genid"
+                    and _eval_scope(e.get("scope_id")) is None}
     gen_table = []
-    for g in sorted({str(e.get("scope_id")) for e in calls
-                     if e.get("scope_type") == "genid"}, key=lambda x: int(x)):
+    for g in sorted(main_gen_ids,
+                    key=lambda x: (0, int(x)) if x.isdigit() else (1, x)):
         cl = [e for e in calls if e.get("scope_type") == "genid"
               and str(e.get("scope_id")) == g]
         a = _agg(cl)
@@ -153,6 +178,24 @@ def analyze(run_dir: str, prices: Optional[dict]) -> Dict[str, Any]:
             "usd": _cost_usd(cl, prices),
         })
 
+    # fixed-root eval rounds (their own task harness per outer)
+    eval_calls: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for e in calls:
+        if e.get("scope_type") == "genid" and _eval_scope(e.get("scope_id")):
+            eval_calls[str(e.get("scope_id"))].append(e)
+    eval_table = []
+    for sid in sorted(eval_calls, key=lambda s: _eval_scope(s) or (0, 0)):
+        cl = eval_calls[sid]
+        a = _agg(cl)
+        o, seq = _eval_scope(sid)
+        eval_table.append({
+            "scope": sid, "outer": o, "seq": seq,
+            "calls": a["calls"], "prompt_tokens": a["prompt_tokens"],
+            "completion_tokens": a["completion_tokens"],
+            "total_tokens": a["total_tokens"], "latency_s": a["latency_s"],
+            "failures": a["failures"], "usd": _cost_usd(cl, prices),
+        })
+
     # wallclock bookkeeping
     t0 = (start_ev or {}).get("timestamp")
     t1 = (done_ev or {}).get("timestamp")
@@ -164,6 +207,7 @@ def analyze(run_dir: str, prices: Optional[dict]) -> Dict[str, Any]:
         "model_cfg": {k: v for k, v in (model_cfg or {}).items()
                       if k.startswith("gan.")}, "prices": bool(prices),
         "roles": roles, "outer_table": outer_table, "gen_table": gen_table,
+        "eval_table": eval_table,
         "calls_total": len(calls),
         "tokens_total": sum(e.get("total_tokens") or 0 for e in calls),
         "failures_total": sum(1 for e in calls if e.get("status") != 200),
@@ -211,15 +255,17 @@ def render_md(r: Dict[str, Any]) -> str:
     L.append("")
 
     if r["outer_table"]:
-        L += ["## 按 outer（角色调用 + 任务代合并到所属 outer）", "",
-              "| outer | wallclock s | planner tok | evaluator tok | task tok | 分数均值 | gens |"
+        L += ["## 按 outer（角色调用 + 任务代合并到所属 outer；task 含固定根评估轮）", "",
+              "| outer | wallclock s | planner tok | evaluator tok | task tok（其中 eval） | 分数均值 | gens |"
               + (" 估算 $ |" if r["prices"] else ""),
               "|---|---|---|---|---|---|---|" + ("---|" if r["prices"] else "")]
         for row in r["outer_table"]:
             usd = f" {row['usd']} |" if r["prices"] else ""
+            tev = row.get("task_eval") or {}
             L.append(f"| {row['outer']} | {row['wallclock_s']} "
                      f"| {row['planner']['total_tokens']:,} | {row['evaluator']['total_tokens']:,} "
-                     f"| {row['task']['total_tokens']:,} | {row['score_mean']} "
+                     f"| {row['task']['total_tokens']:,}（{tev.get('total_tokens', 0):,}） "
+                     f"| {row['score_mean']} "
                      f"| {','.join(map(str, row['gens']))} |{usd}")
         L.append("")
 
@@ -234,6 +280,18 @@ def render_md(r: Dict[str, Any]) -> str:
             L.append(f"| {g['genid']} | {g['outer']} | {g['calls']} | {g['prompt_tokens']:,} "
                      f"| {g['completion_tokens']:,} | {g['latency_s']} | {g['harness_s']} "
                      f"| {g['score']} | {tpp} |{usd}")
+        L.append("")
+
+    if r.get("eval_table"):
+        L += ["## 固定根评估轮（task eval harness；scope=eval_outer<N>_s<M>）", "",
+              "| scope | outer | 调用 | prompt tok | completion tok | 合计 tok | LLM 延迟 s | 失败 |"
+              + (" 估算 $ |" if r["prices"] else ""),
+              "|---|---|---|---|---|---|---|---|" + ("---|" if r["prices"] else "")]
+        for g in r["eval_table"]:
+            usd = f" {g['usd']} |" if r["prices"] else ""
+            L.append(f"| {g['scope']} | {g['outer']} | {g['calls']} | {g['prompt_tokens']:,} "
+                     f"| {g['completion_tokens']:,} | {g['total_tokens']:,} "
+                     f"| {g['latency_s']} | {g['failures']} |{usd}")
         L.append("")
 
     L.append("## 结论（自动摘要）")
@@ -273,6 +331,11 @@ def write_csv(r: Dict[str, Any], path: str) -> None:
                         g["prompt_tokens"], g["completion_tokens"],
                         g["prompt_tokens"] + g["completion_tokens"],
                         g["latency_s"], "", g.get("usd") if r["prices"] else ""])
+        for g in r.get("eval_table") or []:
+            w.writerow([r["name"], g["scope"], "task", g["calls"],
+                        g["prompt_tokens"], g["completion_tokens"],
+                        g["total_tokens"], g["latency_s"], g["failures"],
+                        g.get("usd") if r["prices"] else ""])
 
 
 def main() -> int:
