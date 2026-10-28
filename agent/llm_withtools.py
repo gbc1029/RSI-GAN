@@ -277,6 +277,50 @@ DO NOT HALLUCINATE OR MAKE UP ANYTHING.
 """.format(tools_available=tools_available)
     return tooluse_prompt.strip()
 
+def _json_block_truncated(response):
+    """Real-truncation evidence for the output-context retry.
+
+    The last ``<json>`` block must be MISSING its closing tag, or end with
+    unconsumed OPEN braces. A closed block with extra closers / a broken
+    string is MALFORMED, not truncated -- the malformed-feedback path owns
+    it (field lesson from the polyglot round 2026-10-28,
+    go__kindergarten-garden: the old len>=2000 heuristic looped 'Output
+    context exceeded' on a closed-but-unparseable block until the question
+    produced a BLANK patch; both paths are bounded now).
+    """
+    last = response.rfind("<json>")
+    if last == -1:
+        return False
+    tail = response[last:]
+    end = tail.find("</json>")
+    if end == -1:
+        return True                       # never closed -> truncated
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in tail[:end]:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    # depth > 0: the parser ran out of input with open braces (missing
+    # closers) -> truncated. depth <= 0 (incl. extra closers / a broken
+    # string inside a closed tag) -> MALFORMED, not truncated: a different
+    # error message applies, and both paths are bounded now.
+    return depth > 0
+
+_CTX_RETRY_LIMIT = 5   # consecutive output-truncation retries before forced summary
+
 def should_retry_tool_use(response, tool_uses=None):
     """
     Check if the response attempts to use a tool,
@@ -291,15 +335,17 @@ def should_retry_tool_use(response, tool_uses=None):
     tool_name_pos = response.find("tool_name")
     tool_input_pos = response.find("tool_input")
 
-    # Check ordering and length condition
+    # The response TRIED to call a tool; only real truncation evidence
+    # (unclosed json / unbalanced tail) justifies the output-context retry.
+    # A closed-but-malformed block takes the malformed path instead -- the
+    # old len>=2000 gate mislabeled that case and looped retries.
     if (
         json_pos != -1
         and tool_name_pos != -1
         and tool_input_pos != -1
         and json_pos < tool_name_pos < tool_input_pos
-        and len(response) >= 2000
     ):
-        return True
+        return _json_block_truncated(response)
 
     # No retry
     return False
@@ -599,6 +645,7 @@ def chat_with_agent(
         _last_fp = None
         _repeat_count = 0
         repeat_break = False
+        _ctx_retry_count = 0
         while tool_uses or retry_tool_use or malformed:
             # Reserved cost keys (docs/10 §10): per-session token soft stop,
             # checked BEFORE the next tool turn is started (the call that
@@ -739,6 +786,35 @@ def chat_with_agent(
             if repeat_break:
                 break
             if retry_tool_use:
+                _ctx_retry_count += 1
+                if _ctx_retry_count >= _CTX_RETRY_LIMIT:
+                    # Consecutive-truncation breaker (field lesson from the
+                    # polyglot round 2026-10-28, go__kindergarten-garden: the
+                    # same long-file write retried until the question budget
+                    # died and the prediction came back BLANK). Force a short
+                    # final-summary turn and record the no_answer outcome;
+                    # the session ends cleanly either way.
+                    logging(f"Error: Output context exceeded {_ctx_retry_count}x "
+                            f"in a row; forcing final summary.")
+                    _emit(logging, trajectory_file, "no_answer",
+                          consecutive_truncations=_ctx_retry_count)
+                    try:
+                        response, new_msg_history, info = _counting_llm(
+                            msg=(system_msg
+                                 + "\n\n# Output context exceeded repeatedly\n"
+                                 "Your last attempts were each cut off mid-JSON: "
+                                 "the response was too long. Do NOT call any tool "
+                                 "and do NOT paste file contents. Reply with a "
+                                 "short final answer only."),
+                            model=model,
+                            msg_history=new_msg_history,
+                        )
+                        _emit(logging, trajectory_file, "output", text=response,
+                              **_output_fields(info))
+                    except Exception as e:
+                        logging(f"Error during final summary turn: {e}")
+                    truncated = True
+                    break
                 logging("Error: Output context exceeded. Please try again.")
                 tool_msgs.append("Error: Output context exceeded. Please try again.")
 

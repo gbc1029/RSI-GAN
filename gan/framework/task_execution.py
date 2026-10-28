@@ -927,17 +927,55 @@ def run_polyglot_eval(
     """Parent-side polyglot scoring (Arch 2): docker eval of the child patches.
 
     Each non-blank prediction is a unified diff produced by the task child;
-    the eval-only container applies it to the exercise repo and runs the
-    language test command. Score = resolved/total; the harness's own
-    aggregation json stays next to the per-instance artifacts as evidence.
+    BEFORE dispatch it passes the parent-side pre-flight gate
+    (gan.framework.polyglot_patch_repair): the same ``git apply --check`` the
+    eval-only container runs, plus a repair pass for the corruption classes
+    observed in small_1028_0046 (non-solution stanzas, no-trailing-newline
+    glue). A patch that still fails the gate is NOT dispatched -- the eval
+    scores the pristine exercise (empty_patch) exactly as before, but the
+    report records the per-question ``patch_apply`` status and reason.
+    Score = resolved/total; the harness's own aggregation json stays next to
+    the per-instance artifacts as evidence.
     """
-    df = pd.read_csv(predictions_path, dtype=str)
+    # Read via the stdlib csv module, NOT pandas: the polyglot predictions
+    # can carry binary-poisoned diffs whose content includes NUL bytes, and
+    # the pandas C parser silently TRUNCATES a field at the first NUL (field
+    # audit small_1028_0046 gen0: python predictions lost ~97% of their bytes
+    # here). The gate needs the full bytes to see (and drop) the binary
+    # stanza; a truncated field would instead fail the gate as an
+    # unexplainable corrupt patch.
+    import csv as _csv
+    _csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
+    rows: List[Tuple[str, str]] = []
+    with open(predictions_path, "r", encoding="utf-8", newline="") as f:
+        for row in _csv.DictReader(f):
+            rows.append((str(row.get("question_id") or ""),
+                         row.get("prediction") or ""))
+    from gan.framework.polyglot_patch_repair import PatchPreflight
+    gate = PatchPreflight(dataset_root)
     patches: Dict[str, str] = {}
-    for _, row in df.iterrows():
-        pred = row.get("prediction")
-        if isinstance(pred, str) and pred.strip():
-            patches[str(row["question_id"])] = pred
-    task_list = [str(value) for value in df["question_id"].tolist()]
+    patch_apply: Dict[str, Any] = {}
+    try:
+        for qid, pred in rows:
+            if not (isinstance(pred, str) and pred.strip()):
+                patch_apply[qid] = {"status": "blank"}
+                continue
+            status, dispatch, info = gate.preflight(qid, pred)
+            row_info: Dict[str, Any] = {"status": status}
+            if info.get("gate_error"):
+                row_info["gate_error"] = info["gate_error"]
+            if status == "repaired":
+                row_info["dropped_files"] = info.get("dropped_files") or []
+                row_info["rebuilt_files"] = info.get("rebuilt_files") or []
+            patch_apply[qid] = row_info
+            if status in ("ok", "repaired"):
+                patches[qid] = dispatch
+            # rejected/blank: dispatch NOTHING -> the harness scores the
+            # pristine exercise (empty_patch) with the reason recorded above.
+    finally:
+        gate_summary = gate.summary()
+        gate.cleanup()
+    task_list = [qid for qid, _ in rows]
     from domains.polyglot.harness import harness as polyglot_harness
     run_id = "gan_polyglot"
     polyglot_harness(
@@ -972,6 +1010,12 @@ def run_polyglot_eval(
         # the resolved/unresolved views stay the primary evidence.
         "question_ids_passed": list(resolved),
         "question_ids_failed": sorted(set(unresolved) | set(empty) | set(incomplete)),
+        # per-question patch-apply outcome (ok/repaired/rejected/blank):
+        # additive-only annotation -- the resolved/unresolved views and the
+        # resolved_rate denominator stay EXACTLY as before (a rejected patch
+        # is still a miss; the field exists so the miss is attributable).
+        "patch_apply": patch_apply,
+        "patch_apply_summary": gate_summary,
     }
     report_path = os.path.join(output_path, "report.json")
     with open(report_path, "w", encoding="utf-8") as f:
@@ -2771,6 +2815,14 @@ def compute_report_summary(
     summary["overall_accuracy"] = report.get("overall_accuracy")
     summary["random_guess_accuracy"] = report.get("random_guess_accuracy")
     summary["label_distribution"] = report.get("label_distribution")
+    # polyglot patch-apply aggregate (counts only, no text): a sanctioned
+    # extension of the run_summary projection -- the evaluator/planner must
+    # SEE how many patches were repaired/rejected by the pre-flight gate,
+    # otherwise a generator regression is invisible to the evolution loop
+    # (the small_1028_0046 lesson: 31/90 corrupt patches went unnoticed for
+    # 9 generations). Counts carry no benchmark signal; blind discipline
+    # untouched. Deliberate extension -> run_tool_regression after this.
+    summary["patch_apply_summary"] = report.get("patch_apply_summary")
 
     n_valid = report.get("total")
     if isinstance(n_valid, (int, float)):

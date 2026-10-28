@@ -661,6 +661,17 @@ class DomainTaskRunner:
                       f"(score will read None/failed): {report_path}")
         score = tx.extract_score(report, self.score_key, self.domain)
         report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
+        # polyglot patch-gate aggregate (counts only): one durable event per
+        # generation so the repaired/rejected rates are greppable in
+        # events.jsonl without opening report.json (the small_1028_0046
+        # audit lesson: a gate failure visible ONLY inside docker logs is
+        # invisible to the loop).
+        if report_summary.get("patch_apply_summary"):
+            try:
+                self._event("question_patch_apply", genid=str(genid),
+                            **report_summary["patch_apply_summary"])
+            except Exception as e:  # noqa: BLE001 -- audit write failure
+                print(f"[WARN] question_patch_apply event write failed: {e}")
 
         report_sha = scores.sha256_file(report_path)
         # copy small evidence out of the ephemeral work dir (which is pruned)
