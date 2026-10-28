@@ -620,6 +620,30 @@ def _launch_budget(cfg: Any, inner: Optional[int]) -> tuple[int, int, int]:
     return inner_generations, eval_rounds, inner_generations + eval_rounds
 
 
+def _resolve_eval_subset(raw: str, domain_config: Any) -> tuple[str, str]:
+    """Three-state resolution of the fixed-root evaluation question set.
+
+    Returns ``(subset, source)``:
+      - explicit name  -> ``(name, "explicit")`` -- verbatim, legacy behaviour;
+      - none/off/false -> `("", "explicit_off")` -- the operator disabled the
+        fixed-root evaluation even though the domain may declare a val set;
+      - "" (loop.yaml default) -> inherit the domain's ``val_subset``
+        declaration (domains.yaml, full file stem):
+        `("declared-stem", "domain_declaration")`, or
+        `("", "domain_undeclared")` when the domain has no val set.
+    Pure (no I/O) so the offline tests can drive it directly.
+    """
+    raw = str(raw or "").strip()
+    if raw.lower() in ("none", "off", "false"):
+        return "", "explicit_off"
+    if raw:
+        return raw, "explicit"
+    declared = str((domain_config or {}).get("val_subset") or "").strip()
+    if declared:
+        return declared, "domain_declaration"
+    return "", "domain_undeclared"
+
+
 @_private_driver_umask
 def run_gan_driver(
     repo_root: str,
@@ -692,9 +716,26 @@ def run_gan_driver(
     # main line and the root-side broker pins ``num_samples`` for every harness
     # launch: an over-sized evaluation set would be silently truncated by the
     # harness re-slice, so it is refused instead.
+    #
+    # eval.subset is THREE-STATE (2026-10-28 declared-val redesign, docs/15
+    # §12.5): the loop.yaml default "" inherits the domain's own ``val_subset``
+    # declaration in domains.yaml (full dataset file stem; polyglot resolves
+    # subsets/<stem>.json, CSV domains domains/<folder>/<stem>.csv) -- so the
+    # val split is framework-native instead of an operator-side --set. An
+    # explicit name wins verbatim (legacy --set keeps working); the sentinel
+    # none/off/false explicitly DISABLES the fixed-root evaluation even when
+    # the domain declares a val set. A domain without a declaration disables
+    # the evaluation LOUDLY (event below) instead of resolving a broken name.
+    # The resolved name is what the seed file, the worker pin and the regime
+    # guard all see -- loop.py never sees the empty/inherit state.
     eval_section = cfg.get("eval") or {}
-    eval_subset = str(eval_section.get("subset") or "")
     eval_anchor_k = max(0, int(eval_section.get("anchor_k") or 0))
+    eval_subset, eval_subset_source = _resolve_eval_subset(
+        str(eval_section.get("subset") or ""), domain_config)
+    _log_event(output_dir, {"type": "eval_subset_resolved", "domain": domain,
+                            "source": eval_subset_source,
+                            "subset": eval_subset or None,
+                            "anchor_k": eval_anchor_k or None})
     eval_questions = eval_anchor_k if (eval_subset and eval_anchor_k) else 0
     if eval_questions > int(num_samples):
         raise ValueError(
@@ -1109,6 +1150,13 @@ def run_gan_driver(
                 # B1 rides source_access.deny_deep (its only consumer), not ablation.
                 worker_overrides.setdefault("source_access", {})["deny_deep"] = \
                     bool(cfg.get("source_access.deny_deep", False))
+                # The worker re-loads loop.yaml, whose eval.subset default is
+                # now the INHERIT sentinel ("" = read domains.yaml val_subset).
+                # The worker cannot re-resolve (it already runs inside the
+                # outer), so pin the DRIVER's resolved concrete name -- "" when
+                # the evaluation is off -- so loop.py and the seed file always
+                # agree (docs/15 §12.5, event eval_subset_resolved).
+                worker_overrides.setdefault("eval", {})["subset"] = eval_subset
                 if worker_overrides:
                     cmd.extend(["--cfg-overrides", json.dumps(worker_overrides)])
                 if inner is not None:

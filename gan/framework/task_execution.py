@@ -1000,24 +1000,65 @@ def derive_sample_seed(base_seed: int, genid: str) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
-def load_dataset_frame(dataset_root: str, domain: str, subset: str):
+def load_dataset_frame(dataset_root: str, domain: str, subset: str,
+                       full_stem: bool = False):
     """Load a domain/subset dataset plus its (id column, ground-truth column).
 
     Single place that knows the on-disk dataset layout and the domain utils
     column names, so the sampling entries below cannot drift apart (the id
     column used to be re-derived in three separate functions).
+
+    Path resolution is FLEX (2026-10-28 declared-val redesign, docs/15 §12.5):
+    ``subset`` may be a legacy splice name (``_filtered_100_val`` ->
+    ``dataset{subset}.csv`` / imo ``{name}bench{subset}.csv``) or a DECLARED
+    FULL file stem (domains.yaml ``val_subset``, e.g. ``dataset_filtered_100_val``
+    / ``gradingbench_filtered_100_val``). Legacy-first precedence keeps every
+    existing name resolving exactly as before; the direct
+    ``domains/<folder>/<subset>.csv`` candidate is only consulted when the
+    spliced path does not exist, so the two conventions cannot collide.
+    ``full_stem=True`` skips the legacy candidate entirely.
     """
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
     domain_folder = domain.split("_")[0] if "imo_" in domain else domain
     utils_module = importlib.import_module(f"domains.{domain_folder}.{utils_prefix}utils")
     question_id_col = str(utils_module.QUESTION_ID)
     ground_truth_key = str(utils_module.GROUND_TRUTH_KEY)
-    if "imo_" in domain:
-        rel = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
+    if full_stem:
+        rel = f"domains/{domain_folder}/{subset}.csv"
     else:
-        rel = f"domains/{domain}/dataset{subset}.csv"
+        if "imo_" in domain:
+            rel_legacy = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
+        else:
+            rel_legacy = f"domains/{domain}/dataset{subset}.csv"
+        rel_direct = f"domains/{domain_folder}/{subset}.csv"
+        root_abs = os.path.abspath(dataset_root)
+        if os.path.isfile(os.path.join(root_abs, rel_legacy)) \
+                or not os.path.isfile(os.path.join(root_abs, rel_direct)):
+            rel = rel_legacy
+        else:
+            rel = rel_direct
     dataset = pd.read_csv(os.path.join(os.path.abspath(dataset_root), rel), dtype=str)
     return dataset, question_id_col, ground_truth_key
+
+
+def load_dataset_ids_declared(dataset_root: str, domain: str, name: str) -> List[str]:
+    """Pool of question ids for a DECLARED val-subset file stem (docs/15 §12.5).
+
+    The declared value is the full file stem (``dataset_filtered_100_val`` /
+    ``gradingbench_filtered_100_val``), resolved directly under the domain
+    folder; a stem that does not exist as a direct file falls back to the
+    legacy subset-name splice (``load_dataset_ids``), so an explicit legacy
+    ``--set eval.subset=_filtered_100_val`` keeps resolving unchanged.
+    """
+    name = str(name or "").strip()
+    folder = domain.split("_")[0] if "imo_" in domain else domain
+    direct = os.path.join(os.path.abspath(dataset_root), "domains", folder,
+                          f"{name}.csv")
+    if name and os.path.isfile(direct):
+        dataset, question_id_col, _gt = load_dataset_frame(
+            dataset_root, domain, name, full_stem=True)
+        return [str(v) for v in dataset[question_id_col].tolist()]
+    return load_dataset_ids(dataset_root, domain, name)
 
 
 def load_dataset_ids(dataset_root: str, domain: str, subset: str) -> List[str]:
@@ -1080,15 +1121,40 @@ def _polyglot_subset_ids(dataset_root: str, subset_name: str) -> List[str]:
 
 
 def _polyglot_heldout_ids(dataset_root: str) -> List[str]:
-    """The held-out evaluation ids (``subsets/val.json``), for main exclusion.
+    """The held-out evaluation ids, for main-line pool exclusion.
 
-    Excluded from the MAIN-LINE sampling pool so the planner's feedback
-    channel never sees a val question (docs/15 §12.4-3). Explicit baseline
-    modes are exempt: ``legacy_prefix`` and the full (``num_samples<=0``)
-    runs keep the whole pool -- they are declared A/B baselines / full
-    evaluations, not the rotating main line.
+    The subset NAME comes from domains.yaml ``val_subset`` (declared per
+    domain; full file stem) -- never a literal in framework source (2026-10-28
+    declared-val redesign, docs/15 §12.5). Excluded from the MAIN-LINE
+    sampling pool so the planner's feedback channel never sees a val question
+    (docs/15 §12.4-3). Explicit baseline modes are exempt: ``legacy_prefix``
+    and the full (``num_samples<=0``) runs keep the whole pool -- they are
+    declared A/B baselines / full evaluations, not the rotating main line.
+
+    STRICT on purpose: the exclusion protects the main line from val
+    contamination (R4 anchor criterion + planner feedback), so BOTH a missing
+    domains.yaml declaration AND a declared-but-missing/empty file raise
+    here -- refusing to start beats silently sampling from the full pool.
+    (The EVAL-side reader ``_polyglot_subset_ids`` keeps its soft semantics:
+    there the Defect-1 guard refuses val_mean instead.)
     """
-    return _polyglot_subset_ids(dataset_root, "val")
+    from gan.framework.loader import load_registry, resolve_domain
+    declared = str((resolve_domain(load_registry(), "polyglot") or {})
+                   .get("val_subset") or "").strip()
+    if not declared:
+        raise ValueError(
+            "domains.yaml polyglot val_subset declaration is missing/empty: "
+            "the held-out exclusion cannot be resolved, and running without "
+            "it would leak val questions into the main-line pool (R4 anchor "
+            "contamination). Declare val_subset for polyglot or remove the "
+            "domain.")
+    ids = _polyglot_subset_ids(dataset_root, declared)
+    if not ids:
+        raise ValueError(
+            f"polyglot val subset (domains.yaml val_subset={declared!r}) "
+            f"resolved to zero ids: refusing to run with an empty held-out "
+            f"exclusion (val leakage risk). Restore the subset file.")
+    return ids
 
 
 def select_seeded_positions(
@@ -1231,7 +1297,10 @@ def ensure_sampling_seed(
             elif domain in _SANDBOXED_BALROG_DOMAINS:
                 eval_pool = []
             else:
-                eval_pool = load_dataset_ids(dataset_root, domain, eval_subset_used)
+                # Declared full file stem first (domains.yaml val_subset
+                # convention), legacy subset-name splice as the fallback.
+                eval_pool = load_dataset_ids_declared(
+                    dataset_root, domain, eval_subset_used)
             if eval_pool:
                 erng = random.Random(f"{int(base_seed)}:eval_anchor")
                 eval_ids = sorted(erng.sample(eval_pool, min(eval_k_used, len(eval_pool))))

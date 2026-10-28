@@ -24,11 +24,15 @@ loop:
   stagnation_epsilon: 0.005     # delta threshold；锚点口径下每次变化是 1 个整题，
                                 # 所以任何 +1 都算改进（eps 实际退化为 0）
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
-  self_improve_max_tool_calls: 5  # tool-call budget for role self-improvement
-  plan_max_tool_calls: 6          # tool-call budget for the PLAN seat (planner only;
+  # 座位工具调用预算（2026-10-28 调整：原 5/6/8 对 polyglot 实测过紧——
+  # smoke_1022_222630 在 6 即 1/6 会话截断；提到 16/20/12 后 verify_1028_1633 仍有
+  # 5/16≈31% plan 会话顶满。现取代码回退值 40/30/30 的一半（20/15/15），保留
+  # "缺键放大"回退方向的安全性余量；evaluate blind 15 → reveal 回退 max(6,15//3)=6 不变。
+  self_improve_max_tool_calls: 15  # tool-call budget for role self-improvement
+  plan_max_tool_calls: 20          # tool-call budget for the PLAN seat (planner only;
                                    # the evaluate seat has its own key below -- it must
                                    # at minimum complete its mandatory eval-points)
-  evaluate_max_tool_calls: 8      # tool-call budget for the EVALUATE seat (blind phase;
+  evaluate_max_tool_calls: 15      # tool-call budget for the EVALUATE seat (blind phase;
                                    # the reveal phase gets a third of it, min 6). Must
                                    # cover: eval-points sweep + record/report/judge_fix.
   tool_repeat_limit: 3             # anti-thrash: >= this many CONSECUTIVE identical
@@ -135,8 +139,16 @@ eval:
   # 为什么不用主链的 sampling.anchor_k：实测 k=2 的锚点核没有区分度（一题人人对 +
   # 一题人人错，A1 恒定策略在 36 代上恰好 0.5000）。评估集要"全固定"，因此不受
   # select_samples 的 num_samples//2 上限约束（该上限保护的是主链的锚点+抽签配平）。
-  subset: _filtered_100_val     # 空 = 沿用主链子集（旧行为，题集每代变化）
-  anchor_k: 30                  # 0 = 不做固定锚点评估；建议 >= 20 才有区分度
+  # subset 三态（2026-10-28 声明化，解析点 gan/driver.py，事件 eval_subset_resolved）：
+  #   ""（默认）= 继承 domains.yaml 各域的 val_subset 声明（完整文件名去扩展名；
+  #              polyglot→subsets/val.json，CSV 域→domains/<目录>/<全名>.csv）；
+  #              域未声明 → 固定根评估关闭（loud 事件，跑完无 val_mean）。
+  #   none/off/false = 显式关闭固定根评估（即使域声明了 val_subset）。
+  #   显式子集名 = 按域协议原样解析（旧行为，--set eval.subset=<名> 仍最高优先）。
+  subset: ""                    # 空 = 继承 domains.yaml val_subset（见上）
+  anchor_k: 30                  # 0 = 不做固定锚点评估；建议 >= 20 才有区分度；
+                                # 必须 <= --num_samples（driver 启动 fail-fast，
+                                # 否则 broker 钉值会静默截断评估集）
   eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 
 # ---------------------------------------------------------------------------
