@@ -1021,6 +1021,15 @@ class GanLoop:
         Authority evidence stays in ``runs/<genid>/``; the row (score None,
         score_status "invalid") only asserts that the generation existed and
         produced no measurable score."""
+        node.valid_parent = False
+        node.status = "invalid"
+        node.value.score = None
+        node.value.score_status = "invalid"
+        node.meta["invalid"] = True
+        node.meta["invalid_reason"] = reason
+        node.meta["invalid_detail"] = detail[:500]
+        if outer is not None:
+            node.meta["outer_id"] = outer
         self.task_tree.add_node(node)
         try:
             shutil.rmtree(paths.work_dir(self.output_dir, node.genid), ignore_errors=True)
@@ -1028,6 +1037,7 @@ class GanLoop:
             soft_fail(f"work dir cleanup failed for genid {node.genid}: {e}")
         self._write_invalid(node.genid, reason, detail, outer, inner)
         self.log_event({"type": "inner_invalid", "genid": node.genid,
+                        "outer": outer, "inner": inner,
                         "reason": reason, "detail": detail[:300]})
         self._append_score(node)
 
@@ -2724,19 +2734,8 @@ class GanLoop:
                     trajectory.collect(child.meta.get("run_dir", ""), f"gan_{genid}",
                                        self.output_dir, outer, genid)
                 except Exception as e:
-                    child.valid_parent = False
-                    child.meta["invalid"] = True
-                    child.meta["invalid_reason"] = "trajectory_archive_failed"
-                    child.meta["invalid_detail"] = str(e)[:500]
-                    self.task_tree.add_node(child)
-                    try:
-                        shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
-                    except Exception as e:
-                        soft_fail(f"work dir cleanup failed for genid {genid}: {e}")
-                    self._write_invalid(genid, "trajectory_archive_failed", str(e), outer, inner)
-                    self.log_event({"type": "inner_invalid", "genid": genid,
-                                    "reason": "trajectory_archive_failed",
-                                    "detail": str(e)[:300]})
+                    self._finalize_invalid_node(
+                        child, "trajectory_archive_failed", str(e), outer, inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
 
