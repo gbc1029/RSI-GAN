@@ -99,6 +99,10 @@ class AccessBroker:
         # through the SAME broker object, and a shared slot would let one
         # session read the other's skipped/denied audit (observed failure class).
         self._last_result_tls = threading.local()
+        # Last patch build's three-way-merge audit (``merged`` / ``conflicts``).
+        # Thread-local for the same reason as ``last_result``: the parallel
+        # self-improve sessions build patches through one broker object.
+        self._last_patch_tls = threading.local()
 
     @property
     def last_result(self) -> Dict[str, Any]:
@@ -107,6 +111,14 @@ class AccessBroker:
     @last_result.setter
     def last_result(self, value: Dict[str, Any]) -> None:
         self._last_result_tls.value = value
+
+    @property
+    def last_patch_report(self) -> Dict[str, Any]:
+        return getattr(self._last_patch_tls, "value", None) or {}
+
+    @last_patch_report.setter
+    def last_patch_report(self, value: Dict[str, Any]) -> None:
+        self._last_patch_tls.value = value
 
     # -- workspace ---------------------------------------------------------
     def workspace(self, role: str, node_id: Any) -> str:
@@ -123,6 +135,137 @@ class AccessBroker:
         """Repo dir owning ``rel`` (== repo_root in single layout)."""
         return self.roots.repo_dir(rel) or self.repo_root
 
+    # -- grant-time baseline + backups (deep-write recovery) -----------------
+    # ``.gan_base`` holds the bytes a workspace copy was made FROM. The patch
+    # builder uses it as the a-side of a THREE-WAY merge, so a baseline that
+    # moved after the grant (another session's commit, a role's own earlier
+    # patch) no longer turns the session's edit into "patch does not apply".
+    _BASE_DIRNAME = ".gan_base"
+    _BACKUP_DIRNAME = "_backup"
+
+    def base_dir(self, role: str, node_id: Any) -> str:
+        p = os.path.join(self.workspace(role, node_id), self._BASE_DIRNAME)
+        os.makedirs(p, exist_ok=True)
+        return p
+
+    def backup_root(self, role: str, node_id: Any) -> str:
+        """Backup area for one role instance.
+
+        Deliberately OUTSIDE ``workspaces/<role>/<node_id>`` -- that directory is
+        purged on every session boundary, so a backup stored inside it would be
+        deleted together with the thing it is meant to preserve.
+        """
+        p = os.path.join(self.workspaces_dir, self._BACKUP_DIRNAME,
+                         str(role), str(node_id))
+        os.makedirs(p, exist_ok=True)
+        return p
+
+    def _next_backup_seq(self, role: str, node_id: Any) -> str:
+        root = self.backup_root(role, node_id)
+        try:
+            used = [int(n) for n in os.listdir(root) if n.isdigit()]
+        except OSError:
+            used = []
+        return f"{max(used, default=0) + 1:03d}"
+
+    @staticmethod
+    def _safe_copy(src: str, dst: str) -> None:
+        """Copy file CONTENT into ``dst`` without needing ownership of it.
+
+        ``shutil.copy2`` = copyfile + copystat, and copystat's chmod/utime raise
+        ``PermissionError: [Errno 1] Operation not permitted`` when ``dst`` already
+        exists and belongs to another uid -- which is exactly the state of a
+        workspace copy being refreshed (the file was created by the broker, the
+        refresh may run as the role's own uid). Writing a temp sibling and
+        RENAMING it over the target needs only directory write access, and is
+        atomic besides.
+        """
+        parent = os.path.dirname(dst) or "."
+        os.makedirs(parent, exist_ok=True)
+        tmp = os.path.join(parent, f".gan-tmp-{os.getpid()}-{os.urandom(4).hex()}")
+        try:
+            shutil.copyfile(src, tmp)
+            try:
+                shutil.copystat(src, tmp)
+            except OSError:
+                # metadata is cosmetic here; never fail a grant over it
+                pass
+            os.replace(tmp, dst)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def _snapshot_base(self, source: str, base_root: str, rel: str) -> None:
+        """Record the grant-time baseline bytes (idempotent, best effort)."""
+        try:
+            if os.path.isdir(source):
+                dest = os.path.join(base_root, rel)
+                for dirpath, _dirs, files in os.walk(source):
+                    for name in files:
+                        full = os.path.join(dirpath, name)
+                        sub = os.path.relpath(full, source).replace(os.sep, "/")
+                        target = os.path.join(dest, *sub.split("/"))
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        self._safe_copy(full, target)
+            else:
+                dest = os.path.join(base_root, *rel.split("/"))
+                self._safe_copy(source, dest)
+        except OSError as exc:
+            self.log_event({"type": "grant_base_snapshot_failed", "path": rel,
+                            "error": f"{type(exc).__name__}: {exc}"[:160],
+                            "ts": time.time()})
+
+    def _backup_file(self, source: str, backup_dir: str, rel: str) -> None:
+        """Keep the current workspace bytes before they are overwritten."""
+        try:
+            target = os.path.join(backup_dir, *rel.split("/"))
+            self._safe_copy(source, target)
+        except OSError as exc:
+            self.log_event({"type": "workspace_backup_failed", "path": rel,
+                            "error": f"{type(exc).__name__}: {exc}"[:160],
+                            "ts": time.time()})
+
+    def _backup_session_src(self, role: str, node_id: Any, reason: str) -> Optional[str]:
+        """Preserve the files a session actually CHANGED before the workspace is
+        purged. Files identical to their ``.gan_base`` snapshot are skipped, so a
+        backup contains only real edits (small, and directly usable)."""
+        root = os.path.join(self.workspaces_dir, str(role), str(node_id))
+        src = os.path.join(root, "src")
+        base = os.path.join(root, self._BASE_DIRNAME)
+        if not os.path.isdir(src):
+            return None
+        changed: List[str] = []
+        try:
+            for dirpath, _dirs, files in os.walk(src):
+                for name in files:
+                    full = os.path.join(dirpath, name)
+                    rel = os.path.relpath(full, src).replace(os.sep, "/")
+                    base_file = os.path.join(base, *rel.split("/"))
+                    try:
+                        if os.path.isfile(base_file):
+                            with open(full, "rb") as a, open(base_file, "rb") as b:
+                                if a.read() == b.read():
+                                    continue
+                    except OSError:
+                        pass
+                    changed.append(rel)
+        except OSError:
+            return None
+        if not changed:
+            return None
+        seq = self._next_backup_seq(role, node_id)
+        dest = os.path.join(self.backup_root(role, node_id), seq)
+        for rel in changed:
+            self._backup_file(os.path.join(src, *rel.split("/")), dest, rel)
+        self.log_event({"type": "workspace_backup", "reason": reason,
+                        "role": str(role), "node_id": str(node_id),
+                        "dir": dest, "files": sorted(changed)[:50],
+                        "count": len(changed), "ts": time.time()})
+        return dest
+
     def clear_workspace(self, role: str) -> None:
         """Drop a role's granted-source workspace (called on instance refresh).
 
@@ -133,8 +276,23 @@ class AccessBroker:
         log it loudly: stale copies can no longer enter a patch. Their bytes do
         stay on disk, though -- a later default grant keeps the existing copy
         (``if_absent``), so recovery needs ``refresh=true`` or a manual clean-up.
+
+        Every instance that still holds EDITED files is backed up first (under
+        ``workspaces/_backup/<role>/<instance>/``, outside the cleared tree) --
+        the outer boundary is otherwise a silent delete of any deep edit whose
+        patch did not land.
         """
         p = os.path.join(self.workspaces_dir, role)
+        for node_id in sorted(os.listdir(p)) if os.path.isdir(p) else []:
+            if node_id.startswith("."):
+                continue
+            try:
+                self._backup_session_src(role, node_id, "workspace_clear")
+            except OSError as exc:
+                self.log_event({"type": "workspace_backup_failed",
+                                "role": str(role), "node_id": str(node_id),
+                                "error": f"{type(exc).__name__}: {exc}"[:160],
+                                "ts": time.time()})
         if os.path.isdir(p):
             try:
                 shutil.rmtree(p)
@@ -165,6 +323,11 @@ class AccessBroker:
     def _reset_session(self, role: str, node_id: Any) -> None:
         key = (str(role), str(node_id))
         root = os.path.join(self.workspaces_dir, str(role), str(node_id))
+        # Preserve real edits before they are purged: the reset used to be silent,
+        # so a rejected patch destroyed a session's work with no trace. The
+        # backup is the "undo" the deep-write flow needs.
+        if node_id is not None:
+            self._backup_session_src(role, node_id, "session_reset")
         if os.path.lexists(root):
             if os.name == "posix":
                 fd = os.open(
@@ -245,13 +408,20 @@ class AccessBroker:
     def _grant_concrete(self, rel: str, src_root: str, granted: List[str],
                         denied_list: List[str], missing: List[str],
                         if_absent: bool = False,
-                        skipped: Optional[List[str]] = None) -> None:
+                        skipped: Optional[List[str]] = None,
+                        base_root: Optional[str] = None,
+                        backup_dir: Optional[str] = None,
+                        discarded: Optional[List[str]] = None) -> None:
         """Copy one concrete repo-relative path into the workspace (with guards).
 
         With ``if_absent``, an existing workspace copy is NEVER overwritten -- it may
         hold this session's ``edit_source`` edits or ``unregister_component``
         deletions. The path is still reported as granted (and listed in ``skipped``)
         so the patch builder keeps tracking it.
+
+        ``base_root`` records the grant-time baseline (three-way merge input);
+        ``backup_dir`` preserves the bytes about to be overwritten and the rel
+        paths are appended to ``discarded``.
         """
         try:
             s = self._safe_join(self.repo_dir(rel), rel)
@@ -282,10 +452,23 @@ class AccessBroker:
                 skipped.append(rel)
             return
         os.makedirs(os.path.dirname(d) or src_root, exist_ok=True)
+        # Baseline snapshot FIRST (what we are copying FROM, for a later
+        # three-way merge), then back up whatever the workspace currently holds
+        # (refresh is destructive by design -- the backup makes it recoverable).
+        if base_root:
+            self._snapshot_base(s, base_root, rel)
+        if backup_dir and not os.path.isdir(d) and os.path.exists(d):
+            # Only a FILE copy can be silently overwritten here (a directory
+            # grant merges into the existing tree, which copytree already
+            # reports per file); back the victim up and say so.
+            self._backup_file(d, backup_dir, rel)
+            if discarded is not None:
+                discarded.append(rel)
         if os.path.isdir(s):
-            shutil.copytree(s, d, dirs_exist_ok=True, ignore=self._output_ignored)
+            shutil.copytree(s, d, dirs_exist_ok=True, ignore=self._output_ignored,
+                            copy_function=self._safe_copy)
         else:
-            shutil.copy2(s, d)
+            self._safe_copy(s, d)
         granted.append(rel)
 
     # -- deep-access policy ------------------------------------------------
@@ -358,7 +541,15 @@ class AccessBroker:
         denied_list: List[str] = []
         missing: List[str] = []
         skipped: List[str] = []
+        # Overwritten workspace copies (a refresh) are backed up, never silently
+        # destroyed; the baseline of every copy is snapshotted for a 3-way merge.
+        discarded: List[str] = []
         src_root = self.src_dir(role, node_id)
+        base_root = self.base_dir(role, node_id)
+        backup_dir = None
+        if not if_absent:
+            backup_dir = os.path.join(self.backup_root(role, node_id),
+                                      self._next_backup_seq(role, node_id))
         for raw in paths_list or []:
             rel = str(raw).replace("\\", "/").lstrip("/")
             if not rel or rel == ".":
@@ -385,10 +576,14 @@ class AccessBroker:
                         denied_list.append(m)
                         continue
                     self._grant_concrete(m, src_root, granted, denied_list, missing,
-                                         if_absent=if_absent, skipped=skipped)
+                                         if_absent=if_absent, skipped=skipped,
+                                         base_root=base_root, backup_dir=backup_dir,
+                                         discarded=discarded)
             else:
                 self._grant_concrete(rel, src_root, granted, denied_list, missing,
-                                     if_absent=if_absent, skipped=skipped)
+                                     if_absent=if_absent, skipped=skipped,
+                                     base_root=base_root, backup_dir=backup_dir,
+                                     discarded=discarded)
 
         rec = {
             "type": "source_access_grant",
@@ -396,6 +591,8 @@ class AccessBroker:
             "node_id": str(node_id),
             "paths": granted,
             "skipped": skipped,
+            "discarded": discarded,
+            "backup_dir": backup_dir if discarded else None,
             "denied": denied_list,
             "missing": missing,
             "intent": intent,
@@ -407,7 +604,9 @@ class AccessBroker:
         self.grants.setdefault((role, str(node_id)), []).append(rec)
         self.log_event(rec)
         self.last_result = {"granted": granted, "denied": denied_list,
-                            "missing": missing, "skipped": skipped}
+                            "missing": missing, "skipped": skipped,
+                            "discarded": discarded,
+                            "backup_dir": backup_dir if discarded else None}
         return granted
 
     def granted_paths(self, role: str, node_id: Any, intent: Optional[str] = None) -> List[str]:
@@ -485,7 +684,29 @@ class AccessBroker:
 
     def build_patch(self, role: str, node_id: Any, *, seat: str) -> str:
         from gan.patch import build_patch_from_workspace
-        return build_patch_from_workspace(self, role, node_id)
+        report: Dict[str, Any] = {}
+        try:
+            patch = build_patch_from_workspace(self, role, node_id, report=report)
+        finally:
+            # Three-way merges against a moved baseline and genuine conflicts are
+            # commit-time FACTS: keep them on the broker (audit) instead of
+            # widening the role-result contract, which is validated by exact
+            # field set across the process boundary.
+            self.last_patch_report = report
+        if report.get("merged") or report.get("conflicts"):
+            conflicts = report.get("conflicts") or []
+            self.log_event({
+                "type": "patch_baseline_drift", "role": role, "node_id": str(node_id),
+                "merged": report.get("merged") or [],
+                # markers are the only human-readable trace of a same-region
+                # clash (the patch itself is refused, never written corrupt)
+                "conflicts": [{"path": (c or {}).get("path"),
+                               "markers": str((c or {}).get("markers") or "")[:400]}
+                              for c in conflicts],
+                "patch_refused": bool(conflicts),
+                "ts": time.time(),
+            })
+        return patch
 
     def editable_paths(self, role: str, node_id: Any, cap: int = 300, *,
                        seat: str) -> Dict[str, List[str]]:
