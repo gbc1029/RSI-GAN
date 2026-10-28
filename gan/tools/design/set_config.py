@@ -31,6 +31,9 @@ def tool_info():
         "description": (
             "Set an existing design-config key (including a declared dynamic key). "
             "Declare a new key with add_config_key; add enum values with add_config_value. "
+            "The reserved 'cost' slot subkeys (cm_mode, per_question_token_budget, …) are "
+            "framework-consumed: set them HERE via key=\"cost\" with an object value — "
+            "never declare a same-named dynamic key. "
             "For the component slot ('tools'; legacy 'skills'/'eval_points' aliases) "
             "every name must be a registered, valid tool (same check as "
             "select_component); the whole call is refused otherwise."

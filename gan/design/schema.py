@@ -78,6 +78,13 @@ def _valid_spec(key: str, spec: Dict[str, Any]) -> bool:
         return False
     if not isinstance(spec.get("consumer"), str) or not spec["consumer"]:
         return False
+    # Composite consumer "<tool>@<read-site>" (docs/17 §6): a trailing empty
+    # site is malformed — refuse the entry at load. Bare tool names (legacy
+    # entries written before the composite requirement) stay valid, so old run
+    # trees keep loading unchanged.
+    _ctool, _at, _csite = str(spec["consumer"]).partition("@")
+    if _at and not _csite.strip():
+        return False
     if len(str(spec.get("description", ""))) > MAX_DESCRIPTION_CHARS:
         return False
     enum = spec.get("enum")
