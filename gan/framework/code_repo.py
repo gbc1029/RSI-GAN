@@ -530,11 +530,22 @@ def _hard_rollback(code_root: str, sha: Optional[str]) -> None:
 
 
 def schema_ext_report(code_root: str) -> Dict[str, Any]:
-    """Report malformed dynamic design-key catalogs for differential gating."""
+    """Report malformed dynamic design-key catalogs for differential gating.
+
+    Also reports ``unconsumed`` — declared keys with **no literal occurrence in
+    any Python source of the tree** (docs/17 §6.5, user decision 2026-10-28).
+    A plain substring scan, deliberately NOT an AST analysis and NOT a runtime
+    probe: a mention in a comment counts as a reference (fail-open), and a key
+    assembled dynamically at runtime (``prefix + name``) is falsely rejected —
+    both corners are accepted and recorded; only NEW unconsumed entries block a
+    patch (differential, never pre-existing ones).
+    """
     import json
     from gan.design.schema import _valid_spec, MAX_DYNAMIC_KEYS
     invalid = set()
+    unconsumed = set()
     base = os.path.join(code_root, "gan", "design", "schema_ext")
+    catalogs: Dict[str, List[str]] = {}
     for role in ("task", "planner", "evaluator"):
         p = os.path.join(base, f"{role}.json")
         try:
@@ -542,17 +553,53 @@ def schema_ext_report(code_root: str) -> Dict[str, Any]:
             if not isinstance(raw, dict) or len(raw) > MAX_DYNAMIC_KEYS:
                 invalid.add((role, "catalog"))
                 continue
+            keys = []
             for key, spec in raw.items():
                 if not isinstance(key, str) or not isinstance(spec, dict) or not _valid_spec(key, spec):
                     invalid.add((role, str(key)))
+                    continue
+                keys.append(key)
+            if keys:
+                catalogs[role] = keys
         except (OSError, ValueError, TypeError):
             invalid.add((role, "unparseable"))
-    return {"invalid": invalid}
+    if catalogs:
+        # Consumption evidence = the key name appears literally in some Python
+        # source of the tree. The declaring catalog itself is JSON (not scanned);
+        # a reader must be code. One blob build per report, one substring check
+        # per declared key (<= 16 per role) — negligible at commit frequency.
+        parts: List[str] = []
+        for dirpath, dirs, files in os.walk(code_root):
+            dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git")]
+            for fn in files:
+                if not fn.endswith(".py"):
+                    continue
+                try:
+                    with open(os.path.join(dirpath, fn), encoding="utf-8",
+                              errors="replace") as f:
+                        parts.append(f.read())
+                except OSError:
+                    continue
+        blob = "\n".join(parts)
+        for role, keys in catalogs.items():
+            for key in keys:
+                if key not in blob:
+                    unconsumed.add((role, str(key)))
+    return {"invalid": invalid, "unconsumed": unconsumed}
 
 
 def _schema_ext_worsened(before, after) -> str:
     new = after["invalid"] - before["invalid"]
-    return f"schema extension became invalid: {sorted(new)}" if new else ""
+    if new:
+        return f"schema extension became invalid: {sorted(new)}"
+    new_unc = after.get("unconsumed", set()) - before.get("unconsumed", set())
+    if new_unc:
+        return ("declared dynamic key(s) without any Python reference in the tree "
+                f"(dead keys): {sorted(new_unc)} — author the read in the same patch "
+                "or drop the declaration. Known limitation: a key only assembled "
+                "dynamically at runtime (prefix + name) must appear literally, e.g. "
+                "as a module constant (docs/17 §6.6)")
+    return ""
 
 
 # -- registry validation: differential problem classes (see registry_report).
