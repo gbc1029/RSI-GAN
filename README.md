@@ -114,6 +114,27 @@ stat -Lc '%U %G %a %n' \
   "$(command -v bwrap)" "$(command -v setpriv)" "$(command -v setfacl)"
 ```
 
+### 3b+) Polyglot child-sandbox toolchains (bake, 2026-10-29)
+
+The task sandbox is a read-only projection of the host (`/usr`, `/bin`, ...),
+so a language toolchain becomes available to the task agent simply by
+installing it on the HOST — no extra sandbox config. The eval containers
+bake their own toolchains (Go 1.21.5 et al., `domains/polyglot/dockerfiles.py`);
+match those versions so the agent sees what the grader sees:
+
+```bash
+# Go (align with the eval env image version)
+curl -fsSL --retry 2 -o /tmp/go.tgz   "https://mirrors.aliyun.com/golang/go1.21.5.linux-amd64.tar.gz"
+tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+ln -sf /usr/local/go/bin/go /usr/bin/go && ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
+# Java (javac for the java exercises)
+apt-get install -y openjdk-17-jdk-headless
+```
+
+Offline behaviour is pinned per exercise by `domains/task_worker.py`
+(`GOTOOLCHAIN=local`, `GOPROXY=off`, `GOTELEMETRY=off`); the go build cache
+lands in the sandbox-private tmpfs (`HOME=/tmp`), never in the patch.
+
 ### 3c) Dedicated sandbox accounts (GAN driver)
 
 The driver runs as root but drops every worker to a dedicated unprivileged

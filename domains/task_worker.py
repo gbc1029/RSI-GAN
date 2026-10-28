@@ -235,6 +235,15 @@ def _polyglot_prepare(inputs: dict) -> None:
     used to carry NUL bytes that made `git apply` reject the WHOLE patch).
     """
     files = inputs.get("files") or {}
+    # Go offline pin (host toolchain bake 2026-10-29): the exercises are
+    # stdlib-only (go.mod declares no deps) and the sandbox has no network --
+    # make that explicit so nothing ever hangs on a toolchain/proxy fetch.
+    # The build cache already lands in the sandbox-private tmpfs (HOME=/tmp),
+    # outside the solution-pathspec diff; the pin only makes it deterministic
+    # and fail-fast. setdefault: an explicit design/driver value wins.
+    os.environ.setdefault("GOTOOLCHAIN", "local")
+    os.environ.setdefault("GOPROXY", "off")
+    os.environ.setdefault("GOTELEMETRY", "off")
     for rel, content in files.items():
         rel = os.path.normpath(rel).lstrip(os.sep)
         if rel.startswith(".."):
