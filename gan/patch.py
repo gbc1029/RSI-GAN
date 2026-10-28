@@ -8,10 +8,11 @@ is in play is it applied to the generation's minimal repo copy instead.
 from __future__ import annotations
 
 import difflib
+import json
 import os
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 def _read_lines(path: str, *, missing_ok: bool = False) -> List[str]:
@@ -163,15 +164,134 @@ def _deletion_diff(repo_root: str, rel_file: str) -> str:
     return _no_newline_marker_diff(a_lines, [], f"a/{rel_file}", "/dev/null")
 
 
-def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[List[str]] = None) -> str:
+def _three_way_merge(ours: str, base: str, theirs: str):
+    """Merge ``ours`` (the session edit) with ``theirs`` (the moved baseline).
+
+    ``git merge-file -p ours base theirs`` prints the merged text and exits with
+    the CONFLICT COUNT (0 = clean). Returns ``(lines, clean)``; on a conflict the
+    lines carry git's ``<<<<<<<``/``=======``/``>>>>>>>`` markers, which is the
+    only place a conflict can be shown to a human without corrupting the patch.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "merge-file", "-p", "--quiet", ours, base, theirs],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, False
+    return proc.stdout.splitlines(keepends=True), proc.returncode == 0
+
+
+_MISSING = object()
+
+
+def _json_semantic_merge(ours: str, base: str, theirs: str) -> Optional[str]:
+    """Key-wise three-way merge for a top-level JSON OBJECT (registry files).
+
+    Registry JSONs are the dominant deep-write target, and ``git merge-file``
+    conflicts on ADJACENT lines -- exactly what "the session edited one field
+    while another generation added a field" looks like. Merging at the KEY level
+    is the honest reading of the intent: the session's field edit lands, the
+    upstream addition survives.
+
+    Returns the merged TEXT (formatted like ``registries.loader.write_registry_json``)
+    or ``None`` when both sides changed the SAME key to different values -- a real
+    conflict that must stay a loud refusal.
+    """
+    try:
+        o, b, t = json.loads(ours), json.loads(base), json.loads(theirs)
+    except (TypeError, ValueError):
+        return None
+    if not (isinstance(o, dict) and isinstance(b, dict) and isinstance(t, dict)):
+        return None
+    keys: List[str] = list(o.keys())
+    for k in list(b.keys()) + list(t.keys()):
+        if k not in keys:
+            keys.append(k)
+    merged: Dict[str, object] = {}
+    for k in keys:
+        ov, bv, tv = o.get(k, _MISSING), b.get(k, _MISSING), t.get(k, _MISSING)
+        ours_changed = ov != bv
+        theirs_changed = tv != bv
+        if ours_changed and theirs_changed and ov != tv:
+            return None
+        value = tv if (theirs_changed and not ours_changed) else ov
+        if value is not _MISSING:
+            merged[k] = value
+    text = json.dumps(merged, ensure_ascii=False, indent=2)
+    if ours.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def _merge_drifted(base_root: Optional[str], ws_file: str, repo_root: str,
+                   rel_file: str, a_lines: List[str], b_lines: List[str],
+                   report: Optional[Dict[str, object]]):
+    """Resolve a workspace copy whose grant-time baseline has since MOVED.
+
+    Returns ``(b_lines, conflict_markers_or_None)``. Three cases, in order:
+
+    1. ``base == current repo`` -- the baseline never moved: the plain two-way
+       diff is already correct, return ``b_lines`` untouched (the overwhelmingly
+       common case; zero behaviour change).
+    2. ``base == workspace`` -- the session never edited the file: return the
+       CURRENT repo lines, i.e. emit NO diff. Without this, a stale unedited copy
+       produced a patch that silently REVERTED someone else's committed change.
+    3. both differ -- three-way merge (line level, then a JSON key-level retry).
+       A clean merge becomes the new b-side (the session's intent lands on top of
+       the moved baseline); a conflict returns the markers so the caller can
+       REFUSE the patch instead of emitting a diff that reverts the other side.
+    """
+    if not base_root:
+        return b_lines, None
+    base_file = os.path.join(base_root, *rel_file.split("/"))
+    if not os.path.isfile(base_file):
+        return b_lines, None
+    base_lines = _read_lines(base_file)
+    if base_lines == a_lines:
+        return b_lines, None
+    if base_lines == b_lines:
+        return a_lines, None
+    repo_file = os.path.join(repo_root, rel_file)
+    merged, clean = _three_way_merge(ws_file, base_file, repo_file)
+    if not clean and rel_file.endswith(".json"):
+        text = _json_semantic_merge("".join(b_lines), "".join(base_lines),
+                                    "".join(a_lines))
+        if text is not None:
+            merged, clean = text.splitlines(keepends=True), True
+    if not clean:
+        return b_lines, "".join((merged or [])[:80])
+    if report is not None:
+        report.setdefault("merged", []).append(rel_file)  # type: ignore[union-attr]
+    return merged or b_lines, None
+
+
+def build_patch_from_workspace(broker, role: str, node_id,
+                               rel_paths: Optional[List[str]] = None,
+                               report: Optional[Dict[str, object]] = None) -> str:
     """Unified diff of granted workspace copies vs the source repo.
 
     Handles modifications/additions AND deletions (files present in the repo but
     removed from the workspace, e.g. by ``unregister_component``).
+
+    ``report`` (optional, filled in place) records which files needed a
+    three-way merge (``merged``) and which genuinely conflicted (``conflicts``,
+    ``{"path", "markers"}`` entries).
+
+    A conflict REFUSES the whole patch (``""``): a valid-looking diff built from
+    the workspace alone silently reverts the other side's committed change, and
+    landing half a session's intent is the "lossy but green" failure this path
+    exists to prevent. The session's bytes survive in the workspace backup, and
+    ``refresh=true`` re-syncs onto the moved baseline.
     """
     src_root = broker.src_dir(role, node_id)
+    try:
+        base_root: Optional[str] = broker.base_dir(role, node_id)
+    except Exception:  # a broker without baseline snapshots (tests, old trees)
+        base_root = None
     granted = rel_paths if rel_paths is not None else broker.granted_paths(role, node_id, intent="modify")
     chunks: List[str] = []
+    conflicts: List[Dict[str, str]] = []
     seen = set()
     for rel in granted:
         rel = str(rel).replace("\\", "/").lstrip("/")
@@ -207,6 +327,14 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
             # repo side PRESENT but unreadable => raise
             a_lines = _read_lines(os.path.join(repo_root, rel_file), missing_ok=True)
             b_lines = _read_lines(b_file)
+            if a_lines:
+                b_lines, conflict = _merge_drifted(base_root, b_file, repo_root, rel_file,
+                                                   a_lines, b_lines, report)
+                if conflict is not None and len(conflicts) < 5:
+                    # Keep the markers (bounded) as evidence: they are the only
+                    # way a same-region clash can be shown without writing a
+                    # corrupt patch into the tree.
+                    conflicts.append({"path": rel_file, "markers": conflict[:1200]})
             if a_lines == b_lines:
                 continue
             diff = _no_newline_marker_diff(
@@ -220,6 +348,13 @@ def build_patch_from_workspace(broker, role: str, node_id, rel_paths: Optional[L
                 rel_file = os.path.relpath(a_file, repo_root).replace(os.sep, "/")
                 if rel_file not in b_files:
                     chunks.append(_deletion_diff(repo_root, rel_file))
+    if report is not None:
+        report["conflicts"] = conflicts
+    if conflicts:
+        # Refuse the whole patch: a workspace-only diff for a conflicted file is
+        # VALID but reverts the other side's committed change, and landing the
+        # rest silently drops part of the session's intent.
+        return ""
     return "".join(chunks)
 
 
@@ -296,6 +431,58 @@ def has_deep_write(records) -> bool:
             continue
         return True
     return False
+
+
+# -- same-session multi-writer detection (layer 4) ----------------------------
+# Tools whose recorded op names the file it wrote. ``update_component`` records
+# the registry FILE NAME (``registry``); the rest record a repo-relative ``path``.
+_WRITE_OPS = frozenset({
+    "edit_source", "update_component", "register_component", "unregister_component",
+})
+
+
+def _op_target(r: Dict) -> Optional[str]:
+    op = r.get("op")
+    if op not in _WRITE_OPS:
+        return None
+    if op == "update_component":
+        reg = r.get("registry")
+        if not reg:
+            return None
+        reg = str(reg).replace("\\", "/")
+        if "/" in reg:
+            return reg.lstrip("/")
+        return f"gan/registries/{reg}"
+    path = r.get("path")
+    if not path:
+        return None
+    return str(path).replace("\\", "/").lstrip("/")
+
+
+def multi_writer_paths(records) -> Dict[str, List[str]]:
+    """Files written by MORE THAN ONE tool inside one session.
+
+    Why this exists: an agent that edits a registry JSON twice -- once through
+    ``update_component`` (structured field bump) and once through
+    ``edit_source`` (free-text ``str_replace``) -- produces ONE unified diff per
+    file, so whichever write is applied last silently wins and the other
+    disappears. The patch is not invalid, it is *lossy*, and the loss is
+    invisible in the receipt.
+
+    Derived purely from the session's existing op records (no new IPC surface,
+    no new tool parameters): the caller stamps ``multi_writer`` facts onto the
+    receipt and logs a ``same_field_overwrite`` event, so the conflict becomes
+    auditable and the agent can be told.
+    """
+    touched: Dict[str, List[str]] = {}
+    for r in records or []:
+        if not isinstance(r, dict):
+            continue
+        target = _op_target(r)
+        if not target:
+            continue
+        touched.setdefault(target, []).append(str(r.get("op")))
+    return {p: sorted(set(ops)) for p, ops in touched.items() if len(set(ops)) > 1}
 
 
 def apply_patch(repo_dir: str, patch_str: str) -> bool:

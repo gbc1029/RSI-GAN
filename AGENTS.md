@@ -170,6 +170,11 @@ with a GAN-native data layer.
   - *deep delete* — removes the registry entry + source file via `unregister_component`;
   - *deep add/modify* — new tool or logic; must touch source via the gated `gan/tools/deep/request_source_access`.
 - After a `modify` grant, planner/evaluator edit their granted copies with `edit_source`, confined to the instance workspace `src/`. Roles are never given raw `bash` (it cannot be confined). A repeated `request_source_access` on an already-granted path does NOT re-copy from `code_root` — in-scope edits survive; pass `refresh=true` to discard them and re-sync.
+- **Deep-write recovery (4 layers, so a deep modification can actually land):**
+  1. *copy* — `AccessBroker._safe_copy` writes a temp sibling + `os.replace` and only tries `copystat` best-effort, so a refresh can never fail with `Operation not permitted` just because the workspace copy belongs to another uid (the old `shutil.copy2` did).
+  2. *backup* — every overwrite (`refresh=true`, session reset, `clear_workspace` at an outer boundary) copies the actually-EDITED files to `workspaces/_backup/<role>/<instance>/<seq>/` **outside** the purged tree, logs `workspace_backup{files,count,reason}`, and names the discarded files in the tool's answer. Nothing a session wrote is deleted silently any more.
+  3. *merge* — each grant snapshots the baseline it copied FROM into `workspace/.gan_base/<rel>`. When the baseline has moved by commit time, `build_patch_from_workspace` runs `git merge-file -p <workspace> <grant-time base> <current repo>`: clean → the merged text becomes the b-side (the edit lands on top of the moved baseline); an unedited stale copy emits **no** diff (it used to emit a silent REVERT); a true same-line conflict keeps the plain diff and is recorded (`patch_baseline_drift` event + `broker.last_patch_report`).
+  4. *visibility* — one unified diff per file means a registry JSON written by both `update_component` and `edit_source` lands only ONE write. `gan/patch.py:multi_writer_paths` derives that from the existing op records (no new IPC surface) and both receipts gain `multi_writer{path: [tools]}` + a `same_field_overwrite` event, so a lossy session is auditable.
 - The task agent has **no always-on tools**; its capabilities are all opt-in tools.
 
 ### Ablation switches (`docs/11_消融实验设计.md` is the authority)

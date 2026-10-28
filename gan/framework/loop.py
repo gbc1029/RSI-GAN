@@ -2211,6 +2211,8 @@ class GanLoop:
             # plan session (never the evaluator's — see the cost dict above).
             cost=cost,
         )
+        self._stamp_multi_writer(rec, plan_result.get("records"),
+                                 genid=str(genid), outer=outer, role="planner")
         try:
             d = paths.runs_dir(self.output_dir, genid)
             os.makedirs(d, exist_ok=True)
@@ -2227,6 +2229,33 @@ class GanLoop:
                         "design_applied": rec["design"]["applied"],
                         "code_applied": rec["code_patch"]["applied"],
                         "rejected": bool(rejected), "budget": rec["budget"]})
+        return rec
+
+    def _stamp_multi_writer(self, rec: Dict[str, Any], records: Any, *,
+                            genid: str, outer: int, role: str) -> Dict[str, Any]:
+        """Flag files this session wrote through MORE THAN ONE tool (layer 4).
+
+        One unified diff is emitted per file, so a registry JSON touched by both
+        ``update_component`` and ``edit_source`` lands only ONE of the two writes;
+        the patch is valid but lossy. Derived from the existing op records (no
+        new tool parameter, no wider cross-process contract) and surfaced as a
+        receipt fact + event so the loss is auditable instead of invisible.
+        """
+        from gan.patch import multi_writer_paths
+        try:
+            mw = multi_writer_paths(records)
+        except Exception as exc:  # never let bookkeeping kill a receipt
+            soft_fail(f"multi-writer scan failed ({role}): {exc}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="multi_writer_scan_failed", genid=str(genid),
+                      outer=outer)
+            return rec
+        if not mw:
+            return rec
+        rec["multi_writer"] = mw
+        self.log_event({"type": "same_field_overwrite", "genid": rec.get("genid"),
+                        "outer": outer, "role": role, "stage": rec.get("stage"),
+                        "paths": mw})
         return rec
 
     def _make_self_receipt(self, role: str, outer: int, res: Any) -> Dict[str, Any]:
@@ -2272,6 +2301,8 @@ class GanLoop:
             # the self-improve `recent` payload).
             toolset=getattr(getattr(self, role, None), "assembly_report", None),
         )
+        self._stamp_multi_writer(rec, r.get("records"), genid=f"outer_{outer}",
+                                 outer=outer, role=role)
         try:
             d = paths.runs_dir(self.output_dir, f"self_outer_{outer}_{role}")
             os.makedirs(d, exist_ok=True)
