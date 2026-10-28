@@ -966,6 +966,12 @@ def run_polyglot_eval(
         "incomplete": incomplete,
         "total": total,
         "coverage": (evaluated / total) if total else None,
+        # CSV-domain schema aliases (docs/17 §5.1): the R4 anchor reader
+        # (loop._read_per_question) reads question_ids_passed/failed — a miss
+        # is a miss, so empty_patch/incomplete count as failed. Additive only;
+        # the resolved/unresolved views stay the primary evidence.
+        "question_ids_passed": list(resolved),
+        "question_ids_failed": sorted(set(unresolved) | set(empty) | set(incomplete)),
     }
     report_path = os.path.join(output_path, "report.json")
     with open(report_path, "w", encoding="utf-8") as f:
