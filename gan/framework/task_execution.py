@@ -1274,6 +1274,73 @@ def select_samples(
     return selected, info
 
 
+def proportional_allocate(counts: Dict[str, int], k: int) -> Dict[str, int]:
+    """Largest-remainder allocation of ``k`` draws across categories.
+
+    Floors first, then leftover seats go to the largest fractional remainders
+    (``(k*n) % total``), ties broken by category name -- fully deterministic.
+    For ``k <= total`` every category keeps ``alloc[c] <= counts[c]`` and the
+    allocation sums to exactly ``k``; ``k`` above the pool size clamps to it.
+    """
+    total = sum(counts.values())
+    k = max(0, min(int(k), total))
+    if not counts or k == 0:
+        return {}
+    alloc = {c: (k * n) // total for c, n in counts.items()}
+    order = sorted(counts, key=lambda c: (-(k * counts[c] % total), c))
+    for c in order[: k - sum(alloc.values())]:
+        alloc[c] += 1
+    return alloc
+
+
+def _pool_categories(domain: str, dataset_root: str,
+                     pool: List[str]) -> Dict[str, str]:
+    """Category (today: polyglot language) per pool id, ``{}`` = none.
+
+    Only polyglot declares a category column; every other domain keeps the
+    uniform id draw (behaviour unchanged). The eval-subset ids resolve through
+    the same metadata, so one resolver serves both anchor cores.
+    """
+    if domain != "polyglot":
+        return {}
+    from domains.polyglot import gan_utils as _pgu
+    lang = _pgu.load_language_map(dataset_root)
+    return {i: lang.get(i, "") for i in pool}
+
+
+def _stratified_sample(
+    pool: List[str],
+    categories: Dict[str, str],
+    k: int,
+    rng: random.Random,
+) -> Tuple[List[str], Dict[str, int]]:
+    """Proportional per-category draw (largest remainder); uniform fallback.
+
+    ``categories == {}`` (domains with no category column) keeps the exact
+    historical behaviour: one uniform ``rng.sample`` over the whole pool.
+    Otherwise each category receives its proportional share of ``k`` and is
+    sampled within-category from the SAME ``rng`` -- deterministic per seed;
+    categories iterate in sorted order, ids in pool order. Returns the drawn
+    ids (sorted, matching the historical seed-file ordering convention) and
+    the realized per-category allocation for audit (``{}`` on the fallback).
+    """
+    k = max(0, min(int(k), len(pool)))
+    if k == 0:
+        return [], {}
+    if not categories:
+        return sorted(rng.sample(pool, k)), {}
+    by_cat: Dict[str, List[str]] = {}
+    for i in pool:  # within-category order = pool order (deterministic)
+        by_cat.setdefault(categories.get(i, ""), []).append(i)
+    alloc = proportional_allocate({c: len(v) for c, v in by_cat.items()}, k)
+    picked: List[str] = []
+    for cat in sorted(by_cat):
+        n = int(alloc.get(cat, 0))
+        if n:
+            picked.extend(rng.sample(by_cat[cat], n))
+    return sorted(picked), alloc
+
+
 def ensure_sampling_seed(
     output_dir: str,
     domain: str,
@@ -1296,6 +1363,16 @@ def ensure_sampling_seed(
     used only by the fixed-root evaluation. Because the loader is
     skip-if-exists, both fields only materialize for a NEW run dir -- an old
     dir keeps its historical sampling and its historical (no-val) supernodes.
+
+    BOTH cores draw PROPORTIONALLY across polyglot languages (largest
+    remainder, ``proportional_allocate`` / ``_stratified_sample``): the frozen
+    anchor composition then matches the pool's language mix by construction
+    instead of by small-sample luck. The realized per-category allocation is
+    recorded as ``anchor_alloc`` / ``eval_anchor_alloc`` in the seed file and
+    the ``sampling_seed_ready`` event. Domains without a category column
+    (CSV) keep the uniform draw; the seed recipe strings are unchanged, so
+    resume determinism is preserved (realized anchor SETS differ from the
+    pre-proportional policy only across NEW run dirs).
     """
     seed_path = os.path.join(output_dir, "ckpt", "sample_seed.json")
     if os.path.isfile(seed_path):
@@ -1304,18 +1381,26 @@ def ensure_sampling_seed(
     if base_seed is None:
         base_seed = int.from_bytes(os.urandom(8), "big")
     anchor_ids: List[str] = []
+    anchor_alloc: Dict[str, int] = {}
     try:
         # polyglot: anchors come from the FULL metadata pool (a pinned
         # eval_task_list filters only the eval side, so anchors simply find
         # no row when a pinned pool excludes them); balrog has no pool;
         # CSV domains read their dataset. One resolver for all of them.
+        # Draw is PROPORTIONAL across polyglot languages (largest remainder):
+        # the anchor core is frozen for the whole run, so a small uniform id
+        # draw bakes its language skew into every generation (k=9 uniform
+        # anchors left cpp unanchored in ~32% of simulated runs). CSV domains
+        # have no category column and keep the uniform draw.
         pool = load_pool_ids(domain, dataset_root, subset)
         k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
         if pool and k > 0:
             rng = random.Random(f"{int(base_seed)}:anchor")
-            anchor_ids = sorted(rng.sample(pool, min(k, len(pool))))
+            anchor_ids, anchor_alloc = _stratified_sample(
+                pool, _pool_categories(domain, dataset_root, pool), k, rng)
     except Exception as exc:  # noqa: BLE001 -- anchor drawing must never kill a run
         anchor_ids = []
+        anchor_alloc = {}
         _log_soft_sample_note(f"anchor drawing failed ({exc}); continuing without anchors")
     # Evaluation anchor core (docs/14 section 5.5): the fixed-root evaluation
     # runs on its OWN question set, drawn ONCE per run and identical in every
@@ -1327,6 +1412,7 @@ def ensure_sampling_seed(
     # discriminating power (one always-right plus one always-wrong question; the
     # constant-policy arm A1 scored exactly 0.5000 over 36 generations).
     eval_ids: List[str] = []
+    eval_alloc: Dict[str, int] = {}
     eval_subset_used = str(eval_subset or "")
     eval_k_used = max(0, int(eval_anchor_k or 0))
     if eval_subset_used and eval_k_used > 0:
@@ -1346,16 +1432,27 @@ def ensure_sampling_seed(
                 eval_pool = load_dataset_ids_declared(
                     dataset_root, domain, eval_subset_used)
             if eval_pool:
+                # Same proportional policy as the main-line core: the eval set
+                # is equally frozen per run, and val.json is itself a
+                # proportional-by-language allocation (docs/15 §12.6) -- a
+                # uniform sub-draw of it would re-introduce the skew the
+                # subset was built to avoid. k clamps to the pool inside
+                # _stratified_sample (k=18 over the 18-id val -> the whole set).
                 erng = random.Random(f"{int(base_seed)}:eval_anchor")
-                eval_ids = sorted(erng.sample(eval_pool, min(eval_k_used, len(eval_pool))))
+                eval_ids, eval_alloc = _stratified_sample(
+                    eval_pool, _pool_categories(domain, dataset_root, eval_pool),
+                    eval_k_used, erng)
         except Exception as exc:  # noqa: BLE001 -- evaluation may fall back
             eval_ids = []
+            eval_alloc = {}
             _log_soft_sample_note(
                 f"eval anchor drawing failed ({exc}); the fixed-root evaluation "
                 f"will fall back to a seeded draw over the main subset")
     info = {"base_seed": int(base_seed), "anchor_ids": anchor_ids,
+            "anchor_alloc": anchor_alloc,
             "domain": domain, "subset": subset,
             "eval_anchor_ids": eval_ids,
+            "eval_anchor_alloc": eval_alloc,
             "eval_subset": eval_subset_used,
             "eval_anchor_k": eval_k_used}
     os.makedirs(os.path.dirname(seed_path), exist_ok=True)

@@ -5,7 +5,7 @@
 > 一致，可直接对比。
 > 本文档承载：①实验运行与结果；②全 seat 工具调用上限审计（"tools_max_call"澄清）；
 > ③三项代码修复；④domains.yaml 死键清理；⑤问题登记（未修）；⑥"新键与消费者"的
-> 文档记录方案与简单规划（代码侧候选留待讨论）。
+> 文档记录方案与简单规划（代码侧候选留待讨论）；⑦锚核按语言比例抽样（§9，第四批）。
 
 ## 0. 摘要
 
@@ -23,6 +23,10 @@
 - 问题登记（未修，见 §5）：`anchor_correct` 全程 null（polyglot 报告 schema 与 R4
   读取器不匹配）；新键无消费者（`cost_cm_mode` 案例，§6 给出文档记录方案与代码侧候选）；
   评估轮空 patch 拖累 val_mean。
+- 锚核按语言比例抽样（第四批，§9）：主链 + 固定根评估两套锚核改**最大余数分配**
+  （k=9 → js2/java2/go2/py1/rust1/cpp1，每语言保底 ≥1；原均匀抽取下 cpp 锚为空概率
+  32%）；CSV 域均匀回退不变；`anchor_alloc`/`eval_anchor_alloc` 落 seed 文件与
+  `sampling_seed_ready` 事件。离线测试 28+54+25 全过，工具回归七套全过。
 
 ## 1. 实验运行与结果
 
@@ -343,3 +347,68 @@ java 2/10(无尾换行拼连)、javascript 1/26(package.json 冲突)、go 1/17(�
 - 过程事故留档:接线测试曾误把 field `runs/0/` 当输出目录,`report.json` 被
   覆盖后已按会话留档原文恢复(内容/属主/权限;mtime 无法复原),
   `predictions.csv` 等其余证据未受影响。
+
+## 9. 锚核按语言比例抽样（2026-10-29 第四批）
+
+### 9.1 背景与量化
+
+- 锚题机制盘点：两套锚核——**主链** `sampling.anchor_k`（`ensure_sampling_seed`
+  每 run 一次抽入 `ckpt/sample_seed.json`，`select_seeded_positions` 每代先占位、
+  不轮换）与**固定根评估** `eval.anchor_k`（`eval_anchor_ids`，每届 `fixed_ids`
+  全量钉值）。同一"锚先占 + 半额 cap + 余量重抽"策略存在两份运行时拷贝
+  （`task_execution.select_seeded_positions` 与 `domains/harness.py:_select_samples`；
+  后者运行在无 `gan/` 的沙箱 run-dir 内，物理隔离不可互相 import，归一化 diff
+  确认当日逐行等价）。
+- 主链锚核抽取原本**语言盲**（207 池 = 225 − val18 上均匀按 id；池构成
+  js45/java43/go36/py31/rust28/cpp24）。标准命令 `num_samples=18, anchor_k=10`
+  → k=9 冻结锚核。蒙特卡洛（2 万次）：**P(cpp 锚=0)=32%、rust 27%、python 23%、
+  go 18%**；关键不对称在轮换半区按 genid 重抽、跨代平均抵消，而锚半区偏差
+  `(A_l−k·p_l)/18` **逐代恒定、永不消退**——3000 个 20 代 run 中 100% 至少一个
+  语言 run 级份额偏离名义 >3pp（最大 ~15pp）。下游 `_anchor_correct`（R4 停滞
+  判据，未答计 0）与 `benchmark.mean` 分母继承同一偏斜。
+- 对照：评估侧 val.json 本身按比例构造（docs/15 §12.6：go3/rust2/cpp2/java4/js4/
+  python3，语言内按 instance_id 等距取样）——"按语言配比"在评估集上已是明确设计
+  意图，主链锚核未继承，本批补齐。
+
+### 9.2 设计（本批落地）
+
+- **策略**：两套锚核抽取改为**按类别比例分配**（最大余数法，`proportional_allocate`）：
+  各语言先取 `floor(k·n_l/N)`，余票按 `(k·n_l) mod N` 降序、同票按语言名字典序分配
+  （全确定性）；语言内用同一 `random.Random(f"{base_seed}:anchor")` /
+  `f"{base_seed}:eval_anchor"` 均匀抽取——**种子契约字符串不变**，resume 确定性保持。
+  k=9 时分配 js2/java2/go2/py1/rust1/cpp1，**每语言 ≥1 有构造保证**。
+- **类目解析**：`_pool_categories`——polyglot 走 `gan_utils.load_language_map`
+  （新公开访问器）；其余域无类目列，**保持均匀抽取回退**（CSV 域行为不变，
+  `anchor_alloc={}`）。评估侧 val 子集 id 经同一 metadata 解析，一个解析器服务两核。
+- **审计**：`anchor_alloc` / `eval_anchor_alloc` 落盘 `sample_seed.json` 并进
+  `sampling_seed_ready` 事件（gan/driver.py）。
+- **不变式**：`sum(alloc)=k`；`alloc[c]≤n_c`；`|alloc[c]−k·n_c/N|<1`；k 超池钳制；
+  k=0 → 空。`select_seeded_positions` 的 `num_samples//2` cap 在 k≤cap 时为 no-op。
+
+### 9.3 实现与测试
+
+- 改动文件：`domains/polyglot/gan_utils.py`（`load_language_map`）；
+  `gan/framework/task_execution.py`（`proportional_allocate` / `_pool_categories` /
+  `_stratified_sample` 三个原语 + `ensure_sampling_seed` 双核重接 + docstring）；
+  `gan/driver.py`（事件字段）。`harness._select_samples` **不改**——它只消费
+  `anchor_ids`，不执行锚核抽取。
+- 离线测试（无网络/无 LLM/无 docker，`venv_nat/bin/python`）：
+  - 新 `scripts/local/test_anchor_proportional.py`（gitignore 不入库）：**28/28**——
+    分配单元（精确分配/同票字典序/k 钳制/k=0..29 不变式）；主链核（207 池、k=9
+    手推期望精确匹配、无 val 泄漏、跨 run 目录确定性、cap no-op、幂等）；评估核
+    （k=10 比例、k=18 全集且分配==构成、k=30 钳制、缺文件空核）；CSV 回退
+    （子集内 + alloc={}）；小 k；均匀回退**逐位等于**历史抽法；seed 文件审计字段。
+  - 回归：`test_polyglot_sampling.py` **54/54**、`test_polyglot_val_eval.py`
+    **25/25**、`run_tool_regression.py` 七套全过（deep-tools / batch6 / batch8 /
+    c-dispatch / dynamic-keys / ledger-gate / session-universe）。
+
+### 9.4 边界与遗留
+
+- **既有 run 不受影响**：seed 文件 skip-if-exists，`small_1028_0024/0046` 的锚核
+  原样保留；比例抽取只对**新建** run 目录生效。混用新旧策略目录做跨 run 对比时
+  锚核集合不同——与任何 anchor_k/num_samples 变更同一性质，对比时需声明。
+- **cap 截断池序问题仍在**（两份拷贝同构；仅"同目录缩小 num_samples 重跑"触发）：
+  比例分配给了每语言 `floor(k·n_l/N)` 保底，截断的语言系统性被大幅缓解；彻底修复
+  （随机截断序 + 两实现等价合同测试）另行批次。
+- **类目推广**：`_pool_categories` 当前只接 polyglot language；CSV 域将来若引入
+  类别列（如 accept/reject 配比），沿同一 `_stratified_sample` 通道扩展即可。

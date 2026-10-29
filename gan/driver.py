@@ -994,9 +994,11 @@ def run_gan_driver(
                                     "base_seed": sample_seed_base,
                                     "fixed_by_config": bool(fixed_seed),
                                     "anchor_ids": anchor_ids,
+                                    "anchor_alloc": seed_info.get("anchor_alloc") or {},
                                     "eval_subset": seed_info.get("eval_subset"),
                                     "eval_anchor_k": seed_info.get("eval_anchor_k"),
-                                    "eval_anchor_ids": eval_anchor_ids})
+                                    "eval_anchor_ids": eval_anchor_ids,
+                                    "eval_anchor_alloc": seed_info.get("eval_anchor_alloc") or {}})
         else:
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": sampling_mode})
