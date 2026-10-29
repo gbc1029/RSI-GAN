@@ -248,7 +248,22 @@ def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
     MISSING data stays neutral for BOTH scalars (term skipped, 0.0): a missing
     calibration_error used to be read as 0.0 == perfect calibration, i.e. a
     spurious reward (relevant for arms like A2 where the evaluator never runs).
-    ``fitness_partial`` is stamped by the caller.
+
+    ``verdict_stability`` DEFINITION CHANGED (2026-10, second rewrite): it is now
+    the PER-ISSUE hit-rate produced by the mechanical checkers in
+    ``gan/framework/issue_checks.py`` -- "did the defect this issue named
+    actually go from present (parent) to absent (child), and did the evaluator
+    say so?" -- accumulated by ``loop._update_issue_ledger``.
+
+    The previous definition compared one outer's whole verdict vector against a
+    single shared bit ("did the mean score rise?"). That scored an honest
+    evaluator 0.0 on A1 (planner disabled: nothing can be fixed, so 19/20
+    "not fixed" claims were correct, but the score rose anyway) and asked the
+    evaluator to be right about a claim it never made. Old supernodes keep their
+    old value -- it cannot be recomputed -- and are told apart offline by
+    ``evaluator_stats.verdict_stability_basis``; ``None`` (nothing mechanically
+    verifiable this outer) remains neutral here, exactly like a missing
+    calibration_error.
     """
     ev = sn.get("evaluator_stats") or {}
     ce = ev.get("calibration_error")
@@ -257,11 +272,14 @@ def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
     z_ce = z_ref(ce_val, refs_ce) if ce_val is not None else 0.0
     vs = ev.get("verdict_stability")
     vs_val = float(vs) if isinstance(vs, (int, float)) else None
-    # verdict_stability is a [0,1] hit-rate; z-score it against the reference
-    # window so its contribution is commensurable with z_ce and novelty (the
-    # pre-normalization raw fraction had an effective weight of w2 * sigma_vs,
-    # i.e. a fraction of the nominal w2). Missing data stays NEUTRAL: the term
-    # is skipped (0.0), never scored as a below-average hit-rate.
+    # verdict_stability is a [0,1] per-issue hit-rate (mechanical truth from
+    # issue_checks.py since the 2026-10 rewrite); z-score it against the
+    # reference window so its contribution is commensurable with z_ce and
+    # novelty (the pre-normalization raw fraction had an effective weight of
+    # w2 * sigma_vs, i.e. a fraction of the nominal w2). Missing data stays
+    # NEUTRAL: the term is skipped (0.0), never scored as a below-average
+    # hit-rate -- in particular an outer with nothing mechanically verifiable
+    # is not penalised for it.
     z_vs = (z_ref(vs_val, _ref_scalars(refs, ("evaluator_stats",),
                                        "verdict_stability"))
             if vs_val is not None else 0.0)

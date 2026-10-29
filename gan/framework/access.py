@@ -597,6 +597,14 @@ class AccessBroker:
             "role": role,
             "node_id": str(node_id),
             "paths": granted,
+            # GRANT-TIME SELF-CHECK (issue_checks: access.grant-broken). A grant
+            # that "succeeds" while the workspace copy is unreadable is a silent
+            # framework defect -- the 2026-10 pilot showed `request_source_access`
+            # returning success while `read_file` then said "not a file", which
+            # blocked the evaluator's whole answer-bias audit. Verifying HERE, in
+            # the same call that made the copy, turns that into a recorded fact
+            # instead of an agent's unverifiable complaint.
+            "unreadable": self._unreadable_grants(granted, src_root),
             "skipped": skipped,
             "discarded": discarded,
             "backup_dir": backup_dir if discarded else None,
@@ -615,6 +623,30 @@ class AccessBroker:
                             "discarded": discarded,
                             "backup_dir": backup_dir if discarded else None}
         return granted
+
+    def _unreadable_grants(self, granted: List[str], src_root: str) -> List[str]:
+        """Granted paths that are NOT readable in the workspace right now.
+
+        Best-effort by design (this is an audit fact, never a failure): a path
+        is reported when it is absent from the workspace or cannot be opened.
+        Directories count as readable when they can be listed.
+        """
+        bad: List[str] = []
+        for rel in granted or []:
+            try:
+                d = self._safe_join(src_root, rel)
+            except ValueError:
+                bad.append(rel)
+                continue
+            try:
+                if os.path.isdir(d):
+                    os.listdir(d)
+                else:
+                    with open(d, "rb") as f:
+                        f.read(1)
+            except Exception:  # noqa: BLE001 -- absence/unreadable == the defect
+                bad.append(rel)
+        return bad
 
     def granted_paths(self, role: str, node_id: Any, intent: Optional[str] = None) -> List[str]:
         """Return granted paths, optionally filtered by grant intent."""

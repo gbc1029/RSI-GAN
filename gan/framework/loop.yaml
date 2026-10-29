@@ -123,7 +123,54 @@ fitness:
   beta_variance: 0.1            # F_p: z_mean - beta*z_std + lambda*novelty
   lambda_novelty: 0.2           # F_p / F_e 共用的 novelty 权重
   w1_calibration: 0.6           # F_e: -w1*z_calibration_error
-  w2_verdict_stability: 0.4     # F_e: +w2*verdict_stability
+  w2_verdict_stability: 0.4     # F_e: +w2*z(verdict_stability); 口径见下
+                                # verdict_stability = 逐 issue 的机械真值命中率
+                                # （hits / verified，gan/framework/issue_checks.py）：
+                                # 该 issue 指的缺陷是否真的"父代存在 → 子代消失"，
+                                # 且 evaluator 的 judge_fix 说对了。不是"整届分数涨没涨"
+                                # （旧口径；它会把无事可修的 A1 诚实评估判成 0.0）。
+                                # verified=0 → None（F_e 该项中性，不罚）。
+
+# ---------------------------------------------------------------------------
+# issue 连续性（跨 outer 的缺陷记忆；消费者：gan/framework/loop.py -> 两个
+# issue_ledger/issue_keys 模块）
+#
+# 背景：issue_id 是"本轮第几条"的句柄，父节点一变就从 i-1 重编；跨 outer 时
+# 父代 issues 被清空（因果链已断：evaluator 自身设计、恢复的父代设计、代码分支都
+# 换过），于是每届都要重新发现同一缺陷——A0 实测同一成本问题被重报约 10 次，
+# A6 的 evaluator 访问 bug 报了 3 次（编号 i-2 → i-4 → i-2，无法 join）。
+#
+# 现在：issue 带一个封闭词表的 issue_key（gan/framework/issue_keys.py），每届
+# outer 边界把"提起 / 判修好 / 判未修 / stance"折进 ckpt/issues/ledger.json；
+# 下一轮把"仍未结案"的 key 以只读小抄注入（无 issue_id、无旧 description /
+# suggested_fix —— 搬病史不搬处方，现任 evaluator 重新诊断开方）。
+# ---------------------------------------------------------------------------
+issues:
+  ledger_enabled: true          # false = 不写账本、不注入小抄（旧行为）
+  carried_limit: 6              # 小抄最多几行（按 重报次数/最近 outer 排序）
+  not_actionable_stances: 2     # 同一 key 累计 N 次 out_of_scope/disputed 且 0 次
+                                # 确认修复 -> not_actionable：不再注入 planner
+                                # （planner 修不了的框架侧问题另有 owner=framework
+                                #  过滤，双保险）
+  # 机械检查器阈值（消费者：gan/framework/issue_checks.py；产出 verdict_stability
+  # 的 verified/hits）。阈值越严 -> PRESENT 越少 -> verified 样本越少（不是越准）。
+  check:
+    cost_ratio: 1.5             # cost.tokens: 用掉 > 1.5 倍 token_budget_per_gen
+    bias_share: 0.65            # policy.{accept,reject}-bias: 单一预测标签占比
+                                # 校准依据（pilot 实测）：evaluator 正确报出的宽松
+                                # 偏置落在 0.67-0.70 accept（真值 0.50），旧的 0.75
+                                # 把真实偏置判成"缺陷不存在"，还冤枉 evaluator 编造。
+    constant_share: 0.99        # policy.constant-output: 单一预测标签占比（且真值非单标签）
+    min_samples: 10             # 分布类判据的最少有效样本数（n<10 -> UNKNOWN）。
+                                # n=2 时占比只可能是 0/0.5/1，标准误 ~0.35（n=30 时 ~0.09），
+                                # 任何"偏置/翻转"都是噪声 —— 宁可判不了，不要假判定。
+    constant_min_samples: 6     # policy.constant-output 专用门槛（比上面低）：
+                                # "每个样本同一个标签"对已记录的行是精确的，但"策略恒定"
+                                # 仍是推断 —— n=2 全同有 25% 是巧合，n=6 降到 ~1.6%。
+                                # 0 = 关闭该门槛。
+    acc_tol: 0.05               # policy.overcorrection: 子代准确率比父代"明显更差"的容差
+                                # （判据 = 决策规则反转[acc_C <= 少数类占比 - acc_tol]
+                                #  且 acc_C < acc_P - acc_tol；见 issue_checks.py）
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）

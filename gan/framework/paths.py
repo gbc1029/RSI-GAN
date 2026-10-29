@@ -7,6 +7,8 @@ Everything a run writes lives under ONE of the main buckets:
         checkpoint.json            latest snapshot (overwritten, atomic)
         outer_<N>.json             immutable per-outer snapshot (canonical; a RE-RUN
                                    of the same outer archives outer_<N>_<ms>.json)
+        issues/ledger.json         cross-outer issue ledger keyed by the closed
+                                   issue_key vocabulary (see issue_ledger)
         code/                      per-run git working tree holding the evolvable code
         code.json                  code-tree manifest (see code_repo)
         design/                    role designs (the evolvable *state*)
@@ -105,6 +107,15 @@ def archive_dir(output_dir: str) -> str:
 
 def archive_path(output_dir: str) -> str:
     return os.path.join(archive_dir(output_dir), "mome.json")
+
+
+def issues_dir(output_dir: str) -> str:
+    """Cross-outer issue ledger (see gan/framework/issue_ledger.py)."""
+    return os.path.join(ckpt_dir(output_dir), "issues")
+
+
+def issues_ledger_path(output_dir: str) -> str:
+    return os.path.join(issues_dir(output_dir), "ledger.json")
 
 
 def checkpoint_latest(output_dir: str) -> str:

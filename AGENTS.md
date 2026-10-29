@@ -27,6 +27,16 @@ live under `scripts/dgmh/`.
   `workspace.py` (edit/read confinement), `task_execution.py` (design persistence
   + harness glue + minimal run-dir copy), `task_runner.py`, `checkpoint.py`,
   `scores.py`, `trajectory.py`, `preflight.py`, `context.py`, `access.py`,
+  `issue_keys.py` + `issue_ledger.py` + `issue_checks.py` (cross-outer issue
+  continuity: the closed ``<domain>.<facet>`` vocabulary is the ONLY stable
+  identity a defect has — ``issue_id`` is a per-round handle the framework
+  prefixes with the generation (``g<genid>/i-1``), and every outer boundary folds
+  raises / verdicts / stances into ``ckpt/issues/ledger.json``; the next round
+  receives the open keys as an id-free, prescription-free ``carried_over`` block,
+  so history survives while the incumbent evaluator re-diagnoses instead of
+  re-issuing a stale fix. ``issue_checks.py`` supplies the PER-ISSUE mechanical
+  truth (three states from recorded node facts) that ``verdict_stability``
+  consumes),
   `loop.py`, `tree/`, `reward/`, `cm/` (context-management frozen core —
   block model, primitives, the per-turn seam (``assemble_turn`` DISPATCHES
   only; the pipeline itself is the baseline assembly ``assembly.py`` — one
@@ -235,6 +245,17 @@ with a GAN-native data layer.
 - `gan/components/<role>/knowledge/*.md` are **data** — not registry entries, no `name=stem` contract, never executed.
 - The planner authors task-side notes via the deep patch channel; the whole committed base is materialized into the task sandbox each generation (`.gan_runtime/knowledge` + `GAN_TASK_KNOWLEDGE_DIR`; per-note/total caps, skips reported).
 - The task agent reads on demand via the opt-in `knowledge` tool. Planner/evaluator read their own (and task-side) notes through the normal access channel (`request_source_access(view)` + `list_dir`/`read_file`) — never an un-audited side door.
+
+### Issue continuity across rounds and outers
+
+- **Two identifiers, two jobs.** `issue_id` is a *per-round handle* (`i-1`, renumbered whenever a round has no parent list to continue — a fresh outer, a branch off `initial`). The framework prefixes it with the generation (`g<genid>/i-1`) in `loop._qualify_issue_ids`, so handles are globally unique; a bare `i-N` echoed by either role is normalized back to the parent's qualified id (`_normalize_issue_refs`) instead of silently becoming `unjudged`. `issue_key` is the *cross-round identity*, drawn from the CLOSED vocabulary in `gan/framework/issue_keys.py` (18 `<domain>.<facet>` keys; `other.new` is the only escape hatch). Measured: A0 re-raised the same cost defect ten times under `i-2, i-4, i-5, i-4, i-1, i-3, i-6, i-1, i-1, i-1`; A6 re-raised its access bug three times under `i-2, i-4, i-2`. Nothing could join those, so every outer re-discovered them.
+- **Cross-outer issues are stripped, and NOT for budget reasons.** The live round-trip list is dropped when the selected parent comes from a different outer because the causal chain is broken there (evaluator's own design, restored parent design and code branch all changed) and its `suggested_fix` was written against that older state. What crosses the boundary is the ledger projection instead — **病史, not 处方**.
+- **`ckpt/issues/ledger.json`** (`gan/framework/issue_ledger.py`, `WriterToken`-guarded) accumulates four observations per key — `raised`, `judged_fixed`, `judged_unfixed`, `stance` — joined in `loop._update_issue_ledger` (the only place that owns both parent and child nodes: the raise lands on the node, the verdict/stance lands on its child). Derived `status` = `open` / `fixed` / `not_actionable`; a raise after a fix **reopens** it.
+- **`carried_over`** (injected only when the live channel is empty, and suppressed by the C2/C4 text ablations) carries **no `issue_id`, no `description`, no `suggested_fix`**: the incumbent evaluator is told to re-detect and re-prescribe. `framework`-owned keys (`access.grant-broken`, `harness.infra`, `process.observability`) are never carried to the planner — it has no operator for them (A6's evaluator said so itself: "根源在文件访问/路径解析层，非 planner 的 prompt/config 算子可直接修复").
+- **Stopping the loop.** `issues.not_actionable_stances` declined stances (`out_of_scope`/`disputed`) with zero confirmed fixes mark a key `not_actionable`, and it stops being injected. Config: `issues.{ledger_enabled,carried_limit,not_actionable_stances}` in `loop.yaml`.
+- **`verdict_stability` = per-issue mechanical truth (2026-10 v2).** `hits / verified`, where each judged issue's truth comes from `gan/framework/issue_checks.py` — three states (`PRESENT`/`ABSENT`/`UNKNOWN`) computed from node facts the framework already records (`report_summary`, `toolset_report`, `harness_rc`, `cost_tokens`, plus the grant-time readability self-check), paired as "present in the parent → absent in the child". Bound by `issue_key`, never by a predicate the evaluator writes. Nine checkers ship: `cost.tokens`, `cost.truncation`, `harness.infra`, `design.contract-format`, `access.grant-broken`, `policy.{accept,reject}-bias`, `policy.constant-output`, plus the PAIR checker `policy.overcorrection` (decision rule inverted AND accuracy worse — a single generation cannot decide it). `UNKNOWN` on either side is excluded (never a miss); a defect already `ABSENT` in the parent is `unsupported` and excluded too. `verified == 0` → `None`, neutral in `F_e`. The old definition — one outer's whole verdict vector against the single shared bit "did the mean score rise?" — is GONE: it scored an honest evaluator 0.0 on A1 (planner disabled, so 19/20 `false` claims were correct, but the score rose anyway). Old supernodes keep an unrecomputable old value, told apart offline by `evaluator_stats.verdict_stability_basis` (`"issue_key_checks"` = new). Diagnostics only, not consumed by fitness: `verdict_verified` / `verdict_hits` / `verdict_unsupported`.
+- **Checker thresholds (`issues.check.*`)** are calibrated, not arbitrary: `bias_share=0.65` (the pilot's real leniency cases sat at 0.67–0.70 accept against a 0.50 truth share, so 0.75 called a real defect fabricated); `min_samples=10` for DISTRIBUTION claims only (at n=2 the shares are {0, 0.5, 1} — pure noise, so the honest answer is `UNKNOWN`); `constant_min_samples=6` for `policy.constant-output` (flatness is exact for the recorded rows, but "the policy always answers X" is still an inference — 25% chance at n=2, ~1.6% at n=6); `acc_tol=0.05`.
+- **Ordering invariant**: at an outer boundary `_update_issue_ledger` MUST run before `_record_supernode` — the supernode reads `verdict_stability` back from the ledger that call just wrote.
 
 ### Instances & scheduling
 

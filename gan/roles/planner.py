@@ -64,6 +64,7 @@ class Planner(Role):
         deny_deep: bool = False,
         shallow_prompt_only: bool = False,
         disable_shallow: bool = False,
+        carried_over: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -113,6 +114,21 @@ class Planner(Role):
                 "\n## Diff summary (what changed last round, sanitized)\n"
                 f"```json\n{json.dumps(parent_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
             )
+        if carried_over:
+            # Cross-outer ledger projection (gan/framework/issue_ledger.py).
+            # CONTEXT ONLY: no issue_id (those are per-round handles and would
+            # collide), no description/suggested_fix (the old prescription was
+            # written against an older design+code; the incumbent evaluator
+            # re-detects the defect and re-prescribes it).
+            parts.append(
+                "\n## Carried-over open issues from earlier outer generations "
+                "(context only -- NOT issues to respond to)\n"
+                "These defects were raised in a previous outer and are still open. "
+                "Do NOT call `respond_issue` for them and do not copy their older "
+                "prescriptions; use them to avoid re-trying a fix that already "
+                "failed. The evaluator re-detects and re-prescribes them itself.\n"
+                f"```json\n{json.dumps(carried_over, ensure_ascii=False, indent=2)[:1200]}\n```"
+            )
         if parent_predicted_score is not None or parent_benchmark_score is not None:
             parts.append(
                 "\n## Selected parent calibration\n"
@@ -145,6 +161,7 @@ class Planner(Role):
         max_tool_calls: int = 40,
         tool_repeat_limit: Optional[int] = None,
         cost_statement: str = "",
+        carried_over: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
@@ -189,7 +206,8 @@ class Planner(Role):
                     shallow_prompt_only=bool(getattr(broker, "shallow_prompt_only", False))
                     if broker is not None else False,
                     disable_shallow=bool(getattr(broker, "disable_shallow", False))
-                    if broker is not None else False),
+                    if broker is not None else False,
+                    carried_over=carried_over),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
             _absorb_run_flags()
