@@ -732,10 +732,13 @@ def run_gan_driver(
     eval_anchor_k = max(0, int(eval_section.get("anchor_k") or 0))
     eval_subset, eval_subset_source = _resolve_eval_subset(
         str(eval_section.get("subset") or ""), domain_config)
-    _log_event(output_dir, {"type": "eval_subset_resolved", "domain": domain,
-                            "source": eval_subset_source,
-                            "subset": eval_subset or None,
-                            "anchor_k": eval_anchor_k or None})
+    # NOTE: the eval_subset_resolved EVENT is logged POST-drop, right after the
+    # output_dir ownership check below. Every write into output_dir must belong
+    # to the post-drop caller uid: logging it HERE (still root) created
+    # logs/events.jsonl root-owned, and the first post-drop append died with
+    # PermissionError(13) before any other artifact (small_1029_231632,
+    # 2026-10-29). The values stay in locals; the anchor_k refusal below stays
+    # pre-drop so a bad pair never reaches the sandbox layer.
     eval_questions = eval_anchor_k if (eval_subset and eval_anchor_k) else 0
     if eval_questions > int(num_samples):
         raise ValueError(
@@ -932,6 +935,25 @@ def run_gan_driver(
             pass
         os.chmod(env_mask_file, 0o444)
         proxy.bind()
+        # Ownership reconcile BEFORE the drop (still root here): a pre-drop
+        # failure path (or the d7aa7d9 regression itself) may have left
+        # root-owned files inside output_dir; if logs/events.jsonl stayed
+        # root-owned the first post-drop append would die with
+        # PermissionError(13) and every retry of the SAME output_dir would too.
+        # Only root-owned entries are handed over; ganop-owned files are never
+        # touched.
+        _events_path = paths.events_path(output_dir)
+        for _p in (os.path.dirname(_events_path), _events_path):
+            try:
+                _info = os.stat(_p)
+            except OSError:
+                continue
+            if _info.st_uid != 0:
+                continue
+            try:
+                os.chown(_p, owner_uid, owner_gid)
+            except OSError:
+                pass
         _drop_driver_privileges(owner_uid, owner_gid, owner_username)
         os.makedirs(output_dir, exist_ok=True)
         output_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -950,6 +972,14 @@ def run_gan_driver(
             raise RuntimeError(
                 f"sudo invoking user cannot read/write/traverse output_dir: {output_dir}"
             )
+
+        # First event of the run -- logged as the POST-drop identity. The
+        # pre-drop startup runs as root and must not create anything inside
+        # output_dir (see the eval resolution note above).
+        _log_event(output_dir, {"type": "eval_subset_resolved", "domain": domain,
+                                "source": eval_subset_source,
+                                "subset": eval_subset or None,
+                                "anchor_k": eval_anchor_k or None})
 
         # Re-entry policy. Follow the newest completed attempt.
         newest = ckpt_mod.newest_outer_snapshot(output_dir)
