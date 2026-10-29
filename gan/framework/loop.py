@@ -1285,6 +1285,66 @@ class GanLoop:
             return None
         return int(sum(per_q.get(q, 0.0) for q in self.anchor_ids))
 
+    def _anchor_stats(self, genid: Any) -> tuple:
+        """``(correct, answered)`` on the anchor core, for PARENT SELECTION.
+
+        Deliberately different from :meth:`_anchor_correct`: that one asks "did
+        this generation move on the fixed exam?" and scores a missing anchor as a
+        MISS (a generation that answered nothing did not improve). Selection asks
+        "which node is best?", where a missing answer is not evidence at all --
+        counting it as a miss would systematically demote every truncated or
+        partially-covered generation. So ``answered`` counts observed rows only,
+        and ``_wilson_lcb`` refuses ``answered == 0`` outright.
+
+        The node stamp is written once per generation (``anchor_correct`` /
+        ``anchor_n`` in ``Node.meta``) so selecting a parent never re-reads
+        ``report.json`` per candidate, and a resumed run keeps ONE definition.
+        """
+        if not self.anchor_ids:
+            return None, 0
+        node = self.task_tree.get(genid)
+        if node is not None:
+            c = node.meta.get("anchor_correct")
+            n = node.meta.get("anchor_n")
+            if (isinstance(c, (int, float)) and not isinstance(c, bool)
+                    and isinstance(n, int) and not isinstance(n, bool) and n > 0):
+                return float(c), int(n)
+        per_q = self._read_per_question(genid)
+        if not per_q:
+            return None, 0
+        answered = [q for q in self.anchor_ids if q in per_q]
+        if not answered:
+            return None, 0
+        return float(sum(per_q[q] for q in answered)), len(answered)
+
+    def _backfill_anchor_stamps(self) -> int:
+        """Stamp ``anchor_correct``/``anchor_n`` on restored nodes (resume).
+
+        The LCB selector reads ``Node.meta`` ONLY (by design: one read per
+        generation, not one per candidate). A tree restored from a checkpoint --
+        or written before the stamp existed -- carries no anchor evidence in
+        meta even though ``runs/<genid>/report.json`` is right there, so without
+        this backfill a resumed run would silently treat every earlier generation
+        as "not measured" and pick among the new ones only. Persisted through
+        ``tree.update`` so the evidence is durable (a second resume is a no-op).
+        """
+        if not self.anchor_ids:
+            return 0
+        stamped = 0
+        for node in list(self.task_tree.nodes.values()):
+            if node.meta.get("anchor_n"):
+                continue
+            if node.value.score_status not in _MEASURED:
+                continue
+            c, n = self._anchor_stats(node.genid)
+            if n <= 0:
+                continue
+            node.meta["anchor_correct"] = int(c or 0)
+            node.meta["anchor_n"] = int(n)
+            self.task_tree.update(node.genid, meta=node.meta)
+            stamped += 1
+        return stamped
+
     def _read_per_question(self, genid: Any) -> Dict[str, float]:
         """Reconstruct per-question 0/1 from report.json question_ids_{passed,failed}."""
         try:
@@ -2761,8 +2821,21 @@ class GanLoop:
         eps = float(cfg.get("loop.stagnation_epsilon", 0.005))
         bl = int(cfg.get("tree.branch_limit", 2))
         dl = int(cfg.get("tree.depth_limit", 5))
-        method = cfg.get("tree.selection", "ucb")
+        method = cfg.get("tree.selection", "lcb")
         ucb_c = float(cfg.get("tree.ucb_c", 1.0))
+        # Confidence-set selector (``method="lcb"``, the default). ``lcb_delta=0``
+        # means "auto" (2/anchor_k ~ one standard error, resolved inside the
+        # store); ``lcb_z`` is the Wilson confidence knob (0 => plain ratio).
+        lcb_delta = float(cfg.get("tree.lcb_delta", 0.0))
+        lcb_z = float(cfg.get("tree.lcb_z", 1.64))
+        # Fail fast on a typo: an unknown method silently behaves like ``ucb``
+        # inside the store, which would invalidate an experiment arm without any
+        # visible symptom (same class of bug as a mis-parsed ablation switch).
+        if method not in ("lcb", "ucb", "best", "latest"):
+            raise ValueError(f"tree.selection={method!r} is not one of "
+                             f"lcb|ucb|best|latest")
+        if lcb_z < 0 or lcb_delta < 0:
+            raise ValueError("tree.lcb_z / tree.lcb_delta must be >= 0")
         depth_penalty = float(cfg.get("tree.depth_penalty", 0.05))
         cost_penalty = float(cfg.get("tree.cost_penalty", 0.0))
         n_parents = int(cfg.get("tree.num_parents", 1))  # >1 enables crossover
@@ -2803,6 +2876,16 @@ class GanLoop:
             self.task_tree.add_node(Node(genid="initial", value=NodeValue(score=None)))
             self.log_event({"type": "init", "task_tree": "initial"})
 
+        # Resume: earlier generations were written by a tree that may predate the
+        # anchor stamp, and the LCB selector cannot see evidence that is not in
+        # meta. Backfill once (idempotent) so parent selection spans the WHOLE
+        # tree instead of only the generations created after the resume.
+        if self.resume:
+            backfilled = self._backfill_anchor_stamps()
+            if backfilled:
+                self.log_event({"type": "anchor_stamp_backfill",
+                                "nodes": int(backfilled)})
+
         # A6 ablation: task-only single round -- no planner/evaluator/evolution.
         if self._ab("task_only_single_round"):
             return self._run_task_only_single_round()
@@ -2832,11 +2915,13 @@ class GanLoop:
             for inner in range(inner_start, I_max + 1):
                 _inner_t0 = time.time()
                 use_global = cross_subtree and random.random() < cross_subtree_epsilon
+                sel_report: Dict[str, Any] = {}
                 parents = self.task_tree.select_parents(
                     k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                     ucb_c=ucb_c, depth_penalty=depth_penalty, cost_penalty=cost_penalty,
                     outer_id=None if use_global else outer,
                     exclude={"initial"} if outer > 1 else None,
+                    lcb_delta=lcb_delta, lcb_z=lcb_z, report=sel_report,
                 )
                 # Fallback (docs/13 §2.4, 2026-10 revision): every outer starts
                 # with an EMPTY current subtree, so "subtree only" starves every
@@ -2845,11 +2930,13 @@ class GanLoop:
                 # real nodes) and record it. If cross_subtree_epsilon=1.0 the
                 # pool is already global and this never triggers.
                 if not parents and not use_global:
+                    sel_report.clear()
                     parents = self.task_tree.select_parents(
                         k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                         ucb_c=ucb_c, depth_penalty=depth_penalty,
                         cost_penalty=cost_penalty, outer_id=None,
                         exclude={"initial"} if outer > 1 else None,
+                        lcb_delta=lcb_delta, lcb_z=lcb_z, report=sel_report,
                     )
                     if parents:
                         self.log_event({"type": "inner_pool_fallback",
@@ -2858,6 +2945,13 @@ class GanLoop:
                     self.log_event({"type": "inner_skip", "reason": "no_candidate", "outer": outer, "inner": inner})
                     break
                 parent = parents[0]
+                # Decision-grade audit: WHICH candidates the statistic kept and why
+                # this one won. Reconstructible offline without re-running the tree
+                # (``degenerate`` flags an anchor core that stopped discriminating).
+                self.log_event({"type": "parent_select", "outer": outer,
+                                "inner": inner, "method": method,
+                                "pool": "global" if use_global else "subtree",
+                                **sel_report})
 
                 genid = self._gen_counter
                 self._gen_counter += 1
@@ -3070,6 +3164,17 @@ class GanLoop:
 
                 # score / imputation / validity
                 self._finalize_child(child, parent)
+                # Anchor stamp for CROSS-GENERATION parent selection
+                # (``tree.selection=lcb``): computed ONCE here and carried on the
+                # node, so selection never re-reads report.json per candidate and
+                # a resumed run cannot mix two definitions of the same evidence.
+                # Only REAL measurements are stamped -- an imputed score is a
+                # fallback value, not evidence for a confidence bound.
+                if child.value.score_status in _MEASURED:
+                    anc_c, anc_n = self._anchor_stats(genid)
+                    if anc_n > 0:
+                        child.meta["anchor_correct"] = int(anc_c or 0)
+                        child.meta["anchor_n"] = int(anc_n)
 
                 # archive the current generation's task trajectory BEFORE evaluation,
                 # so the evaluator can read it (current generation).

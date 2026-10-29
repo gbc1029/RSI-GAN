@@ -81,10 +81,28 @@ tree:
   branch_limit: 2               # B: max children per node
   depth_limit: 5                # D: max depth
   num_parents: 1                # >1 enables crossover (DAG, shallow config merge)
-  selection: ucb                # ucb | best | latest
-  ucb_c: 1.0                    # exploration constant
-  depth_penalty: 0.05           # penalty per unit depth
-  cost_penalty: 0.0             # penalty on normalized cost (0 disables)
+  # 父代选择策略（消费者：gan/framework/loop.py -> TreeStore.select_parents）
+  #   lcb    -- 默认。置信集选择：按"锚点核上的 Wilson 下界"筛出 {n: LCB >= 最优 - delta}
+  #             （统计上分不出高下的一撮），再在这一撮里取 children 最少者（最该展开的）。
+  #             探索永不越出置信集——已被证据否定的节点不会因为"没试过"被重选。
+  #   ucb    -- 旧加性bandit：score + c*sqrt(ln N / visits) - penalties。保留为对照臂。
+  #   best / latest -- 纯分数 argmax / 最近加入。
+  # 为什么默认 lcb：score ∈ [0,1] 而 visits=2 时 bonus 可达 ~1.4，旧 metric 实际退化为
+  # "选最少被访问的节点"；且每个 genid 只评估一次，"再拉一次收紧估计"不存在——
+  # 唯一诚实的修法是悲观估计 + 把探索预算关在"仍可能是最好"的集合内。
+  selection: lcb
+  ucb_c: 1.0                    # exploration constant（仅 selection=ucb 生效）
+  lcb_delta: 0.0                # 置信集宽度 = "最优 LCB - delta"。0 = auto = 2/anchor_k
+                                # （k=10 时约 0.2 ≈ 一个标准误）。为什么不取 1/anchor_k：
+                                # z=1.64 下差一道锚点题就是 ~0.13 > 0.1，集合会退化成单元素，
+                                # 集内探索永远不会发生。调大 = 更多探索；调小 = 更贪心。
+                                # 消费者：loop.py -> TreeStore._select_parents_lcb。
+  lcb_z: 1.64                   # Wilson 下界置信系数（1.64 ≈ 单侧 95%）；0 = 退化为
+                                # 纯正确率（消融/回退用）。锚点题同域相关，独立同分布
+                                # 假设偏乐观，故不用 1.96 的更窄版本。
+  depth_penalty: 0.05           # penalty per unit depth（lcb 模式下只作置信集内的
+                                # 二级排序，不参与统计筛选）
+  cost_penalty: 0.0             # penalty on normalized cost (0 disables；同上)
   cross_subtree: false          # docs/13 §2.4: 子树优先。true = 以 cross_subtree_epsilon
                                 # 的概率把候选池扩大到全局；false = 候选池限定在当前 outer
                                 # 子树（meta.outer_id == 当前 outer；initial/迁移节点仍可参与）。
