@@ -46,7 +46,31 @@ def authorize_write(actx: Any, path: str, operation: str = "write") -> Optional[
                 "(read-only); source edits cannot reach any commit.")
     if covering_intent(actx, absolute) != "modify":
         intent = covering_intent(actx, absolute)
-        why = "only covered by a VIEW grant" if intent == "view" else "not covered by any grant"
-        return (f"Error: {operation} refused: this path is {why}. "
+        if intent == "view":
+            return (f"Error: {operation} refused: this path is only covered by a "
+                    "VIEW grant. Re-request the same path with intent='modify'; "
+                    "no refresh is needed.")
+        # Not covered by any grant -- that fact stays in every branch (tests and
+        # projections key on it); the appended sentence says what a re-request
+        # CAN do, because reads are role-wide while writes are seat-narrowed.
+        advice = ""
+        try:
+            from gan.framework import frozen
+            rel = os.path.relpath(absolute, _root(actx)).replace(os.sep, "/")
+            if not frozen.is_allowed(actx.role, rel, "view", seat=actx.seat):
+                advice = (" This path is outside role "
+                          f"{actx.role}'s surface -- request_source_access cannot "
+                          "grant it; edits are refused.")
+            elif not frozen.is_allowed(actx.role, rel, "modify", seat=actx.seat):
+                advice = (f" This path is readable by your role but NOT writable "
+                          f"from this seat ({actx.role}/{actx.seat}) -- a view "
+                          "grant only reads; edits from this seat will always "
+                          "be refused.")
+        except Exception:  # noqa: BLE001 -- fall back to the generic advice
+            advice = ""
+        base = f"Error: {operation} refused: this path is not covered by any grant."
+        if advice:
+            return f"{base}{advice}"
+        return (f"{base} "
                 "Re-request the same path with intent='modify'; no refresh is needed.")
     return None

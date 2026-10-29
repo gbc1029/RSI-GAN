@@ -56,7 +56,8 @@ live under `scripts/dgmh/`.
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
   `read_trajectory`, `read_session_trajectory`, `list_editable`, `list_components`),
   `design/` (shallow design
-  operators), `deep/` (gated deep gate: `request_source_access` + `register_component` +
+  operators incl. the read-only `get_config` design reader: config + gen-0
+  seed + keys view), `deep/` (gated deep gate: `request_source_access` + `register_component` +
   `unregister_component` + `update_component`),
   `assembly.py`.
 - `gan/components/` — **opt-in** tool implementations, one tree per role (batch 6):
@@ -71,7 +72,12 @@ live under `scripts/dgmh/`.
   Every entry is a TOOL (a callable `tool_info`/`tool_function` module); the legacy
   `kind` field (`skill`/`eval_point`) may still appear in content and is a
   descriptive tag only.
-- `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `seeds/`.
+- `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `seeds/`. The
+  seed files (`seeds/<role>.md`) are the framework-owned FACTORY DEFAULTS: in
+  NO role's read or write roots (run-invariant, so the set_prompt seed-restore
+  exemption cannot be moved from inside a session); the only agent-facing seed
+  projection is `get_config`'s `seed` field. An existing design config is
+  authoritative and never re-seeded.
 - `gan/roles/`, `gan/build.py`, `gan/summary.py` — evolvable orchestration/glue.
 
 ## Setup
@@ -280,7 +286,7 @@ with a GAN-native data layer.
 - **Permissions = capability by existence (batch 4 axiom)**: reads are physical absence without a grant; writes are not applied without capability. Enforced by what the framework MOVES (`AccessContext` role+seat; REQUIRED no-default on `set_access_context` / `frozen.write_roots` / `frozen.is_allowed` / `AccessBroker.grant` / `code_repo.check_patch|apply_*`; no `legacy` seat; `frozen.any_seat_allows` is the only deliberate union query — classification, never authorization; `AccessBroker` refuses repo-root / self-containing / oversized grants; local check: `scripts/local/test_frozen.py`).
 - **Reserved cost keys & context-management seam (docs/10 phases C/D)**: authority is `gan/framework/cost_keys.py` (`validate_cost_config` shared by schema/set, `effective_all` the ONLY clamp, `cost_keys_applied` events); task budget keys ride the harness stdin payload (never env). Phase-D seam: `agent/llm_withouts._counting_llm` is the single per-turn assembly point — `CMSession` (per-seat, snapshot-loaded) rewrites only what is SENT; per-entry copies keep canonical history + raw trajectory rows untouched; modes `passthrough` (kill switch) / `slice` / `compact_conservative` / `custom`; audit via `cm_violation` / `cm_*` events and the `cm_events.jsonl` sidecar; runtime `cm` savings are DERIVED, never billing.
 - **Planner→evaluator isolation**: every evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) — summary is ops-only (files exited; changed files are an outcome fact owned by `meta_view.task_patch_files`, grant facts ride `ops[].paths`), receipt exposes only outcomes (`receipt.design.ops`), run summary exposes only `run_summary.meta`/`run_summary.receipt` (no `rejected_reason` full text, which quotes the planner's artifacts), feedback digest exposes only `issue_id`/`accepted`/`stance`. A NEW meta key or receipt field is invisible to the evaluator until its projection is extended on purpose (default-deny, mirroring the role access allowlist). The planner responds to issues with a REQUIRED structured stance (`response_kind`: acted / acted_differently / out_of_scope / disputed / deferred) — the evaluator calibrates on decisions, never on persuasion.
-- **Artifact vs rationale (B29, batch 16)**: the ARTIFACT under evolution gets structural facts; the planner's RATIONALE gets nothing. `set_prompt` / `set_config(key="prompt")` record `prompt_change_facts` (chars/lines/prev_*/added_lines/removed_lines/similarity/changed_from_to/sha256_12/empty/equals_seed — numbers and hashes only, never text), and `DesignContext.record` stamps `target_role` for every design record (framework-owned, written after the caller's fields so it cannot be shadowed). Those facts are whitelisted into `build_diff_summary` and `receipt.design.ops`. The prompt TEXT is deliberately not projected: it is audit evidence the evaluator may fetch from the task trajectory (`read_trajectory` archives the child's input message verbatim, redacted only for benchmark/score strings), never an assertion pushed into its decision surface — the isolation is on the PROMPT surface, not on the read surface. This does NOT relax the `respond_issue.feedback` rule: its derived statistics stay banned.
+- **Artifact vs rationale (B29, batch 16)**: the ARTIFACT under evolution gets structural facts; the planner's RATIONALE gets nothing. `set_prompt` / `set_config(key="prompt")` record `prompt_change_facts` (chars/lines/prev_*/added_lines/removed_lines/similarity/char_similarity/char_survival/changed_from_to/sha256_12/empty/equals_seed — numbers and hashes only, never text), and `DesignContext.record` stamps `target_role` for every design record (framework-owned, written after the caller's fields so it cannot be shadowed). Those facts are whitelisted into `build_diff_summary` and `receipt.design.ops`. The prompt TEXT is deliberately not projected: it is audit evidence the evaluator may fetch from the task trajectory (`read_trajectory` archives the child's input message verbatim, redacted only for benchmark/score strings), never an assertion pushed into its decision surface — the isolation is on the PROMPT surface, not on the read surface; the AUTHOR side reads its own draft via `get_config` (same object the R2 gate compares against). This does NOT relax the `respond_issue.feedback` rule: its derived statistics stay banned.
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator must not fit the benchmark score (blind score first, then reveal).
 
 ## Driver-mode field lessons (v5.1 real-API round)

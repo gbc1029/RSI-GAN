@@ -347,11 +347,17 @@ def build_gan_loop(
         deep_view_only=bool(cfg.get("ablation.deep_view_only", False)),
         shallow_prompt_only=bool(cfg.get("ablation.shallow_prompt_only", False)),
         disable_shallow=bool(cfg.get("ablation.disable_shallow", False)),
-        # R2 (design-write limit, not an ablation arm): a prompt write below this
-        # character-level similarity to the text it replaces is a wholesale
-        # rewrite and is refused. 0.0 = gate off.
-        prompt_rewrite_min_similarity=float(
-            cfg.get("design.prompt_rewrite_min_similarity", 0.0) or 0.0),
+        # R2 (design-write limit, not an ablation arm): a prompt write whose
+        # SURVIVAL (matched chars / previous length) is below the threshold is a
+        # wholesale rewrite and is refused. 0.0 = gate off. The legacy
+        # ``min_similarity`` key is accepted as a fallback for older configs; the
+        # growth cap (multiple of the previous length per single write, 0 = off)
+        # makes the old ratio metric's implicit anti-bloat side effect explicit.
+        prompt_rewrite_min_survival=float(
+            cfg.get("design.prompt_rewrite_min_survival",
+                    cfg.get("design.prompt_rewrite_min_similarity", 0.0)) or 0.0),
+        prompt_rewrite_max_growth=float(
+            cfg.get("design.prompt_rewrite_max_growth", 0.0) or 0.0),
         max_files=int(cfg.get("source_access.max_files_per_grant", 500)),
         max_bytes=int(cfg.get("source_access.max_bytes_per_grant", 50 * 1024 * 1024)),
         roots=roots,

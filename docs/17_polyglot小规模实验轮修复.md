@@ -412,3 +412,81 @@ java 2/10(无尾换行拼连)、javascript 1/26(package.json 冲突)、go 1/17(�
   （随机截断序 + 两实现等价合同测试）另行批次。
 - **类目推广**：`_pool_categories` 当前只接 polyglot language；CSV 域将来若引入
   类别列（如 accept/reject 配比），沿同一 `_stratified_sample` 通道扩展即可。
+
+## 10. 设计面读取与写闸修正批（2026-10-30）
+
+> 起因：`small_1029_231632` outer_1 的 plan 会话（`trajectory/outer_1/roles/planner/
+> plan/gen_0.jsonl`）三次 `set_prompt` 全部被 R2 闸门拒绝（0.11 → 0.10 → 0.08，阈 0.50），
+> planner 为"找到被比较的 incumbent 文本"耗尽工具预算，prompt 改进推迟到下一代。
+> 离线复核确认：三次拒绝的判定**实质正确**（真实保留率仅 0.29/0.19/0.15），但机制存在
+> 三处缺陷——参照文本对写入者不可见、`ratio()` 与长度耦合（385 字符基线下新文
+> ≥1156 字符数学上必败）、报错文案与度量语义错位。本批一次提交修复四项。
+
+### 10.1 `get_config` 设计读取工具（新增 `gan/tools/design/get_config.py`）
+
+- 返回本会话所编辑设计的完整 config（读 `DesignContext`，**与闸门比较的 `prev` 同源**，
+  构造性消除"测 config、读 seed 文件"的错位）；返回 gen-0 seed 全文与
+  `prompt_equals_seed`——"逐字写回 seed 永远放行"的逃生通道首次对 plan 席位可执行；
+- 返回 **keys 视图**：静态键 + 动态键目录（经 `session_overlay_root` workspace-first
+  解析，与 `set_config` 校验语义对齐，本会话新声明键即刻可见）+ allowed/present/
+  unset_allowed；config 面首次可枚举；
+- 作用域由 `ctx.role` 天然决定（plan→task、self_improve→自身、evaluate 无 ctx 自然拒绝）；
+  纯读：不过 shallow 写闸、不落 record（读不是变更）；无文件/授权/ledger 面。
+
+### 10.2 工具报错四态分类（仅报错分支，行为零变更）
+
+- 分类器 `gan/framework/workspace.py:path_class/access_hint`：与 `AccessBroker.grant`
+  同序同源（`deny_paths` → `is_allowed(view)` → `is_allowed(modify)`），四态 =
+  **确实不存在 / 可读可写未授权 / 仅可读未授权 / 角色读集外**；读集外一律不回答
+  仓库存在性（保留"不披露"决定的意图，只描述请求路径本身的类别）；
+- 接线：`read_file` / `list_dir` / `grep`（含空工作区显式声明，消灭静默 `(no matches)`）/
+  `edit_source(view)` 未命中拦截（`agent/tools/editor.py` 基座文案不动）；
+  `write_auth.authorize_write` 的"未被授权覆盖"分支保留 "not covered by any grant"
+  事实前缀并追加席位可写性说明（消除对仅可读席位"必然失败的 modify 重试指引"）；
+  `request_source_access` 分桶回显（outside / readable-not-writable-here / no repo
+  match，来自既有 `last_result` 审计面，零新 RPC）。
+
+### 10.3 R2 闸门改保留率（survival）语义
+
+- `prompt_rewrite_error`（`gan/tools/design/set_prompt.py`）主判据改为
+  **M/len(prev)**（同一 SequenceMatcher，`ratio()` 内部即由 matching blocks 计算，
+  零额外成本）；旧键 `prompt_rewrite_min_similarity` 作回退；新增显式增长上限
+  `design.prompt_rewrite_max_growth`（默认 4，0=不限，把旧 ratio 隐式的防膨胀副作用
+  显式化）；
+- 实测对照：本 run 三次尝试 survival 0.29/0.19/0.15 仍拒（判定不变）；"逐字保留 seed
+  + 追加"从 ratio 0.409 拒 → survival 1.0 过（被误杀的唯一一类 = 闸门自己建议的追加）；
+- 镜像链同步（`build.py` → `AccessBroker` → `broker_info` → 校验集 → `_RemoteBroker`
+  → `context.design_limits`）——**精确字段集校验**，漏一处子进程读 0.0 闸门静默失效
+  （B1 教训同型）；
+- `prompt_change_facts` 新增 `char_survival` 数字事实并**加入 `PROMPT_FACT_KEYS` 白名单**
+  （默认拒绝投影：不加白则决策面与离线分析器不可见）。
+
+### 10.4 seed 收权：出厂默认值归框架
+
+- `frozen.py` 从 `PLANNER_SELF`/`EVALUATOR_SELF` 删除自家 seed 文件（2 行）；三个
+  seed 统一为**任何角色不可读不可写**；框架侧读取（build 装配 / gen-0 / 回退参照）
+  直读代码树、不经 broker，不受影响；
+- 关闭的洗白路径：self_improve 席位曾可 `edit_source` 改自家 seed 文件（deep 通道无
+  相似度闸）→ `set_prompt(改后文本)` 被"写回 seed"豁免放行；seed 运行内不可变后该
+  引用稳定。既有设计 config 权威、永不重置（`_seed_self_designs` 仅补缺失），
+  seed 文本修改只影响未来新 run 的 gen-0；
+- 层位语义：seed = 框架所有的出厂默认值（变更走维护者 PR），config = 角色所有的
+  可演化状态（set_prompt/set_config 唯一写入口）；角色侧 seed 唯一投影 =
+  `get_config` 的 `seed` 字段。
+
+### 10.5 配套与定性记录
+
+- 回归适配：`check_record_contract` roster 将 `design/get_config.py` 归入 EXEMPT
+  （纯读面；并修正 REQUIRED 前缀匹配先于 EXEMPT 的判定顺序），B19 断言更新为分类
+  后消息；六套件全绿 + `test_frozen.py` 通过；
+- **CM 块定性**：seed 中的"上下文管理与预算"块经逐环核实为 **seed 文件内的初始设计
+  内容**（f6e4248 提交写入），**不是**运行时代码注入（运行时无任何往 prompt/消息拼
+  CM 文本的代码；CM 机制只在消息层改写、永不回写 config）。按定义不属漏洞；其
+  "保留税"是闸门对 incumbent 的一致判定，且该块自描述为条件性（未装配工具时
+  "直接按任务作答"），自中和；
+- **既有接受项记录**：任务输出格式契约块（`task_agent.py` 的 JSON schema 段）位于
+  被演化工件源码内、plan 席位可经 deep 修改——防护为解析失败→无效→score null 的
+  结构性自罚 + 评分器在信任锚内 + 补丁过程可见，定性为有意接受，不加闸；
+- **已知残留**（有意保留）：会话内链式漂移边界（逐写保留 ≥50% 的渐进重写合法，现行
+  ratio 下同样可行）；`list_editable` 不加 read_only_here 分节（读写不对称靠 C 类
+  报错兜底）。

@@ -6,7 +6,7 @@ given raw ``bash``; this plus list_dir/grep/edit_source is the read surface.
 import os
 
 from gan.framework.context import get_access_context
-from gan.framework.workspace import resolve
+from gan.framework.workspace import access_hint, resolve
 
 
 def tool_info():
@@ -32,8 +32,13 @@ def tool_function(path, max_chars=8000, **kwargs):
         p = resolve(actx, path)
     except ValueError as e:
         return f"Error: {e}"
+    if os.path.isdir(p):
+        return f"Error: {path} is a directory -- use list_dir."
     if not os.path.isfile(p):
-        return f"Error: not a file: {path}"
+        # No workspace copy: classify WHY (absent / grantable / outside the
+        # role surface) with the same primitives the grant loop uses.
+        hint = access_hint(actx, p)
+        return hint or f"Error: not a file: {path}"
     try:
         with open(p, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()

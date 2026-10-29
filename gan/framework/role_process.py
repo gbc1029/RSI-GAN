@@ -443,7 +443,11 @@ class RoleProcess:
                                      "shallow_prompt_only": bool(getattr(broker, "shallow_prompt_only", False)),
                                      "disable_shallow": bool(getattr(broker, "disable_shallow", False)),
                                      "prompt_rewrite_min_similarity": float(
-                                         getattr(broker, "prompt_rewrite_min_similarity", 0.0) or 0.0)}
+                                         getattr(broker, "prompt_rewrite_min_similarity", 0.0) or 0.0),
+                                      "prompt_rewrite_min_survival": float(
+                                          getattr(broker, "prompt_rewrite_min_survival", 0.0) or 0.0),
+                                      "prompt_rewrite_max_growth": float(
+                                          getattr(broker, "prompt_rewrite_max_growth", 0.0) or 0.0)}
                                     if broker is not None else None),
                     "role_state": {
                         "attempt_id": self.attempt_id,
@@ -666,7 +670,9 @@ class _RemoteBroker:
                  repo_root: str, output_dir: str,
                  deny_deep: bool = False, deep_view_only: bool = False,
                  shallow_prompt_only: bool = False, disable_shallow: bool = False,
-                 prompt_rewrite_min_similarity: float = 0.0):
+                 prompt_rewrite_min_similarity: float = 0.0,
+                 prompt_rewrite_min_survival: float = 0.0,
+                 prompt_rewrite_max_growth: float = 0.0):
         self._reader = reader
         self._writer = writer
         self._call_id = call_id
@@ -681,6 +687,10 @@ class _RemoteBroker:
         # prompt-rewrite limit instead of a local default (a flag that is not
         # mirrored silently reads as 0.0 = gate off in the child).
         self.prompt_rewrite_min_similarity = float(prompt_rewrite_min_similarity or 0.0)
+        # R2 survival + growth-cap mirrors (see AccessBroker; not mirrored =>
+        # silently 0.0 in the child = gate off, the B1 lesson).
+        self.prompt_rewrite_min_survival = float(prompt_rewrite_min_survival or 0.0)
+        self.prompt_rewrite_max_growth = float(prompt_rewrite_max_growth or 0.0)
         self.last_result: Dict[str, Any] = {}
         self.grants = _RemoteGrants(self)
 
@@ -952,7 +962,9 @@ def _worker_main() -> None:
                 if not isinstance(info, dict) or set(info) != {
                         "repo_root", "output_dir", "deny_deep", "deep_view_only",
                         "shallow_prompt_only", "disable_shallow",
-                        "prompt_rewrite_min_similarity"}:
+                        "prompt_rewrite_min_similarity",
+                        "prompt_rewrite_min_survival",
+                        "prompt_rewrite_max_growth"}:
                     raise RoleProcessError("invalid broker info")
                 remote = _RemoteBroker(
                     reader, protocol_writer, call_id,
@@ -962,7 +974,11 @@ def _worker_main() -> None:
                     shallow_prompt_only=bool(info.get("shallow_prompt_only", False)),
                     disable_shallow=bool(info.get("disable_shallow", False)),
                     prompt_rewrite_min_similarity=float(
-                        info.get("prompt_rewrite_min_similarity", 0.0) or 0.0))
+                        info.get("prompt_rewrite_min_similarity", 0.0) or 0.0),
+                    prompt_rewrite_min_survival=float(
+                        info.get("prompt_rewrite_min_survival", 0.0) or 0.0),
+                    prompt_rewrite_max_growth=float(
+                        info.get("prompt_rewrite_max_growth", 0.0) or 0.0))
                 index = _BROKER_POSITION[method]
                 if len(args) > index:
                     args[index] = remote

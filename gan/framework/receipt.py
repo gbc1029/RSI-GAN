@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 PROMPT_FACT_KEYS = (
     "target_role", "changed", "chars", "prev_chars", "lines", "prev_lines",
     "added_lines", "removed_lines", "similarity", "char_similarity",
+    "char_survival",
     "changed_from", "changed_to", "sha256_12", "prev_sha256_12", "empty",
     "equals_seed",
 )
@@ -57,6 +58,13 @@ def prompt_change_facts(prev: Any, new: Any, seed: Any = None) -> Dict[str, Any]
     # cannot distinguish "fixed a typo" from "replaced the whole prompt". The
     # prompt-rewrite gate (set_prompt.prompt_rewrite_error) reads this one.
     char_sm = difflib.SequenceMatcher(a=a_s, b=b_s, autojunk=False)
+    # SURVIVAL = matched chars / previous length: what fraction of the text
+    # being replaced survives into the new prompt. This is the number the R2
+    # gate judges (the symmetric ``ratio`` additionally penalises pure GROWTH,
+    # which is exactly the sanctioned "append" operation). Recorded so receipts
+    # show the same quantity the gate decided on.
+    char_matched = sum(blk.size for blk in char_sm.get_matching_blocks())
+    char_survival = (round(char_matched / len(a_s), 4) if a_s else 1.0)
     added = removed = 0
     first = last = 0
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -77,6 +85,7 @@ def prompt_change_facts(prev: Any, new: Any, seed: Any = None) -> Dict[str, Any]
         "added_lines": added, "removed_lines": removed,
         "similarity": (round(sm.ratio(), 2) if (a or b) else 1.0),
         "char_similarity": (round(char_sm.ratio(), 2) if (a_s or b_s) else 1.0),
+        "char_survival": char_survival,
         "changed_from": first, "changed_to": last,
         "sha256_12": _sha12(b_s), "prev_sha256_12": _sha12(a_s),
         "empty": not b_s.strip(),

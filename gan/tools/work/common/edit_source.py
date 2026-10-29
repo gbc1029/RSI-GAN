@@ -99,6 +99,15 @@ def tool_function(command, path, file_text=None, view_range=None,
     except ValueError as e:
         return f"Error: {e}"
     cmd = str(command)
+    if cmd == "view" and not os.path.exists(abs_path):
+        # Intercept BEFORE the base editor so the miss message classifies the
+        # path (absent / grantable / outside the role surface) instead of the
+        # base layer's bare "does not exist" (which reads as a false statement
+        # for a repo file that simply has no workspace copy yet).
+        from gan.framework.workspace import access_hint
+        hint = access_hint(actx, abs_path)
+        if hint:
+            return hint
     mutating = cmd in ("create", "str_replace", "insert", "undo_edit")
     # A deep edit is only legitimate on a path granted for MODIFY, and only
     # in a session that has a patch builder (evaluate is read-only: session

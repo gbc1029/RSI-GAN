@@ -291,11 +291,14 @@ def design_limits() -> Dict[str, Any]:
     """
     actx = get_access_context()
     broker = getattr(actx, "broker", None) if actx is not None else None
-    try:
-        limit = float(getattr(broker, "prompt_rewrite_min_similarity", 0.0) or 0.0)
-    except (TypeError, ValueError):  # noqa: BLE001 -- a bad value must not break a tool
-        limit = 0.0
-    return {"prompt_rewrite_min_similarity": max(0.0, min(1.0, limit))}
+    def _num(name: str) -> float:
+        try:
+            return float(getattr(broker, name, 0.0) or 0.0)
+        except (TypeError, ValueError):  # noqa: BLE001 -- a bad value must not break a tool
+            return 0.0
+    return {"prompt_rewrite_min_survival": max(0.0, min(1.0, _num("prompt_rewrite_min_survival"))),
+            "prompt_rewrite_min_similarity": max(0.0, min(1.0, _num("prompt_rewrite_min_similarity"))),
+            "prompt_rewrite_max_growth": max(0.0, _num("prompt_rewrite_max_growth"))}
 
 
 def shallow_op_error(op_name: str, key: Optional[str] = None) -> Optional[str]:

@@ -46,13 +46,21 @@ def prompt_rewrite_error(prev, new, seed=None) -> Optional[str]:
     was not enough -- the arm stayed LAST even after format correction, i.e. the
     rewrite changed the JUDGEMENT too, not just the output shape.
 
-    A write is judged by CHARACTER-level similarity to the text it replaces (the
-    line-level measure in ``prompt_change_facts`` scores 0.0 for any edit to a
-    single-line prompt and cannot tell a typo fix from a replacement):
+    A write is judged by how much of the text it replaces SURVIVES: the
+    character-level matched fraction ``M / len(prev)`` (the line-level measure in
+    ``prompt_change_facts`` scores 0.0 for any edit to a single-line prompt and
+    cannot tell a typo fix from a replacement; the former symmetric ``ratio()``
+    also penalised pure GROWTH -- against a 385-char incumbent, any new prompt
+    over ~3x its length could never pass even with the incumbent preserved
+    verbatim, which contradicted this message's own "append a few lines" advice).
 
-    * below ``design.prompt_rewrite_min_similarity`` -> refused, design
-      untouched, and NO record (a refused write must not look like a change);
+    * below ``design.prompt_rewrite_min_survival`` (legacy key:
+      ``prompt_rewrite_min_similarity``) -> refused, design untouched, and NO
+      record (a refused write must not look like a change);
     * ``0`` disables the gate entirely;
+    * ``design.prompt_rewrite_max_growth`` (> 0) separately caps one write's
+      length multiple -- the explicit form of the anti-bloat side effect the
+      old ratio metric provided implicitly;
     * an EMPTY previous prompt (first write) is always allowed;
     * a write that restores the generation-0 seed is always allowed -- that is
       the documented known-good recovery, and blocking it would leave a drifted
@@ -60,7 +68,10 @@ def prompt_rewrite_error(prev, new, seed=None) -> Optional[str]:
 
     Best-effort: an unknown limit or a non-string side never raises.
     """
-    limit = design_limits().get("prompt_rewrite_min_similarity") or 0.0
+    limits = design_limits()
+    limit = float(limits.get("prompt_rewrite_min_survival")
+                  or limits.get("prompt_rewrite_min_similarity") or 0.0)
+    growth = float(limits.get("prompt_rewrite_max_growth") or 0.0)
     if limit <= 0.0:
         return None
     prev_s, new_s = str(prev or ""), str(new or "")
@@ -69,18 +80,26 @@ def prompt_rewrite_error(prev, new, seed=None) -> Optional[str]:
     if seed is not None and new_s == str(seed):
         return None
     try:
-        sim = difflib.SequenceMatcher(a=prev_s, b=new_s, autojunk=False).ratio()
+        sm = difflib.SequenceMatcher(a=prev_s, b=new_s, autojunk=False)
+        matched = sum(b.size for b in sm.get_matching_blocks())
+        survival = (matched / len(prev_s)) if prev_s else 1.0
     except Exception:  # noqa: BLE001 -- a gate must never break the tool
         return None
-    if sim >= limit:
-        return None
-    return (
-        f"Error: prompt rewrite rejected -- only {sim:.2f} of the previous prompt "
-        f"text survives (minimum {limit:.2f}, design.prompt_rewrite_min_similarity). "
-        f"Replacing the whole prompt is treated as an unjustified change. Make a "
-        f"SMALL targeted edit instead (append or adjust a few lines) and state the "
-        f"measurable hypothesis behind it; to roll back a drifted prompt, write the "
-        f"generation-0 seed text exactly (that is always allowed).")
+    if survival < limit:
+        return (
+            f"Error: prompt rewrite rejected -- only {survival:.0%} of the previous "
+            f"prompt text survives ({matched}/{len(prev_s)} chars, minimum "
+            f"{limit:.0%}). Replacing the whole prompt is treated as an unjustified "
+            f"change. Keep at least half of the incumbent text verbatim and append "
+            f"or edit around it (get_config shows the incumbent text); to roll back "
+            f"a drifted prompt, write the generation-0 seed exactly (that is always "
+            f"allowed).")
+    if growth > 0 and len(prev_s) > 0 and len(new_s) > growth * len(prev_s):
+        return (
+            f"Error: prompt growth cap -- {len(new_s)} chars vs {len(prev_s)} "
+            f"(max {growth:g}x per write). Split the change across generations "
+            f"or trim the addition.")
+    return None
 
 
 def _seed_prompt(role: str) -> Optional[str]:
