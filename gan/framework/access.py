@@ -662,23 +662,26 @@ class AccessBroker:
 
     def read_trajectory(self, role: str, node_id: Any, genid: Any,
                         max_chars: int, *, seat: str) -> str:
-        from gan.framework.trajectory import read
+        from gan.framework.trajectory import TRAJ_RENDER_MAX_CHARS, read
         allowed = self._trajectory_scopes.get((str(role), str(node_id)), [])
         if str(genid) not in {str(g) for g in allowed}:
             raise PermissionError("generation is not visible to this role session")
-        return read(self.output_dir, genid, max_chars=min(int(max_chars), 6000),
+        # Ceiling 120000 = TEMPORARY MITIGATION for the legacy silent 6000
+        # clamp (docs/17 §15); the complete fix is offset/pagination over RPC.
+        return read(self.output_dir, genid,
+                    max_chars=min(int(max_chars), TRAJ_RENDER_MAX_CHARS),
                     role="task")
 
     def read_session_trajectory(self, role: str, node_id: Any, outer: Any,
                                 genid: Any, max_chars: int, *, seat: str) -> str:
-        from gan.framework.trajectory import read_session
+        from gan.framework.trajectory import TRAJ_RENDER_MAX_CHARS, read_session
         if seat != "self_improve":
             raise PermissionError("session trajectories require self_improve seat")
         expected = str(node_id).split("__", 1)[0]
         if expected != f"outer_{outer}":
             raise PermissionError("session outer does not match the role instance")
         return read_session(self.output_dir, outer, genid, role,
-                            min(int(max_chars), 6000))
+                            min(int(max_chars), TRAJ_RENDER_MAX_CHARS))
 
     def session_trajectory_index(self, role: str, node_id: Any, outer: Any,
                                  *, seat: str) -> List[Dict[str, Any]]:

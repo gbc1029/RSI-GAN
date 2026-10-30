@@ -962,6 +962,36 @@ def prepare_polyglot_questions_by_ids(
     return questions_path, sample_info
 
 
+def _normalize_eval_payload_ownership(output_path: str) -> None:
+    """Root-phase ownership normalization for polyglot eval payloads.
+
+    The task-broker child runs as root under the driver's private umask, so
+    the per-question eval artifacts (``gan_polyglot_<N>/`` docker logs / eval
+    markdown / result json) land root-owned 0700/0600 inside the work tree,
+    and the unprivileged loop could never clean its own work dir (field audit
+    smoke_1030_204345: ``rmtree_failed`` x3 per run -- the root-owned
+    DIRECTORY was the deletion blocker; root-owned FILES inside ganop-owned
+    dirs were always deletable). The write-side fix in
+    ``domains/polyglot/utils.copy_from_container`` covers only the
+    chat-history tar path -- THIS host-side write path needs its own pass.
+
+    Advisory: chown the whole eval output tree to the nearest non-root
+    ancestor's owner (the run owner by construction); a no-op for
+    unprivileged callers; per-target failures are logged by the helper and
+    never raised.
+    """
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        return
+    try:
+        from pathlib import Path as _Path
+
+        from domains.polyglot.utils import _normalize_extracted_ownership
+        _normalize_extracted_ownership(_Path(output_path))
+    except Exception as e:  # noqa: BLE001 -- advisory, never break scoring
+        print(f"[eval] payload ownership normalization failed ({output_path}): "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
 def run_polyglot_eval(
     predictions_path: str,
     dataset_root: str,
@@ -1070,6 +1100,13 @@ def run_polyglot_eval(
     # unparseable" soft-fail plus a task_runner_failed generation. Same
     # compensation the imo_proof grading report already applies.
     os.chmod(report_path, 0o644)
+    # Root-phase payload ownership (docs/17 §15): the eval artifacts the
+    # harness just wrote (gan_polyglot_<N>/ logs / eval markdown / result
+    # json) landed root-owned 0700/0600 inside the work tree, and the
+    # unprivileged loop could never clean its own work dir (field audit
+    # smoke_1030_204345: rmtree_failed x3 per run). Normalize BEFORE the
+    # report returns to the loop -- write-side fix, not cleanup-side masking.
+    _normalize_eval_payload_ownership(output_path)
     return report
 
 

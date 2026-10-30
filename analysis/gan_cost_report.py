@@ -197,8 +197,11 @@ def analyze(run_dir: str, prices: Optional[dict]) -> Dict[str, Any]:
         })
 
     # wallclock bookkeeping
-    t0 = (start_ev or {}).get("timestamp")
-    t1 = (done_ev or {}).get("timestamp")
+    # generic events stamp "ts"; the proxy stamps "timestamp" on llm_call rows
+    # (a "timestamp" read here yielded None for driver events and the summary
+    # line rendered "运行墙钟 Nones" — field audit smoke_1030_204345).
+    t0 = (start_ev or {}).get("ts")
+    t1 = (done_ev or {}).get("ts")
     run_wall = round(t1 - t0, 1) if (t0 and t1) else None
     llm_wall = round(sum(e.get("latency_ms") or 0 for e in calls) / 1000.0, 1)
 
@@ -225,15 +228,27 @@ def _fmt_tokens(n: Any) -> str:
     return f"{n:,}" if isinstance(n, int) else "—"
 
 
+def _fmt_wall(n: Any) -> str:
+    """Wall-clock rendering: never splice a raw None into the f-string
+    (the old "运行墙钟 Nones" artifact), match _fmt_tokens' "—" convention."""
+    return f"{n}s" if isinstance(n, (int, float)) else "—"
+
+
 def render_md(r: Dict[str, Any]) -> str:
     L = [f"# 成本报告：`{r['name']}`", ""]
     if r["model_cfg"]:
         L.append(f"- 模型配置：`{json.dumps(r['model_cfg'], ensure_ascii=False)}`")
     L.append(f"- 计价：{'按价表估算美元' if r['prices'] else '仅 token 口径（未提供价表）'}")
+    share = r["llm_wall_share"]
+    share_txt = "—" if share is None else f"{share}"
     L.append(f"- 总量：{r['calls_total']} 次调用 / {r['tokens_total']:,} tokens / "
-             f"失败 {r['failures_total']}；运行墙钟 {r['run_wall_s']}s，"
-             f"其中 LLM 延迟 {r['llm_wall_s']}s（占 {r['llm_wall_share'] or '—'}）"
+             f"失败 {r['failures_total']}；运行墙钟 {_fmt_wall(r['run_wall_s'])}，"
+             f"其中 LLM 延迟 {r['llm_wall_s']}s（占 {share_txt}）"
              f"；outer 墙钟合计 {r['sum_outer_wall_s']}s")
+    if share is not None and share > 1:
+        # 并发口径：harness 多题并行，各题 LLM 延迟直接求和可超过 run 墙钟。
+        L.append("- （LLM 延迟占比 >1 为并发口径：各题 LLM 延迟直接求和，"
+                 "可超过 run 墙钟，非计时错误。）")
     if r["rollup_events"]:
         L.append(f"- （本 run 由 driver 记录了 {r['rollup_events']} 个 cost_rollup 事件，"
                  f"本报告从 llm_call 明细独立重算，可互为校验）")

@@ -35,6 +35,16 @@ _SENSITIVE = (
 )
 _REDACTION_MARK = "[REDACTED:sensitive]"
 
+# Rendered-view caps for trajectory reads (docs/17 §15). The tool-level
+# DEFAULT stays 6000; the seat-broker CEILING was a legacy hard 6000 that
+# silently refused every larger request (field audit smoke_1030_204345: the
+# evaluator asked for 60000 and received the same 6000-cut blob, then burned
+# its blind phase reasoning about the cap). Raised to 120000 as a TEMPORARY
+# MITIGATION -- the complete fix (offset/pagination over the RPC face +
+# role-seat CM re-wiring) is documented in docs/17 §15 and remains open.
+TRAJ_RENDER_DEFAULT_CHARS = 6000
+TRAJ_RENDER_MAX_CHARS = 120_000
+
 
 def redact(text: str) -> str:
     """Line-level redaction of benchmark/score material (best-effort)."""

@@ -912,4 +912,81 @@ x86_64-linux-gnu-gcc-13），`open(...,"w")` 跟随三层链接把宿主机编�
   `trajectory.read` 无 offset 分页：评估器请求 60k 仍得 6000 切口，gen_2 评估器
   以 issue 形式投诉（i-5），gen_1 评估器 blind 阶段因 6000 视图进入退化推理循环
   （finish_reason=length，32k tokens）后 blind 预测被迫落到 reveal 阶段。
-  修复方向（上限可配 / RPC 透传 offset）另行批次。
+  **钳制上限已按 §15 放开至 120K（临时缓解）**；offset 分页与席位 CM 复活仍开放。
+
+## 15. 第六批续：渲染上限临时缓解 + 评测载荷属主归一 + eval 轮 work 清理（2026-10-30，离线验证）
+
+> 承接 §14 的审计发现。三项修复均只做了离线测试，未跑真实 run，未形成提交。
+
+### 15.1 read_trajectory 渲染上限：6000 → 120_000（**临时缓解**）
+
+- **改动**：`trajectory.py` 新增常量 `TRAJ_RENDER_DEFAULT_CHARS = 6000` /
+  `TRAJ_RENDER_MAX_CHARS = 120_000`；`access.py` 两处
+  `min(int(max_chars), 6000)` 改为 `min(int(max_chars), TRAJ_RENDER_MAX_CHARS)`
+  （`read_trajectory` 与 `read_session_trajectory` 同批）；两个读取工具的
+  `max_chars` schema 补说明（"Default 6000; requests are honored up to 120000"）。
+  工具级**默认值不变**（6000）；F1 渲染标记自动报告实际生效上限，诚实性不受影响。
+- **效果**：评估器请求 60k 不再被静默砍成 6000——§14.4 的 i-5 投诉与 gen_1 的
+  blind 退化循环失去触发条件。
+- **这是临时缓解，不是完整修复。完整修复需要：**
+  1. **offset/分页过 RPC 面**：`trajectory.read/_render` 增 offset 参数 →
+     `AccessBroker.read_trajectory` 透传 → `_RemoteBroker.read_trajectory`
+     参数列表追加 → 工具透传。offset 走位置参数列表，**不需要动**
+     `role_state`/`broker_info` 的精确键集，协议免改；评估器即可按块翻页读到
+     轨迹尾部，而不是靠加大单次窗口。
+  2. **席位 CM 栈复活**（§14.4 第一条）：把 cm 会话/快照经协议送达席位
+     （`role_state`/`broker_info` 精确键集扩展 + 快照序列化 + 双侧同步），
+     slice/index/`ctx_*` 面在席位可用后，`read_trajectory` 的分面读取才有
+     生产路径——这是把"一次读 120K"变成"按 segment 精准取"的正解。
+  3. （可选）上限进 `loop.yaml`（如 `trajectory.render_max_chars`），免硬编码。
+
+### 15.2 polyglot 评测载荷属主归一（rmtree_failed 根治，§13.2 P3 销项）
+
+- **改动**：`task_execution.py` 新增 `_normalize_eval_payload_ownership(output_path)`
+  （euid==0 门控 + 复用 `domains/polyglot/utils._normalize_extracted_ownership`
+  的"最近非 root 祖先"语义，advisory 永不 raise），并在 `run_polyglot_eval`
+  返回 report 前对 `output_path` 整树调用。
+- **机理**：task-broker 子进程以 root + 私有 umask 077 把每题评测现场
+  （`gan_polyglot_<N>/` 的 docker log / eval md / result json）host 直写进
+  work 树 → root 0700/0600；root-owned **目录**是 ganop 清理的唯一删除障碍。
+  归一化发生在**写入侧**（评测结束时、报告返回 loop 前），不是清理侧掩盖：
+  `safe_rmtree` 从此每代真正清空，`rmtree_failed` 事件自然归零（事件保留给
+  真失败）；顺带把 per-question 评测现场变回 run 属主可读，恢复离线审计面。
+  主链 gen 与固定根评估轮共用同一函数，一处覆盖两面。
+
+### 15.3 eval 轮 work 清理（§9.2/§13.2 的"侥幸存活"销项）
+
+- **改动**：`loop._evaluate_supernode.run_once` 以 try/finally 包裹
+  eval_runner→归档→返回 全程，finally 中按主链同款条件（`not keep_workdirs`）
+  `prune.safe_rmtree(work/eval_outer<N>_s<M>)`。
+- **语义**：清理发生在轨迹归档**之后**（collect 读 run_dir）；覆盖全部出口——
+  空 child、无分 child、归档失败、以及 eval_runner 抛异常（finally 仍执行）。
+  `prune.safe_rmtree` 对缺失路径 no-op、失败只记录（P2 契约不变）。
+
+### 15.4 验证（全部离线）
+
+- 新本地守卫 `scripts/local/test_traj_ceiling_and_ownership.py` **18/18**：
+  A 组——常量值、经真实 `AccessBroker` 的 60k 请求被尊重（修复前会被砍成 6000）、
+  超上限钳到 120000 且带 F1 标记、默认 6000 不变、session 面同上限；
+  B 组——root 相位归一化夹具（ganop 属主树 + root 0700/0600 载荷）→ 属主归一、
+  模式保持、幂等、非 root 调用者 no-op（源码门控断言）。
+- `run_tool_regression.py` 七套件全 PASS（access/task_execution/loop 在触达清单）；
+  `test_frozen.py`、`test_task_env_mirror.py` 全 PASS；六个改动文件 `py_compile` 通过。
+- **待真实 run 确认**：① 评估器大 `max_chars` 请求生效（事件/轨迹可见完整视图）；
+  ② 全 run `rmtree_failed` ×0 且 `work/` 无 root 残留；③ `work/eval_outer*_s*`
+  在评估轮结束后被清理。
+
+### 15.5 cost_report 墙钟 "Nones" 修复（同批，离线验证）
+
+- **根因**：`gan_cost_report.py` 内两处 `driver_start/done` 时间提取——第一处
+  （L104-105）正确用 `.get("ts")` 且注释明写键名约定；第二处（L200-201）误用
+  `.get("timestamp")`（那是 proxy 给 `llm_call` 行盖的键，driver 事件没有）→
+  `run_wall=None` → 汇总行 f-string 直接拼接出 "运行墙钟 Nones"、占比 "（占 —）"。
+  同文件复制漂移，非数据缺失（本 run 的 driver 事件齐全）。
+- **修复**：①第二处改 `.get("ts")`（与第一处同款注释）；②渲染层兜底——新增
+  `_fmt_wall`（数字→"Ns"，None→"—"，对齐 `_fmt_tokens` 惯例），汇总行改用，
+  杜绝任何路径再把 None 拼进文案；③占比 >1 时附并发口径注记（多题并行时各题
+  LLM 延迟直接求和可超 run 墙钟，非计时错误）。
+- **验证**：重生成 `smoke_1030_204345` 报告——"运行墙钟 3299.9s（占 1.159）"
+  （3299.9s 与 driver_done.duration_s 精确一致），"Nones" 归零；合成"缺 driver
+  事件"夹具渲染 "运行墙钟 —（占 —）"，无 None 拼接。

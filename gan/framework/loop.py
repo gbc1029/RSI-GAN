@@ -1630,42 +1630,57 @@ class GanLoop:
                         max_tool_calls=self.plan_max_tool_calls,
                         tool_repeat_limit=self.tool_repeat_limit,
                     ) or {}
-                child = self.eval_runner(plan=plan_result, parent=initial,
-                                         genid=genid, base=eval_base)
-                if child is None:
-                    # A None child used to vanish: run_eval_rounds only counts
-                    # non-None scores, so the batch silently degraded to n_valid=0
-                    # (``supernode_eval_degraded``) with no evidence of WHY.
-                    self.log_event({"type": "eval_round_empty", "outer": outer,
-                                    "sample": sample, "genid": genid,
-                                    "eval_base": eval_base})
-                    return None
-                if child.value.score is None:
-                    self.log_event({"type": "eval_round_no_score", "outer": outer,
-                                    "sample": sample, "genid": genid,
-                                    "score_status": child.value.score_status})
-                    return None
-                # Archive the eval round's task trajectory through the SAME
-                # pipeline as the main line (redaction + llm_calls sidecar).
-                # The eval round is not a decision generation, so an archive
-                # failure is advisory (soft_fail) — unlike the main line's
-                # hard-fail — but it must SPEAK, never vanish (field audit
-                # small_1030_095410: the fixed-root eval's only process
-                # evidence lived in the ephemeral work dir).
                 try:
-                    # D1: the eval round's records live in their OWN tree —
-                    # the outer label carries the instance suffix so the
-                    # archive lands at trajectory/outer_<N>_eval/
-                    # eval_outer<N>_s<M>/task.jsonl (+ sidecar), parseable by
-                    # the same readers as the main line.
-                    trajectory.collect(child.meta.get("run_dir", ""), f"gan_{genid}",
-                                       self.output_dir, f"{outer}_eval", genid)
-                except Exception as e:
-                    soft_fail(f"eval task trajectory archive failed for genid {genid}: {e}",
-                              event_path=paths.events_path(self.output_dir),
-                              event_type="eval_task_trajectory_archive_failed",
-                              outer=outer, genid=str(genid))
-                return child.value.score
+                    child = self.eval_runner(plan=plan_result, parent=initial,
+                                             genid=genid, base=eval_base)
+                    if child is None:
+                        # A None child used to vanish: run_eval_rounds only counts
+                        # non-None scores, so the batch silently degraded to n_valid=0
+                        # (``supernode_eval_degraded``) with no evidence of WHY.
+                        self.log_event({"type": "eval_round_empty", "outer": outer,
+                                        "sample": sample, "genid": genid,
+                                        "eval_base": eval_base})
+                        return None
+                    if child.value.score is None:
+                        self.log_event({"type": "eval_round_no_score", "outer": outer,
+                                        "sample": sample, "genid": genid,
+                                        "score_status": child.value.score_status})
+                        return None
+                    # Archive the eval round's task trajectory through the SAME
+                    # pipeline as the main line (redaction + llm_calls sidecar).
+                    # The eval round is not a decision generation, so an archive
+                    # failure is advisory (soft_fail) — unlike the main line's
+                    # hard-fail — but it must SPEAK, never vanish (field audit
+                    # small_1030_095410: the fixed-root eval's only process
+                    # evidence lived in the ephemeral work dir).
+                    try:
+                        # D1: the eval round's records live in their OWN tree —
+                        # the outer label carries the instance suffix so the
+                        # archive lands at trajectory/outer_<N>_eval/
+                        # eval_outer<N>_s<M>/task.jsonl (+ sidecar), parseable by
+                        # the same readers as the main line.
+                        trajectory.collect(child.meta.get("run_dir", ""), f"gan_{genid}",
+                                           self.output_dir, f"{outer}_eval", genid)
+                    except Exception as e:
+                        soft_fail(f"eval task trajectory archive failed for genid {genid}: {e}",
+                                  event_path=paths.events_path(self.output_dir),
+                                  event_type="eval_task_trajectory_archive_failed",
+                                  outer=outer, genid=str(genid))
+                    return child.value.score
+                finally:
+                    # The eval round's work dir is ephemeral exactly like the
+                    # main line's: the keep_workdirs branch never covered eval
+                    # genids, so work/eval_outer<N>_s<M> survived every run by
+                    # luck (docs/17 §9.2/§15). Cleanup runs AFTER the archive
+                    # attempt (collect reads the run_dir) and on EVERY exit --
+                    # empty child, scoreless child, archive failure, and an
+                    # eval_runner raise (the finally still runs). Like the main
+                    # line it never raises: prune records survivors instead.
+                    if not self.keep_workdirs:
+                        prune.safe_rmtree(
+                            paths.work_dir(self.output_dir, genid),
+                            label=f"work dir cleanup (eval genid {genid})",
+                            event_path=paths.events_path(self.output_dir))
 
             # preserve the main-line task HEAD; the rounds move it to eval tips
             task_root = self._task_root()
