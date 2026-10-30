@@ -75,7 +75,7 @@ loop:
 # ---------------------------------------------------------------------------
 tree:
   branch_limit: 2               # B: max children per node
-  depth_limit: 5                # D: max depth
+  depth_limit: 10               # D: max depth
   num_parents: 1                # >1 enables crossover (DAG, shallow config merge)
   selection: ucb                # ucb | best | latest
   ucb_c: 1.0                    # exploration constant

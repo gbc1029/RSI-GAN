@@ -258,18 +258,23 @@ class _TaskBrokerState:
             raise RuntimeError(f"task questions file is missing: {questions_path}")
 
         launch_num_samples = int(self.config["num_samples"])
+        grading_subset = str(self.config["subset"])
         if fixed_eval:
             seed_path = os.path.join(str(self.config["output_dir"]),
                                      "ckpt", "sample_seed.json")
             try:
                 with open(seed_path, "r", encoding="utf-8") as f:
-                    eval_ids = list(json.load(f).get("eval_anchor_ids") or [])
+                    seed_info = json.load(f)
+                eval_ids = list(seed_info.get("eval_anchor_ids") or [])
             except (OSError, TypeError, ValueError) as exc:
                 raise RuntimeError(
                     f"fixed-root eval seed is unavailable: {seed_path}") from exc
             if not eval_ids:
                 raise RuntimeError("fixed-root eval has no eval_anchor_ids")
             launch_num_samples = len(eval_ids)
+            grading_subset = str(
+                seed_info.get("eval_subset") or self.config["subset"]
+            )
 
         total_timeout = int(self.config["timeout"])
         stage_timeout = max(1, total_timeout // 2) if domain == "imo_proof" else total_timeout
@@ -406,6 +411,8 @@ class _TaskBrokerState:
                     sandbox_etc_dir=str(self.config["sandbox_etc_dir"]),
                     sandbox_profile=dict(self.config["sandbox_profile"]),
                     num_workers=int(self.config["harness_num_workers"]),
+                    dataset_root=str(self.config["repo_root"]),
+                    subset=grading_subset,
                 )
                 output = f"{output}\n[imo_proof_grading]\n{grading_output}"
                 rc = grading_rc

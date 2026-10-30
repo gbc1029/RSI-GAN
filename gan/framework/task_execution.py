@@ -2497,6 +2497,86 @@ def _imo_proof_generation_output_error(
     return None
 
 
+def _prepare_imo_proof_grading_input(
+    predictions_dir: str,
+    run_dir: str,
+    run_id: str,
+    dataset_root: str,
+    subset: str,
+    expected_owner_uid: Optional[int],
+    expected_owner_gid: Optional[int],
+) -> str:
+    """Join task predictions with trusted proof metadata for the grader only."""
+    predictions_path = os.path.join(predictions_dir, "predictions.csv")
+    predictions_fd = _open_grading_output(predictions_path, expected_owner_uid)
+    try:
+        with os.fdopen(predictions_fd, "r", encoding="utf-8", newline="") as stream:
+            predictions_fd = -1
+            predictions = pd.read_csv(stream, dtype=str, keep_default_na=False)
+    finally:
+        if predictions_fd >= 0:
+            os.close(predictions_fd)
+
+    dataset, question_id_col, ground_truth_key = load_dataset_frame(
+        dataset_root, "imo_proof", subset,
+    )
+    required = {
+        question_id_col, "Problem", ground_truth_key, "Grading guidelines",
+    }
+    missing_columns = sorted(required - set(dataset.columns))
+    if missing_columns:
+        raise RuntimeError(
+            f"trusted imo_proof dataset is missing columns: {missing_columns}"
+        )
+    if question_id_col not in predictions.columns or "prediction" not in predictions.columns:
+        raise RuntimeError("proof predictions are missing id or prediction columns")
+
+    predictions = predictions[[question_id_col, "prediction"]].copy()
+    predictions[question_id_col] = predictions[question_id_col].astype(str)
+    if predictions[question_id_col].duplicated().any():
+        raise RuntimeError("proof predictions contain duplicate question ids")
+
+    trusted = dataset.copy()
+    trusted[question_id_col] = trusted[question_id_col].astype(str)
+    if trusted[question_id_col].duplicated().any():
+        raise RuntimeError("trusted imo_proof dataset contains duplicate question ids")
+    trusted = trusted.set_index(question_id_col, drop=False)
+    prediction_ids = predictions[question_id_col].tolist()
+    missing_ids = [qid for qid in prediction_ids if qid not in trusted.index]
+    if missing_ids:
+        raise RuntimeError(
+            f"proof predictions contain ids outside trusted subset {subset!r}: "
+            f"{missing_ids[:3]}"
+        )
+
+    grading_input = trusted.loc[prediction_ids].reset_index(drop=True)
+    grading_input = grading_input.drop(columns=["prediction"], errors="ignore")
+    grading_input["prediction"] = predictions["prediction"].tolist()
+
+    grading_input_dir = os.path.join(
+        run_dir, "input", f"{run_id}_proof_grading",
+    )
+    if os.path.lexists(grading_input_dir):
+        raise RuntimeError(
+            f"proof grading input path already exists: {grading_input_dir}"
+        )
+    os.makedirs(grading_input_dir, mode=0o755)
+    grading_input_path = os.path.join(grading_input_dir, "predictions.csv")
+    grading_input.to_csv(grading_input_path, index=False)
+    if expected_owner_uid is not None:
+        os.chown(
+            grading_input_dir, int(expected_owner_uid), int(expected_owner_gid),
+            follow_symlinks=False,
+        )
+        os.chown(
+            grading_input_path, int(expected_owner_uid), int(expected_owner_gid),
+            follow_symlinks=False,
+        )
+    os.chmod(grading_input_dir, 0o755)
+    os.chmod(grading_input_path, 0o644)
+    return grading_input_dir
+
+
 def run_imo_proof_grading(
     python: str,
     run_dir: str,
@@ -2519,6 +2599,8 @@ def run_imo_proof_grading(
     sandbox_etc_dir: Optional[str] = None,
     sandbox_profile: Optional[Dict[str, Any]] = None,
     num_workers: int = 5,
+    dataset_root: Optional[str] = None,
+    subset: str = "",
 ) -> Tuple[int, str]:
     """Grade generated proofs through the same scoped, sandboxed task path."""
     predictions_dir = os.path.join(run_dir, "outputs", run_id)
@@ -2527,6 +2609,17 @@ def run_imo_proof_grading(
     )
     if generation_error:
         return 1, f"[imo_proof_generation_error] {generation_error}"
+    if not dataset_root:
+        raise RuntimeError("imo_proof grading requires a trusted dataset root")
+    grading_input_dir = _prepare_imo_proof_grading_input(
+        predictions_dir,
+        run_dir,
+        run_id,
+        dataset_root,
+        subset,
+        expected_owner_uid,
+        expected_owner_gid,
+    )
     _require_sandboxable_proofgrader()
     grading_run_id = f"{run_id}_proof_grading"
     _prepare_harness_output_dir(
@@ -2568,7 +2661,7 @@ def run_imo_proof_grading(
         sandbox_etc_dir=sandbox_etc_dir,
         sandbox_profile=sandbox_profile,
         agent_path=agent_path,
-        proofs_dname=predictions_dir,
+        proofs_dname=grading_input_dir,
         num_workers=num_workers,
     )
     if rc != 0:
