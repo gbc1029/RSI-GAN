@@ -768,3 +768,81 @@ run_tool_regression 七套件 + test_frozen 改动后全绿。
 - task_agent 两处插值静态形状验证（契约段存在、旧 "complete final answer" 措辞移除）；
 - 七套件 + test_frozen + 本地 D123 全绿。
 - **待实跑确认**：契约段在真实 child 指令中的出现位置与 polyglot 修复轮不再重贴 diff。
+
+## 13. 冒烟 smoke_1030_195145 归因与修复：/etc 投影子级镜像漂移 + prune 清理崩溃（2026-10-30 第五批）
+
+### 13.1 现象
+
+`NUM_SAMPLES=5 OUTER=1 INNER=3 EVAL_ANCHOR_K=5` 冒烟 rc=1：
+`trajectory.collect` 抛 "no task trajectory sources … (no records parsed)"，随后
+`prune.safe_rmtree` 处 `UnboundLocalError: cannot access local variable
+'first_err'`；verify_smoke_eval 4 FAIL（harness n=1 / 无 supernode val_mean /
+无 driver_done / 无 scores 行）。
+
+### 13.2 归因链（四层，全部有实证）
+
+1. **任务子代理全部即死（根因）**：`runs/0/eval_failures.jsonl` + 5 个
+   `failure_*.log` 显示 5 题同一异常 `TaskAgent sandbox /etc contains an unsafe
+   directory: alternatives`（抛在 harness 进程 `_sandbox_command` 预检，bwrap
+   未启动；每题 ~4s，零 task `llm_call`、cm sidecar "no seam events"、5 空
+   patch、`chat_history_*` 存在但零记录）。机制：`5f95d1b`（java-N-openjdk
+   投影）与 `1ee3a48`（alternatives 投影）只扩展了 root 侧
+   `sandbox_etc.validate_sandbox_etc`（`_JAVA_ETC_RE`/`_ALT_RE` 分支），
+   **未同步** `domains/harness.py:_require_projected_etc` 的子级镜像
+   （白名单仍 `{"ssl","ssl/certs"}`）——沙箱刻意不含 `gan/`（docs/10 §11.0.1），
+   镜像必须双份维护；probe（root 侧校验）通过、子级预检 fail-closed。
+   `1ee3a48` 的本地验证只跑了 root 侧 validator，镜像从未被真实投影过一遍。
+2. **归档失败显式化（设计行为，非 bug）**：`trajectory.collect` 冻结契约——
+   chat_history 文件存在但零记录 = 评测者失去证据 = pipeline 故障 → genid 0
+   走 `_finalize_invalid_node`。
+3. **单代失败放大为 rc=1（次生 bug，304f61d 引入）**：root-owned docker 载荷
+   `gan_polyglot_0/`（既存状态，095410 run 同样存在，曾被
+   `ignore_errors=True` 静默容忍）使 `shutil.rmtree` 抛异常；
+   `prune.py:33` `except Exception as first_err: pass` 在块尾按 Python 语义
+   解绑 `first_err` → 第 46 行 UnboundLocalError → "never raises" 契约破坏 →
+   outer worker 崩溃，scores/inner_invalid/checkpoint/supernode 评测/
+   driver_done 全部未达；work/ 诊断现场被部分销毁（eval_failures 靠
+   `runs/0/` 归档副本幸存——`_dump_failure_log` 的 runs/<genid>/ 拷贝是本轮
+   定罪的唯一完整证据源）。
+4. **P3 遗留（未修，卫生项）**：polyglot docker-broker 载荷提取后无属主
+   归一化（imo_proof 路径 task_execution.py:2844 有先例），每个 run 留
+   root-owned work/ 残留；P2 修复后降级为 `rmtree_failed` 记录，不再致命。
+
+### 13.3 修复
+
+- **P1 `domains/harness.py`**：`_require_projected_etc` 拆出可离线测试的
+  `_audit_projected_etc_tree(root, root_uid)`；镜像扩展 `_SANDBOX_ETC_JAVA_RE`
+  （java-N-openjdk 子树：0444 普通文件）与 `_SANDBOX_ETC_ALT_RE`
+  （alternatives 条目：**强制符号链接** + uid + nlink=1），目录 0555 root。
+  注释明示：任何 builder 侧新投影必须同步此镜像。
+- **P2 `utils/prune.py`**：except 块内定格 `first_err_desc =
+  f"{type(exc).__name__}: {exc}"`（附 Python as-name 解绑 gotcha 注释），
+  detail 行引用该字符串——恢复 never-raises 契约。
+- **新本地守卫（gitignored）**：`scripts/local/test_sandbox_etc_mirror.py`
+  ——真实 `create_sandbox_etc` 构建投影（本轮 189 条 + java-17-openjdk）→
+  子级镜像审计必须通过（5f95d1b/1ee3a48 均会被它拦下）+ rogue 目录 /
+  alternatives 混入普通文件 / 缺必需文件三组拒绝；
+  `scripts/local/test_prune_safe_rmtree.py` —— clean sweep / file-as-path
+  （NotADirectoryError 记录不抛）/ mock 部分清扫（survivors 入记录）/
+  缺路径 no-op。
+
+### 13.4 过程事故与修正（gcc-13）
+
+漂移守卫初版向 `alternatives/` 种名为 `cc` 的普通文件——该名字在真实注册表
+中**已存在且为符号链接**（cc → /usr/bin/gcc → gcc-13 →
+x86_64-linux-gnu-gcc-13），`open(...,"w")` 跟随三层链接把宿主机编译器驱动
+截断为 14 字节并 chmod 0444（root DAC_OVERRIDE 无视 0555 目录权限位）。
+经 `apt-get install --reinstall gcc-13-x86-64-linux-gnu`（网络源，非 docker
+镜像）还原，gcc/cc 链功能验证通过。测试改为**非碰撞名** +
+`O_CREAT|O_EXCL|O_NOFOLLOW` 创建——测试代码自身遵守构建器的防跟随纪律。
+
+### 13.5 验证与关联记录
+
+- 新守卫 2 套件 8/8 PASS；test_frozen PASS；test_d123_fixes 27/27；
+  test_venv_bin_path ALL PASS。
+- `test_polyglot_sandbox_write` V4 为**既有**环境依赖失败：`b213b31` 给
+  `_sandbox_command` 加挂载检查后，V4 在沙箱外构造 bwrap 命令必触发
+  "requires the sanitized /etc projection"（对照 095410 基线 ckpt 同样失败），
+  与本批改动无关，留待单独处理。
+- 复跑确认点：task 阶段出现 task-role `llm_call` 事件 / `[timing] question`
+  行、且全程无 "unsafe directory"（本节修复的端到端判据）。

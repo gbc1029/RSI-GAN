@@ -27,11 +27,16 @@ def safe_rmtree(path: str, *, label: str,
     """
     if not os.path.exists(path) and not os.path.islink(path):
         return True
+    first_err_desc = ""
     try:
         shutil.rmtree(path)
         return True
-    except Exception as first_err:
-        pass
+    except Exception as exc:  # noqa: BLE001 -- recorded below, never re-raised
+        # Do NOT keep the exception object past this block: Python unbinds the
+        # `as` name on block exit, and the old `first_err` reference at the
+        # `detail` line raised UnboundLocalError -- turning this never-raise
+        # helper into a run killer (smoke_1030_195145, docs/17 §13).
+        first_err_desc = f"{type(exc).__name__}: {exc}"
     survivors: List[str] = []
     for current, dirs, files in os.walk(path, topdown=False):
         for name in list(files) + list(dirs):
@@ -43,7 +48,7 @@ def safe_rmtree(path: str, *, label: str,
                     os.remove(target)
             except OSError:
                 survivors.append(target)
-    detail = (f"{type(first_err).__name__}: {first_err}; "
+    detail = (f"{first_err_desc}; "
               f"survivors: {sorted(survivors)[:10]}"
               + (f" (+{len(survivors) - 10} more)" if len(survivors) > 10 else ""))
     if event_path:
