@@ -554,3 +554,109 @@ agent 侧使用错误或设计行为（审查会话记录），本轮不动。
 - **配套**：`run_tool_regression.py` 七套件 + `test_frozen.py` 改动前后各跑一次
   全绿；AGENTS.md 同步四处表述（沙箱 /etc 投影、评测轮归档、渲染标记 + UTC
   时钟、回归套件数 six→seven）。
+
+## 10. 第二批修复：清理策略 / 工具调用分类 / outer-eval 归档树 / 单 score 分析（2026-10-30）
+
+承接 §9（第一四处修复，commit 5f95d1b）。本轮四项 + 一项留档；全部离线验证，
+run_tool_regression 七套件 + test_frozen 改动后全绿。
+
+### 10.1 清理策略修正（F7）
+
+- **表现与根因**：`work/<genid>/` 残留 `gan_polyglot_0/` root 属主载荷（root 0700/0600），
+  loop 进程（ganop）永远删不掉。机制：`domains/polyglot/utils.py:copy_from_container`
+  的**目录级**提取走 `tar.extractall`——tarfile 保留成员 uid/gid，root 相位提取时容器内
+  root 属主被原样带到宿主；单文件路径（`open().write()`）不受影响（agent_evals 为
+  ganop 属主即证）。旧清理两端都错：主路径 `rmtree(ignore_errors=True)` 静默留残渣；
+  `prepare_run_dir` 的裸 `rmtree` 会直接杀死任务运行。
+- **修改（两层）**：
+  1. 写入侧——`copy_from_container` 提取后，root 相位（`euid==0`）把提取树属主归一到
+     最近非 root 祖先（即 run 属主），`_normalize_extracted_ownership`，advisory；
+     非 root 提取为 no-op。此后新世代不再产生不可清载荷。
+  2. 清理侧——新增 `utils/prune.py:safe_rmtree`：整树 rmtree；失败则自深向浅尽力清扫
+     可删部分，幸存路径写入记录（有事件路径时 `soft_fail`，事件 `rmtree_failed`，
+     列前 10 个幸存者；否则 stderr）——**永不 raise**。替换三处调用点：
+     `loop._finalize_invalid`、主成功路径（`keep_workdirs=false`）、
+     `task_execution.prepare_run_dir`（记录后继续重建，逐文件冲突走既有任务失败记账）。
+
+### 10.2 工具调用分类与反馈（W2）
+
+- **表现**：`"tool_name": null`（JSON null 值）穿透旧的**键存在性**检查被当作合法调用
+  分发 → `Tool 'None' not found` ×7 → repeat-break。同一响应里 `{response:…, tool_name:null,
+  tool_input:null}`（正常答案）与 `{tool_name:null, tool_input:{…}}`（有意图无目标）被
+  混为一谈。
+- **修改**（`agent/llm_withtools.py`，新增 `_nullish` 空值判定：None / 缺键 / 空串 /
+  空容器 / `null|none|nil|n/a|na|nan|undefined|未指定|无` 大小写不敏感同义词）：
+  - name 与 input **均 nullish** → 答案载荷（不计数不分发）；
+  - name nullish 而 **input 有内容** → 计 malformed，块级原因（"tool_input present but
+    tool_name is null/missing — name the tool you intend to call"）随三元组返回；
+  - name 非空而 **input nullish/缺失** → **正常调用**（input={}）：无参工具直接执行；
+    有必参工具得到 dispatch 级结构化缺参反馈（`missing required parameter(s): …`），
+    不占 malformed 击数；
+  - unwrap（response 包裹调用）容错保留，同规则适配；JSON 解析失败 → malformed。
+  - 反馈消息携带首个块级原因 + 期望形态示例（`"tool_name": "...", "tool_input": {...}}`），
+    有界（≤2 次）与三击终局结构不变。附带效果：`Tool 'None' not found` 对 null 名不可达。
+- **验证**：分类 12 例 + 分发两级（无参执行 / 缺参结构化报错）单测全过；
+  `scripts/local/test_d123_fixes.py` 的旧规则断言（"嵌套缺 input 不解包"）已更新为新规则。
+
+### 10.3 outer-eval 记录归档树修正（D1，接 §9.2）
+
+- §9.2 把评测轮 task 轨迹归档进了**主线** `outer_<N>` 树（`trajectory/outer_1/
+  eval_outer1_s1/`），planner 会话也一直落在主线 seat 目录——与"评测轮记录完整保存在
+  `outer_N_eval` 且可解析"的期望不符，且主线 seat 目录被 eval 会话污染（W5 隔离瑕疵）。
+- **修改**：轨迹根改为**实例标签派生**（`outer_<标签>`，标签 = 实例名去掉 `outer_` 前缀）：
+  - 主线实例 `outer_N` → `outer_N`（布局不变）；评测实例 `outer_N_eval` → `outer_N_eval`
+    ——`role_process._prepare_paths` 的预建目录行为**本来就按此规则**（此前被视为解析
+    分叉 F2，本修使其成为规范，预建树由幻影空树变为真实树）；
+  - 三个写出方对齐同一标签：`BaseRole.traj_outer`（会话写入 `session_trajectory`）、
+    `BaseRole` 自席读面（`session_outers` 以标签声明；带后缀实例只读自己的树）、
+    `role_broker.launch`（ACL 写根 `trajectory/<traj_root>/roles/<role>/<seat>`）；
+  - `loop.run_once` 的评测轮 collect 以 `f"{outer}_eval"` 为 outer 标签 → 落
+    `trajectory/outer_<N>_eval/eval_outer<N>_s<M>/task.jsonl`（+ `.llm_calls.jsonl`
+    sidecar），与主线同管线同 schema，**可解析性不变**；软失败事件不变；
+  - 消费方核对：`paths` 层对 outer 为纯字符串拼接；`session_universe`/
+    `outer_session_index`/`session_label`/`_declared_outers` 全部字符串安全；
+    `read_session_trajectory` 仅自席可达（self_improve 声明是唯一消费点）；
+    genid 命名空间不相交，主线消费者无感。
+
+### 10.4 得分分析工具：单 score（F8 本轮范围）
+
+- **修改**（仅 `analysis/gan_scores_extract.py`；**在线评分零改动**）：
+  - 删除本地 a/b 级联（八条正则 + `lenient_verdict`）与 strict/lenient 双轨；
+    每 run 单一 `score`（列/变量/曲线只称 score），`method` 列保留作逐行溯源；
+  - score 按 `report.json.score_mode`（运行时自述）分派：`docker_resolved` → 容器
+    resolved；`lenient` → **与在线同一** `gan.framework.verdict.parse_verdict`
+    （labels=accept/reject）重算——离线==在线由构造保证；其余（`strict`，即 search
+    与其他 label 域现状）→ 逐字硬匹配；未解析计错、分母不动；
+  - 输出对齐：CSV 列 `run,genid,question_id,truth,score,method,raw_head`；REPORT 删
+    "严格 vs 宽松重判"节（改单行"总体"+ 二项检验），逐题表/每代表/跨运行表/结论/图例
+    全部去 strict/lenient 措辞；significance 仅 `{run}:score` 两两对比（全零占位伪显著
+    p 值消失）；控制台 `[OK] … score k/n (pct)`；
+  - `report_crosscheck` 语义升级：由"paper 已知漂移诊断"变为全域**离线==在线真探针**
+    （失配即实现漂移报警）。
+- **验证**：polyglot 实跑 `small_1030_095410`——逐 gen score == len(report.resolved)
+  （1/5、2/5、1/5，总 4/15 与 broker 一致），产物零 strict/lenient 字样；paper 分支以
+  `_lenient_verdicts`（在线实现）为参照的逐行等价单测通过；search 分支逐字匹配单测通过。
+- **命名纪律说明**：工具内残留的 "lenient"/"strict" 字样仅为 `score_mode` 运行时值的
+  比对与注释（数据名，非本工具的标注）。
+
+### 10.5 search 在线评分规则变更（延后实施，留档）
+
+本轮不改在线代码。下一轮：`search_arena` 在线评分由逐字硬匹配改为正则提取（与 paper
+方法同构）。落地素材：
+- 已核实事实：数据集 winner 词表恰为 `{model_a, model_b}`（train 50/50，无平局标签）；
+  平局/未解析 → 计错、分母/coverage 不动。
+- 级联草稿（原离线实现，本轮删除后在此留档；顺序即优先级，先短输入精确后全文检索）：
+  1. `model_exact` `^\s*model[_\s-]*([ab])\s*\.?\s*$`（≤8 字符输入）
+  2. `bare` `^\s*([ab])\s*\.?\s*$`（≤8 字符输入）
+  3. `dict_verdict` `['\"]?verdict['\"]?\s*[:=]\s*['\"]?([ab])\b`
+  4. `verdict_line` `\bverdict\b\s*[:\-]\s*(?:response\s*)?([ab])\b`
+  5. `response_better` `\bresponse\s+([ab])\b(?:\s+is)?\s+(?:the\s+)?(?:clearly\s+|significantly\s+|substantially\s+|more\s+)?better`
+  6. `wins` `\b([ab])\s+wins\b`
+  7. `answer` `\b(?:answer|choice)\s*[:\-]?\s*(?:is\s*)?(?:response\s*)?([ab])\b`
+  8. 兜底 `model_mention` `\bmodel[_\s-]*([ab])\b`；否则 unparsed（计错）。
+- 落地步骤：① `gan/framework/verdict.py` 增 `parse_choice(text)`（移植上述级联，返回
+  字母+method）；② `domains/report.py` verdict 钩子按域分派，search 解析字母 L →
+  prediction 置 `model_{L}` 对接 winner 词表；③ 离线工具**零改动**（score_mode 分派
+  自动跟随）；④ AGENTS.md "Offline analysis tools" 一节届时同步刷新。
+- 已知同类未修：rust 链接器 `cc` 缺失（沙箱）；`scripts/local/test_d123_fixes.py` 的
+  D2 pure-runtime 断言为存量漂移（与本轮无关，未动）。

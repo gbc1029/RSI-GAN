@@ -174,6 +174,18 @@ class Role(AgentSystem):
                 self.outer = int(str(instance).split("_")[1])
             except (IndexError, ValueError):
                 self.outer = None
+        # Trajectory-root label derived from the FULL instance tag (D1, field
+        # audit small_1030_095410): main instances "outer_N" -> "N" (the
+        # historical layout), suffixed instances "outer_N_eval" (outer-select
+        # eval rounds) -> "N_eval", so the eval round's planner/evaluator
+        # sessions and the archived task child land in their own
+        # trajectory/outer_N_eval/ tree instead of the main-line seat dir.
+        # Writers (session_trajectory) and the self seat's own-session read
+        # face (session_outers) both resolve through this label.
+        self.traj_outer = None
+        if instance and str(instance).startswith("outer_"):
+            label = str(instance).split("_", 1)[1]
+            self.traj_outer = label or None
         self.prompt_text = prompt_text or ""
         # B46 step-1 gate: design saves go through the run's WriterToken
         # (threaded from build_gan_loop; None keeps read-only stores working).
@@ -211,7 +223,8 @@ class Role(AgentSystem):
 
     def session_trajectory(self, genid: Any = None) -> str:
         """JSONL trajectory file for one session (outer-level if genid is None)."""
-        return paths.session_traj_file(self.output_dir, self.outer, genid, self.role,
+        outer_label = self.traj_outer if self.traj_outer is not None else self.outer
+        return paths.session_traj_file(self.output_dir, outer_label, genid, self.role,
                                        attempt=getattr(self, "attempt_id", None),
                                        seat=self.seat)
 
@@ -480,12 +493,14 @@ class Role(AgentSystem):
         # Own-session visibility (read_session_trajectory face): this outer +
         # the previous outer (L65 ruling) — declared here like
         # trajectory_genids, never derived inside the tool. None (no outer
-        # yet) keeps the tool's legacy current-outer derivation.
+        # yet) keeps the tool's legacy current-outer derivation. Labels are
+        # the instance-derived trajectory labels (D1): main "N", eval rounds
+        # "N_eval"; a suffixed (eval-round) instance reads ONLY its own tree.
         session_outers = None
-        if isinstance(self.outer, int):
-            session_outers = {self.outer}
-            if self.outer > 1:
-                session_outers.add(self.outer - 1)
+        if self.traj_outer is not None:
+            session_outers = {self.traj_outer}
+            if isinstance(self.outer, int) and self.outer > 1:
+                session_outers.add(str(self.outer - 1))
         tok_access = (set_access_context(broker, self.role, self.access_key("self"),
                                          trajectory_genids=trajectory_genids,
                                          seat="self_improve",

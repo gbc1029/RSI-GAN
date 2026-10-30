@@ -769,7 +769,12 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
     """
     run_dir = os.path.join(node_dir, "repo")
     if os.path.exists(run_dir):
-        shutil.rmtree(run_dir)
+        # Cleanup that records instead of killing the task run: residue the
+        # sweep cannot remove (e.g. root-owned eval payloads) is named in the
+        # record; the rebuild proceeds and any per-file collision surfaces
+        # through the ordinary task-failure accounting (utils/prune policy).
+        from utils.prune import safe_rmtree
+        safe_rmtree(run_dir, label=f"run dir rebuild cleanup ({run_dir})")
     os.makedirs(run_dir, exist_ok=True)
 
     for name in _RUNTIME_FILES + _HARNESS_FILES:

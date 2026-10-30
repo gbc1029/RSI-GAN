@@ -136,22 +136,26 @@ with a GAN-native data layer.
 - **`gan_scores_extract.py` — score extraction + analysis** (per run:
   `scores_extract.csv` / `REPORT.md` / `significance.txt` / `progress.png`).
   Reuses `analysis/analysis_utils.py` (`save_significance_tests`,
-  `compute_bootstrap_ci`) verbatim. Conventions: **strict** = the harness's
-  exact lowercase string match against the dataset `winner`
-  (`report.json.total` excludes invalid samples when `coverage<1` — crosscheck
-  counts, not denominators); **lenient** = offline verdict re-parse from the
-  raw prediction text with a per-row parse-method audit trail
-  (dict_verdict/verdict_line/response_better/bare/model_exact/…). NOTE since
-  2026-10-27: the ONLINE score of `paper_review` is itself the lenient verdict
-  (`domains/report.py:_LENIENT_VERDICT_DOMAINS`; `report.json.score_mode` says
-  which rule ran, `overall_accuracy_strict` keeps the strict echo), so the
-  offline "strict" column no longer equals `report.json.overall_accuracy` for
-  that domain — it is now the "what strict matching would have said" diagnostic;
-  ground truth
-  is auto-disambiguated by matching every observed `question_id` against the
-  `domains/<domain>/dataset*.csv` files. Per-generation AND per-question tables
-  (systematic-error localization), evaluator `predicted_score` calibration, and
-  the significance file only include runs with n≥2 samples (n=1 runs are noise).
+  `compute_bootstrap_ci`) verbatim. ONE score per run (named exactly `score` —
+  per-row 0/1 + a `method` provenance column), computed by the run's OWN
+  online rule as self-described by `report.json.score_mode`:
+  `docker_resolved` → the broker's container verdicts; `lenient` → verdict
+  regex extraction via the SAME `gan.framework.verdict.parse_verdict`
+  (paper_review; offline == online by construction); anything else
+  (`strict`) → exact lowercase label match (search_arena and the other label
+  domains, the current online rule). Undecided parses count as wrong; the
+  denominator never shrinks. Because the offline score reuses the online
+  rule, `report_crosscheck` (recomputed vs report.json `total_correct`) is a
+  true offline==online probe — a mismatch means implementation drift, not a
+  convention difference. Ground truth is auto-disambiguated by matching every
+  observed `question_id` against the `domains/<domain>/dataset*.csv` files.
+  Per-generation AND per-question tables (systematic-error localization),
+  evaluator `predicted_score` calibration, and the significance file only
+  include runs with n≥2 samples (n=1 runs are noise). The search_arena online
+  rule change (regex extraction, paper-style) is DEFERRED — the draft cascade
+  and landing steps are archived in `docs/17_polyglot小规模实验轮修复.md` §10.5;
+  the offline tool needs NO change when it lands (score_mode dispatch follows
+  the runtime self-description).
 - **`gan_lineage_graph.py` — genealogy graphs + offline lineage audit** (per
   run: `lineage_inner_{lenient,strict}.png`, `lineage_outer_{lenient,strict}.png`,
   `lineage_audit.md`). Imports `analysis/visualize_archive.py:visualize_graph`
@@ -251,10 +255,10 @@ with a GAN-native data layer.
 |---|---|
 | `ckpt/` | recovery; per-run git tree `code/`; `code.json` manifest; `design/`; `design_drafts/<role>/outer_<N>_draft.json` (audit-only pre-heal self-design snapshots) |
 | `logs/` | `events.log`, `*_tree.log`, `*.log` |
-| `trajectory/outer_<O>/…` | role trajectories; outer-level files are attempt-keyed `<role>__<attempt>.log` (one per loop instance, assigned at role construction so content + stop records share one file; directly-constructed roles use `<role>.log`; readers merge canonical + attempt siblings, newest first; outer-select eval rounds archive the evaluated task child through the same `collect` pipeline as `eval_outer<N>_s<M>/task.jsonl` (+ sidecar), advisory on failure) |
+| `trajectory/outer_<O>/…` | role trajectories; the outer root label is INSTANCE-DERIVED (`outer_` + instance suffix: main `outer_N` → `outer_N`, outer-select eval instances `outer_N_eval` → their own tree — one rule shared by `BaseRole.traj_outer`, `role_process._prepare_paths` and the role broker's ACL write root); outer-level files are attempt-keyed `<role>__<attempt>.log` (one per loop instance, assigned at role construction so content + stop records share one file; directly-constructed roles use `<role>.log`; readers merge canonical + attempt siblings, newest first; outer-select eval rounds archive the evaluated task child through the same `collect` pipeline as `trajectory/outer_<N>_eval/eval_outer<N>_s<M>/task.jsonl` (+ sidecar), advisory on failure) |
 | `scores/scores.jsonl` | decision records (JSONL, one per row) |
 | `runs/<genid>/` | small evidence: `packet.json`, `eval.json`, `feedback_digest.md`, `patch_receipt.json`, `patch_proposed.diff` |
-| `work/<genid>/` | ephemeral, pruned |
+| `work/<genid>/` | ephemeral, pruned (`utils/prune.safe_rmtree`: best-effort sweep, failures RECORDED — `rmtree_failed` event with the survivor list — never raised; root-phase payload extraction normalizes ownership to the run owner so the tree stays cleanable) |
 | `workspaces/<role>/outer_<O>/` | per-role workspaces |
 
 `ckpt/checkpoint.json` = the latest checkpoint, overwritten atomically; outer boundaries also write an immutable `ckpt/outer_<N>.json` (archived as `ckpt/outer_<N>_<ms>.json` when the same outer re-runs). `restore_trees` appends an `op=reset` event instead of truncating the log.
@@ -263,7 +267,7 @@ with a GAN-native data layer.
 
 - Every agent writes structured **JSONL** (one file per instance) via shared `utils/trajectory_log.py`; `gan/framework/trajectory.py` (frozen — redaction is part of the trust anchor) archives + redacts task trajectories and also redacts role sessions (`Role.run`).
 - The visible set is explicit: `AccessContext.trajectory_genids` (evaluator = current + parent; planner = parent; self-improvement = this outer's generations + the direct parent). `read_trajectory` reads visible task generations; `read_session_trajectory` reads the role's own sessions over the declared `AccessContext.session_outers` (self seat: this outer + the previous; other seats never reach it — labels: genid-qualified for the current, `outer_<O>/`-prefixed for extras, ONE rule shared by materialization and the tool fallback).
-- The current generation's task trajectory is archived **before** evaluation; the fixed-root eval round's task trajectory is archived through the same `collect` pipeline when the round completes (advisory on failure — it is not a decision generation).
+- The current generation's task trajectory is archived **before** evaluation; the fixed-root eval round's task trajectory is archived through the same `collect` pipeline when the round completes, under the eval round's OWN tree (`trajectory/outer_<N>_eval/` — planner sessions included), advisory on failure — it is not a decision generation.
 - Rendered decision views mark their cap explicitly (`...[render truncated at max_chars=N]`): a capped VIEW is distinguishable from a short archive (field audit small_1030_095410 — a default-cap read was misread as truncated files). `ts` is authoritative; `time` is UTC for every writer (driver/loop/sandbox TZ views differ by design).
 
 ### Sandboxing & activation

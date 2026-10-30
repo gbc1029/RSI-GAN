@@ -110,6 +110,7 @@ def _receipt_for_evaluator(receipt):
         "patch_rejected": bool(cp.get("rejected_reason")),
     }
 from utils.soft_fail import soft_fail
+from utils import prune
 
 _MEASURED = ("ok", "partial")
 
@@ -1031,10 +1032,10 @@ class GanLoop:
         if outer is not None:
             node.meta["outer_id"] = outer
         self.task_tree.add_node(node)
-        try:
-            shutil.rmtree(paths.work_dir(self.output_dir, node.genid), ignore_errors=True)
-        except Exception as e:
-            soft_fail(f"work dir cleanup failed for genid {node.genid}: {e}")
+        prune.safe_rmtree(
+            paths.work_dir(self.output_dir, node.genid),
+            label=f"work dir cleanup (invalid genid {node.genid})",
+            event_path=paths.events_path(self.output_dir))
         self._write_invalid(node.genid, reason, detail, outer, inner)
         self.log_event({"type": "inner_invalid", "genid": node.genid,
                         "outer": outer, "inner": inner,
@@ -1644,8 +1645,13 @@ class GanLoop:
                 # small_1030_095410: the fixed-root eval's only process
                 # evidence lived in the ephemeral work dir).
                 try:
+                    # D1: the eval round's records live in their OWN tree —
+                    # the outer label carries the instance suffix so the
+                    # archive lands at trajectory/outer_<N>_eval/
+                    # eval_outer<N>_s<M>/task.jsonl (+ sidecar), parseable by
+                    # the same readers as the main line.
                     trajectory.collect(child.meta.get("run_dir", ""), f"gan_{genid}",
-                                       self.output_dir, outer, genid)
+                                       self.output_dir, f"{outer}_eval", genid)
                 except Exception as e:
                     soft_fail(f"eval task trajectory archive failed for genid {genid}: {e}",
                               event_path=paths.events_path(self.output_dir),
@@ -2931,7 +2937,10 @@ class GanLoop:
                 if child.meta.get("task_patch_files") and self.broker is not None:
                     self._resync_workspace(outer, child.meta["task_patch_files"])
                 if not self.keep_workdirs:
-                    shutil.rmtree(paths.work_dir(self.output_dir, genid), ignore_errors=True)
+                    prune.safe_rmtree(
+                        paths.work_dir(self.output_dir, genid),
+                        label=f"work dir cleanup (genid {genid})",
+                        event_path=paths.events_path(self.output_dir))
 
                 # sanitized diff summary + text digest for the previous round
                 # Ops-only: the report_path feed and the files bag are gone (the
