@@ -263,3 +263,40 @@ Dockerfile/setup 脚本里的 `python -m pip` 属镜像构建环境，不改。
 
 单次提交：`agent/tools/bash.py` + `gan/components/task/knowledge/environment.md`
 + 本节。回滚 = revert 单提交，无数据/格式迁移。
+
+## 12. 子进程 PATH 补 venv bin（`python` 可用化，本提交）
+
+### 12.1 设计
+
+§7 链路的闭环：`python` 缺失的唯一环节是 PATH 值——venv 根已随
+`python_prefix = realpath(sys.prefix)`（driver.py:783）绑入沙箱、
+`--copies` venv 的 `bin/python` 是真实文件，因此**零 symlink、零新 bind、
+bash 工具零改动**，只需在 task 子进程 env 构造处改 PATH 值：
+
+- 新 helper `task_execution._child_path_with_venv_bin(env, venv_prefix)`：
+  `venv_prefix/bin` 存在且含真实 `python` 文件、且尚不在 PATH 分量中时
+  **prepend**；否则原样返回（系统 python 启动驱动 / DGM-H 直连场景优雅
+  no-op）。prepend = venv 激活语义：venv 的 `pip`/`pytest` 一并就位；
+- **两个注入点**（env 值级修改，无新 env 通道键，不触碰 driver 的
+  `os.environ`——避免 venv bin 泄漏进 root 侧 git 等无关子进程）：
+  1. `task_execution.py` 直连 harness 路径
+     （`_run_harness_and_report_local`，`_task_safe_env` 之后）；
+  2. `task_broker.py` broker 子进程 env 构造（`base_env` 过滤后，
+     `python_prefix` 取自 broker config——与 bwrap 绑定同一值，保证沙箱内
+     可见）。role seat 子进程刻意不注入（role 无 bash 面）。
+
+### 12.2 冒烟发现与 erratum
+
+bwrap+setpriv 冒烟（venv 根 ro-bind、rsi_gan_task 身份）：`command -v
+python` → `venv_nat/bin/python`、`python -V` 3.12.3、`python -m py_compile`
+通过。**注意 `python3` 同样解析到 venv**（prepend 后 venv 的 `python3`
+优先）——§11.2 知识库笔记"python3 为系统"已同步修正为实际语义
+（`/usr/bin/python3` 仍可用）。
+
+### 12.3 验证
+
+- `scripts/local/test_venv_bin_path.py`（本地，不入库）**10/10**：prepend /
+  去重 / 空 PATH / 无 prefix no-op / 无 `python` 文件 no-op / 真实 venv
+  前置 / `_task_safe_env` 过滤保 PATH / broker 与直连两处 wiring 断言；
+- 沙箱冒烟见 §12.2；`run_tool_regression.py` 七套件 PASS；
+  `test_frozen.py` PASS；`test_bash_tool_one_shot.py` 复跑 ALL PASS。

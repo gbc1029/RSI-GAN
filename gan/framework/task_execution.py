@@ -107,6 +107,32 @@ def _task_parent_env(base_env: Dict[str, str]) -> Dict[str, str]:
             if key in _TASK_PARENT_ENV_NAMES or key.startswith("LC_")}
 
 
+def _child_path_with_venv_bin(env: Dict[str, str], venv_prefix: str) -> str:
+    """Prepend the bound venv ``bin`` dir so bare ``python`` resolves inside
+    the task sandbox.
+
+    The driver runs the venv interpreter WITHOUT activating it, so the
+    inherited PATH lacked the venv bin and agents kept hitting
+    ``python: command not found`` (docs/18 §7).  ``venv_prefix`` is the SAME
+    prefix the sandbox binds (driver's ``python_prefix`` = realpath(sys.prefix)),
+    so the prepended dir is guaranteed visible inside the sandbox.
+
+    Value-only change: no new env channel, no process-global os.environ swap.
+    No-op when the prefix carries no real ``python`` (system-python driver)
+    or the dir is already on PATH.
+    """
+    bin_dir = os.path.join(venv_prefix, "bin")
+    current = env.get("PATH", "")
+    if not os.path.isdir(bin_dir):
+        return current
+    if not os.path.exists(os.path.join(bin_dir, "python")):
+        return current
+    parts = [p for p in current.split(os.pathsep) if p]
+    if bin_dir in parts:
+        return current
+    return os.pathsep.join([bin_dir] + parts)
+
+
 def validate_domain_sandbox_profile(
     domain: str,
     profile: Any,
@@ -2397,6 +2423,8 @@ def _run_harness_and_report_local(
     broker_launch = expected_owner_uid is not None
     secure_launch = needs_sandbox_identity or broker_launch
     child_env = _task_safe_env(env)
+    child_env["PATH"] = _child_path_with_venv_bin(
+        child_env, os.path.realpath(sys.prefix))
     if needs_sandbox_identity and not broker_launch:
         child_env["PYTHONPATH"] = "/proc/self/cwd"
     lease = None

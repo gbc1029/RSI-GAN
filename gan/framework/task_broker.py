@@ -280,6 +280,10 @@ class _TaskBrokerState:
                 "PYTHONDONTWRITEBYTECODE",
             } or key.startswith("LC_")
         }
+        # Bare `python` must resolve inside the sandbox: prepend the bound
+        # venv bin (same prefix as the bwrap bind; docs/18 §7/§12).
+        env["PATH"] = tx._child_path_with_venv_bin(
+            env, str(self.config["python_prefix"]))
         env.update({
             "HOME": "/tmp",
             "PYTHONPATH": run_dir,
