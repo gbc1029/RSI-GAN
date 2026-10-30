@@ -1049,3 +1049,72 @@ x86_64-linux-gnu-gcc-13），`open(...,"w")` 跟随三层链接把宿主机编�
 - **待真实 run 确认**：① 评估器 blind 无预测时出现重试轮且预测在 blind 窗口内
   落账（digest 出现真实 delta 而非 "?"）；② reveal 阶段无 predicted_score 变动；
   ③ `gen_N.jsonl` 出现 `kind:"log"` 停止记录、attempt 兄弟文件不再增长。
+
+### 16.5 malformed 反馈携带病灶位置（本轮修正，离线验证、未提交）
+
+- **根因**：`check_for_tool_uses` 的失败分支是 `_note('invalid JSON')` 字面量——
+  `JSONDecodeError` 自带的 `msg/lineno/colno` 被整体丢弃；而同一次失败在会话结束
+  的预测抽取路径（`utils/common.extract_jsons`）里本有带位置的完整诊断
+  （`json_extract[tagged]: ... strict: Expecting ',' delimiter: line 3 column 4219`）
+  却只在日志里。工具循环的反馈文案由此只剩 "(invalid JSON)"。
+- **实证**：go__poker 两次收到笼统反馈后**逐字节原样重发**（4554 字符 ×2，
+  completion 1752/1753 tokens），第三次换 bash heredoc 仍带同一缺陷 → 3 击熔断；
+  对照 eval 轮 go__alphametics（笼统反馈下碰巧猜对、一次自愈）——笼统反馈下修复
+  靠运气。
+- **修复**：`_note(f"invalid JSON: {e.msg} (line {e.lineno} column {e.colno})")`
+  ——reason 经既有 `reason_note` 管道原样进入有界反馈轮，模型从"知道坏了"变为
+  "知道坏在哪、什么坏"。
+- **验证**：新守卫 `test_malformed_feedback_reason.py` **9/9**——两种实测病灶形状
+  （缺外层右括号 → "Expecting ',' delimiter (line/column)"；非法 `\'` 转义 →
+  "Invalid \\escape (line/column)"，与 gen1 java 实测诊断逐字吻合）+ 合法块 /
+  答案载荷 / null-name 分类三个不回归断言；`test_d123_fixes.py` 27/27、七套件、
+  `test_frozen` 全 PASS。
+- **边界说明**：本修复只改善 malformed 路径的反馈信息量；截断重试的文案分流
+  （"缺标签但配平" vs "真截断"）与"配平即捞回"仍属 §16.5 之外的独立设计裁决。
+
+### 16.6 LITELLM_LOCAL_MODEL_COST_MAP 不过 broker env 白名单（仅登记，未修）
+
+- **机制**：`run_gan.py:191` 在 root 侧 `setdefault(..., "True")`——litellm
+  **import 时**默认从 github 拉取价目表，该变量改为使用打包本地表（意图即
+  "no github egress"）。但到达 task child 的路上有四道关卡：broker env 过滤
+  （`task_broker.py`，仅放行 PATH/LANG/LC_*/TZ/PYTHONDONTWRITEBYTECODE——
+  **决定性丢失点**）、harness 白名单、task_worker 白名单均无此键；只有已被禁用
+  的直连路径白名单（`task_execution.py`）列了它。
+- **影响**：本轮无可观测后果（224 次 llm_call 全 200、时延正常——离线沙箱下
+  import 时的拉取尝试立即失败并回退；价目表只服务计价，task child 不计价）。
+  残余风险是 import 时出网尝试的确定性保证被放弃（行为随 litellm 版本漂移）。
+  该键非 GAN_*，`test_task_env_mirror` 守卫不覆盖（当时有意为之）。
+- **修法（暂不做）**：`task_broker.py` 白名单加键（决定性一处）+ 两份子级镜像
+  同步；可选把镜像守卫从 GAN_* 扩为全键超集（需处理
+  `GAN_SECURE_CAPABILITY_HOLDER` 这类下游自设反向差异）。
+
+### 16.7 截断重试反馈矩阵化（本轮修正，离线验证、同 16.5 一份提交）
+
+- **问题回顾**：判定（`should_retry_tool_use`/`_json_block_truncated`）可达形状
+  只有"最后一个 `<json>` 缺 `</json>`"；重试文案写死尺寸归因（"Output context
+  exceeded... too long"）——对 rust__doubly-linked-list 型（JSON 配平、只缺标签、
+  finish_reason=stop）是错误诊断，模型五次收缩输出（9969→543 字符）并切换
+  append 模式去适应一个不存在的尺寸约束 → `no_answer` → 空补丁。
+- **设计裁定**（本轮与方案评估共同确定）：判定器**零改动**；反馈按 finish_reason
+  矩阵化——`length` 保留现有尺寸归因文案（API 自己裁定的截断，缩块是唯一可行
+  建议）；**其余一切**（stop/content_filter/缺失）走单一中性提示，但**点名具体
+  结构假设**（最常见 = 缺 `</json>` 闭合标签且内容本身完好；其次 = 括号/引号
+  不配平）+ "re-emit the COMPLETE `<json>...</json>` block"（裸标签续写不可被
+  抽取正则捕获，必须整块重发）；**任意分支必带非归因长度行**
+  （`response length: N chars / M tokens`，tokens 缺失显式缺省、永不写 0），
+  让模型自行排除尺寸假设。5 连击终局消息**同矩阵**。
+- **实现**：文案单点构造器 `_truncation_feedback(info, response, terminal)`——
+  重试点与终局点共用一份 f-string（镜像漂移教训：两处独立维护必然分叉）；
+  顺带修正计数语义——工具成功派发后 `_ctx_retry_count` 清零（"consecutive" 回归
+  字面义，恢复过的会话不再继承旧击数）；`no_answer` 事件追加
+  `finish_reason`/`completion_tokens` 两个离线审计字段（additive）。
+- **与 16.5 的互补**：四个实测缺陷形状至此全部获得可执行反馈——缺右括号/非法
+  转义 → malformed 路径带病灶位置（16.5）；缺标签/真截断 → 重试路径按矩阵分流
+  （本节）。
+- **验证**：新守卫 `test_truncation_feedback.py` **19/19**（矩阵七格 + usage
+  缺失显式缺省 + 终局同矩阵 + 复位位置 init→increment→reset 源码序断言 +
+  no_answer 新字段）；`test_d123_fixes.py` 27/27、malformed 守卫 9/9、七套件、
+  `test_frozen` 全 PASS；`py_compile` 通过。
+- **待真实 run 确认**：① stop 型缺标签场景出现中性文案（含标签假设）且模型
+  整块重发而非缩块；② `no_answer` 事件带 finish_reason/completion_tokens；
+  ③ 混合场景（截断→成功→截断）计数从 1 起算。

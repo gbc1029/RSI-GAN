@@ -445,8 +445,15 @@ def check_for_tool_uses(response):
                 continue
             tool_uses.append({'tool_name': name,
                               'tool_input': {} if inp_null else inp})
-        except json.JSONDecodeError:
-            _note('invalid JSON')
+        except json.JSONDecodeError as e:
+            # Field audit smoke_1030_204345 (go__poker): the bare "invalid
+            # JSON" reason gave the model nothing to act on -- it re-emitted
+            # the byte-identical broken block twice and the loop died on the
+            # 3-strike breaker. The exception already knows the defect and
+            # its position; carry both into the bounded feedback turn so the
+            # model fixes THIS defect instead of guessing (the reason rides
+            # the feedback verbatim via `reason_note` below).
+            _note(f"invalid JSON: {e.msg} (line {e.lineno} column {e.colno})")
     return (tool_uses if tool_uses else None), malformed, reason
 
 def _emit(logging, trajectory_file, kind, **fields):
@@ -486,6 +493,57 @@ def _output_fields(info):
             if usage.get(key) is not None:
                 fields[key] = usage[key]
     return fields
+
+
+def _truncation_feedback(info, response, terminal: bool = False) -> str:
+    """Model-facing feedback for an output-incomplete response (docs/17 §16.7).
+
+    ONE construction point for the retry turn AND the forced-summary turn --
+    two call sites, one f-string (the mirror-drift lesson: separately
+    maintained copies drift). The JUDGMENT (should_retry_tool_use /
+    _json_block_truncated) is unchanged; only the model-facing ADVICE is
+    matrixed on finish_reason, which rides `info` at both call sites:
+
+    - "length": the API itself ruled the response cut by the output limit --
+      keep the size attribution verbatim (re-emitting the same content would
+      re-cut at the same place; shrinking is the only viable advice).
+    - anything else (stop / content_filter / missing): ONE neutral message
+      that names the two concrete hypotheses -- most commonly a missing
+      closing `</json>` tag with otherwise-complete content, or an unbalanced
+      brace/quote -- and requires a COMPLETE block re-emit (a bare `</json>`
+      continuation is not capturable: the extractor needs one paired block in
+      a single response). Non-attributive response-length line lets the model
+      rule the size hypothesis in or out itself (543 chars cannot be a limit
+      problem).
+
+    Length is factual only: chars always; completion_tokens when the usage
+    block exists -- absent stays absent, never 0 (the _output_fields
+    convention).
+    """
+    fr = (info or {}).get("finish_reason")
+    usage = (info or {}).get("usage")
+    ctok = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    length = f"response length: {len(response or '')} chars"
+    if ctok is not None:
+        length += f" / {ctok} tokens"
+    if fr == "length":
+        if terminal:
+            return ("Your last attempts were each cut off mid-JSON: "
+                    f"the response was too long. ({length}) Do NOT call any "
+                    "tool and do NOT paste file contents. Reply with a short "
+                    "final answer only.")
+        return (f"Error: Output context exceeded. Please try again. ({length})")
+    core = ("Error: the tool-call block in your last message was incomplete -- "
+            "either the response was cut by the output limit, or the block is "
+            "structurally incomplete (most commonly a missing closing `</json>` "
+            "tag with the content itself fine, or an unbalanced brace/quote). "
+            "Re-emit the COMPLETE <json>...</json> block; keep the content, do "
+            "not shorten it based on length alone.")
+    if terminal:
+        return (core + f" ({length}) Do NOT call any tool and do NOT paste file "
+                "contents. Reply with a short final answer only.")
+    return core + f" ({length})"
+
 
 def chat_with_agent(
     msg,
@@ -776,6 +834,11 @@ def chat_with_agent(
                     tool_output, tool_audit = process_tool_call(
                         tools_dict, tool_name, tool_input, timeout_s=tool_timeout_s)
                     num_tool_calls += 1
+                    # A dispatched call resets the output-incomplete retry
+                    # counter (docs/17 §16.7): "consecutive" is literal -- a
+                    # recovered session between failures must not inherit the
+                    # earlier strikes toward the 5-strike forced summary.
+                    _ctx_retry_count = 0
                     if tool_audit.get("wedged"):
                         _emit(logging, trajectory_file, "tool_wedged", tool=tool_name,
                               wedged=tool_audit["wedged"], wedge_limit=tool_audit["wedge_limit"])
@@ -850,16 +913,18 @@ def chat_with_agent(
                     # the session ends cleanly either way.
                     logging(f"Error: Output context exceeded {_ctx_retry_count}x "
                             f"in a row; forcing final summary.")
+                    _info = info or {}
+                    _usage = _info.get("usage") or {}
                     _emit(logging, trajectory_file, "no_answer",
-                          consecutive_truncations=_ctx_retry_count)
+                          consecutive_truncations=_ctx_retry_count,
+                          finish_reason=_info.get("finish_reason"),
+                          completion_tokens=_usage.get("completion_tokens"))
                     try:
                         response, new_msg_history, info = _counting_llm(
-                            msg=(system_msg
-                                 + "\n\n# Output context exceeded repeatedly\n"
-                                 "Your last attempts were each cut off mid-JSON: "
-                                 "the response was too long. Do NOT call any tool "
-                                 "and do NOT paste file contents. Reply with a "
-                                 "short final answer only."),
+                            msg=(system_msg + "\n\n"
+                                 "# Output context exceeded repeatedly\n"
+                                 + _truncation_feedback(info, response,
+                                                        terminal=True)),
                             model=model,
                             msg_history=new_msg_history,
                         )
@@ -869,8 +934,9 @@ def chat_with_agent(
                         logging(f"Error during final summary turn: {e}")
                     truncated = True
                     break
-                logging("Error: Output context exceeded. Please try again.")
-                tool_msgs.append("Error: Output context exceeded. Please try again.")
+                retry_msg = _truncation_feedback(info, response)
+                logging(retry_msg)
+                tool_msgs.append(retry_msg)
 
             # Get tool response
             response, new_msg_history, info = _counting_llm(
