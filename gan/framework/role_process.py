@@ -615,7 +615,11 @@ def _dispatch_broker(
             raise PermissionError("build_patch role does not match the role process")
         node = (f"{args[1]}__{expected_seat}" if expected_node is not None
                 else args[1])
-        return broker.build_patch(str(args[0]), node, seat=expected_seat)
+        # The build REPORT rides the result, not a new RPC method: a caller dict
+        # cannot be mutated across the process boundary, and the child needs the
+        # conflict facts to explain a refused patch to the agent.
+        patch = broker.build_patch(str(args[0]), node, seat=expected_seat)
+        return {"patch": patch, "report": dict(broker.last_patch_report)}
     if method == "repo_dir":
         # Which repo root owns this relative path: the child already knows
         # repo_root; this only answers "which of the split roots".
@@ -692,6 +696,8 @@ class _RemoteBroker:
         self.prompt_rewrite_min_survival = float(prompt_rewrite_min_survival or 0.0)
         self.prompt_rewrite_max_growth = float(prompt_rewrite_max_growth or 0.0)
         self.last_result: Dict[str, Any] = {}
+        # Last patch build's three-way-merge / conflict facts (mirrored).
+        self.last_patch_report: Dict[str, Any] = {}
         self.grants = _RemoteGrants(self)
 
     def _rpc(self, method: str, args: list[Any], kwargs: Dict[str, Any]) -> Any:
@@ -744,8 +750,15 @@ class _RemoteBroker:
                            {"seat": seat})
         return list(result or [])
 
-    def build_patch(self, role: str, node_id: Any, *, seat: str) -> str:
-        return str(self._rpc("build_patch", [role, node_id], {"seat": seat}))
+    def build_patch(self, role: str, node_id: Any, *, seat: str,
+                    report: Optional[dict] = None) -> str:
+        result = self._rpc("build_patch", [role, node_id], {"seat": seat})
+        if isinstance(result, dict) and "patch" in result:
+            self.last_patch_report = dict(result.get("report") or {})
+            if report is not None:
+                report.update(self.last_patch_report)
+            return str(result.get("patch") or "")
+        return str(result)
 
     def editable_paths(self, role: str, node_id: Any, seat: str,
                        cap: int = 300) -> dict[str, list[str]]:

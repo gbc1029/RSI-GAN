@@ -514,24 +514,44 @@ class Role(AgentSystem):
                             tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
             _absorb_run_flags()
 
-            def _build_patch() -> str:
+            def _build_patch() -> tuple[str, str]:
+                """Return ``(patch, refusal)``.
+
+                Non-empty ``refusal`` means the build said NO: the workspace and
+                the committed baseline changed the SAME region, so the builder
+                refuses instead of emitting a diff that reverts the other side.
+                """
                 if broker is None or not has_deep_write(dctx.records):
-                    return ""
+                    return "", ""
                 # No catch — a patch build failure propagates (session ->
                 # <role>_failed), never masquerades as a legitimate empty patch.
-                return build_patch_from_workspace(broker, self.role, self.access_key("self"))
+                report: dict = {}
+                patch = build_patch_from_workspace(broker, self.role,
+                                                   self.access_key("self"),
+                                                   report=report)
+                conflicts = report.get("conflicts") or []
+                if not conflicts:
+                    return patch, ""
+                return "", (
+                    "# Patch refused (baseline moved)\n"
+                    "Your workspace copy and the committed baseline both changed the same "
+                    "region of: " + ", ".join(str(c.get("path")) for c in conflicts)
+                    + ". Re-request those paths with request_source_access(refresh=true) "
+                    "and redo the edit on the fresh baseline.")
 
             last_hash = None
             for attempt in range(patch_retry_k + 1):
-                patch_str = _build_patch()
-                if not patch_str or not self.code_root:
+                patch_str, refusal = _build_patch()
+                if refusal:
+                    ok, reason = False, refusal
+                elif not patch_str or not self.code_root:
                     rejected = None
                     break
                 # Seat mode: the projected code view has no git metadata by
                 # design (the authoritative per-run tree stays parent-only),
                 # so validation must ride the role-broker RPC to the real
                 # tree — same dispatch as the planner plan seat.
-                if broker is not None and hasattr(broker, "check_patch"):
+                elif broker is not None and hasattr(broker, "check_patch"):
                     ok, reason = broker.check_patch(patch_str, role=self.role,
                                                     seat="self_improve")
                 else:
@@ -542,7 +562,7 @@ class Role(AgentSystem):
                     rejected = None
                     break
                 rejected = reason
-                h = hash(patch_str)
+                h = hash(patch_str or reason)
                 if h == last_hash or attempt >= patch_retry_k:
                     exhausted = True
                     break

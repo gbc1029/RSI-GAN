@@ -212,28 +212,52 @@ class Planner(Role):
                 trajectory_file=traj)
             _absorb_run_flags()
 
-            def _build_patch() -> str:
+            def _build_patch() -> tuple[str, str]:
+                """Return ``(patch, refusal)``.
+
+                ``refusal`` is non-empty when the build itself said NO: the
+                session's workspace and the committed baseline changed the SAME
+                region, so ``build_patch_from_workspace`` refuses rather than
+                emit a valid-looking diff that reverts the other side. Treated
+                like a validation rejection so the agent is TOLD (and can retry
+                with ``refresh=true``) instead of silently losing its edit.
+                """
                 if broker is None:
-                    return ""
+                    return "", ""
                 if not has_deep_write(design_ctx.records + plan_ctx.records):
-                    return ""
+                    return "", ""
                 # No catch — a patch-BUILD failure must never masquerade as
                 # a legitimate empty patch. Any failure (unreadable workspace /
                 # repo file, a builder defect) propagates and fails the session;
                 # the loop then marks the generation planner_failed (B-level)
                 # instead of applying a semantically wrong diff.
+                report: dict = {}
                 if hasattr(broker, "build_patch"):
-                    return broker.build_patch("planner", akey, seat="plan")
-                return build_patch_from_workspace(broker, "planner", akey)
+                    patch = broker.build_patch("planner", akey, seat="plan",
+                                               report=report)
+                else:
+                    patch = build_patch_from_workspace(broker, "planner", akey,
+                                                      report=report)
+                conflicts = report.get("conflicts") or []
+                if not conflicts:
+                    return patch, ""
+                return "", (
+                    "# Patch refused (baseline moved)\n"
+                    "Your workspace copy and the committed baseline both changed the same "
+                    "region of: " + ", ".join(str(c.get("path")) for c in conflicts)
+                    + ". Re-request those paths with request_source_access(refresh=true) "
+                    "and redo the edit on the fresh baseline.")
 
             patch_str = _build_patch()
             last_hash = None
             for attempt in range(patch_retry_k + 1):
-                patch_str = _build_patch()
-                if not patch_str or not self.code_root:
+                patch_str, refusal = _build_patch()
+                if refusal:
+                    ok, reason = False, refusal
+                elif not patch_str or not self.code_root:
                     rejected = None
                     break
-                if broker is not None and hasattr(broker, "check_patch"):
+                elif broker is not None and hasattr(broker, "check_patch"):
                     ok, reason = broker.check_patch(patch_str, role="planner", seat="plan")
                 else:
                     ok, reason = code_repo.check_patch(
@@ -242,7 +266,7 @@ class Planner(Role):
                     rejected = None
                     break
                 rejected = reason
-                h = hash(patch_str)
+                h = hash(patch_str or reason)
                 if h == last_hash or attempt >= patch_retry_k:
                     exhausted = True
                     break

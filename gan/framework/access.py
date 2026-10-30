@@ -721,22 +721,28 @@ class AccessBroker:
             raise PermissionError("session outer does not match the role instance")
         return outer_session_index(self.output_dir, outer, role)
 
-    def build_patch(self, role: str, node_id: Any, *, seat: str) -> str:
+    def build_patch(self, role: str, node_id: Any, *, seat: str,
+                    report: Optional[Dict[str, Any]] = None) -> str:
+        """Build the session's patch; ``report`` (optional) receives the
+        three-way-merge / conflict facts so a caller can turn a refusal into an
+        actionable message instead of an unexplained empty patch."""
         from gan.patch import build_patch_from_workspace
-        report: Dict[str, Any] = {}
+        facts: Dict[str, Any] = {}
         try:
-            patch = build_patch_from_workspace(self, role, node_id, report=report)
+            patch = build_patch_from_workspace(self, role, node_id, report=facts)
         finally:
             # Three-way merges against a moved baseline and genuine conflicts are
             # commit-time FACTS: keep them on the broker (audit) instead of
             # widening the role-result contract, which is validated by exact
             # field set across the process boundary.
-            self.last_patch_report = report
-        if report.get("merged") or report.get("conflicts"):
-            conflicts = report.get("conflicts") or []
+            self.last_patch_report = facts
+        if report is not None:
+            report.update(facts)
+        if facts.get("merged") or facts.get("conflicts"):
+            conflicts = facts.get("conflicts") or []
             self.log_event({
                 "type": "patch_baseline_drift", "role": role, "node_id": str(node_id),
-                "merged": report.get("merged") or [],
+                "merged": facts.get("merged") or [],
                 # markers are the only human-readable trace of a same-region
                 # clash (the patch itself is refused, never written corrupt)
                 "conflicts": [{"path": (c or {}).get("path"),
