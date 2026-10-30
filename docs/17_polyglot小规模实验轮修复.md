@@ -660,3 +660,62 @@ run_tool_regression 七套件 + test_frozen 改动后全绿。
   自动跟随）；④ AGENTS.md "Offline analysis tools" 一节届时同步刷新。
 - 已知同类未修：rust 链接器 `cc` 缺失（沙箱）；`scripts/local/test_d123_fixes.py` 的
   D2 pure-runtime 断言为存量漂移（与本轮无关，未动）。
+
+## 11. 第三批修复：沙箱 alternatives 投影 / 兜底补丁口径 / 成本接线 seat 缺失（2026-10-30）
+
+### 11.1 沙箱 `cc` 缺失（W4 同类，接 §9.4）
+
+- **机制（实机验证）**：`/usr/bin/cc → /etc/alternatives/cc → /usr/bin/gcc`（Debian
+  alternatives 符号链）。沙箱 `/usr` 只读绑定宿主 → 链接存在；合成 `/etc` 无
+  `/etc/alternatives` → 悬空 → rustc/cargo 报 linker `cc` not found。宿主有
+  build-essential——纯投影缺口，与 `java.security → /etc/java-17-openjdk` 同型。
+- **修改**：`sandbox_etc.create_sandbox_etc` 在 java 投影块后追加 alternatives 投影：
+  仅复制**符号链接本体**（目标在沙箱 `/usr` 视图内可解析）、悬空项与指向目录的项跳过；
+  `validate_sandbox_etc` 新增 `_ALT_RE`（`alternatives(/.*)?`）放行：目录层、
+  **符号链接条目专用分支**（lstat 必须 S_ISLNK + root 属主——普通文件视为投影被篡改）、
+  末尾聚合复查同步。负例（rogue 目录）仍 fail-closed。
+- **验证**：以真实身份（ganop/rsi_gan_task/planner/evaluator）构建投影 → validate 通过，
+  189 条 alternatives 条目、`cc → /usr/bin/gcc` 经共享 /usr 视图可解析。
+
+### 11.2 兜底补丁口径错误（本地 D2b 暴露，代码 bug 而非旧断言）
+
+- **根因**：`_polyglot_workspace_patch_difflib` 内两处 solution_paths 过滤**口径不一致**
+  ——步行收集 `if rel not in solution_paths`（无空值豁免）vs diff 循环
+  `if solution_paths and rel not in ...`（有豁免）。空 solution_paths（= 不限定，与 git
+  路径 `git add -A --` 无 pathspec 同义）时收集为空 → 每个 starter 文件被读成"已删除"
+  → 产出删除补丁。同 commit（ab71580）引入。
+- **连带发现（自污染）**：`_cm_emit({"type": "patch_difflib_fallback"})` 先于 diff 落盘
+  `cm_events.jsonl`（`_cm_events_path` 兜底落 cwd；沙箱内绑定在 workspace 视图），
+  被不限定遍历收进补丁。git 路径在空 scope 下同理可泄漏。
+- **修改**：① 步行过滤补空值豁免（与 diff 循环、git 路径三方一致）；② 兜底的 audit
+  emit **后置**到补丁构建之后；③ 新增 `_RUNTIME_SIDECARS = (cm_events.jsonl,
+  cm_events_failed.jsonl)`：兜底步行排除 + git 路径 pathspec `:(exclude)`（两种 scope
+  下 sidecar 都永不进补丁）。本地 leg1 断言同步收紧（要求"修改而非删除"，旧断言对删除
+  补丁空洞成立）。套件 27/27 全绿。
+- **判性说明**：D2（`diff_versus_commit`）两腿本就正确；失败属 **run_d2b 的代码实现
+  错误**，非旧断言未更新——测试期望与 git 主路径语义一致。
+
+### 11.3 成本记录接线 seat 缺失（F5）
+
+- **现象**：`logs/cost_sessions.jsonl` 整场不存在、`cost_session` 事件 ×0、cost.json 的
+  `planner_plan`/`evaluator_evaluate` 三代全 null；task 侧（proxy_audit + 轨迹聚合）
+  正常——半边有数掩盖角色侧断线。
+- **根因（同根四处）**：角色会话自 fix3 起落盘 seat 键控布局
+  `trajectory/outer_<O>/roles/<role>/<seat>/…`，成本接线却按 legacy 非 seat 形状解析：
+  ① `loop._record_session_cost` genid 分支 `session_traj_file(...)` 漏 `seat=` →
+  解析到不存在的 `outer_1/<genid>/<role>.jsonl` → rec None 直接 return（append 分支
+  永不可达）；② `cost_ledger.gen_session_costs` 同漏 `seat=`；③
+  `cost_ledger.self_session_costs` 用 `outer_traj_dir` 裸拼 `{role}.jsonl`；④ 同函数
+  glob `{role}__*.jsonl` 与写入方实际名 `outer__<attempt>.jsonl`（seat 分支命名）不匹配，
+  且 `outer__*.jsonl` 会误吞 `.llm_calls.jsonl` sidecar（修正：匹配写入方命名 + sidecar
+  过滤，sidecar 指标在 `session_cost_from_file` 内合并）。
+- **修改**：四处对齐——① 补 `seat=seat`；② 补 `seat=seat`；③ 目录改
+  `paths.role_traj_dir(output_dir, outer, role, "self_improve")`；④ glob 改
+  `outer.jsonl` + `outer__*.jsonl` 并过滤 `.llm_calls.jsonl`。
+- **验证（对 real run small_1030_095410）**：`gen_session_costs(d,1,"0")` →
+  planner_plan 109,317 tok（6 calls）/ evaluator_evaluate 1,039,372 tok（19 calls，
+  sidecar 指标已合并）；`self_session_costs` → planner self 100,652 tok、evaluator
+  self 45,923 tok（attempt=1ef065f2 正确提取）。七套件 + test_frozen + 本地 D123 全绿。
+- **残项**：eval 轮会话（`gen_eval_outer1_s1`）仍不归属任何 gen 的 cost.json（eval gen
+  无 cost.json）——成本归属口径另行决策；历史 run 的账本可用 `cost_ledger.reconcile`
+  回填重建（现成接口，未对本 run 执行以免改写产物）。

@@ -267,6 +267,11 @@ def _polyglot_prepare(inputs: dict) -> None:
         _remove_patch_base(os.getcwd())
 
 
+# Runtime sidecar files the child itself writes into the workspace view
+# (_cm_events_path): never solution content, excluded from every patch path.
+_RUNTIME_SIDECARS = ("cm_events.jsonl", "cm_events_failed.jsonl")
+
+
 def _remove_patch_base(cwd: str) -> None:
     shutil.rmtree(os.path.join(cwd, ".git"), ignore_errors=True)
 
@@ -293,9 +298,15 @@ def _polyglot_workspace_patch(inputs: dict) -> str:
                       for p in solution_paths if str(p).strip()]
     cwd = os.getcwd()
     if os.path.isdir(os.path.join(cwd, ".git")):
-        _polyglot_git(cwd, "add", "-A", "--", *solution_paths)
+        # Runtime sidecars (the child's own seam-event sink, _cm_events_path)
+        # are never solution content: exclude them in BOTH scopes so the
+        # unscoped path (empty solution_paths == `git add -A` whole-tree)
+        # cannot leak cm_events.jsonl into the prediction patch.
+        spec = list(solution_paths) or ["."]
+        spec += [f":(exclude){name}" for name in _RUNTIME_SIDECARS]
+        _polyglot_git(cwd, "add", "-A", "--", *spec)
         proc = _polyglot_git(cwd, "diff", "--cached", "--no-color", "--",
-                             *solution_paths)
+                             *spec)
         patch = proc.stdout or ""
         if "Binary files" in patch or "GIT binary patch" in patch:
             # A solution file with binary content cannot pass the tests
@@ -308,9 +319,13 @@ def _polyglot_workspace_patch(inputs: dict) -> str:
     # Fallback ONLY when the patch-base repo is unavailable (prepare said so
     # loudly). Guarded difflib path: solution-files-only, NUL sentinel, and
     # per-line no-newline markers (the old code marked the end of the FILE
-    # diff, which cannot repair a glued MID-diff line).
+    # diff, which cannot repair a glued MID-diff line). The audit event is
+    # emitted AFTER the patch build: the sidecar lives in the workspace view,
+    # and emitting first would leak cm_events.jsonl into the very patch being
+    # computed (observed in the local D2b suite once the walk went unscoped).
+    patch = _polyglot_workspace_patch_difflib(files, solution_paths)
     _cm_emit({"type": "patch_difflib_fallback"})
-    return _polyglot_workspace_patch_difflib(files, solution_paths)
+    return patch
 
 
 def _drop_binary_stanzas(patch: str) -> str:
@@ -347,7 +362,14 @@ def _polyglot_workspace_patch_difflib(files: dict, solution_paths: list) -> str:
         for name in names:
             full = os.path.join(base, name)
             rel = os.path.relpath(full, cwd).replace(os.sep, "/")
-            if rel not in solution_paths:
+            if rel in _RUNTIME_SIDECARS:
+                continue  # the child's own seam-event sink, never solution content
+            # Same empty-list semantics as the diff loop below and the git
+            # path above (`git add -A --` with no pathspec): an EMPTY
+            # solution_paths means UNSCOPED, not "collect nothing" — the old
+            # unguarded filter made every starter file read as DELETED
+            # (local D2b leg-2 false deletion patch).
+            if solution_paths and rel not in solution_paths:
                 continue
             with open(full, "rb") as f:
                 if b"\x00" in f.read(8192):

@@ -624,7 +624,13 @@ class GanLoop:
         try:
             if genid is not None:
                 rec = cost_ledger.session_cost_from_file(
-                    paths.session_traj_file(self.output_dir, outer, genid, role),
+                    # seat is REQUIRED under the seat-keyed layout: without it
+                    # the path resolves to the legacy non-seat shape
+                    # (outer_<O>/<genid>/<role>.jsonl, which no role writes)
+                    # and every plan/evaluate session cost read as None — the
+                    # cost_sessions.jsonl ledger stayed empty all run (F5).
+                    paths.session_traj_file(self.output_dir, outer, genid, role,
+                                            seat=seat),
                     role=role, seat=seat, outer=outer, genid=genid,
                     output_dir=self.output_dir)
             else:
