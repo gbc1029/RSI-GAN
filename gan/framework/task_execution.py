@@ -78,7 +78,13 @@ _TASK_ENV_NAMES = {
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
     # framework-owned output contract (F4/C1): derived from domains.yaml's
-    # output_contract / the domain's prediction source — read-only for the child
+    # output_contract / the domain's prediction source — read-only for the child.
+    # MIRROR RULE: this is the SOURCE whitelist of the child env chain; every
+    # GAN_* key added here must be mirrored into BOTH child-side hops or it
+    # dies silently at that filter (domains/harness.py and domains/task_worker.py
+    # each carry their own _TASK_ENV_NAMES). Observed live: the contract never
+    # reached the TaskAgent (field audit smoke_1030_204345). Guard:
+    # scripts/local/test_task_env_mirror.py
     "GAN_RESPONSE_CONTRACT",
     # context-management snapshot (docs/10 §11 D2): the frozen seam core and
     # the selected policy component live under .gan_runtime/cm (no gan/ bind);

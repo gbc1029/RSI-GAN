@@ -21,6 +21,11 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # framework-owned output contract (F4/C1). HOP 2 of the child env chain
+    # (worker -> TaskAgent child): mirror of the framework-side whitelist
+    # (gan/framework/task_execution.py:_TASK_ENV_NAMES) — an unmirrored key
+    # dies silently here. Guard: scripts/local/test_task_env_mirror.py.
+    "GAN_RESPONSE_CONTRACT",
     # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
     # audit sidecar (§11.5: rw bind in the sandbox; cwd fallback locally)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",

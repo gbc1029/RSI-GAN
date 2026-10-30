@@ -767,7 +767,10 @@ run_tool_regression 七套件 + test_frozen 改动后全绿。
   未知键报错 / 无契约 ctx 字段缺席）通过；
 - task_agent 两处插值静态形状验证（契约段存在、旧 "complete final answer" 措辞移除）；
 - 七套件 + test_frozen + 本地 D123 全绿。
-- **待实跑确认**：契约段在真实 child 指令中的出现位置与 polyglot 修复轮不再重贴 diff。
+- **实跑确认（smoke_1030_204345，2026-10-30）**：①未通过——契约段未出现在真实 child
+  指令、修复轮退回旧通用句，断链根因与修复见 §14；②polyglot 修复轮未诱发重贴 diff
+  （该轮仅 2 个修复轮，均以摘要收尾），但这是 planner 把契约文本内嵌进自撰 task prompt
+  （经 get_config 的 `output_contract` 字段，§12.2③ 实证有效）后的行为掩盖，非注入链生效。
 
 ## 13. 冒烟 smoke_1030_195145 归因与修复：/etc 投影子级镜像漂移 + prune 清理崩溃（2026-10-30 第五批）
 
@@ -846,3 +849,67 @@ x86_64-linux-gnu-gcc-13），`open(...,"w")` 跟随三层链接把宿主机编�
   与本批改动无关，留待单独处理。
 - 复跑确认点：task 阶段出现 task-role `llm_call` 事件 / `[timing] question`
   行、且全程无 "unsafe directory"（本节修复的端到端判据）。
+
+## 14. smoke_1030_204345 审计：F4/C1 契约注入断链修复（2026-10-30 第六批）
+
+> 起因：对 `runs/polyglot/smoke_1030_204345`（1 outer × 3 inner + 固定根评估）的全量
+> 审查发现 §12 的框架输出契约未按预期呈现——本节只记录该断链的根因与修复；本轮其余
+> 审计发现（评估器 6000 钳制、rmtree 残留、空补丁机理等）另行登记。
+
+### 14.1 现象与根因（三份白名单、两处漏键）
+
+- **现象**：4 个任务 launch 的 child 指令均无 `Output contract (framework-owned...)`
+  段；2 个 format-repair 轮全部退回 `GAN_RESPONSE_CONTRACT` 缺席时的通用兜底句
+  （"The response must contain the complete final answer"）——§12.2② 的域感知要求
+  与 §12.2① 的注入段同时失效。行为面被 planner 掩盖：它经 `get_config` 的
+  `output_contract` 框架字段（§12.2③，实证有效）把契约句内嵌进了自撰 task prompt。
+- **根因**：任务 child env 链有**三份** `_TASK_ENV_NAMES` 白名单——
+  `gan/framework/task_execution.py`（源，已含 `GAN_RESPONSE_CONTRACT`）→
+  `domains/harness.py`（**hop 1：harness → task_worker，漏**）→
+  `domains/task_worker.py`（**hop 2：worker → TaskAgent child，漏**）。driver 派生
+  契约并经 broker env 注入成功，但两跳子过滤器各自把键静默丢弃，TaskAgent 的
+  `os.environ` 里该键为空 → `contract_block` 空串、`response_requirement` 走兜底。
+  与 §13.2 P1（/etc 投影子级镜像漂移）同型：**镜像双份维护第三次失步**，且这次一
+  失失两处。
+
+### 14.2 修复
+
+| 文件 | 改动 |
+|---|---|
+| `domains/harness.py` | `_TASK_ENV_NAMES` 增 `GAN_RESPONSE_CONTRACT`（hop 1），注释写明镜像规则与守卫 |
+| `domains/task_worker.py` | 同上（hop 2） |
+| `gan/framework/task_execution.py` | 源白名单处注释补 **MIRROR RULE**（新增 GAN_* 键必须同步两跳镜像） |
+
+- **新本地守卫（gitignored）**：`scripts/local/test_task_env_mirror.py` ——
+  ①三份白名单的 GAN_* 超集关系（框架侧 ⊆ 两跳镜像）；②探针 env 端到端过两跳过滤
+  （`GAN_RESPONSE_CONTRACT`/`GAN_TASK_BRIEF` 存活）；③`GAN_DATASET_ROOT` 在三份
+  白名单中均缺席（基准标签边界不变式）。修复前 4 FAIL、修复后全 PASS。
+- **刻意不做**：非 GAN 键不强行对齐（`LITELLM_LOCAL_MODEL_COST_MAP` 不过 broker
+  边界、`GAN_SECURE_CAPABILITY_HOLDER` 是下游自设）；不做 import 期断言（避免
+  把镜像漂移升级成启动崩溃，守卫测试承载）。
+
+### 14.3 验证
+
+- `test_task_env_mirror.py` 全 PASS（修复前红）；
+- `run_tool_regression.py` 七套件全 PASS、`test_frozen.py` PASS、
+  `test_venv_bin_path.py` / `test_sandbox_etc_mirror.py` 全 PASS、三文件
+  `py_compile` 通过；
+- **待下一真实 run 确认**：child 指令出现 `Output contract (framework-owned...)`
+  段（位于 Task input 之后、JSON schema 段之前）；polyglot 修复轮的
+  `response_requirement` 为 "Your written solution files are the deliverable..."
+  而非通用兜底句。
+
+### 14.4 附带登记（本轮审计暴露、未在本批修）
+
+- 同一转移缺口（`RoleProcess` 包装上的属性盖章不跨进程，`role_state`/`broker_info`
+  精确键集）使**席位 CM 栈在 driver 模式整体休眠**：`ctx_index`/`ctx_fetch`/
+  `read_trajectory` 的 slice 面对角色席位不可达（实证：evaluator 调 `ctx_index`
+  得 "no context-management session is active"）；`cost.cm_mode` 对席位是死旋钮
+  （planner 本轮给自己设的 `compact_conservative` 不会生效）；`session_token_budget`
+  疑似同批休眠，待核查。复活属协议变更（非小改动），另批处理。
+- `AccessBroker.read_trajectory`/`read_session_trajectory` 的
+  `min(int(max_chars), 6000)` 硬钳制（4e5e73a，早于 fix3，无文档化理由）叠加
+  `trajectory.read` 无 offset 分页：评估器请求 60k 仍得 6000 切口，gen_2 评估器
+  以 issue 形式投诉（i-5），gen_1 评估器 blind 阶段因 6000 视图进入退化推理循环
+  （finish_reason=length，32k tokens）后 blind 预测被迫落到 reveal 阶段。
+  修复方向（上限可配 / RPC 透传 offset）另行批次。

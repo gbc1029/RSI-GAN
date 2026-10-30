@@ -37,6 +37,14 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # framework-owned output contract (F4/C1). MIRROR RULE: this whitelist is
+    # HOP 1 of the child env chain (harness -> task_worker); a key added to
+    # the framework-side whitelist (gan/framework/task_execution.py:
+    # _TASK_ENV_NAMES) without being mirrored HERE (and in domains/
+    # task_worker.py, hop 2) dies silently at this filter — observed live as
+    # the contract never reaching the TaskAgent (field audit
+    # smoke_1030_204345). Guard: scripts/local/test_task_env_mirror.py.
+    "GAN_RESPONSE_CONTRACT",
     # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
     # audit sidecar (§11.5: rw-bound host file, folded back by task_runner)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
