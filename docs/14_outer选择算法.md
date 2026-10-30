@@ -50,7 +50,7 @@
 | task 起点 | **继续当前 task HEAD**（task 连续演化，outer 只换 P/E 策略） |
 | 违规处理 | 当前代码：`rule_violation=true` 且 `evidence_ref` **非空** → 排除（"可定位"校验与第二意见尚未实现，见 §11） |
 | 冷却（漏洞 10） | 最近 `cooldown_window` 届被选过的父代移出候选池；空池则放宽 |
-| verdict_stability 口径 | **客观事实命中率**：`fix_verdict`（evaluator 判"修好没"）与 benchmark 相对父代是否真的提升，一致率 |
+| verdict_stability 口径 | **逐 issue 机械真值命中率**：`hits / verified`，真值由 `issue_checks.py` 按 `issue_key` 判定缺陷"父代 PRESENT → 子代 ABSENT"（2026-10 第二版，替换"整届一个 bit"的旧口径） |
 
 沿用 `docs/13` §6 的既有决策：联合 MOME、运行 z-score、重复评估 2–3 次。
 
@@ -73,7 +73,11 @@
     "rule_violation": {"triggered": false, "evidence_ref": null},
     "accepted_fixed_rate": 0.67,
     "calibration_error": 0.12,
-    "verdict_stability": null
+    "verdict_stability": 0.75,
+    "verdict_stability_basis": "issue_key_checks",
+    "verdict_verified": 8,
+    "verdict_hits": 6,
+    "verdict_unsupported": 1
   },
   "benchmark": {
     "...": "已有字段",
@@ -88,7 +92,11 @@
 - `rule_violation`：从该届各 `runs/<genid>/eval.json` 的 `eval_point_results` 聚合（`point == "rule_violation"`）。
 - `accepted_fixed_rate`：evaluator 提出的 issues 中被 planner 接受并修复的比例（从 `feedback.issues` + `fix_verdicts` + `respond_issue` 聚合）。
 - `calibration_error`：$\lvert\text{predicted}-\text{actual}\rvert$ 均值（越低越好，$F_e$ 主指标；数据来自 `eval.json` 的 `predicted_score` + `benchmark_score`）。
-- `verdict_stability`：客观事实命中率 = `fix_verdict` 与 **benchmark 相对父代是否真的提升**的一致率；数据不足（无 fix_verdict / 无父代 benchmark）时 `null`，$F_e$ 自动退化为只用 `calibration_error`。
+- `verdict_stability`：**逐 issue 的机械真值命中率** = `hits / verified`（2026-10 第二版；口径见 §4.3）。缺陷状态由 `gan/framework/issue_checks.py` 按 `issue_key` 判定（三态 PRESENT/ABSENT/UNKNOWN），配对"父代 present → 子代 absent"得到该 issue 的真值，再与 `judge_fix.fixed` 比对。`verified=0` → `null`（$F_e$ 该项中性，不罚）。
+  - 旧口径（已废弃）：`fix_verdict` 与该届 **benchmark 均值是否高于父代** 的一致率。它把整届 verdict 向量压在一个共享 bit 上，A1（`disable_planner`，根本没东西可修，19/20 条 `false` 是**正确**的）因为分数照样上涨而被判 0.0；且它要求 evaluator 对"整届均值涨没涨"这个它从未做出的判断负责。旧值**无法重算**，用 `verdict_stability_basis` 区分：
+    - `evaluator_stats.verdict_stability_basis = "issue_key_checks"` → 新口径；
+    - 缺该字段 → 2026-10 之前的旧口径。
+  - 同批诊断字段（**不参与 fitness**）：`verdict_verified` / `verdict_hits` / `verdict_unsupported`（编造 issue 数：缺陷在父代本就 ABSENT，不计入分母，避免"报一个不存在的问题 + 判未修"白得一次命中）。
 - `benchmark.eval_baseline`：本次评估使用的固定 root ref（所有条目相同 → 可比）。
 - `benchmark.reevaluated`：**有 ≥1 轮有效时为 `true`**；`eval_base` 缺失、全部轮次失败或评估异常时为 `false`，此时**保留该届 inner 分数**（绝不写 `None` 把唯一分数抹掉），并记 `supernode_eval_degraded`。
 - **无 benchmark 的 supernode 不入档**（`supernode_not_archived: no_benchmark`）：$F_p$ 缺失的条目永不被支配裁剪、却会占满每格容量，还可能在锦标赛中胜出。
@@ -151,10 +159,41 @@ $$\text{novelty}(s) = \frac{1}{k}\sum_{r \in \mathrm{kNN}_k(s,\, R)} d(s, r)$$
 
 $$F_p = z_{\text{ref}}(\overline{\text{bench}})\;-\;\beta\, z_{\text{ref}}(\sigma_{\text{bench}})\;+\;\lambda\cdot\text{novelty}$$
 
-$$F_e = -\;w_1\cdot z_{\text{ref}}(\text{calibration\_error})\;+\;w_2\cdot\text{verdict\_stability}\;+\;\lambda\cdot\text{novelty}$$
+$$F_e = -\;w_1\cdot z_{\text{ref}}(\text{calibration\_error})\;+\;w_2\cdot z_{\text{ref}}(\text{verdict\_stability})\;+\;\lambda\cdot\text{novelty}$$
 
 - $z_{\text{ref}}$ = 相对参考伙伴窗口的运行 z-score（bench 与 calibration_error 共用同一基准）。
 - $F_e$ **不挂 bench**（漏洞 3）：只由"校准误差（取负）"与"判准稳定性"构成；`verdict_stability` 缺数据时该项取 0 并标记 `fitness_partial`。
+- **`verdict_stability` 口径（2026-10 第二版）**：逐 issue 的机械真值命中率
+  $$\text{verdict\_stability} = \frac{\text{hits}}{\text{verified}}$$
+  其中，对每一条 `judge_fix(issue_id, fixed=X)`，框架按该 issue 的 `issue_key` 在
+  `gan/framework/issue_checks.py` 里求两次机械判定——父代 `p` 与子代 `c`：
+
+  | 情形 | 计入分母 | 真值 |
+  |---|---|---|
+  | 两侧都 `PRESENT/ABSENT`，且父代 `PRESENT` | ✅ | `truth = (c == ABSENT)` |
+  | 任一侧 `UNKNOWN`（无 checker / 数据不足） | ❌ | 不可核验，不罚 |
+  | 父代 `ABSENT`（缺陷本不存在） | ❌（计入 `verdict_unsupported`） | 编造，白送分被拦 |
+
+  命中 = `X == truth`。`verified = 0` → `null`（$F_e$ 中性）。
+  这一版替换掉"整届 verdict 向量 vs 一个共享 bit（均值涨没涨）"的旧口径——旧口径在 A1 上把**正确的** 19/20 条 `false` 判成 0.0 命中率。
+
+  **检查器（9 个，纯函数、只读节点已有事实）**：
+
+  | key | 判据 |
+  |---|---|
+  | `cost.tokens` | `cost_tokens > issues.check.cost_ratio × token_budget_per_gen` |
+  | `cost.truncation` | `coverage < 1.0` |
+  | `harness.infra` | `harness_rc != 0` 或 `invalid_reason` 属基础设施类 |
+  | `design.contract-format` | `report_summary.contract_ok is False` |
+  | `access.grant-broken` | 授权期自检记录的 `unreadable` 非空（`AccessBroker.grant` 复制完立即验证可读性） |
+  | `policy.accept-bias` / `policy.reject-bias` | 该标签预测占比 ≥ `bias_share`（**默认 0.65**），且 `n_valid ≥ min_samples` |
+  | `policy.constant-output` | 单一预测标签占比 ≥ `constant_share` 且真值非单标签（平坦度是精确量，不受样本门槛限制） |
+  | `policy.overcorrection` | **配对检查器**：子代决策规则反转（`acc_C < 少数类占比 − acc_tol`）**且** `acc_C < acc_P − acc_tol` |
+
+  `min_samples`（默认 10）只约束**分布类**判据：n=2 时占比只可能取 0/0.5/1（标准误 ~0.35，n=30 时 ~0.09），任何"偏置/翻转"都是噪声——宁可判不了，不要假判定。
+  `constant_min_samples`（默认 6）是 `policy.constant-output` 的专用下限："每个样本同一个标签"对已记录的行是精确的，但"策略恒定"仍是**推断**（均衡题集上 n=2 全同有 25% 是巧合，n=6 降到 ~1.6%）。设 0 可关闭。
+  `bias_share` 从 0.75 下调到 0.65 有实测依据：pilot 里 evaluator 正确报出的宽松偏置落在 0.67–0.70 accept（真值 0.50），旧阈值把真实缺陷判成"编造"。
+  仍未覆盖（`UNKNOWN`）：`design.toolset-mismatch`/`design.prompt-ineffective`/`process.*`/`generalization.overfit`/`calibration.*`/`other.new`。
 - 两维都是"越高越好"，Pareto 支配方向一致（漏洞 3 的方向问题）。
 - 权重：$\beta$=`fitness.beta_variance`(0.1)，$\lambda$=`fitness.lambda_novelty`(0.2)，$w_1$=`fitness.w1_calibration`(0.6)，$w_2$=`fitness.w2_verdict_stability`(0.4)（`loop.yaml` 可调）。
 
@@ -265,7 +304,7 @@ fitness:
   beta_variance: 0.1      # F_p: z_mean - beta*z_std + lambda*novelty
   lambda_novelty: 0.2     # F_p / F_e 共用
   w1_calibration: 0.6     # F_e: -w1*z_calibration_error
-  w2_verdict_stability: 0.4  # F_e: +w2*verdict_stability
+  w2_verdict_stability: 0.4  # F_e: +w2*z(verdict_stability)（逐 issue 机械真值命中率）
 
 eval:
   eval_base: eval_base    # 固定 root ref（初始 = initial task commit）
@@ -315,9 +354,9 @@ eval:
 |---|---|---|
 | **每届固定评估成本** | 评估成功时每届跑 2–3 次 plan+task，成本稳定但更高 | `eval_samples` 可调；`enabled=false` 可整体关闭；`eval_base` 缺失/异常时跳过 |
 | **heal 可能放弃父代** | 历史设计与当前代码不兼容时被放弃 | `restore_max_tries` 限制尝试；全失败退回链式 |
-| **$F_e$ 数据稀疏** | `verdict_stability` 多数届无数据 | 自动退化只留 `calibration_error`，标记 `fitness_partial` |
+| **$F_e$ 数据稀疏** | `verdict_stability` 多数届无数据（新口径要求该届至少一条 issue 的缺陷状态在父子两侧都可机械判定） | 自动退化只留 `calibration_error`，标记 `fitness_partial`；`verdict_verified` 记录分母，离线可区分"没数据"与"不可核验" |
 | **evaluator 单方面淘汰** | `rule_violation` 由当届 evaluator 单方判定，误判即永久排除好 supernode（无第二意见/申诉） | 暂不解决，记为已知风险（§11） |
-| **$F_e$ 自评可刷分** | `calibration_error` / `verdict_stability` 均由当届 evaluator 产出，存在"保守预测/固定 verdict"刷分空间 | 暂不解决，记为已知风险（§11） |
+| **$F_e$ 自评可刷分** | `calibration_error` 仍由当届 evaluator 产出（"保守预测"刷分）；`verdict_stability` 自 2026-10 第二版起由框架机械判定（`issue_checks.py`），**已不可刷** | `calibration_error` 暂不解决，记为已知风险（§11）；`verdict_stability` 已解决 |
 | **档案是派生索引** | 与 supernode 文件可能不一致 | `rebuild` 从 `ckpt/supernodes/*.json` 重建；启动时校验 |
 | **混合基准** | `reevaluated=true` 条目用固定 root 分数，`false` 条目用主线 inner 分数，两者**尺度不同**却同进一个 $z_{\text{ref}}$ 池 | **已改为硬拒绝**（2026-10）：①`fitness_p` 优先读 `val_mean`；②`fitness.py:scale_conflict()` 检测"候选的尺度 ≠ 参考窗口的主导尺度"时直接返回 `None`（不评分），`_archive_supernode` 记 `supernode_not_archived{reason:scale_mismatch}`——降级的 supernode 不再把 train 分混进 val 池，也进不了档案（就不会被选成父代）；③`scalar_vector`/`novelty` 显式传入同一个 `level_key`，特征列不会一半 val 一半 mean。全 mean 窗口（旧 run）仍然自洽可评，过度不拒绝 |
 | **val 题集缺失** | 旧 run dir 没有 `eval_anchor_ids`（seed 文件 skip-if-exists），或锚点抽样失败 → `eval_runner` 回落到主线 runner（每题集每轮重抽） | `_evaluate_supernode` 开跑前检查 `fixed_question_ids`，缺失就**跑都不跑**、不写 `val_mean`，并记 `eval_question_set_missing`（带 hint：需要新建 run dir）。这修的是"静默退化成不可比"——若不拦，`fitness_p` 会优先采用那个不可比的数 |
@@ -338,7 +377,7 @@ eval:
 4. `eval_base` ref 的命名与固定策略（当前 = initial task commit，永不移动）。
 5. ~~配置键未接入~~ **已解决**：`fitness.{beta_variance,lambda_novelty,w1_calibration,w2_verdict_stability}`、`mome.{x_buckets,y_buckets,z_buckets}`、`eval.eval_timeout_s` 均已接入 consumer（`loop.__init__` 读取 → `_archive_obj` / `_archive_supernode` / `run_eval_rounds` 消费）。分桶给 int 时是**断言**（桶数不一致启动报错），给 list 才是显式边界。
 
-> 已解决：漏洞 10（冷却，`outer_select.cooldown_window`）、verdict_stability（客观事实命中率 = `fix_verdict` vs benchmark 相对父代的一致率）。
+> 已解决：漏洞 10（冷却，`outer_select.cooldown_window`）；~~verdict_stability（客观事实命中率 = `fix_verdict` vs benchmark 相对父代的一致率）~~ —— **该口径已二次替换**（2026-10）：现为 `hits / verified` 的**逐 issue 机械真值命中率**，真值来自 `gan/framework/issue_checks.py` 的 `issue_key` 检查器（父代 PRESENT → 子代 ABSENT），见 §3.1 / §4.3。旧口径会把"无事可修"的诚实评估判成 0.0（A1 实测），已废弃。
 
 ### 已知风险：不冻结 evaluator（暂不解决）
 

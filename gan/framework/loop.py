@@ -272,6 +272,25 @@ class GanLoop:
                 f"threshold and outer parent selection is permanently disabled")
         self.novelty_k = int(cfg.get("mome.novelty_k", 5))
         self.max_elites_per_cell = int(cfg.get("mome.max_elites_per_cell", 3))
+        # -- cross-outer issue ledger (gan/framework/issue_ledger.py) ---------
+        # The ledger is what makes "still unfixed after N outers" visible; the
+        # carrier is ``ckpt/issues/ledger.json`` keyed by the closed issue_key
+        # vocabulary. ``carried_limit`` bounds the prompt block (one line per
+        # key), and ``not_actionable_stances`` is the count of declined stances
+        # after which a key stops being routed to the planner.
+        self.issue_ledger_enabled = bool(cfg.get("issues.ledger_enabled", True))
+        self.issue_carried_limit = int(cfg.get("issues.carried_limit", 6))
+        self.issue_not_actionable_stances = max(
+            1, int(cfg.get("issues.not_actionable_stances", 2)))
+        # Thresholds for the mechanical issue checkers (gan/framework/issue_checks.py).
+        self.issue_check_params: Dict[str, float] = {
+            "cost_ratio": float(cfg.get("issues.check.cost_ratio", 1.5)),
+            "bias_share": float(cfg.get("issues.check.bias_share", 0.65)),
+            "constant_share": float(cfg.get("issues.check.constant_share", 0.99)),
+            "min_samples": int(cfg.get("issues.check.min_samples", 10)),
+            "constant_min_samples": int(cfg.get("issues.check.constant_min_samples", 6)),
+            "acc_tol": float(cfg.get("issues.check.acc_tol", 0.05)),
+        }
         self.eval_samples = int(cfg.get("eval.eval_samples", 3))
         self.eval_base_ref = str(cfg.get("eval.eval_base", "eval_base"))
         # The evaluation question set (docs/14 §5.5): a held-out subset with a
@@ -500,6 +519,108 @@ class GanLoop:
             },
             penalties=dict(getattr(ctx, "penalties", {}) or {}),
         )
+
+    # -- issue identity: genid prefix + cross-outer carry-over --------------
+    @staticmethod
+    def _parent_issue_id_map(parent_feedback: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        """bare id (``i-1``) -> qualified id (``g9/i-1``) for the PARENT's issues."""
+        out: Dict[str, str] = {}
+        for it in ((parent_feedback or {}).get("issues") or []):
+            if not isinstance(it, dict):
+                continue
+            iid = str(it.get("issue_id") or "").strip()
+            if not iid:
+                continue
+            out.setdefault(iid.rsplit("/", 1)[-1], iid)
+        return out
+
+    def _qualify_issue_ids(self, ctx: Any, genid: Any,
+                           parent_feedback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Namespace this round's issue ids by GENERATION (``g<genid>/i-1``).
+
+        ``issue_id`` is a per-round handle: it restarts at ``i-1`` whenever a
+        round has no parent issue list to continue (a fresh outer, a branch off
+        ``initial``), so two rounds of DIFFERENT outers can both hold ``i-1``.
+        Nothing downstream could tell them apart, which is exactly why the loop
+        used to strip a cross-outer parent's issues wholesale. Stamping the
+        generation makes the handle globally unique, so carrying issues across an
+        outer no longer collides.
+
+        The prefix is applied HERE, by the framework, and not by the evaluator:
+        an id the model invents is not an identity (the same reason the design
+        stamp and the receipt facts are framework-owned). Verdict and response
+        references are then normalized back to the qualified form, so a model
+        that echoes a bare ``i-1`` still lands on the right issue instead of
+        silently becoming ``unjudged``.
+        """
+        prefix = f"g{genid}/"
+        renamed: List[str] = []
+        seen: Dict[str, int] = {}
+        for it in (getattr(ctx, "issues", []) or []):
+            if not isinstance(it, dict):
+                continue
+            raw = str(it.get("issue_id") or "").strip()
+            if not raw:
+                continue
+            qid = raw if "/" in raw else prefix + raw
+            seen[qid] = seen.get(qid, 0) + 1
+            if seen[qid] > 1:
+                # A duplicate handle would make the verdict map ambiguous (later
+                # writes win silently), so it is disambiguated and logged rather
+                # than left to corrupt the classification.
+                qid = f"{qid}-dup{seen[qid]}"
+                renamed.append(qid)
+            it["issue_id"] = qid
+        norm = self._normalize_issue_refs(getattr(ctx, "fix_verdicts", []),
+                                          "issue_id", parent_feedback)
+        return {"renamed": renamed, "verdict_refs_normalized": norm}
+
+    def _normalize_issue_refs(self, items: Any, id_key: str,
+                              parent_feedback: Optional[Dict[str, Any]]) -> int:
+        """Rewrite bare ``i-N`` references to the parent's qualified ids."""
+        pmap = self._parent_issue_id_map(parent_feedback)
+        fixed = 0
+        for it in (items or []):
+            if not isinstance(it, dict):
+                continue
+            iid = str(it.get(id_key) or "").strip()
+            if not iid or "/" in iid:
+                continue
+            qid = pmap.get(iid)
+            if qid:
+                it[id_key] = qid
+                fixed += 1
+        return fixed
+
+    def _normalize_plan_issue_refs(self, plan_result: Dict[str, Any],
+                                   parent_feedback: Optional[Dict[str, Any]]) -> int:
+        """Same normalization for the planner's side (responses + records)."""
+        if not isinstance(plan_result, dict):
+            return 0
+        fixed = self._normalize_issue_refs(plan_result.get("responses"),
+                                           "issue_id", parent_feedback)
+        for rec in (plan_result.get("records") or []):
+            if isinstance(rec, dict) and rec.get("op") == "respond_issue" \
+                    and self._normalize_issue_refs([rec], "issue_id", parent_feedback):
+                fixed += 1
+        return fixed
+
+    def _carried_over(self, audience: str) -> List[Dict[str, Any]]:
+        """The ledger's open issues, or ``[]`` (disabled / unreadable / empty).
+
+        Advisory by construction: a broken ledger must never cost a round.
+        """
+        if not self.issue_ledger_enabled:
+            return []
+        try:
+            from gan.framework import issue_ledger
+            return issue_ledger.carried_over(
+                self.output_dir, limit=self.issue_carried_limit, audience=audience)
+        except Exception as e:  # noqa: BLE001 -- advisory sink
+            soft_fail(f"issue ledger read failed: {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="issue_ledger_read_failed")
+            return []
 
     def _settle_feedback_digest(
         self,
@@ -1171,6 +1292,66 @@ class GanLoop:
             return None
         return int(sum(per_q.get(q, 0.0) for q in self.anchor_ids))
 
+    def _anchor_stats(self, genid: Any) -> tuple:
+        """``(correct, answered)`` on the anchor core, for PARENT SELECTION.
+
+        Deliberately different from :meth:`_anchor_correct`: that one asks "did
+        this generation move on the fixed exam?" and scores a missing anchor as a
+        MISS (a generation that answered nothing did not improve). Selection asks
+        "which node is best?", where a missing answer is not evidence at all --
+        counting it as a miss would systematically demote every truncated or
+        partially-covered generation. So ``answered`` counts observed rows only,
+        and ``_wilson_lcb`` refuses ``answered == 0`` outright.
+
+        The node stamp is written once per generation (``anchor_correct`` /
+        ``anchor_n`` in ``Node.meta``) so selecting a parent never re-reads
+        ``report.json`` per candidate, and a resumed run keeps ONE definition.
+        """
+        if not self.anchor_ids:
+            return None, 0
+        node = self.task_tree.get(genid)
+        if node is not None:
+            c = node.meta.get("anchor_correct")
+            n = node.meta.get("anchor_n")
+            if (isinstance(c, (int, float)) and not isinstance(c, bool)
+                    and isinstance(n, int) and not isinstance(n, bool) and n > 0):
+                return float(c), int(n)
+        per_q = self._read_per_question(genid)
+        if not per_q:
+            return None, 0
+        answered = [q for q in self.anchor_ids if q in per_q]
+        if not answered:
+            return None, 0
+        return float(sum(per_q[q] for q in answered)), len(answered)
+
+    def _backfill_anchor_stamps(self) -> int:
+        """Stamp ``anchor_correct``/``anchor_n`` on restored nodes (resume).
+
+        The LCB selector reads ``Node.meta`` ONLY (by design: one read per
+        generation, not one per candidate). A tree restored from a checkpoint --
+        or written before the stamp existed -- carries no anchor evidence in
+        meta even though ``runs/<genid>/report.json`` is right there, so without
+        this backfill a resumed run would silently treat every earlier generation
+        as "not measured" and pick among the new ones only. Persisted through
+        ``tree.update`` so the evidence is durable (a second resume is a no-op).
+        """
+        if not self.anchor_ids:
+            return 0
+        stamped = 0
+        for node in list(self.task_tree.nodes.values()):
+            if node.meta.get("anchor_n"):
+                continue
+            if node.value.score_status not in _MEASURED:
+                continue
+            c, n = self._anchor_stats(node.genid)
+            if n <= 0:
+                continue
+            node.meta["anchor_correct"] = int(c or 0)
+            node.meta["anchor_n"] = int(n)
+            self.task_tree.update(node.genid, meta=node.meta)
+            stamped += 1
+        return stamped
+
     def _read_per_question(self, genid: Any) -> Dict[str, float]:
         """Reconstruct per-question 0/1 from report.json question_ids_{passed,failed}."""
         try:
@@ -1271,7 +1452,6 @@ class GanLoop:
             actual: List[float] = []
             rule_violation: Dict[str, Any] = {"triggered": False, "evidence_ref": None}
             mae: Optional[float] = None
-            fix_verdicts: List[Dict[str, Any]] = []
             for g in outer_genids:
                 node = self.task_tree.get(g)
                 if node is None:
@@ -1300,7 +1480,6 @@ class GanLoop:
                 m = self._read_mae(g)
                 if m is not None:
                     mae = m
-                fix_verdicts.extend(self._read_fix_verdicts(g))
                 p = node.meta.get("predicted_score")
                 a = node.meta.get("benchmark_score")
                 if p is not None and a is not None:
@@ -1319,18 +1498,27 @@ class GanLoop:
                         "actual": float(statistics.mean(actual))}
                 calibration_error = float(statistics.mean(
                     [abs(p - a) for p, a in zip(predicted, actual)]))
-            # verdict_stability: fix_verdict vs objective benchmark delta (vs parent).
-            # "用客观事实代替 planner 的 accepted" (docs/14 §11): the evaluator's
-            # "fixed" claim is verified against whether the score really improved
-            # over the selected parent's benchmark.
-            verdict_stability = None
-            parent_bench = (((self._parent_supernode or {}).get("benchmark") or {}).get("mean")
-                            if self._parent_supernode else None)
-            if fix_verdicts and parent_bench is not None and scores:
-                this_bench = float(statistics.mean(scores))
-                hits = sum(1 for fv in fix_verdicts
-                           if bool(fv.get("fixed")) == (this_bench > parent_bench))
-                verdict_stability = hits / len(fix_verdicts)
+            # verdict_stability (2026-10 rewrite): PER-ISSUE truth, accumulated
+            # by ``_update_issue_ledger`` earlier in this boundary and sourced
+            # from the mechanical checkers in gan/framework/issue_checks.py.
+            #
+            # The previous definition compared this outer's WHOLE verdict vector
+            # against ONE shared bit ("did the mean score rise above the
+            # parent's?"). It scored an honest evaluator 0.0 on A1: with the
+            # planner disabled nothing can be fixed, so 19/20 "not fixed" claims
+            # were CORRECT, yet the score rose anyway (the task agent improved
+            # itself) and every ``false`` counted as a miss. It also scored
+            # verdicts against a claim the evaluator never made.
+            #
+            # ``None`` when nothing was mechanically verifiable this outer ->
+            # neutral in F_e (term skipped, never a below-average hit-rate).
+            try:
+                from gan.framework import issue_ledger as _il
+                tr = _il.outer_verdict_stats(self.output_dir, outer)
+                verdict_stability = tr["verdict_stability"]
+            except Exception:  # noqa: BLE001 -- advisory
+                tr = {"verified": 0, "hits": 0, "unsupported": 0, "judged": 0}
+                verdict_stability = None
 
             payload = {
                 "outer": outer,
@@ -1383,6 +1571,15 @@ class GanLoop:
                     "rule_violation": rule_violation,
                     "calibration_error": calibration_error,
                     "verdict_stability": verdict_stability,
+                    # Diagnostic basis + counters: a supernode recorded before
+                    # this rewrite carries the OLD definition (whole-outer
+                    # verdict vector vs one shared bit) and cannot be recomputed,
+                    # so offline analysis needs to tell them apart. Not consumed
+                    # by fitness.
+                    "verdict_stability_basis": "issue_key_checks",
+                    "verdict_verified": tr["verified"],
+                    "verdict_hits": tr["hits"],
+                    "verdict_unsupported": tr["unsupported"],
                 },
             }
             record_supernode(self.output_dir, outer, payload, writer=self.ledger_writer)
@@ -1496,6 +1693,166 @@ class GanLoop:
             soft_fail(f"archive upsert failed (outer {outer}): {e}",
                       event_path=paths.events_path(self.output_dir),
                       event_type="archive_upsert_failed", outer=outer)
+
+    def _grant_health(self, outer: Any) -> Optional[bool]:
+        """``access.grant-broken`` input: were this outer's grants readable?
+
+        ``True``  -- at least one granted path failed the grant-time self-check,
+        ``False`` -- every grant verified readable,
+        ``None``  -- no grant this outer, or the audit record predates the
+                     self-check (old run dirs) -> undecidable, never "fine".
+
+        Advisory: a broker hiccup must not cost a round.
+        """
+        cache = getattr(self, "_grant_health_cache", None)
+        if cache is None:
+            cache = {}
+            self._grant_health_cache = cache
+        key = str(outer)
+        if key in cache:
+            return cache[key]
+        verdict: Optional[bool] = None
+        try:
+            recs = self._source_access_log(outer) or []
+        except Exception:  # noqa: BLE001 -- advisory
+            recs = []
+        checked = False
+        for rec in recs:
+            if not isinstance(rec, dict) or "unreadable" not in rec:
+                continue
+            checked = True
+            if rec.get("unreadable"):
+                verdict = True
+                break
+        if verdict is None and checked:
+            verdict = False
+        cache[key] = verdict
+        return verdict
+
+    def _issue_facts_cached(self, genid: Any) -> Optional[Dict[str, Any]]:
+        """Measurable facts of one generation, cached for this outer boundary."""
+        cache = getattr(self, "_issue_facts_by_genid", None)
+        if cache is None:
+            cache = {}
+            self._issue_facts_by_genid = cache
+        k = str(genid)
+        if k in cache:
+            return cache[k]
+        from gan.framework import issue_checks
+        node = None
+        try:
+            node = self.task_tree.get(genid)
+        except Exception:  # noqa: BLE001 -- a missing node is a legitimate gap
+            node = None
+        facts = issue_checks.generation_facts(node) if node is not None else None
+        if facts is not None:
+            # Loop-level facts (not node facts): the budget reference the
+            # cost.tokens checker divides by, and the outer's grant health.
+            facts["token_budget_per_gen"] = getattr(self, "token_budget_per_gen", None)
+            outer = None
+            try:
+                outer = (node.meta or {}).get("outer_id")
+            except Exception:  # noqa: BLE001 -- missing meta is a legitimate gap
+                outer = None
+            if outer is not None:
+                facts["grant_unreadable"] = self._grant_health(outer)
+        cache[k] = facts
+        return facts
+
+    def _update_issue_ledger(self, outer: int, outer_genids: List[Any]) -> None:
+        """Fold this outer's issue evidence into ``ckpt/issues/ledger.json``.
+
+        The JOIN lives here because the loop is the only place that owns the
+        tree: an issue is RAISED on the node whose evaluator reported it, while
+        the verdict and the stance about that issue arrive on its CHILD
+        (``judge_fix`` judges the parent's issues, ``respond_issue`` answers
+        them). Resolving ``issue_id`` -> ``issue_key`` therefore needs parent and
+        child together, which no role session has.
+
+        Advisory sink: a malformed observation, an unreadable tree or a broken
+        ledger must never cost a round.
+        """
+        if not self.issue_ledger_enabled:
+            return
+        try:
+            from gan.framework import issue_ledger
+            from gan.framework import issue_checks
+            obs: List[Dict[str, Any]] = []
+            facts_cache: Dict[str, Dict[str, Any]] = {}
+            for g in outer_genids:
+                node = self.task_tree.get(g)
+                if node is None:
+                    continue
+                meta = node.meta or {}
+                for it in ((meta.get("feedback") or {}).get("issues") or []):
+                    if isinstance(it, dict) and it.get("issue_key"):
+                        obs.append({"key": str(it["issue_key"]), "kind": "raised",
+                                    "genid": str(g)})
+                pmap: Dict[str, str] = {}
+                parent = None
+                if node.parent_genid not in (None, ""):
+                    try:
+                        parent = self.task_tree.get(node.parent_genid)
+                    except Exception:  # noqa: BLE001 -- missing parent is fine
+                        parent = None
+                if parent is not None:
+                    for it in (((parent.meta or {}).get("feedback") or {})
+                               .get("issues") or []):
+                        if not isinstance(it, dict):
+                            continue
+                        iid, key = it.get("issue_id"), it.get("issue_key")
+                        if iid and key:
+                            pmap[str(iid)] = str(key)
+                            # A bare `i-N` from the model resolves to the same key.
+                            pmap.setdefault(str(iid).rsplit("/", 1)[-1], str(key))
+                if not pmap:
+                    continue
+                parent_facts = (self._issue_facts_cached(parent.genid)
+                                if parent is not None else None)
+                child_facts = self._issue_facts_cached(g)
+                for v in self._read_fix_verdicts(g):
+                    key = pmap.get(str((v or {}).get("issue_id") or ""))
+                    if not key:
+                        continue
+                    claimed = bool(v.get("fixed"))
+                    # Mechanical truth for THIS pair (parent state -> child
+                    # state). ``None`` = not verifiable (no checker for the key,
+                    # either side unknown); ``unsupported`` = the defect was
+                    # already absent in the parent, i.e. the finding was not real.
+                    truth, before, after, unsupported = issue_checks.pair_truth(
+                        key, parent_facts, child_facts,
+                        getattr(self, "issue_check_params", None))
+                    obs.append({"key": key,
+                                "kind": ("judged_fixed" if claimed
+                                         else "judged_unfixed"),
+                                "claimed": claimed, "truth": truth,
+                                "unsupported": unsupported,
+                                "state_before": before, "state_after": after,
+                                "genid": str(g)})
+                for rec in (meta.get("records") or []):
+                    if isinstance(rec, dict) and rec.get("op") == "respond_issue":
+                        key = pmap.get(str(rec.get("issue_id") or ""))
+                        if key:
+                            obs.append({"key": key, "kind": "stance",
+                                        "stance": rec.get("response_kind"),
+                                        "genid": str(g)})
+            if not obs and not os.path.isfile(paths.issues_ledger_path(self.output_dir)):
+                # Nothing observed yet and no ledger to update: do not create an
+                # empty artifact (the ledger appears with the first real issue).
+                return
+            issue_ledger.apply_round(
+                self.output_dir, outer=outer, observations=obs,
+                writer=self.ledger_writer,
+                not_actionable_stances=self.issue_not_actionable_stances)
+            self.log_event({"type": "issue_ledger_updated", "outer": outer,
+                            "observations": len(obs),
+                            "summary": issue_ledger.summary(self.output_dir),
+                            "not_actionable": issue_ledger.not_actionable_keys(
+                                self.output_dir)})
+        except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
+            soft_fail(f"issue ledger update failed (outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="issue_ledger_update_failed", outer=outer)
 
     def _resolve_eval_base(self) -> Optional[str]:
         """The fixed eval root (docs/14 §5.5): eval_base ref, else the run's initial task commit."""
@@ -2508,8 +2865,21 @@ class GanLoop:
         eps = float(cfg.get("loop.stagnation_epsilon", 0.005))
         bl = int(cfg.get("tree.branch_limit", 2))
         dl = int(cfg.get("tree.depth_limit", 5))
-        method = cfg.get("tree.selection", "ucb")
+        method = cfg.get("tree.selection", "lcb")
         ucb_c = float(cfg.get("tree.ucb_c", 1.0))
+        # Confidence-set selector (``method="lcb"``, the default). ``lcb_delta=0``
+        # means "auto" (2/anchor_k ~ one standard error, resolved inside the
+        # store); ``lcb_z`` is the Wilson confidence knob (0 => plain ratio).
+        lcb_delta = float(cfg.get("tree.lcb_delta", 0.0))
+        lcb_z = float(cfg.get("tree.lcb_z", 1.64))
+        # Fail fast on a typo: an unknown method silently behaves like ``ucb``
+        # inside the store, which would invalidate an experiment arm without any
+        # visible symptom (same class of bug as a mis-parsed ablation switch).
+        if method not in ("lcb", "ucb", "best", "latest"):
+            raise ValueError(f"tree.selection={method!r} is not one of "
+                             f"lcb|ucb|best|latest")
+        if lcb_z < 0 or lcb_delta < 0:
+            raise ValueError("tree.lcb_z / tree.lcb_delta must be >= 0")
         depth_penalty = float(cfg.get("tree.depth_penalty", 0.05))
         cost_penalty = float(cfg.get("tree.cost_penalty", 0.0))
         n_parents = int(cfg.get("tree.num_parents", 1))  # >1 enables crossover
@@ -2550,6 +2920,16 @@ class GanLoop:
             self.task_tree.add_node(Node(genid="initial", value=NodeValue(score=None)))
             self.log_event({"type": "init", "task_tree": "initial"})
 
+        # Resume: earlier generations were written by a tree that may predate the
+        # anchor stamp, and the LCB selector cannot see evidence that is not in
+        # meta. Backfill once (idempotent) so parent selection spans the WHOLE
+        # tree instead of only the generations created after the resume.
+        if self.resume:
+            backfilled = self._backfill_anchor_stamps()
+            if backfilled:
+                self.log_event({"type": "anchor_stamp_backfill",
+                                "nodes": int(backfilled)})
+
         # A6 ablation: task-only single round -- no planner/evaluator/evolution.
         if self._ab("task_only_single_round"):
             return self._run_task_only_single_round()
@@ -2579,11 +2959,13 @@ class GanLoop:
             for inner in range(inner_start, I_max + 1):
                 _inner_t0 = time.time()
                 use_global = cross_subtree and random.random() < cross_subtree_epsilon
+                sel_report: Dict[str, Any] = {}
                 parents = self.task_tree.select_parents(
                     k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                     ucb_c=ucb_c, depth_penalty=depth_penalty, cost_penalty=cost_penalty,
                     outer_id=None if use_global else outer,
                     exclude={"initial"} if outer > 1 else None,
+                    lcb_delta=lcb_delta, lcb_z=lcb_z, report=sel_report,
                 )
                 # Fallback (docs/13 §2.4, 2026-10 revision): every outer starts
                 # with an EMPTY current subtree, so "subtree only" starves every
@@ -2592,11 +2974,13 @@ class GanLoop:
                 # real nodes) and record it. If cross_subtree_epsilon=1.0 the
                 # pool is already global and this never triggers.
                 if not parents and not use_global:
+                    sel_report.clear()
                     parents = self.task_tree.select_parents(
                         k=n_parents, branch_limit=bl, depth_limit=dl, method=method,
                         ucb_c=ucb_c, depth_penalty=depth_penalty,
                         cost_penalty=cost_penalty, outer_id=None,
                         exclude={"initial"} if outer > 1 else None,
+                        lcb_delta=lcb_delta, lcb_z=lcb_z, report=sel_report,
                     )
                     if parents:
                         self.log_event({"type": "inner_pool_fallback",
@@ -2605,6 +2989,13 @@ class GanLoop:
                     self.log_event({"type": "inner_skip", "reason": "no_candidate", "outer": outer, "inner": inner})
                     break
                 parent = parents[0]
+                # Decision-grade audit: WHICH candidates the statistic kept and why
+                # this one won. Reconstructible offline without re-running the tree
+                # (``degenerate`` flags an anchor core that stopped discriminating).
+                self.log_event({"type": "parent_select", "outer": outer,
+                                "inner": inner, "method": method,
+                                "pool": "global" if use_global else "subtree",
+                                **sel_report})
 
                 genid = self._gen_counter
                 self._gen_counter += 1
@@ -2623,13 +3014,20 @@ class GanLoop:
                 parent_outer = parent_meta.get("outer_id")
                 cross_outer = parent_outer is not None and parent_outer != outer
                 # Cross-outer lineage (docs/13 §2.4): the evaluator's issue
-                # round-trip is per-outer session state (fresh instance each
-                # outer; issue_id resets to i-1...). A parent selected from a
-                # DIFFERENT outer carries stale issues -- forcing respond_issue/
-                # judge_fix on them wastes budget and collides ids with this
-                # outer's fresh issues. Strip issues (keep diff_summary/scores/
-                # calibration); the planner and evaluator both read THIS
-                # parent_feedback, so one scrub covers both.
+                # round-trip is per-round state. A parent selected from a
+                # DIFFERENT outer carries issues whose causal chain is broken --
+                # the evaluator's own design, the restored parent design and the
+                # code branch all changed in between, so a cross-outer
+                # "fixed?" verdict is unattributable (and its prescription was
+                # written against the OLD design/code: carrying it forward would
+                # keep re-issuing a fix that may already have failed).
+                #
+                # What replaces it is the LEDGER projection below: a distilled,
+                # id-free list of open keys ("病史, not 处方"). The defect stays
+                # visible across outers, while the incumbent evaluator re-detects
+                # it and writes a fresh prescription. Identity no longer
+                # collides because issue ids are genid-qualified
+                # (``_qualify_issue_ids``).
                 if cross_outer:
                     if parent_feedback and parent_feedback.get("issues"):
                         parent_feedback = {**parent_feedback, "issues": []}
@@ -2659,6 +3057,15 @@ class GanLoop:
                     plan_feedback = None
                     plan_issues = None
                     plan_pred = None
+                # Cross-outer carry-over (issue continuity): only when the LIVE
+                # round-trip channel is empty -- a fresh outer (issues stripped
+                # above) or a parent that raised none. The C2/C4 text ablations
+                # are suppressed explicitly: they are defined as "no textual
+                # feedback at all".
+                text_feedback_off = (self._ab("feedback_numeric_only")
+                                     or self._ab("feedback_benchmark_score_only"))
+                plan_carried = ([] if (text_feedback_off or plan_issues)
+                                else self._carried_over("planner"))
                 traj_plan = self._traj_vis([], parent_ref)
 
                 # Reserved cost keys for the PLAN seat (docs/10 §10, phase C):
@@ -2739,6 +3146,7 @@ class GanLoop:
                             patch_retry_k=plan_ck.get("patch_retry_k", self.patch_retry_k),
                             max_tool_calls=plan_ck.get("plan_max_tool_calls", self.plan_max_tool_calls),
                             tool_repeat_limit=self.tool_repeat_limit,
+                            carried_over=plan_carried,
                             **plan_cost_kwargs,
                         ) or {}
                 except code_repo.RepoIntegrityError:
@@ -2748,6 +3156,10 @@ class GanLoop:
                     self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
+                # A bare `i-N` echoed by the planner is normalized to the parent's
+                # qualified id, so it still joins the parent issue in the digest
+                # and the ledger instead of becoming a silent "unjudged".
+                self._normalize_plan_issue_refs(plan_result, parent_feedback)
                 # Settled plan session -> cost ledger (A5). Success-only: a
                 # planner_failed round has no settled session to record.
                 _plan_cm = getattr(self.planner, "cm_session", None)
@@ -2798,6 +3210,17 @@ class GanLoop:
 
                 # score / imputation / validity
                 self._finalize_child(child, parent)
+                # Anchor stamp for CROSS-GENERATION parent selection
+                # (``tree.selection=lcb``): computed ONCE here and carried on the
+                # node, so selection never re-reads report.json per candidate and
+                # a resumed run cannot mix two definitions of the same evidence.
+                # Only REAL measurements are stamped -- an imputed score is a
+                # fallback value, not evidence for a confidence bound.
+                if child.value.score_status in _MEASURED:
+                    anc_c, anc_n = self._anchor_stats(genid)
+                    if anc_n > 0:
+                        child.meta["anchor_correct"] = int(anc_c or 0)
+                        child.meta["anchor_n"] = int(anc_n)
 
                 # archive the current generation's task trajectory BEFORE evaluation,
                 # so the evaluator can read it (current generation).
@@ -2913,6 +3336,9 @@ class GanLoop:
                             max_tool_calls=(eval_ck.get("evaluate_blind_max_tool_calls")
                                             or self.evaluate_max_tool_calls),
                             tool_repeat_limit=self.tool_repeat_limit,
+                            carried_over=([] if (text_feedback_off
+                                                or (parent_feedback or {}).get("issues"))
+                                          else self._carried_over("evaluator")),
                             **eval_cost_kwargs,
                         )
                 except code_repo.RepoIntegrityError:
@@ -2938,6 +3364,16 @@ class GanLoop:
                     "evaluator", "evaluate", outer, genid,
                     cm_session=_eval_cm)
                 self.evaluator.cm_session = None  # no stamp leak (§11 D11)
+
+                # Issue identity (framework-owned): namespace this round's ids by
+                # generation so a later round/outer can never collide with them,
+                # and normalize the verdict references back to the parent's
+                # qualified ids. Done BEFORE the packet/digest/eval.json writes so
+                # every sink sees one consistent id space.
+                issue_id_report = self._qualify_issue_ids(ctx, genid, parent_feedback)
+                if issue_id_report.get("renamed"):
+                    self.log_event({"type": "issue_id_duplicate", "genid": str(genid),
+                                    "renamed": issue_id_report["renamed"]})
 
                 packet = self._build_packet(child, ctx)
                 if getattr(ctx, "predicted_score", None) is not None:
@@ -3278,6 +3714,11 @@ class GanLoop:
                             "self_cost_tokens": self_own_costs,
                             "duration_s": round(time.time() - _outer_t0, 1)})
             self._save_checkpoint("outer", outer, I_max)
+            # Issue continuity: accumulate this outer's raises/verdicts/stances
+            # (and their mechanical truth) under the closed issue_key vocabulary.
+            # MUST run BEFORE _record_supernode: verdict_stability is read back
+            # from the ledger this call just wrote.
+            self._update_issue_ledger(outer, outer_genids)
             self._record_supernode(outer, outer_genids)
             self._evaluate_supernode(outer)
             self._archive_supernode(outer)

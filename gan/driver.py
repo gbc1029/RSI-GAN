@@ -1067,6 +1067,13 @@ def run_gan_driver(
             # two runs' inner-loop stopping behaviour incomparable -- the regime
             # guard must see it.
             "sampling.anchor_k": int((cfg.get("sampling") or {}).get("anchor_k", 0) or 0),
+            # Parent-selection policy. ``lcb`` (confidence set) and ``ucb``
+            # (legacy additive bonus) explore different lineages from the same
+            # tree, so two runs that differ here are NOT comparable -- the
+            # collector's regime guard must see it. ``lcb_delta`` changes the
+            # width of the confidence set, i.e. how much exploration happens.
+            "tree.selection": str(cfg.get("tree.selection", "lcb")),
+            "tree.lcb_delta": float(cfg.get("tree.lcb_delta", 0.0)),
             # Resolve exactly like _launch_budget: --inner OVERRIDES the yaml value
             # inside the worker, so recording the yaml 2 while the worker runs 3
             # would make the audit trail (and the collector's regime guard) lie

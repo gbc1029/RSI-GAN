@@ -22,13 +22,22 @@
 ```json
 {
   "issue_id": "i-<n>",
+  "issue_key": "<本次缺陷的固定词表键>",
   "description": "问题描述",
   "severity": "low|medium|high",
   "evidence": "轨迹/代码中的证据（引用片段）",
   "suggested_fix": "建议的修复方向"
 }
 ```
-调用 `report_issue(issue_id, description, severity, evidence, suggested_fix)` 记录。
+调用 `report_issue(issue_id, issue_key, description, severity, evidence, suggested_fix)` 记录。
+
+- `issue_id` 只是**本轮**的局部位次（框架会加上代际前缀），同一个缺陷换一轮就要换新位次。
+- `issue_key` 是**跨轮身份**，取自固定词表（见工具 schema 的 enum，如 `cost.tokens`、
+  `policy.accept-bias`、`access.grant-broken`）。**同一个缺陷重复上报时必须复用同一个
+  key**，否则跨 outer 的记忆会断掉；词表外的真实缺陷用 `other.new`。
+- 词表里标 `framework` 的 key（`access.grant-broken` / `harness.infra` /
+  `process.observability`）不是 planner 能修的，仍应如实上报（它用于审计与账本统计），
+  但不要把修复责任推给 planner。
 
 ## 对上一轮问题的修复判定（必填）
 对上一轮你提出的**每一个问题**，调用 `judge_fix(issue_id, fixed, evidence)`：

@@ -30,6 +30,7 @@ class Evaluator(Role):
         task_brief: Optional[str] = None,
         cost_statement: str = "",
         benchmark_score: Optional[float] = None,
+        carried_over: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         parts = [
             "Evaluate the task agent this round.",
@@ -64,8 +65,28 @@ class Evaluator(Role):
             parts.append(
                 "\n## YOUR issues from the previous round\n"
                 "For EACH issue below, call `judge_fix(issue_id, fixed, evidence)` judging "
-                "from the NEW trajectory/code whether it was actually fixed (not merely changed).\n"
+                "from the NEW trajectory/code whether it was actually fixed (not merely changed). "
+                "Copy `issue_id` EXACTLY as shown (it carries the round prefix; a bare "
+                "`i-N` is not a valid reference).\n"
                 f"```json\n{json.dumps(parent_feedback.get('issues'), ensure_ascii=False, indent=2)[:3000]}\n```"
+            )
+        if carried_over:
+            # Cross-outer ledger projection (gan/framework/issue_ledger.py).
+            # CONTEXT ONLY -- deliberately NOT in the "judge each issue" block:
+            # the causal chain across outers is broken (the evaluator's own
+            # design, the restored parent design and the code branch all changed
+            # in between), so a cross-outer "fixed?" verdict is unattributable
+            # and would inject noise into verdict_stability. Re-DETECT instead:
+            # raise the key again with a fresh description when it is still real.
+            parts.append(
+                "\n## Carried-over open issues from earlier outer generations "
+                "(context only -- do NOT call judge_fix for these)\n"
+                "These defects were raised in a previous outer generation and are "
+                "still open. They are not part of this round's judging set. If one "
+                "is still present, raise it again with `report_issue` and the SAME "
+                "`issue_key`, writing a fresh description/evidence/fix — the older "
+                "prescription was written against an older design and older code.\n"
+                f"```json\n{json.dumps(carried_over, ensure_ascii=False, indent=2)[:1200]}\n```"
             )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
             # The block is scoped to the parent round explicitly --
@@ -133,6 +154,7 @@ class Evaluator(Role):
         reveal_max_tool_calls: Optional[int] = None,
         tool_repeat_limit: Optional[int] = None,
         cost_statement: str = "",
+        carried_over: Optional[List[Dict[str, Any]]] = None,
     ) -> EvalContext:
         """Two-phase evaluation: blind first, then reveal benchmark (if provided).
 
@@ -179,7 +201,8 @@ class Evaluator(Role):
         try:
             hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief,
                                                     cost_statement=cost_statement,
-                                                    benchmark_score=(benchmark_score if not blind_enabled else None)),
+                                                    benchmark_score=(benchmark_score if not blind_enabled else None),
+                                                    carried_over=carried_over),
                             max_tool_calls=blind_cap,
                             tool_repeat_limit=tool_repeat_limit,
                             trajectory_file=self.session_trajectory(node_id))
