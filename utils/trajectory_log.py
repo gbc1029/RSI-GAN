@@ -61,8 +61,16 @@ def _rotate(path: str) -> None:
 
 
 def _readable(t: float) -> str:
-    """Human-readable local timestamp (ms precision) alongside the epoch ``ts``."""
-    base = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    """Human-readable UTC timestamp (ms precision) alongside the epoch ``ts``.
+
+    UTC is deliberate: ``events.jsonl`` mixes writers whose TZ view differs —
+    the driver runs on the host (``localtime`` == host zone) while the loop and
+    sandboxed workers see the synthetic ``/etc`` with ``Etc/UTC`` — so
+    ``localtime`` produced one timezone per writer in the same file (field
+    audit small_1030_095410). ``gmtime`` pins every writer to the same clock
+    regardless of its environment; the epoch ``ts`` stays authoritative.
+    """
+    base = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
     return f"{base}.{int(t * 1000) % 1000:03d}"
 
 

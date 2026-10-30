@@ -490,3 +490,67 @@ java 2/10(无尾换行拼连)、javascript 1/26(package.json 冲突)、go 1/17(�
 - **已知残留**（有意保留）：会话内链式漂移边界（逐写保留 ≥50% 的渐进重写合法，现行
   ratio 下同样可行）；`list_editable` 不加 read_only_here 分节（读写不对称靠 C 类
   报错兜底）。
+
+## 9. small_1030_095410 审计与四处修复（2026-10-30 第四批）
+
+全量审查 polyglot 小规模轮 `small_1030_095410`（1 outer × 3 inner + 固定根评测 +
+双角色 self-improve）的运行记录，确认四处框架级缺陷并修复；其余发现归因为
+agent 侧使用错误或设计行为（审查会话记录），本轮不动。
+
+### 9.1 渲染视图截断无标记（F1）
+
+- **表现**：`read_trajectory` 默认 `max_chars=6000`，`trajectory._render` 对整条
+  轨迹渲染流按字符数硬切、切口无任何标记——"视图被切"与"数据就这么多"不可区分。
+  评估器在单次默认 cap 读取上得出 6 条伪问题（3 条 severity=high）：把 6000 切口
+  逐字读成"文件被截断"（i-4 "forth.go 截断于 `func applyBuiltin(...)`"、i-9
+  "记录终止于第 4 个 bash 调用"内部）、"只有 1 次工具调用"、"写后无 bash 验证"、
+  "3 个工具调用的会话"。原始轨迹全部完整（write_file 4502 字符完整收尾；真实会话
+  13–22 次工具调用）。模拟验证：cap=6000 的切口与评估器引用逐字吻合；30k/120k
+  渲染远超该点——其"30k/120k 复核切口相同"的声明为假。
+- **修改**：`_render` 切断时追加 `...[render truncated at max_chars=N]`（只标注
+  视图上限，不改脱敏语义；`read`/`read_session`/`read_trajectory`/
+  `read_session_trajectory` 各决策面同享）。
+
+### 9.2 outer-eval 任务轨迹不归档（F3）
+
+- **表现**：固定根评测轮（`eval_outer<N>_s<M>`）的 task 子轨迹从未归档——
+  `run_once` 不调 `trajectory.collect`，过程证据只存在于临时 `work/` 的未脱敏
+  `chat_history`（侥幸存活：`keep_workdirs` 清理分支不覆盖 eval genid）。评测轮
+  `python__phone-number` 空补丁（malformed 链）的现场因此只能在 work/ 取证。
+- **修改**：`loop._evaluate_supernode.run_once` 在拿到 child 后走与主线相同的
+  `trajectory.collect`（落 `trajectory/outer_<O>/eval_outer<N>_s<M>/task.jsonl`
+  + `.llm_calls.jsonl` sidecar，脱敏一致）。评测轮不是决策代：失败 `soft_fail`
+  （事件 `eval_task_trajectory_archive_failed`），不像主线那样硬失败。
+- **未动**：eval 记录保存位置（`outer_<N>_eval` 独立树方案）与 eval planner
+  会话/成本隔离，留待下一轮决策。
+
+### 9.3 events.jsonl `time` 字段双时区（F6）
+
+- **表现**：同一 events.jsonl 混用两种时区——loop/沙箱侧进程看到合成 `/etc`
+  （`Etc/UTC` 设计），`localtime` 产出 UTC（如 `outer_start 01:54:45`）；driver
+  侧进程在宿主机（+08），产出本地时间（如 `driver_done 10:45:42`、
+  `eval_subset_resolved 09:54:21`）。`ts` 一致、`time` 各说各话。
+- **修改**：`utils/trajectory_log._readable` 与 `llm_proxy._audit` 的可读时间固定
+  `time.gmtime`（UTC）——不依赖任何进程的 TZ 视图，driver/loop/沙箱三个写出方
+  统一；格式不变，`ts` 仍为权威。沙箱 `/etc` 的 `Etc/UTC` 设计保持不动（不向
+  凭据无关的合成 /etc 投影宿主时区）。
+
+### 9.4 任务沙箱 JDK 不可用（W4 框架部分）
+
+- **表现**：polyglot java 题在任务沙箱内无法自检——`java -version` 报
+  `InternalError: Error loading java.security file`。实证机制：Debian 的 OpenJDK
+  把 `conf/security/{java.security,java.policy,nss.cfg}` 做成指向
+  `/etc/java-17-openjdk/security/` 的符号链接，而合成 `/etc` 不含该子树 → 悬空
+  链接。任务 agent 因此进入 apt 安装螺旋（13×120s bash 超时的间接推手之一；
+  评测侧 docker 的 java 是好的，两侧能力不对齐）。`/usr/lib/jvm` 里 JDK 完整，
+  只差 /etc 侧 5 个真实文件。
+- **修改**：`sandbox_etc.create_sandbox_etc` 可选投影 `/etc/java-*-openjdk`
+  子树：逐文件解引用、`_trusted_file_bytes` 信任校验（root 属主、限定 /etc 根）、
+  0444 root-owned 重建；目标逃出 /etc 或信任失败的源**跳过不跟进**（可选投影
+  不得拖垮沙箱，validate 门仍兜底）；`validate_sandbox_etc` 放行
+  `java-\d+-openjdk(/.*)?` 形状的目录与文件（含末尾聚合复查的同步修正），其余
+  一切仍 fail-closed。实测：投影 35 个文件，`java.security` 与宿主逐字节一致，
+  validate 通过。已知同类（未修）：rust 链接器 `cc` 缺失。
+- **配套**：`run_tool_regression.py` 七套件 + `test_frozen.py` 改动前后各跑一次
+  全绿；AGENTS.md 同步四处表述（沙箱 /etc 投影、评测轮归档、渲染标记 + UTC
+  时钟、回归套件数 six→seven）。

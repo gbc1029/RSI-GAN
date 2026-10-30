@@ -1636,6 +1636,21 @@ class GanLoop:
                                     "sample": sample, "genid": genid,
                                     "score_status": child.value.score_status})
                     return None
+                # Archive the eval round's task trajectory through the SAME
+                # pipeline as the main line (redaction + llm_calls sidecar).
+                # The eval round is not a decision generation, so an archive
+                # failure is advisory (soft_fail) — unlike the main line's
+                # hard-fail — but it must SPEAK, never vanish (field audit
+                # small_1030_095410: the fixed-root eval's only process
+                # evidence lived in the ephemeral work dir).
+                try:
+                    trajectory.collect(child.meta.get("run_dir", ""), f"gan_{genid}",
+                                       self.output_dir, outer, genid)
+                except Exception as e:
+                    soft_fail(f"eval task trajectory archive failed for genid {genid}: {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="eval_task_trajectory_archive_failed",
+                              outer=outer, genid=str(genid))
                 return child.value.score
 
             # preserve the main-line task HEAD; the rounds move it to eval tips

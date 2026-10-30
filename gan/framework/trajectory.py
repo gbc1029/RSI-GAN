@@ -251,7 +251,16 @@ def _render(text: str, max_chars: int, expose_reasoning: Optional[bool] = None) 
                     else:
                         out += f" [reasoning omitted: {len(rsn)} chars]"
             parts.append(out)
-    return "\n".join(parts)[:max_chars]
+    rendered = "\n".join(parts)
+    if len(rendered) > max_chars:
+        # Mark VIEW truncation explicitly: a silently cut render is
+        # indistinguishable from a short archive, and a downstream evaluator
+        # has already misread the 6000-char default cut as truncated FILES
+        # (field audit small_1030_095410: fabricated mid-function EOFs).
+        # Redaction semantics are unchanged — this only labels the cap.
+        rendered = rendered[:max_chars] + \
+            f"\n...[render truncated at max_chars={max_chars}]"
+    return rendered
 
 
 def read(output_dir: str, genid: Any, max_chars: int = 6000, role: str = "task",
