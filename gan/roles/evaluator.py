@@ -10,6 +10,12 @@ from gan.framework.context import EvalContext, reset_eval_context, set_eval_cont
 from gan.framework.receipt import render_receipt
 from gan.roles.base_role import Role
 
+# Blind-phase retry budget (docs/17 §16): ONE bounded retry when the blind
+# phase ended without a recorded prediction. 3 calls = the mandatory record
+# plus margin for a single re-read; deliberately NOT the blind cap, so the
+# retry cannot become a second full blind phase.
+BLIND_RETRY_MAX_TOOL_CALLS = 3
+
 
 class Evaluator(Role):
     def __init__(self, model: str, output_dir: str, instance: Optional[str] = None, **kwargs):
@@ -86,13 +92,31 @@ class Evaluator(Role):
             f"`benchmark_score = {benchmark_score}`.\n"
             "Do a deep evaluation: compare with your blind prediction, refine issues, "
             "run the remaining eval points (trajectory_quality/hard_failure/reward_hacking/"
-            "rule_violation). If a check needs source, call `request_source_access` first. "
+            "rule_violation). Do NOT call `record_predicted_score` -- the blind window "
+            "is closed and your blind prediction (or its absence) stands for calibration. "
+            "If a check needs source, call `request_source_access` first. "
             "Note: deep registry changes (`register_component` / `unregister_component` / `update_component`) "
             "are currently unavailable in this session."
         ]
         if penalties_hint:
             parts.append(f"\nPenalty hints: {json.dumps(penalties_hint, ensure_ascii=False)}")
         return "\n".join(parts)
+
+    def _blind_retry_instruction(self) -> str:
+        """One bounded blind-window retry after a prediction-less blind phase.
+
+        Short nudge on the SAME history (the model keeps its analysis) and the
+        SAME blind frame (the benchmark score is still unrevealed): record the
+        estimate now, no new exploration. Guarded by
+        ``blind_enabled and ctx.predicted_score is None`` in evaluate()."""
+        return (
+            "\n## BLIND PREDICTION MISSING\n"
+            "Your blind evaluation ended without a recorded prediction. Call "
+            "`record_predicted_score` ONCE now with your 0..1 estimate of this "
+            "round's benchmark score, based ONLY on the evidence you already "
+            "gathered (the benchmark score has NOT been revealed). Do not start "
+            "new exploration; record and stop."
+        )
 
     # -- API ---------------------------------------------------------------
     def evaluate(
@@ -124,6 +148,15 @@ class Evaluator(Role):
         own design through the frozen cost-key table and passes them here.
         """
         ctx = EvalContext()
+        # Blind-discipline phase flags (docs/17 §16): instance-private (NOT
+        # dataclass fields -- `asdict` keeps them out of the IPC result and
+        # the evaluate exact-field-set validation stays untouched). The
+        # record_predicted_score tool reads the SAME object, so mutations
+        # between the two runs are visible to it. `blind_discipline=False`
+        # is the C1 ablation shape: the score is known from turn one and
+        # recording stays legal for the whole session.
+        ctx.blind_discipline = bool(blind_enabled)
+        ctx.revealed = False
         tb_exhausted_any = False
         truncated_any = False
 
@@ -151,7 +184,25 @@ class Evaluator(Role):
                             tool_repeat_limit=tool_repeat_limit,
                             trajectory_file=self.session_trajectory(node_id))
             _absorb_flush_flags()
+            if blind_enabled and ctx.predicted_score is None:
+                # Blind phase ended WITHOUT a prediction (empty response /
+                # degenerate reasoning / forgotten record -- field audit
+                # smoke_1030_204345 gen_1: an empty completion ended the blind
+                # phase and the prediction was recorded post-reveal). One
+                # bounded retry BEFORE the reveal: the calibration signal is
+                # rescued inside the blind window instead of being replaced by
+                # a post-hoc value. Still no prediction after this -> proceed
+                # with None (the digest renders "predicted ?, actual X.").
+                hist = self.run(
+                    self._blind_retry_instruction(),
+                    msg_history=hist,
+                    max_tool_calls=BLIND_RETRY_MAX_TOOL_CALLS,
+                    tool_repeat_limit=tool_repeat_limit,
+                    trajectory_file=self.session_trajectory(node_id),
+                )
+                _absorb_flush_flags()
             if benchmark_score is not None:
+                ctx.revealed = True
                 self.run(
                     self._reveal_instruction(benchmark_score),
                     msg_history=hist,

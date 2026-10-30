@@ -990,3 +990,62 @@ x86_64-linux-gnu-gcc-13），`open(...,"w")` 跟随三层链接把宿主机编�
 - **验证**：重生成 `smoke_1030_204345` 报告——"运行墙钟 3299.9s（占 1.159）"
   （3299.9s 与 driver_done.duration_s 精确一致），"Nones" 归零；合成"缺 driver
   事件"夹具渲染 "运行墙钟 —（占 —）"，无 None 拼接。
+
+## 16. 第六批续二：blind-reveal 纪律（评分闸门 + 盲评重试）+ 会话 log 归位（2026-10-30，离线验证）
+
+### 16.1 reveal 阶段评分禁止（工具闸门）
+
+- **依据**：`record_predicted_score` 契约原文 "BEFORE the benchmark is revealed"；
+  reveal 指令本无录分任务；全部消费端把"缺失预测"当一等状态（digest 渲染
+  "predicted ?, actual X."、MAE 聚合跳过 None、potential 仅 context）。禁录不是
+  改设计，是把既有契约补上强制。
+- **改动**：工具侧双条件闸门 `revealed AND blind_discipline` —— 拒绝以正常工具
+  返回表达（不计 malformed、模型当场知情）；`blind_discipline=False` 即 C1 消融
+  形态（分数第一轮就已知），闸门全程开放不误伤。旗标为 **ctx 实例私有属性**
+  （`evaluate()` 在两 run 之间设置）—— `asdict` 只序列化 dataclass 字段，IPC
+  精确键集契约零影响（测试 A 组绊线锁死该前提）；工具经 `get_eval_context()`
+  持同一对象引用，跨 run 可见。
+- **配套**：`_reveal_instruction` 增 "Do NOT call record_predicted_score" 句
+  （指令层 belt，工具闸门是 suspenders）。
+
+### 16.2 blind 阶段一次重试
+
+- **插入点**：blind run 与 reveal run 之间（benchmark 未揭示，纪律无损）。触发
+  条件 `blind_enabled and ctx.predicted_score is None`，与是否有 reveal 解耦。
+- **重试轮**：同一 history 续传 + 短促指令（"BLIND PREDICTION MISSING ... record
+  ONCE now ... Do not start new exploration"），预算 `BLIND_RETRY_MAX_TOOL_CALLS=3`
+  （必录 1 次 + 单次复读余量；刻意不用 blind_cap，防止重试变成第二个完整盲评阶
+  段）；同一 trajectory_file，成本聚合与审计面不变。
+- **失败路径**：重试后仍无预测 → 照常进入 reveal（闸门已锁）、`predicted_score
+  =None` 走诚实渲染。gen_1 型"空响应 → reveal 后补录 → 假 +0.05 delta"链条
+  被双重切断（重试自救 + 闸门拦截）。
+
+### 16.3 会话 log 归位（分体存储修复）
+
+- **机理**：`AgentSystem` 构造期把 `self.log` 钉在 outer 级 attempt 键控文件
+  （`session_trajectory(None)`），而 plan/evaluate 会话的结构化记录走 per-
+  generation `gen_<N>.jsonl` —— 预算熔断/malformed/截断等事故现场 log 落在
+  attempt 兄弟文件且跨会话混装（实证：`plan/outer__9fb0ba08.jsonl` 仅 1 条、
+  `evaluate/outer__9fb0ba08.jsonl` 仅 2 条，时间戳各自落在对应 gen 窗口内）。
+- **改动**：`BaseRole.run()` 在 chat 调用期间把 log 目标临时换绑到本次会话文件
+  （`finally` 恢复）—— 内容与停止记录同文件（attempt 键控契约从 outer 级扩展到
+  per-generation 会话）；会话外 log 仍落实例文件；self 席位同文件 no-op；并行
+  self-improve 线程分属不同实例，无竞争。附带收益：会话内 log 纳入会话文件的
+  脱敏通道（attempt 兄弟文件原先不在 `run()` 尾部的 `redact_file` 覆盖面内）。
+- **记录形状零新增**：`{"kind":"log","level","text"}` 与任务 child 的 task.jsonl
+  同构。存量 run 不迁移。
+
+### 16.4 验证
+
+- 新守卫 `test_blind_reveal_gate.py` **18/18**：IPC 契约绊线（`asdict(EvalContext)`
+  过 `_validated_result` 精确键集、私有旗标不入 dataclass）；闸门单测（blind 可录 /
+  reveal 拒绝且旧值保持 / C1 可录）；流程四形态（空盲评→重试救回→reveal 拒录 /
+  重试也败→None 诚实路径 / 即时录分→无重试 / C1 全程可录且 reveal 覆盖合法）。
+- 新守卫 `test_session_log_scoping.py` **7/7**：log 落会话文件、结构化记录同文件、
+  attempt 文件不再接收、run 后恢复实例目标、self 席位形状不变。
+- `run_tool_regression.py` 七套件全 PASS（record_predicted_score 在触达清单）；
+  `test_frozen.py`、§15 全部守卫（ceiling/ownership/mirror）全 PASS；
+  六个改动文件 `py_compile` 通过。
+- **待真实 run 确认**：① 评估器 blind 无预测时出现重试轮且预测在 blind 窗口内
+  落账（digest 出现真实 delta 而非 "?"）；② reveal 阶段无 predicted_score 变动；
+  ③ `gen_N.jsonl` 出现 `kind:"log"` 停止记录、attempt 兄弟文件不再增长。

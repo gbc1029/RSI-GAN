@@ -378,30 +378,52 @@ class Role(AgentSystem):
                           role=self.role)
         if cm_session is not None:
             chat_kwargs["cm"] = cm_session
-        hist, info = chat_with_agent(
-            full_msg,
-            model=self.model,
-            msg_history=msg_history or [],
-            logging=self.log,
-            tools_available=tools_available,
-            tools_dir=self.tools_dir,
-            max_tool_calls=max_tool_calls,
-            # Reserved cost key (docs/10 §10): explicit arg > the loop's
-            # instance stamp > None (unlimited, pre-C behavior).
-            max_total_tokens=(token_budget if token_budget is not None
-                              else getattr(self, "session_token_budget", None)),
-            trajectory_file=path,
-            reasoning_effort=self.reasoning_effort,
-            api_key=proxy_token,
-            load_report_path=load_report_path,
-            # Per-CALL budget. Resolution order: explicit arg -> the
-            # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
-            # -> the dispatch default (agent.llm_withtools, 600).
-            tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
-                            else getattr(self, "tool_timeout_s", None)),
-            return_info=True,
-            **chat_kwargs,
-        )
+        # Session-scoped log target (docs/17 §16): `self.log` is bound at
+        # CONSTRUCTION to the outer-level attempt-keyed file, so free-text
+        # logging() calls inside the chat loop (budget stops, malformed-JSON
+        # notices, truncation breakers...) used to land in the attempt sibling
+        # while the session's structured records went to the per-generation
+        # gen_<N>.jsonl -- one session's evidence split across two files, and
+        # the sibling mixed every session of the instance (field audit
+        # smoke_1030_204345). Rebind for exactly this chat call so content +
+        # stop records share ONE file (the attempt-keying contract, extended
+        # to per-generation sessions); out-of-session logs keep going to the
+        # instance file. Safe under the parallel self-improve threads: they
+        # run on DIFFERENT role instances (seat write surfaces are disjoint).
+        # The self seat passes the same file -> no-op. Bonus: in-session logs
+        # now ride the session file's redaction pass below.
+        _prev_trajectory_file = self.trajectory_file
+        _log_rebound = bool(path) and path != _prev_trajectory_file
+        if _log_rebound:
+            self.trajectory_file = path
+        try:
+            hist, info = chat_with_agent(
+                full_msg,
+                model=self.model,
+                msg_history=msg_history or [],
+                logging=self.log,
+                tools_available=tools_available,
+                tools_dir=self.tools_dir,
+                max_tool_calls=max_tool_calls,
+                # Reserved cost key (docs/10 §10): explicit arg > the loop's
+                # instance stamp > None (unlimited, pre-C behavior).
+                max_total_tokens=(token_budget if token_budget is not None
+                                  else getattr(self, "session_token_budget", None)),
+                trajectory_file=path,
+                reasoning_effort=self.reasoning_effort,
+                api_key=proxy_token,
+                load_report_path=load_report_path,
+                # Per-CALL budget. Resolution order: explicit arg -> the
+                # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
+                # -> the dispatch default (agent.llm_withtools, 600).
+                tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
+                                else getattr(self, "tool_timeout_s", None)),
+                return_info=True,
+                **chat_kwargs,
+            )
+        finally:
+            if _log_rebound:
+                self.trajectory_file = _prev_trajectory_file
         self._merge_load_report(load_report_path)
         # expose the last run's outcome (truncated/tool_calls) to callers
         self.last_run_info = info
