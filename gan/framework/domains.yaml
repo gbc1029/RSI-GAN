@@ -92,6 +92,15 @@ domains:
       as messages_a and messages_b. Judge which response is better for the
       user and say why briefly. Your final answer must be exactly one
       identifier: model_a or model_b.
+    # Filled 2026-10-30 (F4/C1): the scorer IS an exact label match on this
+    # vocabulary, so the contract is a label contract like paper_review — the
+    # derived response contract names the same words (compute_report_summary
+    # additionally gains contract_ok for search runs; measurement only).
+    output_contract:
+      kind: label
+      allowed_labels: [model_a, model_b]
+      case_insensitive: true
+      strip: true
     ensembled: true
     eval_subset: _filtered_100_train
     test_subset: _filtered_100_test

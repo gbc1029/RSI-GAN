@@ -77,6 +77,9 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # framework-owned output contract (F4/C1): derived from domains.yaml's
+    # output_contract / the domain's prediction source — read-only for the child
+    "GAN_RESPONSE_CONTRACT",
     # context-management snapshot (docs/10 §11 D2): the frozen seam core and
     # the selected policy component live under .gan_runtime/cm (no gan/ bind);
     # GAN_CM_EVENTS is the child's seam-audit sidecar (rw bind, §11.5)
@@ -632,6 +635,7 @@ def assemble_task_env(
     config: Dict[str, Any],
     code_root: Optional[str] = None,
     task_brief: Optional[str] = None,
+    response_contract: Optional[str] = None,
 ) -> Dict[str, str]:
     """Build the environment and sandbox-visible runtime assets for TaskAgent.
 
@@ -753,6 +757,8 @@ def assemble_task_env(
     env["GAN_TASK_KNOWLEDGE_DIR"] = "/workspace/.gan_runtime/knowledge"
     if task_brief:
         env["GAN_TASK_BRIEF"] = task_brief
+    if response_contract:
+        env["GAN_RESPONSE_CONTRACT"] = response_contract
     return env
 
 
@@ -2888,6 +2894,43 @@ def _normalize(value: Any, contract: Dict[str, Any]) -> str:
     if contract.get("case_insensitive", True):
         s = s.lower()
     return s
+
+
+_UNIVERSAL_RESPONSE_CONTRACT = (
+    "The response must contain the complete final answer from your prior work.")
+
+
+def derive_response_contract(domain: Optional[str],
+                             domain_cfg: Optional[Dict[str, Any]]) -> str:
+    """The framework-owned final-answer requirement, as ONE sentence.
+
+    Single source for BOTH consumers: the task child's explicit output-contract
+    section (assembled instruction) and the format-repair turn. Derivation:
+
+    - ``output_contract.kind == "label"`` (domains.yaml) -> the label list,
+      so the repair turn and the main prompt name the SAME vocabulary the
+      online scorer matches against;
+    - domains whose prediction is NOT the response text (polyglot: the
+      workspace diff is the deliverable) get their prediction-source fact —
+      the old universal "return the COMPLETE final answer" pushed polyglot
+      into re-pasting whole diffs and tripping finish_reason=length;
+    - everything else -> the universal sentence (fail-open: a domain with no
+      contract still gets an explicit requirement).
+    """
+    cfg = domain_cfg or {}
+    contract = cfg.get("output_contract") or {}
+    if contract.get("kind") == "label":
+        labels = [str(a) for a in (contract.get("allowed_labels") or [])
+                  if str(a).strip()]
+        if labels:
+            return ("The response must be exactly one of: "
+                    + " / ".join(labels) + ".")
+    if domain == "polyglot":
+        return ("Your written solution files are the deliverable - the response "
+                "only needs a 1-3 sentence summary. Do NOT paste code or diffs.")
+    if domain == "imo_proof":
+        return ("The response must contain the complete proof solution text.")
+    return _UNIVERSAL_RESPONSE_CONTRACT
 
 
 def compute_report_summary(

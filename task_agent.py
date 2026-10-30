@@ -96,6 +96,15 @@ class TaskAgent(AgentSystem):
         task_brief = os.environ.get("GAN_TASK_BRIEF") or ""
 
         brief_block = f"{task_brief}\n\n" if task_brief else ""
+        # Framework-owned output contract (F4/C1): injected by the framework
+        # and not reachable through the design config — the design prompt above
+        # is role-authored, so the contract is a SEPARATE, explicitly labeled
+        # section rather than text any role could rewrite away.
+        response_contract = os.environ.get("GAN_RESPONSE_CONTRACT") or ""
+        contract_block = (
+            "Output contract (framework-owned; in any conflict with the "
+            f"instructions above, follow this contract):\n{response_contract}\n\n"
+            if response_contract else "")
         instruction = f"""{prompt}
 
 {brief_block}Task input:
@@ -103,7 +112,7 @@ class TaskAgent(AgentSystem):
 {inputs}
 ```
 
-Respond in JSON format with the following schema (wrap the object in <json>...</json> tags; no markdown fences; no text outside the tags; write math in plain text without LaTeX backslash escapes):
+{contract_block}Respond in JSON format with the following schema (wrap the object in <json>...</json> tags; no markdown fences; no text outside the tags; write math in plain text without LaTeX backslash escapes):
 <json>
 {{
     "response": ...
@@ -145,12 +154,19 @@ Respond in JSON format with the following schema (wrap the object in <json>...</
         if extraction_error:
             self.log(f"prediction_extract failed: {extraction_error}; "
                      "requesting one format-repair turn")
+            # Domain-aware requirement (F4/C1): the framework-derived contract
+            # names what the response must contain (label vocabulary /
+            # summary-only for diff-deliverable domains / complete proof);
+            # the universal fallback keeps a no-contract domain working.
+            response_requirement = (os.environ.get("GAN_RESPONSE_CONTRACT")
+                                    or "The response must contain the complete "
+                                       "final answer from your prior work.")
             repair_instruction = f"""Your previous final output could not be accepted: {extraction_error}.
 
-Do not call any tool. Return the COMPLETE final answer from your prior work as exactly one tagged JSON object, with no markdown fences and no text outside the tags. The response value must be a non-empty JSON string; write math in plain text without LaTeX backslash escapes.
+Do not call any tool. Return your final answer as exactly one tagged JSON object, with no markdown fences and no text outside the tags. The response value must be a non-empty JSON string; write math in plain text without LaTeX backslash escapes. {response_requirement}
 <json>
 {{
-    "response": "complete final answer"
+    "response": "final answer"
 }}
 </json>"""
             try:

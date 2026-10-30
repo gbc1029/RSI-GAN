@@ -145,13 +145,21 @@ class Planner(Role):
         max_tool_calls: int = 40,
         tool_repeat_limit: Optional[int] = None,
         cost_statement: str = "",
+        response_contract: Optional[str] = None,
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
 
         task_design = config if isinstance(config, dict) else {}
         plan_ctx = PlanContext(config=task_design, node_id=node_id, output_dir=self.output_dir)
-        design_ctx = DesignContext(role="task", config=task_design, node_id=node_id)
+        # F4/C1: the framework's output contract rides the design context so
+        # the AUTHOR sees it at the point of rewriting the task prompt
+        # (soft constraint: known to exist; not a set_config-writable key).
+        oc = ({"text": str(response_contract),
+               "source": "framework; read-only, outside set_config keys"}
+              if response_contract else None)
+        design_ctx = DesignContext(role="task", config=task_design, node_id=node_id,
+                                   output_contract=oc)
         tok_plan = set_plan_context(plan_ctx)
         tok_design = set_design_context(design_ctx)
         akey = self.access_key(node_id)

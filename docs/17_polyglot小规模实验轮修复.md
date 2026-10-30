@@ -719,3 +719,52 @@ run_tool_regression 七套件 + test_frozen 改动后全绿。
 - **残项**：eval 轮会话（`gen_eval_outer1_s1`）仍不归属任何 gen 的 cost.json（eval gen
   无 cost.json）——成本归属口径另行决策；历史 run 的账本可用 `cost_ledger.reconcile`
   回填重建（现成接口，未对本 run 执行以免改写产物）。
+
+## 12. 修复轮契约域化与输出契约显式化（F4/C1，2026-10-30）
+
+### 12.1 设计裁定（两处修正后定稿）
+
+- **不新增 `response_contract` 键**：label 域由既有 `output_contract.allowed_labels`
+  派生；search_arena **填充既有键**（null → label 契约，词表 = 在线 exact match 词表
+  model_a/model_b；`compute_report_summary` 对 search 仅新增 `contract_ok` 测量事实，
+  无打分行为变化）；polyglot/imo_proof 的特殊句来自**框架预测来源映射**（"prediction
+  从哪来"是框架事实，非逐域运营参数）。零新 yaml 键。
+- **不变性范围收窄**：硬约束仅"role 无法直接修改契约表述/注入代码"（契约不在任何可写
+  面——非 set_config 键、domains.yaml 不在写根、env 白名单只读）；**role 在自己的
+  prompt 里重写一份不同契约不被禁止也不检测**——软约束"已知存在输出契约"（作者在写作
+  现场经 get_config 看到契约；在线打分恒按框架规则执行，竞争契约自败）。无内容审查
+  （shape-only 政策保持）。
+- **AGENTS.md 对 roles 不可见** → 可见性全部带内（工具面/指令文本/轨迹），无文档层通道。
+
+### 12.2 实现
+
+- **单一派生**：`task_execution.derive_response_contract(domain, domain_cfg)` —
+  label 派生（"exactly one of: …"）/ polyglot（"files are the deliverable — response
+  is a 1-3 sentence summary; do NOT paste code or diffs"，直接消除旧通用句诱导全量
+  重贴 → finish_reason=length 的失效路径）/ imo_proof（"complete proof solution
+  text"）/ fallback 通用句。
+- **三个消费点**：① task 子指令显式契约段（装配于 role 撰写 prompt 之后、JSON 形状段
+  之前，头行声明冲突时以契约为准——写给任务 agent 的读序指令，非 role 侧强制）；②
+  修复轮 `response_requirement` 插值（旧 "Return the COMPLETE final answer" 移除）；
+  ③ `get_config` 无参视图的 `output_contract` 框架字段。
+- **两条注入链**（各对齐既有先例）：task 子进程 = driver broker config →
+  `task_broker` env → `GAN_RESPONSE_CONTRACT`（镜像 GAN_TASK_BRIEF，白名单
+  `_TASK_ENV_NAMES` 增项）；role seat = `loop → planner.plan(response_contract=…)`
+  显式参数 → `DesignContext` 框架盖章字段（先例：record 的 target_role 后置盖章）→
+  get_config 读 ctx 转发。
+- **get_config 双态**：无参 = 仅键视图（`_keys_view` 现成）+ 框架字段；带参 = 单键值
+  ——`prompt` 附 gen-0 seed 与 prompt_equals_seed（改写门上下文随 prompt 读取走，
+  不再每次全量附带）；枚举型 dynamic key 附 `enum`（schema 现成）；未知键报错串。
+  prompt 全文（≤20k）从"每次顺带 dump"变为显式按键读取。兼容面核查：无程序化消费方
+  依赖旧全量形状（套件仅 AST 文件级豁免引用）。
+- **loop 传值**：主线与 eval 轮两个 `planner.plan` 调用点均传
+  `self.task_runner.response_contract`（init 时派生一次）。
+
+### 12.3 验证
+
+- `derive_response_contract` 矩阵（4 域 + 空 labels 回退 + 无契约回退）通过；
+- get_config 双态单测（无参仅键 + 契约字段 / keyed prompt 附 seed / keyed cost /
+  未知键报错 / 无契约 ctx 字段缺席）通过；
+- task_agent 两处插值静态形状验证（契约段存在、旧 "complete final answer" 措辞移除）；
+- 七套件 + test_frozen + 本地 D123 全绿。
+- **待实跑确认**：契约段在真实 child 指令中的出现位置与 polyglot 修复轮不再重贴 diff。

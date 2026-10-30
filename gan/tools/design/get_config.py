@@ -67,32 +67,54 @@ def tool_info():
     return {
         "name": "get_config",
         "description": (
-            "Read the design config THIS session edits (role, prompt/tools/"
-            "params/cost) -- the exact text set_prompt measures its rewrite "
-            "gate against -- plus the generation-0 seed (write it back verbatim "
-            "to roll back a drifted prompt) and a keys view enumerating what "
-            "set_config/set_param may set. Read-only."),
-        "input_schema": {"type": "object", "properties": {}},
+            "Read the design config THIS session edits. TWO modes: (a) no "
+            "argument -> the KEYS VIEW only (static/dynamic keys with "
+            "value_type/enum/consumer, what is present vs unset) plus "
+            "framework-owned facts -- the task's output contract when one is "
+            "declared (read-only, outside set_config keys); (b) "
+            "get_config(key=\"...\") -> that key's value; for \"prompt\" this "
+            "includes the generation-0 seed (write it back verbatim to roll "
+            "back a drifted prompt) and prompt_equals_seed; for enum-typed "
+            "dynamic keys it includes the allowed enum values. Read-only."),
+        "input_schema": {"type": "object",
+                         "properties": {"key": {"type": "string",
+                                                "description": "config key to read (e.g. \"prompt\")"}},
+                         "required": []},
     }
 
 
-def tool_function(**kwargs):
+def tool_function(key=None):
     ctx = get_design_context()
     if ctx is None:
         return "Error: no design context"
-    cfg = dict(ctx.config or {})
-    seed = _seed_prompt(ctx.role)
     try:
         keys = _keys_view(ctx)
     except Exception:  # noqa: BLE001 -- advisory view must never fail the read
         keys = {}
-    payload = {
-        "role": ctx.role,
-        "config": cfg,
-        "seed": seed,
-        "prompt_equals_seed": (cfg.get("prompt") == seed) if seed is not None else None,
-        "keys": keys,
-    }
+    if key is None:
+        # Keys-only view: values (notably the <=20k prompt) are fetched
+        # explicitly per key, so a design read costs no full-text dumps.
+        payload = {"role": ctx.role, "keys": keys}
+        oc = getattr(ctx, "output_contract", None)
+        if oc:
+            payload["output_contract"] = oc
+        return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    key = str(key)
+    cfg = dict(ctx.config or {})
+    allowed = set((keys or {}).get("allowed_keys") or [])
+    if key not in cfg and key not in allowed:
+        known = ", ".join(sorted(set(cfg) | allowed)) or "(none)"
+        return f"Error: unknown config key '{key}' (readable keys: {known})"
+    payload = {"role": ctx.role, "key": key, "value": cfg.get(key)}
+    if key == "prompt":
+        # The rewrite-gate context travels with the prompt read, not with
+        # every keys view (the seed is prompt-specific, ~6k chars).
+        seed = _seed_prompt(ctx.role)
+        payload["seed"] = seed
+        payload["prompt_equals_seed"] = (cfg.get("prompt") == seed) if seed is not None else None
+    dyn = (keys or {}).get("dynamic_keys", {}).get(key)
+    if dyn and dyn.get("enum") is not None:
+        payload["enum"] = dyn["enum"]
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 

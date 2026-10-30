@@ -319,6 +319,9 @@ class _TaskBrokerState:
         task_brief = str(self.config.get("task_brief") or "")
         if task_brief:
             env["GAN_TASK_BRIEF"] = task_brief
+        response_contract = str(self.config.get("response_contract") or "")
+        if response_contract:
+            env["GAN_RESPONSE_CONTRACT"] = response_contract
 
         try:
             # Harness-side sampling (only for domains that score in the harness

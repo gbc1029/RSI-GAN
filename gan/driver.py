@@ -880,6 +880,7 @@ def run_gan_driver(
         "python_prefix": python_prefix,
         "timeout": harness_timeout,
         "task_brief": (domain_cfg.get("task_brief") or ""),
+        "response_contract": task_execution.derive_response_contract(domain, domain_cfg),
         "parent_scored": task_execution.uses_parent_scoring(domain),
         # Question-sampling scheme (loop.yaml sampling.*). The broker reads the
         # run-persistent seed file at launch time (per generation) so a resume

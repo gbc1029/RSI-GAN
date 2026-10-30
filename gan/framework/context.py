@@ -108,6 +108,10 @@ class DesignContext:
     config: Dict[str, Any]
     node_id: Any = None
     records: List[Dict[str, Any]] = field(default_factory=list)
+    # Framework-owned output contract (F4/C1), stamped by the CALLER (the
+    # loop passes the derived contract into plan()); NOT a config key --
+    # set_config can never write it. Shape: {"text": ..., "source": ...}.
+    output_contract: Optional[Dict[str, Any]] = None
 
     def record(self, op: str, **detail: Any) -> None:
         """Append one structured record; the framework stamps ``target_role``.

@@ -207,6 +207,10 @@ class DomainTaskRunner:
         self.score_key = self.domain_cfg.get("score_key")
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
+        # Framework-owned final-answer requirement (F4/C1): one derivation,
+        # three consumers — the child's explicit output-contract section, the
+        # format-repair turn, and the planner's get_config visibility field.
+        self.response_contract = tx.derive_response_contract(domain, self.domain_cfg)
 
         # Fail fast (smoke_1022_222630 lesson, see pool_check): the candidate
         # pool (a pinned eval_task_list, the full metadata pool for polyglot,
@@ -423,6 +427,7 @@ class DomainTaskRunner:
             os.environ.copy(), design_path=design_path,
             run_dir=run_dir, config=config,
             code_root=self.code_root, task_brief=self.task_brief,
+            response_contract=self.response_contract,
         )
         patch_applied = patch_applied or patch_applied_copy
 

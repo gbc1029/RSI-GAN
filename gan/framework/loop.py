@@ -1620,6 +1620,8 @@ class GanLoop:
                         node_id=genid,
                         broker=self.broker,
                         task_brief=self.task_brief,
+                        response_contract=(self.task_runner.response_contract
+                                           if self.task_runner else None),
                         trajectory_genids=[],
                         receipt=None,
                         parent_predicted_score=None,
@@ -2713,6 +2715,8 @@ class GanLoop:
                             node_id=genid,
                             broker=self.broker,
                             task_brief=self.task_brief,
+                            response_contract=(self.task_runner.response_contract
+                                               if self.task_runner else None),
                             trajectory_genids=traj_plan,
                             receipt=parent_receipt,
                             parent_predicted_score=plan_pred,
