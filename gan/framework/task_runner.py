@@ -566,16 +566,36 @@ class DomainTaskRunner:
                               event_type="parent_scoring_failed", genid=str(genid))
         else:
             # Preserve independent harness/evaluator domains.
-            rc, _out = tx.run_harness_and_report(
-                self.python, run_dir, self.domain, run_id, self.subset,
-                self.num_samples, model, env, self.timeout,
-                dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
-                reasoning_effort=self.reasoning_effort,
-            )
+            if self.fixed_question_ids:
+                # Fixed-root evaluation must use the same explicit question
+                # ids on every outer.  The broker receives this file through
+                # the eval scope and must not resample the training subset.
+                questions_path, _ground_truth, sample_info = (
+                    tx.prepare_questions_by_ids(
+                        self.repo_root, run_dir, self.domain, self.subset,
+                        self.fixed_question_ids))
+                rc, _out = tx.run_harness_and_report(
+                    self.python, run_dir, self.domain, run_id, self.subset,
+                    self.num_samples, model, env, self.timeout,
+                    questions_path=questions_path, scope_id=str(genid),
+                    log_path=self.log_path,
+                    reasoning_effort=self.reasoning_effort,
+                )
+            else:
+                sample_info = {}
+                rc, _out = tx.run_harness_and_report(
+                    self.python, run_dir, self.domain, run_id, self.subset,
+                    self.num_samples, model, env, self.timeout,
+                    dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
+                    reasoning_effort=self.reasoning_effort,
+                )
             if self.domain == "imo_proof":
                 self._event("task_harness_done", genid=str(genid), rc=rc,
                             question_timeout_s=question_timeout_s,
-                            harness_timeout_s=self.timeout)
+                            harness_timeout_s=self.timeout,
+                            sample_mode=sample_info.get("mode"),
+                            sampled_ids=sample_info.get("sampled_ids"),
+                            anchor_ids=sample_info.get("anchor_ids"))
             report = None
             if self.domain == "imo_proof":
                 # Proof grading is completed inside the privileged broker with

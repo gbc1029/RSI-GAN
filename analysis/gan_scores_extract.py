@@ -225,6 +225,7 @@ def extract_run(run_dir):
         rec = dict(
             genid=g, score=s.get("score"), coverage=s.get("coverage"),
             score_status=s.get("score_status"), valid_parent=s.get("valid_parent"),
+            parent_genid=(inner_done.get(g) or {}).get("parent_genid"),
             report_sha=sha, same_report_as_prev=bool(sha and sha_prev.get("prev") == sha),
             predicted_score=ev.get("predicted_score"),
             n_issues=len(issues),
@@ -582,22 +583,80 @@ def write_plot(run, outdir):
 
 
 def write_proof_plot(run, outdir):
-    """Plot proof score and coverage; never interpret proof prose as verdicts."""
-    x = np.arange(1, len(run["gens"]) + 1)
-    scores = [run["per_gen"][g]["score"] for g in run["gens"]]
-    coverage = [run["per_gen"][g]["coverage"] for g in run["gens"]]
-    scores = [float(v) if v is not None else np.nan for v in scores]
-    coverage = [float(v) if v is not None else np.nan for v in coverage]
+    """Plot proof score and coverage using the recorded generation DAG.
+
+    A sequential line would imply that generation ``n`` is always the parent
+    of ``n+1``. Outer selection can branch, so only recorded parent edges are
+    connected; node markers carry the measurement status.
+    """
+    def gen_order(value):
+        try:
+            return (0, int(value))
+        except (TypeError, ValueError):
+            return (1, str(value))
+
+    gens = sorted({str(g) for g in run["gens"]}, key=gen_order)
+    x = np.asarray([int(g) if str(g).isdigit() else i for i, g in enumerate(gens)],
+                   dtype=float)
+    recs = run["per_gen"]
+    scores = {g: (float(recs[g]["score"]) if recs[g].get("score") is not None
+                  else np.nan) for g in gens}
+    coverage = {g: (float(recs[g]["coverage"]) if recs[g].get("coverage") is not None
+                    else np.nan) for g in gens}
+    status_colors = {
+        "ok": "#2E8B57",
+        "partial": "#D98C00",
+        "imputed": "#7A7A7A",
+        "failed": "#C23B22",
+        "invalid": "#8B1E3F",
+    }
+    statuses = {g: str(recs[g].get("score_status") or "unknown") for g in gens}
+    xpos = dict(zip(gens, x))
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
-    ax1.plot(x, scores, "o-", label="points score")
+
+    # Connect only actual parent -> child edges, never adjacent genids.
+    for child in gens:
+        parent = recs[child].get("parent_genid")
+        if parent is None:
+            continue
+        parent = str(parent)
+        if (parent not in recs or parent not in scores
+                or not np.isfinite(scores[child])
+                or not np.isfinite(scores.get(parent, np.nan))):
+            continue
+        ax1.plot([xpos[parent], xpos[child]], [scores[parent], scores[child]],
+                 color="#B0B0B0", lw=0.9, alpha=0.8, zorder=1)
+        if (np.isfinite(coverage[child]) and np.isfinite(coverage.get(parent, np.nan))):
+            ax2.plot([xpos[parent], xpos[child]],
+                     [coverage[parent], coverage[child]],
+                     color="#D0D0D0", lw=0.8, alpha=0.8, zorder=1)
+
+    for status in sorted(set(statuses.values())):
+        members = [g for g in gens if statuses[g] == status]
+        color = status_colors.get(status, "#4C72B0")
+        non_parents = [g for g in members if recs[g].get("valid_parent") is False]
+        ax1.scatter([xpos[g] for g in members], [scores[g] for g in members],
+                    color=color,
+                    marker="x" if status in {"failed", "invalid"} else "o",
+                    label=f"{status} score", zorder=3)
+        if non_parents and status not in {"failed", "invalid"}:
+            ax1.scatter([xpos[g] for g in non_parents], [scores[g] for g in non_parents],
+                        color="#6A3D9A", marker="x", label=f"{status} (not parent)",
+                        zorder=4)
+        ax2.scatter([xpos[g] for g in members], [coverage[g] for g in members],
+                    color=color, marker="x" if status in {"failed", "invalid"} else "s",
+                    label=f"{status} coverage", zorder=3)
+        if non_parents and status not in {"failed", "invalid"}:
+            ax2.scatter([xpos[g] for g in non_parents], [coverage[g] for g in non_parents],
+                        color="#6A3D9A", marker="x", label=f"{status} (not parent)",
+                        zorder=4)
     ax1.set_ylim(-0.05, 1.05)
-    ax1.set_xlabel("generation")
+    ax1.set_xlabel("generation id")
     ax1.set_title(f"{run['name']} proof score")
     ax1.grid(alpha=0.3)
     ax1.legend(fontsize=8)
-    ax2.plot(x, coverage, "s-", color="#4C72B0", label="coverage")
     ax2.set_ylim(-0.05, 1.05)
-    ax2.set_xlabel("generation")
+    ax2.set_xlabel("generation id")
     ax2.set_title("graded proof coverage")
     ax2.grid(alpha=0.3)
     ax2.legend(fontsize=8)

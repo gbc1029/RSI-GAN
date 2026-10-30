@@ -27,6 +27,7 @@ def report_proof_grading(dname):
             "correct_percentage": 0.0,
             "total": 0,
             "label_distribution": {"prediction": {}},
+            "question_points": {},
             "question_ids_failed": [],
             "question_ids_passed": [],
         }
@@ -62,12 +63,17 @@ def report_proof_grading(dname):
 
     question_ids_passed = df.loc[correct_mask, "Problem ID"].tolist()
     question_ids_failed = df.loc[~correct_mask, "Problem ID"].tolist()
+    question_points = {
+        str(qid): int(points)
+        for qid, points in zip(df["Problem ID"], df["prediction_points"])
+    }
 
     report = {
         "points_percentage": points_percentage,
         "correct_percentage": correct_percentage,
         "total": total,
         "label_distribution": label_distribution,
+        "question_points": question_points,
         "question_ids_failed": question_ids_failed,
         "question_ids_passed": question_ids_passed,
     }
