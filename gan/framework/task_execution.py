@@ -2441,7 +2441,7 @@ def _imo_proof_grading_output_error(
     grading_dir: str,
     expected_owner_uid: Optional[int],
 ) -> Optional[str]:
-    """Reject missing grading output and invalid labels, but allow partial runs."""
+    """Reject unusable grading output, but allow explicit missing rows."""
     predictions_path = os.path.join(grading_dir, "predictions.csv")
     try:
         predictions_fd = _open_grading_output(predictions_path, expected_owner_uid)
@@ -2457,8 +2457,13 @@ def _imo_proof_grading_output_error(
     if "prediction" not in grades.columns or len(grades) == 0:
         return "proof grader produced no grading labels"
     grades["prediction"] = grades["prediction"].astype(str).str.strip().str.lower()
-    allowed = {"incorrect", "partial", "almost", "correct"}
-    observed = [value for value in grades["prediction"] if value]
+    # Numeric 0-7 is canonical. Legacy labels remain readable so deployment of
+    # the new package cannot turn an older installed grader into a batch failure.
+    allowed = {str(i) for i in range(8)} | {
+        "incorrect", "partial", "almost", "correct",
+    }
+    missing = {"", "none", "null", "nan"}
+    observed = [value for value in grades["prediction"] if value not in missing]
     if not observed:
         return "proof grader produced no grading labels"
     invalid = sorted({value for value in observed if value not in allowed})

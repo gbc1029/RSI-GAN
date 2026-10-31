@@ -184,8 +184,12 @@ def setup_default(dst_dir, proofautograder=False):
     """
     src = "."
     excluded_dirs = {
+        ".git",
         ".claude",
+        ".s3_smoke_outputs",
         "outputs",
+        "runs",
+        "work",
         "analysis",
         "misc",
         "baselines",
@@ -207,6 +211,8 @@ def setup_default(dst_dir, proofautograder=False):
         "run_task_agent.py",
     }
     excluded_patterns = [
+        ".proofgrader-test-*",
+        "tmp*",
         "venv*",
         "__pycache__*",
         "*.png",

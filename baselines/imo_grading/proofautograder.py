@@ -15,6 +15,8 @@ Keep in mind the standards at the IMO are extremely high: only arguments that ar
 Scores are assigned on a 0-7 scale. The general guidelines are:
 * **7 Points (Correct):** The solution is complete, correct, and fully rigorous. If the submission contains incorrect attempts or lines of reasoning but ultimately presents a complete and correct solution, it should still be awarded full points; the presence of earlier, discarded work does not detract from the final correct proof.
 * **6 Points (Almost Correct):** The solution is almost correct with a sound core argument, but contains minor errors in calculation or small gaps in logic. Missing proofs for major components, unjustified claims, or sketchy arguments are **not** eligible for 6 points.
+* **4-5 Points (Substantial Progress):** The solution has a sound and substantial core, but still has a significant gap or error. Use 5 rather than 4 when the remaining defect is narrower and the solution is close to the 6-point standard.
+* **2-3 Points (Partial Progress):** The solution contains meaningful progress beyond an isolated observation, but is missing major components. Use 3 rather than 2 when several important steps are correct.
 * **1 Point (Partial Progress):** The solution demonstrates substantial progress explicitly mentioned in the grading guidelines. Initial observations, reformulating the problem without making substantive headway, or proving partial results not mentioned in the grading guidelines are generally **not** eligible for this score.
 * **0 Points (Incorrect):** The solution doesn't make substantial progress that is a key step in the full solution or is fundamentally flawed. All partial progress without key results or lacking rigor also fall in this category.
 
@@ -53,9 +55,33 @@ Present your detailed thought process and formal justification based on the scor
 [Select one of the following options]
 <points>7 out of 7</points>
 <points>6 out of 7</points>
+<points>5 out of 7</points>
+<points>4 out of 7</points>
+<points>3 out of 7</points>
+<points>2 out of 7</points>
 <points>1 out of 7</points>
 <points>0 out of 7</points>
 """
+
+
+_POINTS_BLOCK_RE = re.compile(r"<points>\s*(.*?)\s*</points>", re.IGNORECASE | re.DOTALL)
+_POINTS_VALUE_RE = re.compile(
+    r"([0-7])(?:\s*(?:out\s+of|/)\s*7)?\s*[.!]?",
+    re.IGNORECASE,
+)
+_FORMAT_REPAIR_PROMPT = """Your previous grading response could not be parsed.
+Return exactly one line and nothing else, using this format:
+<points>N out of 7</points>
+N must be the integer score you selected, from 0 through 7 inclusive."""
+
+
+def extract_points(raw_text):
+    """Return the exact 0-7 point value, or None for an ambiguous response."""
+    blocks = _POINTS_BLOCK_RE.findall(str(raw_text or ""))
+    if len(blocks) != 1:
+        return None
+    match = _POINTS_VALUE_RE.fullmatch(blocks[0].strip())
+    return match.group(1) if match else None
 
 
 class TaskAgent(AgentSystem):
@@ -84,39 +110,30 @@ class TaskAgent(AgentSystem):
             reasoning_effort=self.reasoning_effort,
         )
 
-        # Extract the response
-        prediction = "None"
-        try:
-            raw_text = new_msg_history[-1].get('text', '')
+        raw_text = new_msg_history[-1].get("text", "") if new_msg_history else ""
+        prediction = extract_points(raw_text)
+        if prediction is None:
+            self.log("Point score was not exactly one valid 0-7 <points> block; retrying format once.")
+            try:
+                new_msg_history = chat_with_agent(
+                    _FORMAT_REPAIR_PROMPT,
+                    model=self.model,
+                    msg_history=new_msg_history,
+                    logging=self.log,
+                    reasoning_effort=self.reasoning_effort,
+                )
+                repaired_text = (
+                    new_msg_history[-1].get("text", "") if new_msg_history else ""
+                )
+                prediction = extract_points(repaired_text)
+            except Exception as e:
+                self.log(f"Point-score format repair failed: {e}")
 
-            # Extract content between <points>...</points>
-            match = re.search(r"<points>(.*?)</points>", raw_text, re.DOTALL)
-            if match:
-                points_text = match.group(1).strip()  # e.g., "7 out of 7"
-
-                # Extract just the leading integer
-                num_match = re.search(r"\d+", points_text)
-                if num_match:
-                    prediction = int(num_match.group())  # e.g., 7
-                    # Map prediction to reward text
-                    reward_map = {
-                        0: "incorrect",
-                        1: "partial",
-                        6: "almost",
-                        7: "correct",
-                    }
-                    prediction = reward_map.get(prediction, "None")
-                else:
-                    self.log("No numeric score found inside <points> tag.")
-                    prediction = "None"
-
-            else:
-                self.log("No <points> tag found in model output.")
-                prediction = "None"
-
-        except Exception as e:
-            self.log(f"Error extracting prediction: {e}")
-            prediction = "None"
+        # A per-question parse failure is missing data. The report layer keeps
+        # the measured rows and records partial coverage for the generation.
+        if prediction is None:
+            self.log("Point score remains unparseable after one repair attempt.")
+            prediction = ""
 
         return prediction, new_msg_history
 

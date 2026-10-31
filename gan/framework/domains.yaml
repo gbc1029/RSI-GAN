@@ -202,10 +202,10 @@ domains:
     question_timeout_s: 1800  # grading long proofs, same latency class
     task_brief: >-
       Grade a candidate proof against the official solution. Your final answer
-      must be exactly one of: incorrect, partial, almost, correct.
+      must be exactly one integer score from 0 through 7.
     output_contract:
       kind: label
-      allowed_labels: [incorrect, partial, almost, correct]
+      allowed_labels: ["0", "1", "2", "3", "4", "5", "6", "7"]
       case_insensitive: true
       strip: true
     sandbox:
