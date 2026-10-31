@@ -2553,17 +2553,30 @@ def _prepare_imo_proof_grading_input(
     grading_input = grading_input.drop(columns=["prediction"], errors="ignore")
     grading_input["prediction"] = predictions["prediction"].tolist()
 
+    grading_input_root = os.path.join(run_dir, "input")
+    input_root_created = False
+    try:
+        os.mkdir(grading_input_root, mode=0o755)
+        input_root_created = True
+    except FileExistsError:
+        pass
     grading_input_dir = os.path.join(
-        run_dir, "input", f"{run_id}_proof_grading",
+        grading_input_root, f"{run_id}_proof_grading",
     )
     if os.path.lexists(grading_input_dir):
         raise RuntimeError(
             f"proof grading input path already exists: {grading_input_dir}"
         )
-    os.makedirs(grading_input_dir, mode=0o755)
+    os.mkdir(grading_input_dir, mode=0o755)
     grading_input_path = os.path.join(grading_input_dir, "predictions.csv")
     grading_input.to_csv(grading_input_path, index=False)
     if expected_owner_uid is not None:
+        if input_root_created:
+            os.chown(
+                grading_input_root,
+                int(expected_owner_uid), int(expected_owner_gid),
+                follow_symlinks=False,
+            )
         os.chown(
             grading_input_dir, int(expected_owner_uid), int(expected_owner_gid),
             follow_symlinks=False,
