@@ -39,7 +39,11 @@ PLANNER_SELF: List[str] = [
     "gan/tools/work/planner/**",
     "gan/components/planner/**",
     "gan/registries/planner.json",
-    "gan/design/seeds/planner.md",
+    # NOTE: gan/design/seeds/*.md is deliberately in NO role's set. Seeds are
+    # the framework-owned FACTORY DEFAULTS (gen-0 only; an existing design
+    # config is authoritative and never re-seeded) -- run-invariant, so the
+    # set_prompt "restore the seed" exemption cannot be moved from inside a
+    # session. The agent-facing seed projection is get_config's `seed` field.
     "gan/design/schema_ext/planner.json",
 ]
 
@@ -48,7 +52,6 @@ EVALUATOR_SELF: List[str] = [
     "gan/tools/work/evaluator/**",
     "gan/components/evaluator/**",
     "gan/registries/evaluator.json",
-    "gan/design/seeds/evaluator.md",
     "gan/design/schema_ext/evaluator.json",
 ]
 

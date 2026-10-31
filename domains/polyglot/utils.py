@@ -1,3 +1,4 @@
+import os
 import tarfile
 import io
 import logging
@@ -204,12 +205,57 @@ def copy_from_container(container, source_path: Union[str, Path], dest_path: Uni
                 extracted_path = dest_path.parent / Path(stat['name']).name
                 if extracted_path != dest_path and extracted_path.exists():
                     extracted_path.rename(dest_path)
-        
+
+        # A root-phase extraction must not leave the container's ownership
+        # behind: tar.extractall preserves member uid/gid, so a run-directory
+        # payload extracted by a privileged harness phase came out root-owned
+        # and the (unprivileged) loop could never clean its own work dir
+        # (field audit small_1030_095410 — gan_polyglot_0/ residue). Normalize
+        # the extracted tree to the nearest non-root ancestor owner (the run
+        # owner by construction); a no-op for unprivileged harness runs.
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            _normalize_extracted_ownership(dest_path)
+
         safe_log(f"Successfully copied from container to {dest_path}")
         
     except Exception as e:
         safe_log(f"Error copying from container: {e}", logging.ERROR)
         raise
+
+def _normalize_extracted_ownership(dest_path: Path) -> None:
+    """Chown an extracted tree to the nearest non-root ancestor's owner.
+
+    Walks up from ``dest_path`` to find an existing ancestor not owned by
+    root — inside a run that is the run owner's directories — and applies
+    that uid/gid to the extracted entries. Advisory only: any failure is
+    logged and swallowed (cleanup robustness must never break the copy).
+    """
+    owner_uid = owner_gid = None
+    probe = Path(dest_path).parent
+    while str(probe) not in ("", "/"):
+        try:
+            st = os.stat(probe)
+        except OSError:
+            probe = probe.parent
+            continue
+        if st.st_uid != 0:
+            owner_uid, owner_gid = st.st_uid, st.st_gid
+            break
+        probe = probe.parent
+    if owner_uid is None:
+        return
+    targets = [Path(dest_path)]
+    if Path(dest_path).is_dir():
+        for current, dirs, files in os.walk(dest_path):
+            targets.extend(Path(current) / n for n in dirs + files)
+    for target in targets:
+        try:
+            os.chown(target, owner_uid, owner_gid,
+                     follow_symlinks=False)
+        except OSError as e:
+            safe_log(f"ownership normalization skipped for {target}: {e}",
+                     logging.WARNING)
+
 
 def log_container_output(exec_result, raise_error=True):
     """

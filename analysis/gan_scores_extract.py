@@ -11,14 +11,22 @@ Usage:
   venv_nat/bin/python analysis/gan_scores_extract.py RUN_DIR [RUN_DIR ...]
 
 Outputs (per run, into <run>/score_analysis/):
-  scores_extract.csv   per-sample rows: strict + lenient correctness, parse method
+  scores_extract.csv   per-sample rows: score + parse method
   significance.txt     pairwise tests (reused save_significance_tests)
   progress.png         per-gen curves + per-question correctness
   REPORT.md            the analysis report
 
+One score per run, computed by the SAME rule the run's online scorer used
+(report.json `score_mode` self-describes it): docker_resolved -> the broker's
+container verdicts; lenient -> verdict regex extraction via
+gan.framework.verdict.parse_verdict (paper_review; identical function, so
+offline == online by construction); anything else -> exact lowercase label
+match (search_arena and the other label domains, current online rule).
+Verdicts that do not parse count as wrong; the denominator never shrinks.
+
 Ground truth: auto-detected from each domain's dataset catalogue.  For
 imo_proof, proofbench identifies the questions while report.json supplies the
-proof score; proof text is never parsed as an A/B verdict.
+proof score; proof text is never parsed as a verdict.
 """
 import argparse
 import csv
@@ -35,6 +43,7 @@ sys.path.insert(0, REPO)
 
 from analysis.analysis_utils import compute_bootstrap_ci, save_significance_tests  # noqa: E402
 from gan.framework import cost_ledger  # noqa: E402
+from gan.framework.verdict import parse_verdict  # noqa: E402
 from scipy import stats  # noqa: E402
 
 import matplotlib  # noqa: E402
@@ -42,43 +51,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 csv.field_size_limit(10 ** 7)
-
-# ---------------------------------------------------------------- lenient parser
-_MODEL_EXACT = re.compile(r"^\s*model[_\s-]*([ab])\s*\.?\s*$", re.I)
-_VERDICT_DICT = re.compile(r"['\"]?verdict['\"]?\s*[:=]\s*['\"]?([ab])\b", re.I)
-_VERDICT_LINE = re.compile(r"\bverdict\b\s*[:\-]\s*(?:response\s*)?([ab])\b", re.I)
-_BARE = re.compile(r"^\s*([ab])\s*\.?\s*$", re.I)
-_RESP_BETTER = re.compile(
-    r"\bresponse\s+([ab])\b(?:\s+is)?\s+(?:the\s+)?(?:clearly\s+|significantly\s+|"
-    r"substantially\s+|more\s+)?better", re.I)
-_WINS = re.compile(r"\b([ab])\s+wins\b", re.I)
-_ANSWER = re.compile(r"\b(?:answer|choice)\s*[:\-]?\s*(?:is\s*)?(?:response\s*)?([ab])\b", re.I)
-_MODEL_MENTION = re.compile(r"\bmodel[_\s-]*([ab])\b", re.I)
-
-
-def lenient_verdict(pred):
-    """Return (verdict_letter_or_None, method_tag). Conservative, order matters."""
-    if pred is None:
-        return None, "empty"
-    p = pred.strip()
-    if not p:
-        return None, "empty"
-    if len(p) <= 8:
-        m = _MODEL_EXACT.match(p)
-        if m:
-            return m.group(1).lower(), "model_exact"
-        m = _BARE.match(p)
-        if m:
-            return m.group(1).lower(), "bare"
-    for rx, tag in ((_VERDICT_DICT, "dict_verdict"), (_VERDICT_LINE, "verdict_line"),
-                    (_RESP_BETTER, "response_better"), (_WINS, "wins"), (_ANSWER, "answer")):
-        m = rx.search(p)
-        if m:
-            return m.group(1).lower(), tag
-    m = _MODEL_MENTION.search(p)
-    if m:
-        return m.group(1).lower(), "model_mention"
-    return None, "unparsed"
 
 
 # ---------------------------------------------------------------- loaders
@@ -244,62 +216,83 @@ def extract_run(run_dir):
         per_gen[g] = rec
         for qid, raw in sorted(preds.items()):
             rows.append(dict(run=name, genid=g, question_id=qid, raw_head=re.sub(r"\s+", " ", (raw or ""))[:120],
-                             strict_correct=None, lenient=None, method=None, lenient_correct=None))
+                             score=None, method=None))
+    # the run's own scoring rule (report.json self-describes it): docker
+    # runs say "docker_resolved", verdict-extraction runs say "lenient",
+    # exact-match runs say "strict"; proof runs are re-labeled in main().
+    score_mode = None
+    for g in gens:
+        smode = (per_gen[g].get("report") or {}).get("score_mode")
+        if smode:
+            score_mode = smode
+            break
     return dict(name=name, dir=run_dir, gens=gens, per_gen=per_gen, rows=rows,
                 model_cfg=model_cfg, stagnation=stagnation, brief_missing=brief_missing,
                 llm_calls=llm_calls, self_receipts=self_receipts,
                 sessions=cost_ledger.read_session_costs(run_dir),
-                domain=domain,
+                domain=domain, score_mode=score_mode,
                 events=events)
 
 
+_VERDICT_LABELS = ("accept", "reject")
+
+
 def attach_truth(run, truth):
+    """Score every row by the run's own online rule (report.json score_mode).
+
+    ``lenient`` -> verdict regex extraction via the SAME parse_verdict the
+    online scorer calls (labels accept/reject) — offline == online by
+    construction. Anything else -> exact lowercase label match (the current
+    online rule of search_arena and the other label domains). Undecided
+    parses count as wrong; the denominator never shrinks."""
+    mode = run.get("score_mode")
     for r in run["rows"]:
         raw = run["per_gen"][r["genid"]]["preds"].get(r["question_id"], "")
         tlab = truth.get(r["question_id"])
         r["truth"] = tlab
-        r["strict_correct"] = int(bool(tlab) and (raw or "").strip().lower() == tlab)
-        if run.get("domain") == "imo_grading":
-            candidate = (raw or "").strip().lower()
-            allowed = {"incorrect", "partial", "almost", "correct"}
-            v, method = (candidate, "label_exact") if candidate in allowed else (None, "unparsed")
+        if mode == "lenient":
+            v = parse_verdict(str(raw), labels=_VERDICT_LABELS)
+            r["method"] = v.method if v.label else (
+                "empty" if not (raw or "").strip() else "unparsed")
+            r["score"] = int(bool(v.label and tlab and v.label == tlab))
         else:
-            v, method = lenient_verdict(raw)
-        r["lenient"], r["method"] = v, method
-        r["lenient_correct"] = int(bool(v and tlab and v == tlab.split("_")[-1]))
+            candidate = (raw or "").strip().lower()
+            r["method"] = "label_exact" if candidate else "empty"
+            r["score"] = int(bool(candidate and tlab and candidate == tlab))
 
 
 def attach_polyglot_truth(run):
     """Polyglot has no dataset*.csv: the broker-side docker eval IS the ground
     truth. Derive per-question correctness from runs/<genid>/report.json's
     resolved list (container-verified), which extract_run already loaded as
-    per_gen[genid]["report"]. Lenient verdict parsing does not apply — the
-    prediction is a unified diff, not a verdict text."""
+    per_gen[genid]["report"]. The prediction is a unified diff, so the score
+    is the container's own verdict, never a text parse."""
     n = 0
     for r in run["rows"]:
         rep = (run["per_gen"].get(r["genid"]) or {}).get("report") or {}
         hit = r["question_id"] in set(rep.get("resolved") or [])
         r["truth"] = "resolved" if hit else "unresolved"
-        r["strict_correct"] = int(hit)
-        r["lenient"] = None
+        r["score"] = int(hit)
         r["method"] = "docker_resolved"
-        r["lenient_correct"] = None
         n += int(hit)
     return n
 
 
 def report_crosscheck(run):
-    """Compare recomputed strict correctness with the harness report.json.
+    """Compare recomputed score with the harness report.json.
 
     report.json's `total` excludes invalid predictions (coverage<1), so only the
     correctness COUNT is compared; a denominator difference is expected there.
+    Because the offline score reuses the online rule (score_mode dispatch),
+    this is a true offline==online probe: a mismatch means implementation
+    drift, not a convention difference.
     """
     mism, denom = [], []
     for g in run["gens"]:
         rep = run["per_gen"][g]["report"]
         if not rep:
             continue
-        mine = sum(r["strict_correct"] for r in run["rows"] if r["genid"] == g)
+        mine = sum(r["score"] or 0 for r in run["rows"] if r["genid"] == g)
         theirs = rep.get("total_correct")
         if theirs is not None and mine != theirs:
             mism.append((g, mine, theirs))
@@ -310,14 +303,12 @@ def report_crosscheck(run):
 
 
 # ---------------------------------------------------------------- stats
-def run_vectors(run):
+def run_scores(run):
     if run.get("domain") == "imo_proof":
         values = [run["per_gen"][g].get("score") for g in run["gens"]]
         finite = [float(v) for v in values if v is not None]
-        return np.asarray(finite, dtype=float), np.asarray(finite, dtype=float)
-    strict = np.array([r["strict_correct"] or 0 for r in run["rows"]], dtype=float)
-    lenient = np.array([r["lenient_correct"] or 0 for r in run["rows"]], dtype=float)
-    return strict, lenient
+        return np.asarray(finite, dtype=float)
+    return np.array([r["score"] or 0 for r in run["rows"]], dtype=float)
 
 
 def fmt_ci(ci):
@@ -327,8 +318,7 @@ def fmt_ci(ci):
 # ---------------------------------------------------------------- outputs
 def write_extract_csv(run, outdir):
     path = os.path.join(outdir, "scores_extract.csv")
-    cols = ["run", "genid", "question_id", "truth", "strict_correct",
-            "lenient", "method", "lenient_correct", "raw_head"]
+    cols = ["run", "genid", "question_id", "truth", "score", "method", "raw_head"]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
@@ -338,8 +328,7 @@ def write_extract_csv(run, outdir):
 
 def write_report(run, truth_path, outdir, cross=None):
     gens = run["gens"]
-    strict, lenient = run_vectors(run)
-    valid = np.array([r["lenient"] is not None for r in run["rows"]], dtype=float)
+    score = run_scores(run)
     L = []  # markdown lines
 
     L.append(f"# 成绩分析：`{run['name']}`\n")
@@ -352,8 +341,11 @@ def write_report(run, truth_path, outdir, cross=None):
              f"domain=`{run['domain']}`")
     L.append(f"- ground truth：`{os.path.relpath(truth_path, REPO) if truth_path else 'N/A'}`")
     if run.get("score_mode") == "docker_resolved":
-        L.append("- 打分模式：broker docker 评测（strict = 容器验证的 resolved；"
-                 "lenient 不适用于 diff 预测）")
+        L.append("- 打分：broker docker 评测（score = 容器验证的 resolved）")
+    elif run.get("score_mode") == "lenient":
+        L.append("- 打分：verdict 正则提取（与在线一致，同一 parse_verdict）")
+    else:
+        L.append("- 打分：逐字硬匹配（与在线一致）")
     if run["brief_missing"]:
         L.append(f"- ⚠ `task_brief_missing` ×{run['brief_missing']}（task_brief 注入缺失）")
     if run["stagnation"]:
@@ -362,15 +354,15 @@ def write_report(run, truth_path, outdir, cross=None):
 
     # per-gen table
     L.append("## 每 generation 一览\n")
-    L.append("| gen | score | cov | evaluator预测 | 宽松正确 | issues | patch ops | 无效子代 | harness_s | inner_s | 时长(s) | cost_tokens | plan_tok | eval_tok |")
+    L.append("| gen | score | cov | evaluator预测 | 正确 | issues | patch ops | 无效子代 | harness_s | inner_s | 时长(s) | cost_tokens | plan_tok | eval_tok |")
     L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for g in gens:
         r = run["per_gen"][g]
-        lk = sum((x["lenient_correct"] or 0) for x in run["rows"] if x["genid"] == g)
-        lt = sum(1 for x in run["rows"] if x["genid"] == g)
+        sk = sum((x["score"] or 0) for x in run["rows"] if x["genid"] == g)
+        st = sum(1 for x in run["rows"] if x["genid"] == g)
         nokey = "同report_sha" if r["same_report_as_prev"] else ""
         L.append(f"| {g} | {r['score']} | {r['coverage']} | {r['predicted_score']} "
-                 f"| {lk}/{lt} | {r['n_issues']} {r['sev'] or ''} | {r['n_ops']} "
+                 f"| {sk}/{st} | {r['n_issues']} {r['sev'] or ''} | {r['n_ops']} "
                  f"| {nokey} | {r['harness_s']} | {r['inner_s']} "
                  f"| {r['cost_wallclock_s'] if r['cost_wallclock_s'] is not None else '—'} "
                  f"| {r['cost_tokens']} | {r['plan_tokens']} | {r['eval_tokens']} |")
@@ -393,34 +385,33 @@ def write_report(run, truth_path, outdir, cross=None):
                      f"| {s.get('total_tokens') or '—'} | {s.get('wallclock_s') or '—'} |")
         L.append("")
 
-    # strict vs lenient
-    L.append("## 严格 vs 宽松重判\n")
-    ns = len(strict)
-    L.append(f"| 口径 | 正确 | n | 准确率 | bootstrap CI(median of per-gen accs) | 二项检验 vs 0.5（greater） |")
-    L.append("|---|---|---|---|---|---|")
-    for label, vec in (("严格（exact `model_a/model_b`）", strict), ("宽松（verdict 重判）", lenient)):
-        k = int(vec.sum())
-        bt = stats.binomtest(k, ns, 0.5, alternative="greater") if ns else None
-        p = f"{bt.pvalue:.4f}" if bt else "—"
-        acc = f"{k / ns:.3f}" if ns else "—"
-        L.append(f"| {label} | {k}/{ns} | {ns} | {acc} | — | {p} |")
+    # overall (one score; the rule was declared in the header)
+    L.append("## 总体\n")
+    ns = len(score)
+    k = int(score.sum())
+    bt = stats.binomtest(k, ns, 0.5, alternative="greater") if ns else None
+    p = f"{bt.pvalue:.4f}" if bt else "—"
+    acc = f"{k / ns:.3f}" if ns else "—"
+    L.append("| 口径 | 正确 | n | 准确率 | 二项检验 vs 0.5（greater） |")
+    L.append("|---|---|---|---|---|")
+    L.append(f"| score | {k}/{ns} | {ns} | {acc} | {p} |")
     # bootstrap CI on per-generation accuracies (reused compute_bootstrap_ci)
-    gen_accs = np.array([np.mean([(x["lenient_correct"] or 0) for x in run["rows"] if x["genid"] == g])
+    gen_accs = np.array([np.mean([(x["score"] or 0) for x in run["rows"] if x["genid"] == g])
                          for g in gens], dtype=float)
     if len(gen_accs) >= 2:
-        L.append(f"- 每 gen 宽松准确率：{', '.join(f'{g}:{a:.2f}' for g, a in zip(gens, gen_accs))}；"
+        L.append(f"- 每 gen 准确率：{', '.join(f'{g}:{a:.2f}' for g, a in zip(gens, gen_accs))}；"
                  f"跨 gen 分布 median/CI = {fmt_ci(compute_bootstrap_ci(gen_accs))}")
     L.append("")
 
     # per-question
     L.append("## 逐题（系统性错误定位）\n")
     qids = sorted({r["question_id"] for r in run["rows"]})
-    L.append("| question_id | truth | 各 gen 宽松判定（方法） | 宽松正确 | 判定 |")
+    L.append("| question_id | truth | 各 gen 判定（方法） | 正确 | 判定 |")
     L.append("|---|---|---|---|---|")
     for q in qids:
         rs = [r for r in run["rows"] if r["question_id"] == q]
-        seq = "/".join(f"{r['lenient'] or '∅'}({(r['method'] or '')[:4]})" for r in rs)
-        k = sum((r["lenient_correct"] or 0) for r in rs)
+        seq = "/".join((r["method"] or "∅") for r in rs)
+        k = sum((r["score"] or 0) for r in rs)
         verdict = "全对" if k == len(rs) else ("全错（系统性反相关）" if k == 0 else "混合")
         L.append(f"| {q} | {rs[0]['truth']} | {seq} | {k}/{len(rs)} | {verdict} |")
     L.append("")
@@ -454,58 +445,43 @@ def write_report(run, truth_path, outdir, cross=None):
 
     if cross:
         L.append("## 跨运行对比\n")
-        L.append("| run | n | 严格 | 宽松 | 宽松acc |")
-        L.append("|---|---|---|---|---|")
-        for other, s2, l2 in cross:
-            L.append(f"| {other['name']} | {len(s2)} | {int(s2.sum())} | {int(l2.sum())} | {l2.mean():.3f} |")
+        L.append("| run | n | 正确 | acc |")
+        L.append("|---|---|---|---|")
+        for other, s2 in cross:
+            L.append(f"| {other['name']} | {len(s2)} | {int(s2.sum())} | {s2.mean():.3f} |")
         L.append("")
 
     # auto conclusion
     L.append("## 结论（自动摘要）\n")
     docker_mode = run.get("score_mode") == "docker_resolved"
-    verdict_key = "strict_correct" if docker_mode else "lenient_correct"
     qs = {}
     for r in run["rows"]:
-        qs.setdefault(r["question_id"], []).append(r[verdict_key] or 0)
+        qs.setdefault(r["question_id"], []).append(r["score"] or 0)
     all_wrong = sorted(q for q, v in qs.items() if sum(v) == 0)
     all_right = sorted(q for q, v in qs.items() if sum(v) == len(v))
-    k, n = int(lenient.sum()), len(lenient)
+    k, n = int(score.sum()), len(score)
     bt = stats.binomtest(k, n, 0.5, alternative="greater") if n else None
     pct = f"{k / n:.1%}" if n else "n/a"
     if docker_mode:
-        L.append(f"- 严格（容器 resolved）{int(strict.sum())}/{len(strict)}；"
-                 "宽松 verdict 重判不适用于 diff 预测。")
+        L.append(f"- score = 容器 resolved：{k}/{n}（{pct}）—— broker 评测结论，无文本重判。")
     else:
-        L.append(f"- 严格 {int(strict.sum())}/{n} vs 宽松 {k}/{n}（{pct}）："
-                 + ("输出格式失败而非判断失败（strict 被答案接口钉死）。" if strict.sum() == 0 and k > 0
-                    else "两口径差距见上表。"))
+        L.append(f"- score {k}/{n}（{pct}）—— 口径见报告头部（与在线同规则重算）。")
     if all_wrong:
         L.append(f"- 系统性错误（全部 gen 判错）：question {all_wrong} —— 单题集中，非均匀噪声。")
     if all_right:
         L.append(f"- 全对题：{all_right}。")
-    if docker_mode:
-        L.append("- 宽松口径不适用，跳过二项检验；strict 即 broker 容器评测结论。")
-    elif bt is not None:
-        L.append(f"- 宽松口径 vs 随机(0.5) 二项检验（greater）：p={bt.pvalue:.4f}。")
+    if bt is not None:
+        L.append(f"- vs 随机(0.5) 二项检验（greater）：p={bt.pvalue:.4f}。")
     else:
-        L.append("- 宽松口径无有效样本（polyglot 的 diff 预测不适用 verdict 重判），跳过二项检验。")
+        L.append("- 无有效样本，跳过二项检验。")
     noop = [g for g in gens if run["per_gen"][g]["same_report_as_prev"]]
     if noop:
         L.append(f"- 无效子代：gen {noop}（与前代同 report_sha，patch 未产生有效变化）。")
     pcorr = [run["per_gen"][g]["predicted_score"] for g in gens]
     if pcorr and all(v is not None for v in pcorr) and len(set(pcorr)) > 1:
         rho = stats.spearmanr(pcorr, gen_accs).statistic if len(gen_accs) >= 3 else float("nan")
-        L.append(f"- evaluator 预测分 {pcorr} 与宽松 acc 的 Spearman ρ={rho:.2f}"
-                 f"（strict 全 0 的平台期，预测分只反映过程/宽松质量）。")
+        L.append(f"- evaluator 预测分 {pcorr} 与每 gen acc 的 Spearman ρ={rho:.2f}。")
     L.append(f"- 产物：scores_extract.csv / significance.txt / progress.png（本目录）。")
-    coincide = [g for g in gens
-                if run["per_gen"][g]["score"] is not None
-                and abs((run["per_gen"][g]["score"]
-                         - float(np.mean([(r["lenient_correct"] or 0) for r in run["rows"]
-                                          if r["genid"] == g]) or 0))) < 1e-9]
-    if coincide:
-        L.append(f"- 注：gen {','.join(coincide)} 的 strict 与 lenient 完全重合"
-                 f"（预测全部为精确格式，hollow 大标记即可在 progress.png 中同时看到两条线）。")
     L.append("")
 
     path = os.path.join(outdir, "REPORT.md")
@@ -540,25 +516,23 @@ def write_proof_report(run, truth_path, outdir):
 def write_plot(run, outdir):
     gens = run["gens"]
     x = np.arange(1, len(gens) + 1)
-    strict_g = [run["per_gen"][g]["score"] for g in gens]
-    lenient_g = [np.mean([(r["lenient_correct"] or 0) for r in run["rows"] if r["genid"] == g]) for g in gens]
+    score_g = [np.mean([(r["score"] or 0) for r in run["rows"] if r["genid"] == g])
+               if any(r["genid"] == g for r in run["rows"]) else np.nan
+               for g in gens]
     pred_g = [run["per_gen"][g]["predicted_score"] if run["per_gen"][g]["predicted_score"] is not None else np.nan
               for g in gens]
-    best = np.maximum.accumulate([0.0] + lenient_g)[1:]
+    vals = [0.0 if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
+            for v in score_g]
+    best = np.maximum.accumulate([0.0] + vals)[1:]
 
     qids = sorted({r["question_id"] for r in run["rows"]})
-    q_ok = [sum((r["lenient_correct"] or 0) for r in run["rows"] if r["question_id"] == q) for q in qids]
+    q_ok = [sum((r["score"] or 0) for r in run["rows"] if r["question_id"] == q) for q in qids]
     q_truth = [next(r["truth"] for r in run["rows"] if r["question_id"] == q) for q in qids]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
-    # strict drawn LAST with a HOLLOW, larger marker: when strict == lenient
-    # (exact-format predictions) the two curves coincide and an opaque
-    # overlay would hide strict entirely.
-    ax1.plot(x, lenient_g, "s-", ms=5, label="lenient acc", zorder=3)
-    ax1.plot(x, strict_g, "o-", ms=10, markerfacecolor="none",
-             markeredgewidth=1.6, label="strict score", zorder=4)
+    ax1.plot(x, score_g, "o-", ms=5, label="score", zorder=3)
     ax1.plot(x, pred_g, "^--", label="evaluator predicted")
-    ax1.plot(x, best, ":", color="gray", label="best-so-far (lenient)")
+    ax1.plot(x, best, ":", color="gray", label="best-so-far (score)")
     ax1.axhline(0.5, color="r", lw=0.8, alpha=0.6, label="random guess")
     ax1.set_ylim(-0.05, 1.05)
     ax1.set_xticks(x)
@@ -571,7 +545,7 @@ def write_plot(run, outdir):
     ax2.set_xticks(range(len(qids)))
     ax2.set_xticklabels([f"{q}\ntruth={t.split('_')[-1]}" for q, t in zip(qids, q_truth)], fontsize=8)
     ax2.set_ylim(0, len(gens))
-    ax2.set_ylabel("lenient correct (of all gens)")
+    ax2.set_ylabel("correct (of all gens)")
     ax2.set_title("per-question correctness")
     ax2.grid(alpha=0.3, axis="y")
     fig.tight_layout()
@@ -627,7 +601,7 @@ def main():
             continue
         if truth is None and run["domain"] == "polyglot":
             # No dataset CSV exists for polyglot by design; the broker docker
-            # eval is the authority. Skip the strict crosscheck — both sides
+            # eval is the authority. Skip the crosscheck — both sides
             # would derive from the same resolved list.
             n = attach_polyglot_truth(run)
             run["truth_path"] = None
@@ -642,7 +616,8 @@ def main():
         run["truth_path"] = tp
         mism, denom = report_crosscheck(run)
         if mism:
-            print(f"[WARN] {run['name']} strict cross-check mismatch: {mism}")
+            print(f"[WARN] {run['name']} score cross-check mismatch "
+                  f"(offline != online, investigate): {mism}")
         if denom:
             print(f"[NOTE] {run['name']} report total excludes invalid samples: {denom}")
 
@@ -651,16 +626,10 @@ def main():
     methods = {}
     meta = {}
     for run in runs:
-        s, l = run_vectors(run)
+        s = run_scores(run)
         if len(s) >= 2:
-            methods[f"{run['name']}:strict"] = s
-            methods[f"{run['name']}:lenient"] = l
+            methods[f"{run['name']}:score"] = s
             meta.setdefault("n_samples", []).append(f"{run['name']}={len(s)}")
-    if not methods:  # fallback: all lenient
-        for run in runs:
-            _, l = run_vectors(run)
-            methods[f"{run['name']}:lenient"] = l
-            meta.setdefault("n_samples", []).append(f"{run['name']}={len(l)}")
     sig_path = os.path.join(runs[0]["dir"], "score_analysis")
     os.makedirs(sig_path, exist_ok=True)
     save_significance_tests({k: v for k, v in methods.items()},
@@ -676,9 +645,8 @@ def main():
         for other in runs[1:]:
             oq = {r["question_id"] for r in other["rows"]}
             shared = base_q & oq
-            s2 = np.array([r["strict_correct"] for r in other["rows"] if r["question_id"] in shared], dtype=float)
-            l2 = np.array([r["lenient_correct"] for r in other["rows"] if r["question_id"] in shared], dtype=float)
-            cross.append((other, s2, l2))
+            s2 = np.array([r["score"] for r in other["rows"] if r["question_id"] in shared], dtype=float)
+            cross.append((other, s2))
 
     for run in runs:
         outdir = os.path.join(run["dir"], "score_analysis")
@@ -690,13 +658,13 @@ def main():
         else:
             rep_path = write_report(run, run["truth_path"], outdir, cross=cross if run is runs[0] else None)
             plot_path = None if args.skip_plots else write_plot(run, outdir)
-        s, l = run_vectors(run)
+        s = run_scores(run)
         if run.get("score_mode") == "proof_points":
             print(f"[OK] {run['name']}: proof score mean "
                   f"{(float(s.mean()) if len(s) else float('nan')):.3f} ({len(s)} scored generations)")
         else:
-            print(f"[OK] {run['name']}: strict {int(s.sum())}/{len(s)}, "
-                  f"lenient {int(l.sum())}/{len(l)} ({l.mean():.1%})")
+            print(f"[OK] {run['name']}: score {int(s.sum())}/{len(s)} "
+                  f"({s.mean():.1%})" if len(s) else f"[OK] {run['name']}: score —/0")
         for p in (csv_path, rep_path, plot_path):
             if p:
                 print(f"     {p}")

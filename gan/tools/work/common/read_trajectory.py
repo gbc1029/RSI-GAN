@@ -44,7 +44,10 @@ def tool_info():
             "type": "object",
             "properties": {
                 "genid": {"description": "Target generation id (must be visible)."},
-                "max_chars": {"type": "integer"},
+                "max_chars": {"type": "integer",
+                              "description": "Render cap in chars. Default 6000; "
+                                             "requests are honored up to 120000 "
+                                             "(ceiling)."},
                 "fetch": {"description": "Materialize one segment by seg_id "
                                         "(any mode: the slice index lists the "
                                         "seg_ids; without it the segment is "

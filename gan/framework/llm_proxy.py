@@ -283,7 +283,10 @@ class ParentLLMProxy:
     def _audit(self, fields: Dict[str, Any]) -> None:
         os.makedirs(os.path.dirname(self.audit_path), exist_ok=True)
         now = time.time()
-        readable = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) \
+        # UTC pinned (gmtime): the proxy runs in the driver process (host TZ)
+        # while events.jsonl's other writers are loop / sandboxed processes on
+        # Etc/UTC — localtime produced a mixed-timezone file (small_1030_095410).
+        readable = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)) \
             + f".{int(now * 1000) % 1000:03d}"
         record = {"type": "llm_call", "timestamp": now, "time": readable, **fields}
         with self._audit_lock:

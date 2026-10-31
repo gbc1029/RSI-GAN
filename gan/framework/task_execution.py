@@ -77,6 +77,15 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # framework-owned output contract (F4/C1): derived from domains.yaml's
+    # output_contract / the domain's prediction source — read-only for the child.
+    # MIRROR RULE: this is the SOURCE whitelist of the child env chain; every
+    # GAN_* key added here must be mirrored into BOTH child-side hops or it
+    # dies silently at that filter (domains/harness.py and domains/task_worker.py
+    # each carry their own _TASK_ENV_NAMES). Observed live: the contract never
+    # reached the TaskAgent (field audit smoke_1030_204345). Guard:
+    # scripts/local/test_task_env_mirror.py
+    "GAN_RESPONSE_CONTRACT",
     # context-management snapshot (docs/10 §11 D2): the frozen seam core and
     # the selected policy component live under .gan_runtime/cm (no gan/ bind);
     # GAN_CM_EVENTS is the child's seam-audit sidecar (rw bind, §11.5)
@@ -102,6 +111,32 @@ def _task_parent_env(base_env: Dict[str, str]) -> Dict[str, str]:
     """Keep framework-only proxy metadata for the trusted harness parent."""
     return {key: value for key, value in base_env.items()
             if key in _TASK_PARENT_ENV_NAMES or key.startswith("LC_")}
+
+
+def _child_path_with_venv_bin(env: Dict[str, str], venv_prefix: str) -> str:
+    """Prepend the bound venv ``bin`` dir so bare ``python`` resolves inside
+    the task sandbox.
+
+    The driver runs the venv interpreter WITHOUT activating it, so the
+    inherited PATH lacked the venv bin and agents kept hitting
+    ``python: command not found`` (docs/18 §7).  ``venv_prefix`` is the SAME
+    prefix the sandbox binds (driver's ``python_prefix`` = realpath(sys.prefix)),
+    so the prepended dir is guaranteed visible inside the sandbox.
+
+    Value-only change: no new env channel, no process-global os.environ swap.
+    No-op when the prefix carries no real ``python`` (system-python driver)
+    or the dir is already on PATH.
+    """
+    bin_dir = os.path.join(venv_prefix, "bin")
+    current = env.get("PATH", "")
+    if not os.path.isdir(bin_dir):
+        return current
+    if not os.path.exists(os.path.join(bin_dir, "python")):
+        return current
+    parts = [p for p in current.split(os.pathsep) if p]
+    if bin_dir in parts:
+        return current
+    return os.pathsep.join([bin_dir] + parts)
 
 
 def validate_domain_sandbox_profile(
@@ -632,6 +667,7 @@ def assemble_task_env(
     config: Dict[str, Any],
     code_root: Optional[str] = None,
     task_brief: Optional[str] = None,
+    response_contract: Optional[str] = None,
 ) -> Dict[str, str]:
     """Build the environment and sandbox-visible runtime assets for TaskAgent.
 
@@ -753,6 +789,8 @@ def assemble_task_env(
     env["GAN_TASK_KNOWLEDGE_DIR"] = "/workspace/.gan_runtime/knowledge"
     if task_brief:
         env["GAN_TASK_BRIEF"] = task_brief
+    if response_contract:
+        env["GAN_RESPONSE_CONTRACT"] = response_contract
     return env
 
 
@@ -769,7 +807,12 @@ def prepare_run_dir(source_root: str, node_dir: str, patch_str: str, domain: Opt
     """
     run_dir = os.path.join(node_dir, "repo")
     if os.path.exists(run_dir):
-        shutil.rmtree(run_dir)
+        # Cleanup that records instead of killing the task run: residue the
+        # sweep cannot remove (e.g. root-owned eval payloads) is named in the
+        # record; the rebuild proceeds and any per-file collision surfaces
+        # through the ordinary task-failure accounting (utils/prune policy).
+        from utils.prune import safe_rmtree
+        safe_rmtree(run_dir, label=f"run dir rebuild cleanup ({run_dir})")
     os.makedirs(run_dir, exist_ok=True)
 
     for name in _RUNTIME_FILES + _HARNESS_FILES:
@@ -919,6 +962,36 @@ def prepare_polyglot_questions_by_ids(
     return questions_path, sample_info
 
 
+def _normalize_eval_payload_ownership(output_path: str) -> None:
+    """Root-phase ownership normalization for polyglot eval payloads.
+
+    The task-broker child runs as root under the driver's private umask, so
+    the per-question eval artifacts (``gan_polyglot_<N>/`` docker logs / eval
+    markdown / result json) land root-owned 0700/0600 inside the work tree,
+    and the unprivileged loop could never clean its own work dir (field audit
+    smoke_1030_204345: ``rmtree_failed`` x3 per run -- the root-owned
+    DIRECTORY was the deletion blocker; root-owned FILES inside ganop-owned
+    dirs were always deletable). The write-side fix in
+    ``domains/polyglot/utils.copy_from_container`` covers only the
+    chat-history tar path -- THIS host-side write path needs its own pass.
+
+    Advisory: chown the whole eval output tree to the nearest non-root
+    ancestor's owner (the run owner by construction); a no-op for
+    unprivileged callers; per-target failures are logged by the helper and
+    never raised.
+    """
+    if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+        return
+    try:
+        from pathlib import Path as _Path
+
+        from domains.polyglot.utils import _normalize_extracted_ownership
+        _normalize_extracted_ownership(_Path(output_path))
+    except Exception as e:  # noqa: BLE001 -- advisory, never break scoring
+        print(f"[eval] payload ownership normalization failed ({output_path}): "
+              f"{type(e).__name__}: {e}", flush=True)
+
+
 def run_polyglot_eval(
     predictions_path: str,
     dataset_root: str,
@@ -927,17 +1000,55 @@ def run_polyglot_eval(
     """Parent-side polyglot scoring (Arch 2): docker eval of the child patches.
 
     Each non-blank prediction is a unified diff produced by the task child;
-    the eval-only container applies it to the exercise repo and runs the
-    language test command. Score = resolved/total; the harness's own
-    aggregation json stays next to the per-instance artifacts as evidence.
+    BEFORE dispatch it passes the parent-side pre-flight gate
+    (gan.framework.polyglot_patch_repair): the same ``git apply --check`` the
+    eval-only container runs, plus a repair pass for the corruption classes
+    observed in small_1028_0046 (non-solution stanzas, no-trailing-newline
+    glue). A patch that still fails the gate is NOT dispatched -- the eval
+    scores the pristine exercise (empty_patch) exactly as before, but the
+    report records the per-question ``patch_apply`` status and reason.
+    Score = resolved/total; the harness's own aggregation json stays next to
+    the per-instance artifacts as evidence.
     """
-    df = pd.read_csv(predictions_path, dtype=str)
+    # Read via the stdlib csv module, NOT pandas: the polyglot predictions
+    # can carry binary-poisoned diffs whose content includes NUL bytes, and
+    # the pandas C parser silently TRUNCATES a field at the first NUL (field
+    # audit small_1028_0046 gen0: python predictions lost ~97% of their bytes
+    # here). The gate needs the full bytes to see (and drop) the binary
+    # stanza; a truncated field would instead fail the gate as an
+    # unexplainable corrupt patch.
+    import csv as _csv
+    _csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
+    rows: List[Tuple[str, str]] = []
+    with open(predictions_path, "r", encoding="utf-8", newline="") as f:
+        for row in _csv.DictReader(f):
+            rows.append((str(row.get("question_id") or ""),
+                         row.get("prediction") or ""))
+    from gan.framework.polyglot_patch_repair import PatchPreflight
+    gate = PatchPreflight(dataset_root)
     patches: Dict[str, str] = {}
-    for _, row in df.iterrows():
-        pred = row.get("prediction")
-        if isinstance(pred, str) and pred.strip():
-            patches[str(row["question_id"])] = pred
-    task_list = [str(value) for value in df["question_id"].tolist()]
+    patch_apply: Dict[str, Any] = {}
+    try:
+        for qid, pred in rows:
+            if not (isinstance(pred, str) and pred.strip()):
+                patch_apply[qid] = {"status": "blank"}
+                continue
+            status, dispatch, info = gate.preflight(qid, pred)
+            row_info: Dict[str, Any] = {"status": status}
+            if info.get("gate_error"):
+                row_info["gate_error"] = info["gate_error"]
+            if status == "repaired":
+                row_info["dropped_files"] = info.get("dropped_files") or []
+                row_info["rebuilt_files"] = info.get("rebuilt_files") or []
+            patch_apply[qid] = row_info
+            if status in ("ok", "repaired"):
+                patches[qid] = dispatch
+            # rejected/blank: dispatch NOTHING -> the harness scores the
+            # pristine exercise (empty_patch) with the reason recorded above.
+    finally:
+        gate_summary = gate.summary()
+        gate.cleanup()
+    task_list = [qid for qid, _ in rows]
     from domains.polyglot.harness import harness as polyglot_harness
     run_id = "gan_polyglot"
     polyglot_harness(
@@ -972,6 +1083,12 @@ def run_polyglot_eval(
         # the resolved/unresolved views stay the primary evidence.
         "question_ids_passed": list(resolved),
         "question_ids_failed": sorted(set(unresolved) | set(empty) | set(incomplete)),
+        # per-question patch-apply outcome (ok/repaired/rejected/blank):
+        # additive-only annotation -- the resolved/unresolved views and the
+        # resolved_rate denominator stay EXACTLY as before (a rejected patch
+        # is still a miss; the field exists so the miss is attributable).
+        "patch_apply": patch_apply,
+        "patch_apply_summary": gate_summary,
     }
     report_path = os.path.join(output_path, "report.json")
     with open(report_path, "w", encoding="utf-8") as f:
@@ -983,6 +1100,13 @@ def run_polyglot_eval(
     # unparseable" soft-fail plus a task_runner_failed generation. Same
     # compensation the imo_proof grading report already applies.
     os.chmod(report_path, 0o644)
+    # Root-phase payload ownership (docs/17 §15): the eval artifacts the
+    # harness just wrote (gan_polyglot_<N>/ logs / eval markdown / result
+    # json) landed root-owned 0700/0600 inside the work tree, and the
+    # unprivileged loop could never clean its own work dir (field audit
+    # smoke_1030_204345: rmtree_failed x3 per run). Normalize BEFORE the
+    # report returns to the loop -- write-side fix, not cleanup-side masking.
+    _normalize_eval_payload_ownership(output_path)
     return report
 
 
@@ -1000,24 +1124,65 @@ def derive_sample_seed(base_seed: int, genid: str) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
-def load_dataset_frame(dataset_root: str, domain: str, subset: str):
+def load_dataset_frame(dataset_root: str, domain: str, subset: str,
+                       full_stem: bool = False):
     """Load a domain/subset dataset plus its (id column, ground-truth column).
 
     Single place that knows the on-disk dataset layout and the domain utils
     column names, so the sampling entries below cannot drift apart (the id
     column used to be re-derived in three separate functions).
+
+    Path resolution is FLEX (2026-10-28 declared-val redesign, docs/15 §12.5):
+    ``subset`` may be a legacy splice name (``_filtered_100_val`` ->
+    ``dataset{subset}.csv`` / imo ``{name}bench{subset}.csv``) or a DECLARED
+    FULL file stem (domains.yaml ``val_subset``, e.g. ``dataset_filtered_100_val``
+    / ``gradingbench_filtered_100_val``). Legacy-first precedence keeps every
+    existing name resolving exactly as before; the direct
+    ``domains/<folder>/<subset>.csv`` candidate is only consulted when the
+    spliced path does not exist, so the two conventions cannot collide.
+    ``full_stem=True`` skips the legacy candidate entirely.
     """
     utils_prefix = domain.split("_", 1)[1] + "_" if domain.startswith("imo_") else ""
     domain_folder = domain.split("_")[0] if "imo_" in domain else domain
     utils_module = importlib.import_module(f"domains.{domain_folder}.{utils_prefix}utils")
     question_id_col = str(utils_module.QUESTION_ID)
     ground_truth_key = str(utils_module.GROUND_TRUTH_KEY)
-    if "imo_" in domain:
-        rel = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
+    if full_stem:
+        rel = f"domains/{domain_folder}/{subset}.csv"
     else:
-        rel = f"domains/{domain}/dataset{subset}.csv"
+        if "imo_" in domain:
+            rel_legacy = f"domains/imo/{domain.split('_')[-1]}bench{subset}.csv"
+        else:
+            rel_legacy = f"domains/{domain}/dataset{subset}.csv"
+        rel_direct = f"domains/{domain_folder}/{subset}.csv"
+        root_abs = os.path.abspath(dataset_root)
+        if os.path.isfile(os.path.join(root_abs, rel_legacy)) \
+                or not os.path.isfile(os.path.join(root_abs, rel_direct)):
+            rel = rel_legacy
+        else:
+            rel = rel_direct
     dataset = pd.read_csv(os.path.join(os.path.abspath(dataset_root), rel), dtype=str)
     return dataset, question_id_col, ground_truth_key
+
+
+def load_dataset_ids_declared(dataset_root: str, domain: str, name: str) -> List[str]:
+    """Pool of question ids for a DECLARED val-subset file stem (docs/15 §12.5).
+
+    The declared value is the full file stem (``dataset_filtered_100_val`` /
+    ``gradingbench_filtered_100_val``), resolved directly under the domain
+    folder; a stem that does not exist as a direct file falls back to the
+    legacy subset-name splice (``load_dataset_ids``), so an explicit legacy
+    ``--set eval.subset=_filtered_100_val`` keeps resolving unchanged.
+    """
+    name = str(name or "").strip()
+    folder = domain.split("_")[0] if "imo_" in domain else domain
+    direct = os.path.join(os.path.abspath(dataset_root), "domains", folder,
+                          f"{name}.csv")
+    if name and os.path.isfile(direct):
+        dataset, question_id_col, _gt = load_dataset_frame(
+            dataset_root, domain, name, full_stem=True)
+        return [str(v) for v in dataset[question_id_col].tolist()]
+    return load_dataset_ids(dataset_root, domain, name)
 
 
 def load_dataset_ids(dataset_root: str, domain: str, subset: str) -> List[str]:
@@ -1080,15 +1245,40 @@ def _polyglot_subset_ids(dataset_root: str, subset_name: str) -> List[str]:
 
 
 def _polyglot_heldout_ids(dataset_root: str) -> List[str]:
-    """The held-out evaluation ids (``subsets/val.json``), for main exclusion.
+    """The held-out evaluation ids, for main-line pool exclusion.
 
-    Excluded from the MAIN-LINE sampling pool so the planner's feedback
-    channel never sees a val question (docs/15 §12.4-3). Explicit baseline
-    modes are exempt: ``legacy_prefix`` and the full (``num_samples<=0``)
-    runs keep the whole pool -- they are declared A/B baselines / full
-    evaluations, not the rotating main line.
+    The subset NAME comes from domains.yaml ``val_subset`` (declared per
+    domain; full file stem) -- never a literal in framework source (2026-10-28
+    declared-val redesign, docs/15 §12.5). Excluded from the MAIN-LINE
+    sampling pool so the planner's feedback channel never sees a val question
+    (docs/15 §12.4-3). Explicit baseline modes are exempt: ``legacy_prefix``
+    and the full (``num_samples<=0``) runs keep the whole pool -- they are
+    declared A/B baselines / full evaluations, not the rotating main line.
+
+    STRICT on purpose: the exclusion protects the main line from val
+    contamination (R4 anchor criterion + planner feedback), so BOTH a missing
+    domains.yaml declaration AND a declared-but-missing/empty file raise
+    here -- refusing to start beats silently sampling from the full pool.
+    (The EVAL-side reader ``_polyglot_subset_ids`` keeps its soft semantics:
+    there the Defect-1 guard refuses val_mean instead.)
     """
-    return _polyglot_subset_ids(dataset_root, "val")
+    from gan.framework.loader import load_registry, resolve_domain
+    declared = str((resolve_domain(load_registry(), "polyglot") or {})
+                   .get("val_subset") or "").strip()
+    if not declared:
+        raise ValueError(
+            "domains.yaml polyglot val_subset declaration is missing/empty: "
+            "the held-out exclusion cannot be resolved, and running without "
+            "it would leak val questions into the main-line pool (R4 anchor "
+            "contamination). Declare val_subset for polyglot or remove the "
+            "domain.")
+    ids = _polyglot_subset_ids(dataset_root, declared)
+    if not ids:
+        raise ValueError(
+            f"polyglot val subset (domains.yaml val_subset={declared!r}) "
+            f"resolved to zero ids: refusing to run with an empty held-out "
+            f"exclusion (val leakage risk). Restore the subset file.")
+    return ids
 
 
 def select_seeded_positions(
@@ -1164,6 +1354,73 @@ def select_samples(
     return selected, info
 
 
+def proportional_allocate(counts: Dict[str, int], k: int) -> Dict[str, int]:
+    """Largest-remainder allocation of ``k`` draws across categories.
+
+    Floors first, then leftover seats go to the largest fractional remainders
+    (``(k*n) % total``), ties broken by category name -- fully deterministic.
+    For ``k <= total`` every category keeps ``alloc[c] <= counts[c]`` and the
+    allocation sums to exactly ``k``; ``k`` above the pool size clamps to it.
+    """
+    total = sum(counts.values())
+    k = max(0, min(int(k), total))
+    if not counts or k == 0:
+        return {}
+    alloc = {c: (k * n) // total for c, n in counts.items()}
+    order = sorted(counts, key=lambda c: (-(k * counts[c] % total), c))
+    for c in order[: k - sum(alloc.values())]:
+        alloc[c] += 1
+    return alloc
+
+
+def _pool_categories(domain: str, dataset_root: str,
+                     pool: List[str]) -> Dict[str, str]:
+    """Category (today: polyglot language) per pool id, ``{}`` = none.
+
+    Only polyglot declares a category column; every other domain keeps the
+    uniform id draw (behaviour unchanged). The eval-subset ids resolve through
+    the same metadata, so one resolver serves both anchor cores.
+    """
+    if domain != "polyglot":
+        return {}
+    from domains.polyglot import gan_utils as _pgu
+    lang = _pgu.load_language_map(dataset_root)
+    return {i: lang.get(i, "") for i in pool}
+
+
+def _stratified_sample(
+    pool: List[str],
+    categories: Dict[str, str],
+    k: int,
+    rng: random.Random,
+) -> Tuple[List[str], Dict[str, int]]:
+    """Proportional per-category draw (largest remainder); uniform fallback.
+
+    ``categories == {}`` (domains with no category column) keeps the exact
+    historical behaviour: one uniform ``rng.sample`` over the whole pool.
+    Otherwise each category receives its proportional share of ``k`` and is
+    sampled within-category from the SAME ``rng`` -- deterministic per seed;
+    categories iterate in sorted order, ids in pool order. Returns the drawn
+    ids (sorted, matching the historical seed-file ordering convention) and
+    the realized per-category allocation for audit (``{}`` on the fallback).
+    """
+    k = max(0, min(int(k), len(pool)))
+    if k == 0:
+        return [], {}
+    if not categories:
+        return sorted(rng.sample(pool, k)), {}
+    by_cat: Dict[str, List[str]] = {}
+    for i in pool:  # within-category order = pool order (deterministic)
+        by_cat.setdefault(categories.get(i, ""), []).append(i)
+    alloc = proportional_allocate({c: len(v) for c, v in by_cat.items()}, k)
+    picked: List[str] = []
+    for cat in sorted(by_cat):
+        n = int(alloc.get(cat, 0))
+        if n:
+            picked.extend(rng.sample(by_cat[cat], n))
+    return sorted(picked), alloc
+
+
 def ensure_sampling_seed(
     output_dir: str,
     domain: str,
@@ -1186,6 +1443,16 @@ def ensure_sampling_seed(
     used only by the fixed-root evaluation. Because the loader is
     skip-if-exists, both fields only materialize for a NEW run dir -- an old
     dir keeps its historical sampling and its historical (no-val) supernodes.
+
+    BOTH cores draw PROPORTIONALLY across polyglot languages (largest
+    remainder, ``proportional_allocate`` / ``_stratified_sample``): the frozen
+    anchor composition then matches the pool's language mix by construction
+    instead of by small-sample luck. The realized per-category allocation is
+    recorded as ``anchor_alloc`` / ``eval_anchor_alloc`` in the seed file and
+    the ``sampling_seed_ready`` event. Domains without a category column
+    (CSV) keep the uniform draw; the seed recipe strings are unchanged, so
+    resume determinism is preserved (realized anchor SETS differ from the
+    pre-proportional policy only across NEW run dirs).
     """
     seed_path = os.path.join(output_dir, "ckpt", "sample_seed.json")
     if os.path.isfile(seed_path):
@@ -1194,18 +1461,26 @@ def ensure_sampling_seed(
     if base_seed is None:
         base_seed = int.from_bytes(os.urandom(8), "big")
     anchor_ids: List[str] = []
+    anchor_alloc: Dict[str, int] = {}
     try:
         # polyglot: anchors come from the FULL metadata pool (a pinned
         # eval_task_list filters only the eval side, so anchors simply find
         # no row when a pinned pool excludes them); balrog has no pool;
         # CSV domains read their dataset. One resolver for all of them.
+        # Draw is PROPORTIONAL across polyglot languages (largest remainder):
+        # the anchor core is frozen for the whole run, so a small uniform id
+        # draw bakes its language skew into every generation (k=9 uniform
+        # anchors left cpp unanchored in ~32% of simulated runs). CSV domains
+        # have no category column and keep the uniform draw.
         pool = load_pool_ids(domain, dataset_root, subset)
         k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
         if pool and k > 0:
             rng = random.Random(f"{int(base_seed)}:anchor")
-            anchor_ids = sorted(rng.sample(pool, min(k, len(pool))))
+            anchor_ids, anchor_alloc = _stratified_sample(
+                pool, _pool_categories(domain, dataset_root, pool), k, rng)
     except Exception as exc:  # noqa: BLE001 -- anchor drawing must never kill a run
         anchor_ids = []
+        anchor_alloc = {}
         _log_soft_sample_note(f"anchor drawing failed ({exc}); continuing without anchors")
     # Evaluation anchor core (docs/14 section 5.5): the fixed-root evaluation
     # runs on its OWN question set, drawn ONCE per run and identical in every
@@ -1217,6 +1492,7 @@ def ensure_sampling_seed(
     # discriminating power (one always-right plus one always-wrong question; the
     # constant-policy arm A1 scored exactly 0.5000 over 36 generations).
     eval_ids: List[str] = []
+    eval_alloc: Dict[str, int] = {}
     eval_subset_used = str(eval_subset or "")
     eval_k_used = max(0, int(eval_anchor_k or 0))
     if eval_subset_used and eval_k_used > 0:
@@ -1231,18 +1507,32 @@ def ensure_sampling_seed(
             elif domain in _SANDBOXED_BALROG_DOMAINS:
                 eval_pool = []
             else:
-                eval_pool = load_dataset_ids(dataset_root, domain, eval_subset_used)
+                # Declared full file stem first (domains.yaml val_subset
+                # convention), legacy subset-name splice as the fallback.
+                eval_pool = load_dataset_ids_declared(
+                    dataset_root, domain, eval_subset_used)
             if eval_pool:
+                # Same proportional policy as the main-line core: the eval set
+                # is equally frozen per run, and val.json is itself a
+                # proportional-by-language allocation (docs/15 §12.6) -- a
+                # uniform sub-draw of it would re-introduce the skew the
+                # subset was built to avoid. k clamps to the pool inside
+                # _stratified_sample (k=18 over the 18-id val -> the whole set).
                 erng = random.Random(f"{int(base_seed)}:eval_anchor")
-                eval_ids = sorted(erng.sample(eval_pool, min(eval_k_used, len(eval_pool))))
+                eval_ids, eval_alloc = _stratified_sample(
+                    eval_pool, _pool_categories(domain, dataset_root, eval_pool),
+                    eval_k_used, erng)
         except Exception as exc:  # noqa: BLE001 -- evaluation may fall back
             eval_ids = []
+            eval_alloc = {}
             _log_soft_sample_note(
                 f"eval anchor drawing failed ({exc}); the fixed-root evaluation "
                 f"will fall back to a seeded draw over the main subset")
     info = {"base_seed": int(base_seed), "anchor_ids": anchor_ids,
+            "anchor_alloc": anchor_alloc,
             "domain": domain, "subset": subset,
             "eval_anchor_ids": eval_ids,
+            "eval_anchor_alloc": eval_alloc,
             "eval_subset": eval_subset_used,
             "eval_anchor_k": eval_k_used}
     os.makedirs(os.path.dirname(seed_path), exist_ok=True)
@@ -2176,6 +2466,8 @@ def _run_harness_and_report_local(
     broker_launch = expected_owner_uid is not None
     secure_launch = needs_sandbox_identity or broker_launch
     child_env = _task_safe_env(env)
+    child_env["PATH"] = _child_path_with_venv_bin(
+        child_env, os.path.realpath(sys.prefix))
     if needs_sandbox_identity and not broker_launch:
         child_env["PYTHONPATH"] = "/proc/self/cwd"
     lease = None
@@ -2675,6 +2967,43 @@ def _normalize(value: Any, contract: Dict[str, Any]) -> str:
     return s
 
 
+_UNIVERSAL_RESPONSE_CONTRACT = (
+    "The response must contain the complete final answer from your prior work.")
+
+
+def derive_response_contract(domain: Optional[str],
+                             domain_cfg: Optional[Dict[str, Any]]) -> str:
+    """The framework-owned final-answer requirement, as ONE sentence.
+
+    Single source for BOTH consumers: the task child's explicit output-contract
+    section (assembled instruction) and the format-repair turn. Derivation:
+
+    - ``output_contract.kind == "label"`` (domains.yaml) -> the label list,
+      so the repair turn and the main prompt name the SAME vocabulary the
+      online scorer matches against;
+    - domains whose prediction is NOT the response text (polyglot: the
+      workspace diff is the deliverable) get their prediction-source fact —
+      the old universal "return the COMPLETE final answer" pushed polyglot
+      into re-pasting whole diffs and tripping finish_reason=length;
+    - everything else -> the universal sentence (fail-open: a domain with no
+      contract still gets an explicit requirement).
+    """
+    cfg = domain_cfg or {}
+    contract = cfg.get("output_contract") or {}
+    if contract.get("kind") == "label":
+        labels = [str(a) for a in (contract.get("allowed_labels") or [])
+                  if str(a).strip()]
+        if labels:
+            return ("The response must be exactly one of: "
+                    + " / ".join(labels) + ".")
+    if domain == "polyglot":
+        return ("Your written solution files are the deliverable - the response "
+                "only needs a 1-3 sentence summary. Do NOT paste code or diffs.")
+    if domain == "imo_proof":
+        return ("The response must contain the complete proof solution text.")
+    return _UNIVERSAL_RESPONSE_CONTRACT
+
+
 def compute_report_summary(
     report: Optional[Dict[str, Any]],
     requested: int,
@@ -2702,6 +3031,14 @@ def compute_report_summary(
     summary["overall_accuracy"] = report.get("overall_accuracy")
     summary["random_guess_accuracy"] = report.get("random_guess_accuracy")
     summary["label_distribution"] = report.get("label_distribution")
+    # polyglot patch-apply aggregate (counts only, no text): a sanctioned
+    # extension of the run_summary projection -- the evaluator/planner must
+    # SEE how many patches were repaired/rejected by the pre-flight gate,
+    # otherwise a generator regression is invisible to the evolution loop
+    # (the small_1028_0046 lesson: 31/90 corrupt patches went unnoticed for
+    # 9 generations). Counts carry no benchmark signal; blind discipline
+    # untouched. Deliberate extension -> run_tool_regression after this.
+    summary["patch_apply_summary"] = report.get("patch_apply_summary")
 
     n_valid = report.get("total")
     if isinstance(n_valid, (int, float)):

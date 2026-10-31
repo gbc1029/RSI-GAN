@@ -35,6 +35,11 @@ class EvaluatorIssue:
     severity: str = "medium"          # low | medium | high
     evidence: str = ""
     suggested_fix: str = ""
+    # Cross-round identity (closed vocabulary, gan/framework/issue_keys.py).
+    # Carried so the digest can name the defect by a label that survives the
+    # per-round ``issue_id`` renumbering; ``None`` for issues recorded before
+    # the vocabulary existed.
+    issue_key: Optional[str] = None
 
 
 @dataclass
@@ -237,7 +242,12 @@ def build_feedback_digest(
         for o in outcomes:
             it = issues_by_id.get(o.issue_id, {})
             resp_list = responses_by_id.get(o.issue_id, [])
-            lines.append(f"- issue {o.issue_id}: {it.get('description', '')}".rstrip())
+            # The cross-round key rides the header when present: it is the one
+            # label that lets the evaluator recognise "I already raised this
+            # defect three outers ago" (gan/framework/issue_keys.py).
+            key_tag = f" [{it.get('issue_key')}]" if it.get("issue_key") else ""
+            lines.append(f"- issue {o.issue_id}{key_tag}: "
+                         f"{it.get('description', '')}".rstrip())
             lines.append(f"    outcome: {_LABEL_TEXT.get(o.cell, o.cell)}")
             if resp_list:
                 for resp in resp_list:

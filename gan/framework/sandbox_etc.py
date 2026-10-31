@@ -1,7 +1,9 @@
 """Create and validate the minimal ``/etc`` exposed to secure GAN workers."""
 from __future__ import annotations
 
+import glob
 import os
+import re
 import shutil
 import stat
 from typing import Dict, Iterable, Optional, Tuple
@@ -28,6 +30,17 @@ _OPTIONAL_FILES = {
 }
 _ALLOWED_DIRS = {"ssl", "ssl/certs"}
 _MAX_RUNTIME_FILE_BYTES = 16 * 1024 * 1024
+
+# Debian/Ubuntu ship OpenJDK's security config as /etc-managed real files while
+# the JDK tree symlinks into them (conf/security/java.security ->
+# /etc/java-N-openjdk/security/java.security). A synthetic /etc without that
+# subtree leaves every symlink dangling and Java unusable inside the sandbox
+# ("Error loading java.security file"; field audit small_1030_095410). The
+# subtree is projected as dereferenced real files when the host has it.
+_JAVA_ETC_GLOB = "/etc/java-*-openjdk"
+_JAVA_ETC_RE = re.compile(r"java-\d+-openjdk(/.*)?$")
+# Debian alternatives registry (symlink entries only; see create_sandbox_etc)
+_ALT_RE = re.compile(r"alternatives(/.*)?$")
 
 
 def _trusted_file_bytes(path: str, allowed_roots: Iterable[str]) -> Optional[bytes]:
@@ -188,6 +201,53 @@ def create_sandbox_etc(
             if data is not None:
                 _write_file(root, relative, data)
 
+        # OpenJDK security config (optional projection): the /etc side of the
+        # JDK's conf/security symlinks. Files are dereferenced, trust-checked
+        # against /etc, and re-created 0444 root-owned; a source whose target
+        # escapes /etc (or fails the trust walk) is SKIPPED, never followed —
+        # an optional projection must not fail the sandbox, and the validate
+        # gate below still rejects anything this loop should not have written.
+        for java_dir in sorted(glob.glob(_JAVA_ETC_GLOB)):
+            if os.path.islink(java_dir) or not os.path.isdir(java_dir):
+                continue
+            for current, _dirs, files in os.walk(java_dir, followlinks=True):
+                for name in files:
+                    real = os.path.realpath(os.path.join(current, name))
+                    if not real.startswith("/etc/"):
+                        continue
+                    try:
+                        data = _trusted_file_bytes(real, ("/etc",))
+                    except RuntimeError:
+                        continue
+                    if data is None:
+                        continue
+                    relative = os.path.relpath(real, "/etc").replace(os.sep, "/")
+                    _write_file(root, relative, data)
+
+        # Debian alternatives registry (optional projection): /usr/bin/cc ->
+        # /etc/alternatives/cc -> /usr/bin/gcc — rustc's default linker
+        # driver. Same failure class as the JDK block above: the synthetic
+        # /etc without this subtree leaves the toolchain's symlinks dangling
+        # ("linker 'cc' not found"; field audit small_1030_095410, rust
+        # exercises). The SYMLINKS are re-created verbatim — the sandbox /usr
+        # is the host's read-only view, so the original targets resolve there.
+        # Only entries whose target exists (host view) are reproduced; a
+        # non-symlink or dangling entry is skipped, never followed.
+        alt_src = "/etc/alternatives"
+        if os.path.isdir(alt_src) and not os.path.islink(alt_src):
+            alt_root = os.path.join(root, "alternatives")
+            os.makedirs(alt_root, exist_ok=True)
+            for name in sorted(os.listdir(alt_src)):
+                entry = os.path.join(alt_src, name)
+                if not os.path.islink(entry):
+                    continue
+                if os.path.isdir(entry):
+                    continue  # symlink-to-directory: out of scope for a flat registry
+                target = os.readlink(entry)
+                if not os.path.exists(entry):
+                    continue  # dangling on the host: nothing to provide
+                os.symlink(target, os.path.join(alt_root, name))
+
         for current, directories, _files in os.walk(root, topdown=False):
             for name in directories:
                 os.chmod(os.path.join(current, name), 0o555)
@@ -217,23 +277,39 @@ def validate_sandbox_etc(path: str) -> str:
         for name in directories:
             relative = "/".join(part for part in (relative_root, name) if part)
             info = os.lstat(os.path.join(current, name))
-            if (relative not in _ALLOWED_DIRS or not stat.S_ISDIR(info.st_mode)
+            allowed_dir = (relative in _ALLOWED_DIRS
+                           or bool(_JAVA_ETC_RE.match(relative))
+                           or bool(_ALT_RE.match(relative)))
+            if (not allowed_dir or not stat.S_ISDIR(info.st_mode)
                     or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o555):
                 raise RuntimeError(f"sandbox /etc contains an unsafe directory: {relative}")
             observed_dirs.add(relative)
         for name in files:
             relative = "/".join(part for part in (relative_root, name) if part)
             info = os.lstat(os.path.join(current, name))
-            if (relative not in _REQUIRED_FILES | _OPTIONAL_FILES
-                    or not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+            allowed_file = (relative in _REQUIRED_FILES | _OPTIONAL_FILES
+                            or bool(_JAVA_ETC_RE.match(relative))
+                            or bool(_ALT_RE.match(relative)))
+            if _ALT_RE.match(relative):
+                # alternatives entries are re-created SYMLINKS (their targets
+                # live in the sandbox's read-only /usr view); a regular file
+                # here means the projection was tampered with
+                if (not stat.S_ISLNK(info.st_mode) or info.st_uid != 0
+                        or info.st_nlink != 1):
+                    raise RuntimeError(
+                        f"sandbox /etc contains an unsafe alternatives entry: {relative}")
+            elif (not allowed_file or not stat.S_ISREG(info.st_mode) or info.st_uid != 0
                     or stat.S_IMODE(info.st_mode) != 0o444 or info.st_nlink != 1):
                 raise RuntimeError(f"sandbox /etc contains an unsafe file: {relative}")
             observed_files.add(relative)
     if not _REQUIRED_FILES <= observed_files:
         missing = sorted(_REQUIRED_FILES - observed_files)
         raise RuntimeError(f"sandbox /etc projection is incomplete: {missing}")
-    if observed_dirs - _ALLOWED_DIRS:
-        raise RuntimeError("sandbox /etc projection contains unexpected directories")
+    extra_dirs = observed_dirs - _ALLOWED_DIRS
+    if any(not (_JAVA_ETC_RE.match(d) or _ALT_RE.match(d)) for d in extra_dirs):
+        unexpected = sorted(d for d in extra_dirs
+                            if not (_JAVA_ETC_RE.match(d) or _ALT_RE.match(d)))
+        raise RuntimeError(f"sandbox /etc projection contains unexpected directories: {unexpected}")
 
     marker = os.path.join(real, SANDBOX_ETC_MARKER)
     fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)

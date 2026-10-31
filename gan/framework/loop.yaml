@@ -24,11 +24,15 @@ loop:
   stagnation_epsilon: 0.005     # delta threshold；锚点口径下每次变化是 1 个整题，
                                 # 所以任何 +1 都算改进（eps 实际退化为 0）
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
-  self_improve_max_tool_calls: 5  # tool-call budget for role self-improvement
-  plan_max_tool_calls: 6          # tool-call budget for the PLAN seat (planner only;
+  # 座位工具调用预算（2026-10-28 调整：原 5/6/8 对 polyglot 实测过紧——
+  # smoke_1022_222630 在 6 即 1/6 会话截断；提到 16/20/12 后 verify_1028_1633 仍有
+  # 5/16≈31% plan 会话顶满。现取代码回退值 40/30/30 的一半（20/15/15），保留
+  # "缺键放大"回退方向的安全性余量；evaluate blind 15 → reveal 回退 max(6,15//3)=6 不变。
+  self_improve_max_tool_calls: 15  # tool-call budget for role self-improvement
+  plan_max_tool_calls: 20          # tool-call budget for the PLAN seat (planner only;
                                    # the evaluate seat has its own key below -- it must
                                    # at minimum complete its mandatory eval-points)
-  evaluate_max_tool_calls: 8      # tool-call budget for the EVALUATE seat (blind phase;
+  evaluate_max_tool_calls: 15      # tool-call budget for the EVALUATE seat (blind phase;
                                    # the reveal phase gets a third of it, min 6). Must
                                    # cover: eval-points sweep + record/report/judge_fix.
   tool_repeat_limit: 3             # anti-thrash: >= this many CONSECUTIVE identical
@@ -77,10 +81,28 @@ tree:
   branch_limit: 2               # B: max children per node
   depth_limit: 5                # D: max depth
   num_parents: 1                # >1 enables crossover (DAG, shallow config merge)
-  selection: ucb                # ucb | best | latest
-  ucb_c: 1.0                    # exploration constant
-  depth_penalty: 0.05           # penalty per unit depth
-  cost_penalty: 0.0             # penalty on normalized cost (0 disables)
+  # 父代选择策略（消费者：gan/framework/loop.py -> TreeStore.select_parents）
+  #   lcb    -- 默认。置信集选择：按"锚点核上的 Wilson 下界"筛出 {n: LCB >= 最优 - delta}
+  #             （统计上分不出高下的一撮），再在这一撮里取 children 最少者（最该展开的）。
+  #             探索永不越出置信集——已被证据否定的节点不会因为"没试过"被重选。
+  #   ucb    -- 旧加性bandit：score + c*sqrt(ln N / visits) - penalties。保留为对照臂。
+  #   best / latest -- 纯分数 argmax / 最近加入。
+  # 为什么默认 lcb：score ∈ [0,1] 而 visits=2 时 bonus 可达 ~1.4，旧 metric 实际退化为
+  # "选最少被访问的节点"；且每个 genid 只评估一次，"再拉一次收紧估计"不存在——
+  # 唯一诚实的修法是悲观估计 + 把探索预算关在"仍可能是最好"的集合内。
+  selection: lcb
+  ucb_c: 1.0                    # exploration constant（仅 selection=ucb 生效）
+  lcb_delta: 0.0                # 置信集宽度 = "最优 LCB - delta"。0 = auto = 2/anchor_k
+                                # （k=10 时约 0.2 ≈ 一个标准误）。为什么不取 1/anchor_k：
+                                # z=1.64 下差一道锚点题就是 ~0.13 > 0.1，集合会退化成单元素，
+                                # 集内探索永远不会发生。调大 = 更多探索；调小 = 更贪心。
+                                # 消费者：loop.py -> TreeStore._select_parents_lcb。
+  lcb_z: 1.64                   # Wilson 下界置信系数（1.64 ≈ 单侧 95%）；0 = 退化为
+                                # 纯正确率（消融/回退用）。锚点题同域相关，独立同分布
+                                # 假设偏乐观，故不用 1.96 的更窄版本。
+  depth_penalty: 0.05           # penalty per unit depth（lcb 模式下只作置信集内的
+                                # 二级排序，不参与统计筛选）
+  cost_penalty: 0.0             # penalty on normalized cost (0 disables；同上)
   cross_subtree: false          # docs/13 §2.4: 子树优先。true = 以 cross_subtree_epsilon
                                 # 的概率把候选池扩大到全局；false = 候选池限定在当前 outer
                                 # 子树（meta.outer_id == 当前 outer；initial/迁移节点仍可参与）。
@@ -119,7 +141,54 @@ fitness:
   beta_variance: 0.1            # F_p: z_mean - beta*z_std + lambda*novelty
   lambda_novelty: 0.2           # F_p / F_e 共用的 novelty 权重
   w1_calibration: 0.6           # F_e: -w1*z_calibration_error
-  w2_verdict_stability: 0.4     # F_e: +w2*verdict_stability
+  w2_verdict_stability: 0.4     # F_e: +w2*z(verdict_stability); 口径见下
+                                # verdict_stability = 逐 issue 的机械真值命中率
+                                # （hits / verified，gan/framework/issue_checks.py）：
+                                # 该 issue 指的缺陷是否真的"父代存在 → 子代消失"，
+                                # 且 evaluator 的 judge_fix 说对了。不是"整届分数涨没涨"
+                                # （旧口径；它会把无事可修的 A1 诚实评估判成 0.0）。
+                                # verified=0 → None（F_e 该项中性，不罚）。
+
+# ---------------------------------------------------------------------------
+# issue 连续性（跨 outer 的缺陷记忆；消费者：gan/framework/loop.py -> 两个
+# issue_ledger/issue_keys 模块）
+#
+# 背景：issue_id 是"本轮第几条"的句柄，父节点一变就从 i-1 重编；跨 outer 时
+# 父代 issues 被清空（因果链已断：evaluator 自身设计、恢复的父代设计、代码分支都
+# 换过），于是每届都要重新发现同一缺陷——A0 实测同一成本问题被重报约 10 次，
+# A6 的 evaluator 访问 bug 报了 3 次（编号 i-2 → i-4 → i-2，无法 join）。
+#
+# 现在：issue 带一个封闭词表的 issue_key（gan/framework/issue_keys.py），每届
+# outer 边界把"提起 / 判修好 / 判未修 / stance"折进 ckpt/issues/ledger.json；
+# 下一轮把"仍未结案"的 key 以只读小抄注入（无 issue_id、无旧 description /
+# suggested_fix —— 搬病史不搬处方，现任 evaluator 重新诊断开方）。
+# ---------------------------------------------------------------------------
+issues:
+  ledger_enabled: true          # false = 不写账本、不注入小抄（旧行为）
+  carried_limit: 6              # 小抄最多几行（按 重报次数/最近 outer 排序）
+  not_actionable_stances: 2     # 同一 key 累计 N 次 out_of_scope/disputed 且 0 次
+                                # 确认修复 -> not_actionable：不再注入 planner
+                                # （planner 修不了的框架侧问题另有 owner=framework
+                                #  过滤，双保险）
+  # 机械检查器阈值（消费者：gan/framework/issue_checks.py；产出 verdict_stability
+  # 的 verified/hits）。阈值越严 -> PRESENT 越少 -> verified 样本越少（不是越准）。
+  check:
+    cost_ratio: 1.5             # cost.tokens: 用掉 > 1.5 倍 token_budget_per_gen
+    bias_share: 0.65            # policy.{accept,reject}-bias: 单一预测标签占比
+                                # 校准依据（pilot 实测）：evaluator 正确报出的宽松
+                                # 偏置落在 0.67-0.70 accept（真值 0.50），旧的 0.75
+                                # 把真实偏置判成"缺陷不存在"，还冤枉 evaluator 编造。
+    constant_share: 0.99        # policy.constant-output: 单一预测标签占比（且真值非单标签）
+    min_samples: 10             # 分布类判据的最少有效样本数（n<10 -> UNKNOWN）。
+                                # n=2 时占比只可能是 0/0.5/1，标准误 ~0.35（n=30 时 ~0.09），
+                                # 任何"偏置/翻转"都是噪声 —— 宁可判不了，不要假判定。
+    constant_min_samples: 6     # policy.constant-output 专用门槛（比上面低）：
+                                # "每个样本同一个标签"对已记录的行是精确的，但"策略恒定"
+                                # 仍是推断 —— n=2 全同有 25% 是巧合，n=6 降到 ~1.6%。
+                                # 0 = 关闭该门槛。
+    acc_tol: 0.05               # policy.overcorrection: 子代准确率比父代"明显更差"的容差
+                                # （判据 = 决策规则反转[acc_C <= 少数类占比 - acc_tol]
+                                #  且 acc_C < acc_P - acc_tol；见 issue_checks.py）
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
@@ -135,8 +204,16 @@ eval:
   # 为什么不用主链的 sampling.anchor_k：实测 k=2 的锚点核没有区分度（一题人人对 +
   # 一题人人错，A1 恒定策略在 36 代上恰好 0.5000）。评估集要"全固定"，因此不受
   # select_samples 的 num_samples//2 上限约束（该上限保护的是主链的锚点+抽签配平）。
-  subset: _filtered_100_val     # 空 = 沿用主链子集（旧行为，题集每代变化）
-  anchor_k: 30                  # 0 = 不做固定锚点评估；建议 >= 20 才有区分度
+  # subset 三态（2026-10-28 声明化，解析点 gan/driver.py，事件 eval_subset_resolved）：
+  #   ""（默认）= 继承 domains.yaml 各域的 val_subset 声明（完整文件名去扩展名；
+  #              polyglot→subsets/val.json，CSV 域→domains/<目录>/<全名>.csv）；
+  #              域未声明 → 固定根评估关闭（loud 事件，跑完无 val_mean）。
+  #   none/off/false = 显式关闭固定根评估（即使域声明了 val_subset）。
+  #   显式子集名 = 按域协议原样解析（旧行为，--set eval.subset=<名> 仍最高优先）。
+  subset: ""                    # 空 = 继承 domains.yaml val_subset（见上）
+  anchor_k: 30                  # 0 = 不做固定锚点评估；建议 >= 20 才有区分度；
+                                # 必须 <= --num_samples（driver 启动 fail-fast，
+                                # 否则 broker 钉值会静默截断评估集）
   eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 
 # ---------------------------------------------------------------------------
@@ -155,7 +232,14 @@ eval:
 # generation-0 是合法的恢复路径）。0 = 关闭闸门（供试验/回退场景）。
 # ---------------------------------------------------------------------------
 design:
-  prompt_rewrite_min_similarity: 0.5   # 保留不足 50% 原文即视为整段重写并拒绝
+  # R2 闸门主判据 = 保留率（新文与旧文的字符级匹配数 / 旧文长度）：低于阈值即
+  # 判为整段替换并拒绝。0 = 关闭闸门（供试验/回退场景）。旧键
+  # prompt_rewrite_min_similarity 仅作旧配置回退，新配置请用本键。
+  prompt_rewrite_min_survival: 0.5
+  prompt_rewrite_min_similarity: 0.5   # [legacy] 旧对称相似度键，仅回退用
+  # 单次写入的长度倍数上限（新文长度 / 旧文长度，0 = 不限）。保留式追加的
+  # 反膨胀约束显式化——旧 ratio 度量曾隐式提供该效果。
+  prompt_rewrite_max_growth: 4
 
 # ---------------------------------------------------------------------------
 # 修改深度 / 源码门控（v1.1 修订）

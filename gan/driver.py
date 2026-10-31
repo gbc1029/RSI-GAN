@@ -620,6 +620,30 @@ def _launch_budget(cfg: Any, inner: Optional[int]) -> tuple[int, int, int]:
     return inner_generations, eval_rounds, inner_generations + eval_rounds
 
 
+def _resolve_eval_subset(raw: str, domain_config: Any) -> tuple[str, str]:
+    """Three-state resolution of the fixed-root evaluation question set.
+
+    Returns ``(subset, source)``:
+      - explicit name  -> ``(name, "explicit")`` -- verbatim, legacy behaviour;
+      - none/off/false -> `("", "explicit_off")` -- the operator disabled the
+        fixed-root evaluation even though the domain may declare a val set;
+      - "" (loop.yaml default) -> inherit the domain's ``val_subset``
+        declaration (domains.yaml, full file stem):
+        `("declared-stem", "domain_declaration")`, or
+        `("", "domain_undeclared")` when the domain has no val set.
+    Pure (no I/O) so the offline tests can drive it directly.
+    """
+    raw = str(raw or "").strip()
+    if raw.lower() in ("none", "off", "false"):
+        return "", "explicit_off"
+    if raw:
+        return raw, "explicit"
+    declared = str((domain_config or {}).get("val_subset") or "").strip()
+    if declared:
+        return declared, "domain_declaration"
+    return "", "domain_undeclared"
+
+
 @_private_driver_umask
 def run_gan_driver(
     repo_root: str,
@@ -692,9 +716,29 @@ def run_gan_driver(
     # main line and the root-side broker pins ``num_samples`` for every harness
     # launch: an over-sized evaluation set would be silently truncated by the
     # harness re-slice, so it is refused instead.
+    #
+    # eval.subset is THREE-STATE (2026-10-28 declared-val redesign, docs/15
+    # §12.5): the loop.yaml default "" inherits the domain's own ``val_subset``
+    # declaration in domains.yaml (full dataset file stem; polyglot resolves
+    # subsets/<stem>.json, CSV domains domains/<folder>/<stem>.csv) -- so the
+    # val split is framework-native instead of an operator-side --set. An
+    # explicit name wins verbatim (legacy --set keeps working); the sentinel
+    # none/off/false explicitly DISABLES the fixed-root evaluation even when
+    # the domain declares a val set. A domain without a declaration disables
+    # the evaluation LOUDLY (event below) instead of resolving a broken name.
+    # The resolved name is what the seed file, the worker pin and the regime
+    # guard all see -- loop.py never sees the empty/inherit state.
     eval_section = cfg.get("eval") or {}
-    eval_subset = str(eval_section.get("subset") or "")
     eval_anchor_k = max(0, int(eval_section.get("anchor_k") or 0))
+    eval_subset, eval_subset_source = _resolve_eval_subset(
+        str(eval_section.get("subset") or ""), domain_config)
+    # NOTE: the eval_subset_resolved EVENT is logged POST-drop, right after the
+    # output_dir ownership check below. Every write into output_dir must belong
+    # to the post-drop caller uid: logging it HERE (still root) created
+    # logs/events.jsonl root-owned, and the first post-drop append died with
+    # PermissionError(13) before any other artifact (small_1029_231632,
+    # 2026-10-29). The values stay in locals; the anchor_k refusal below stays
+    # pre-drop so a bad pair never reaches the sandbox layer.
     eval_questions = eval_anchor_k if (eval_subset and eval_anchor_k) else 0
     if eval_questions > int(num_samples):
         raise ValueError(
@@ -836,6 +880,7 @@ def run_gan_driver(
         "python_prefix": python_prefix,
         "timeout": harness_timeout,
         "task_brief": (domain_cfg.get("task_brief") or ""),
+        "response_contract": task_execution.derive_response_contract(domain, domain_cfg),
         "parent_scored": task_execution.uses_parent_scoring(domain),
         # Question-sampling scheme (loop.yaml sampling.*). The broker reads the
         # run-persistent seed file at launch time (per generation) so a resume
@@ -891,6 +936,25 @@ def run_gan_driver(
             pass
         os.chmod(env_mask_file, 0o444)
         proxy.bind()
+        # Ownership reconcile BEFORE the drop (still root here): a pre-drop
+        # failure path (or the d7aa7d9 regression itself) may have left
+        # root-owned files inside output_dir; if logs/events.jsonl stayed
+        # root-owned the first post-drop append would die with
+        # PermissionError(13) and every retry of the SAME output_dir would too.
+        # Only root-owned entries are handed over; ganop-owned files are never
+        # touched.
+        _events_path = paths.events_path(output_dir)
+        for _p in (os.path.dirname(_events_path), _events_path):
+            try:
+                _info = os.stat(_p)
+            except OSError:
+                continue
+            if _info.st_uid != 0:
+                continue
+            try:
+                os.chown(_p, owner_uid, owner_gid)
+            except OSError:
+                pass
         _drop_driver_privileges(owner_uid, owner_gid, owner_username)
         os.makedirs(output_dir, exist_ok=True)
         output_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -909,6 +973,14 @@ def run_gan_driver(
             raise RuntimeError(
                 f"sudo invoking user cannot read/write/traverse output_dir: {output_dir}"
             )
+
+        # First event of the run -- logged as the POST-drop identity. The
+        # pre-drop startup runs as root and must not create anything inside
+        # output_dir (see the eval resolution note above).
+        _log_event(output_dir, {"type": "eval_subset_resolved", "domain": domain,
+                                "source": eval_subset_source,
+                                "subset": eval_subset or None,
+                                "anchor_k": eval_anchor_k or None})
 
         # Re-entry policy. Follow the newest completed attempt.
         newest = ckpt_mod.newest_outer_snapshot(output_dir)
@@ -953,9 +1025,11 @@ def run_gan_driver(
                                     "base_seed": sample_seed_base,
                                     "fixed_by_config": bool(fixed_seed),
                                     "anchor_ids": anchor_ids,
+                                    "anchor_alloc": seed_info.get("anchor_alloc") or {},
                                     "eval_subset": seed_info.get("eval_subset"),
                                     "eval_anchor_k": seed_info.get("eval_anchor_k"),
-                                    "eval_anchor_ids": eval_anchor_ids})
+                                    "eval_anchor_ids": eval_anchor_ids,
+                                    "eval_anchor_alloc": seed_info.get("eval_anchor_alloc") or {}})
         else:
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": sampling_mode})
@@ -993,6 +1067,13 @@ def run_gan_driver(
             # two runs' inner-loop stopping behaviour incomparable -- the regime
             # guard must see it.
             "sampling.anchor_k": int((cfg.get("sampling") or {}).get("anchor_k", 0) or 0),
+            # Parent-selection policy. ``lcb`` (confidence set) and ``ucb``
+            # (legacy additive bonus) explore different lineages from the same
+            # tree, so two runs that differ here are NOT comparable -- the
+            # collector's regime guard must see it. ``lcb_delta`` changes the
+            # width of the confidence set, i.e. how much exploration happens.
+            "tree.selection": str(cfg.get("tree.selection", "lcb")),
+            "tree.lcb_delta": float(cfg.get("tree.lcb_delta", 0.0)),
             # Resolve exactly like _launch_budget: --inner OVERRIDES the yaml value
             # inside the worker, so recording the yaml 2 while the worker runs 3
             # would make the audit trail (and the collector's regime guard) lie
@@ -1109,6 +1190,13 @@ def run_gan_driver(
                 # B1 rides source_access.deny_deep (its only consumer), not ablation.
                 worker_overrides.setdefault("source_access", {})["deny_deep"] = \
                     bool(cfg.get("source_access.deny_deep", False))
+                # The worker re-loads loop.yaml, whose eval.subset default is
+                # now the INHERIT sentinel ("" = read domains.yaml val_subset).
+                # The worker cannot re-resolve (it already runs inside the
+                # outer), so pin the DRIVER's resolved concrete name -- "" when
+                # the evaluation is off -- so loop.py and the seed file always
+                # agree (docs/15 §12.5, event eval_subset_resolved).
+                worker_overrides.setdefault("eval", {})["subset"] = eval_subset
                 if worker_overrides:
                     cmd.extend(["--cfg-overrides", json.dumps(worker_overrides)])
                 if inner is not None:

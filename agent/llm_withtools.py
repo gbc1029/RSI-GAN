@@ -277,6 +277,50 @@ DO NOT HALLUCINATE OR MAKE UP ANYTHING.
 """.format(tools_available=tools_available)
     return tooluse_prompt.strip()
 
+def _json_block_truncated(response):
+    """Real-truncation evidence for the output-context retry.
+
+    The last ``<json>`` block must be MISSING its closing tag, or end with
+    unconsumed OPEN braces. A closed block with extra closers / a broken
+    string is MALFORMED, not truncated -- the malformed-feedback path owns
+    it (field lesson from the polyglot round 2026-10-28,
+    go__kindergarten-garden: the old len>=2000 heuristic looped 'Output
+    context exceeded' on a closed-but-unparseable block until the question
+    produced a BLANK patch; both paths are bounded now).
+    """
+    last = response.rfind("<json>")
+    if last == -1:
+        return False
+    tail = response[last:]
+    end = tail.find("</json>")
+    if end == -1:
+        return True                       # never closed -> truncated
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in tail[:end]:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    # depth > 0: the parser ran out of input with open braces (missing
+    # closers) -> truncated. depth <= 0 (incl. extra closers / a broken
+    # string inside a closed tag) -> MALFORMED, not truncated: a different
+    # error message applies, and both paths are bounded now.
+    return depth > 0
+
+_CTX_RETRY_LIMIT = 5   # consecutive output-truncation retries before forced summary
+
 def should_retry_tool_use(response, tool_uses=None):
     """
     Check if the response attempts to use a tool,
@@ -291,66 +335,119 @@ def should_retry_tool_use(response, tool_uses=None):
     tool_name_pos = response.find("tool_name")
     tool_input_pos = response.find("tool_input")
 
-    # Check ordering and length condition
+    # The response TRIED to call a tool; only real truncation evidence
+    # (unclosed json / unbalanced tail) justifies the output-context retry.
+    # A closed-but-malformed block takes the malformed path instead -- the
+    # old len>=2000 gate mislabeled that case and looped retries.
     if (
         json_pos != -1
         and tool_name_pos != -1
         and tool_input_pos != -1
         and json_pos < tool_name_pos < tool_input_pos
-        and len(response) >= 2000
     ):
-        return True
+        return _json_block_truncated(response)
 
     # No retry
     return False
+
+_NULL_WORDS = {"", "null", "none", "nil", "n/a", "na", "nan", "undefined",
+               "未指定", "无"}
+
+
+def _nullish(value):
+    """True when a value carries no usable content.
+
+    Covers JSON null, a missing key (the caller passes ``.get``), empty
+    strings/containers, and the bare null-synonym words models emit instead
+    of null (case-insensitive, stripped). Numbers/bools/dicts with content
+    are NOT nullish.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in _NULL_WORDS
+    if isinstance(value, (dict, list, tuple)):
+        return len(value) == 0
+    return False
+
 
 def check_for_tool_uses(response):
     """
     Checks if the response contains one or more tool calls in json code blocks.
 
-    Returns ``(tool_uses_or_None, malformed_count)``. A-level sweep: malformed
-    blocks are no longer a fully silent skip — the caller feeds a bounded
-    structured error back to the model so it can self-correct instead of
-    burning turns unaware that its calls were ignored.
+    Returns ``(tool_uses_or_None, malformed_count, malformed_reason)`` where
+    ``malformed_reason`` names the FIRST malformed block's specific defect
+    (or None). Classification of a parsed block (W2, field audit
+    small_1030_095410 — ``"tool_name": null`` slipped through the old
+    key-presence check and dispatched as tool 'None', burning 7 dead turns):
+
+    - ``tool_name`` and ``tool_input`` both null/absent -> ANSWER payload
+      (the documented answer contract), not a call and not malformed;
+    - ``tool_name`` null but ``tool_input`` has content  -> a malformed CALL
+      attempt (intent without a target): counted, reason carried back for
+      the bounded feedback turn;
+    - ``tool_name`` present but ``tool_input`` null/absent -> a NORMAL call
+      with empty input (no-input tools run; tools with required params get
+      the dispatch-level missing-params error, which is more actionable
+      than a malformed count).
+
+    Null synonyms: JSON null, missing key, empty string/container, and the
+    bare words null/none/nil/n/a/na/nan/undefined (case-insensitive).
     """
     pattern = r'<json>\s*(\{.*?\})\s*</json>'
     matches = re.findall(pattern, response, re.DOTALL)
     tool_uses = []
     malformed = 0
+    reason = None
+
+    def _note(block_reason):
+        nonlocal malformed, reason
+        malformed += 1
+        if reason is None:
+            reason = block_reason
+
     for match in matches:
         try:
             tool_use = json.loads(match)
-            if not isinstance(tool_use, dict) or 'tool_name' not in tool_use:
-                # Format-slip tolerance (first real hit: A6 polyglot task
-                # round 2026-10-27): some models nest the tool call INSIDE
-                # the answer contract -- <json>{"response": {"tool_name":
-                # ..., "tool_input": ...}}</json>. That used to fall through
-                # to the answer-payload branch below: the loop ended as a
-                # "final answer", prediction extraction failed (response is
-                # a dict, not a string), the one no-tools format-repair turn
-                # was burned re-asking for text, and the model's real work
-                # (the files it tried to write) never landed. Unwrap ONE
-                # level and execute the call; string answers are untouched.
-                resp = (tool_use.get('response')
-                        if isinstance(tool_use, dict) else None)
-                if (isinstance(resp, dict) and 'tool_name' in resp
-                        and 'tool_input' in resp):
-                    tool_uses.append(resp)
+            if not isinstance(tool_use, dict):
+                # Non-object JSON is prose/data, never a call attempt.
+                continue
+            # Format-slip tolerance (first real hit: A6 polyglot task
+            # round 2026-10-27): some models nest the tool call INSIDE
+            # the answer contract -- <json>{"response": {"tool_name":
+            # ..., "tool_input": ...}}</json>. That used to fall through
+            # to the answer-payload branch below: the loop ended as a
+            # "final answer", prediction extraction failed (response is
+            # a dict, not a string), the one no-tools format-repair turn
+            # was burned re-asking for text, and the model's real work
+            # (the files it tried to write) never landed. Unwrap ONE
+            # level and execute the call; string answers are untouched.
+            resp = tool_use.get('response')
+            if isinstance(resp, dict):
+                name, inp = resp.get('tool_name'), resp.get('tool_input')
+                if not _nullish(name):
+                    tool_uses.append({'tool_name': name,
+                                      'tool_input': {} if _nullish(inp) else inp})
                     continue
-                # A JSON block that parses but carries no tool_name is NOT a
-                # malformed tool call -- it is the agent's ANSWER payload (the
-                # task template answers as <json>{"response": ...}</json>).
-                # Counting it as malformed made the tool loop nag the model
-                # until it abandoned its answer format entirely (observed
-                # pr4: the final answer "accept" arrived bare, unparsable).
+            name, inp = tool_use.get('tool_name'), tool_use.get('tool_input')
+            name_null, inp_null = _nullish(name), _nullish(inp)
+            if name_null and inp_null:
+                # A block carrying no usable tool_name AND no tool_input is
+                # the agent's ANSWER payload (the task template answers as
+                # <json>{"response": ...}</json>). Counting it as malformed
+                # made the tool loop nag the model until it abandoned its
+                # answer format entirely (observed pr4: the final answer
+                # "accept" arrived bare, unparsable).
                 continue
-            if 'tool_input' not in tool_use:
-                malformed += 1  # invalid shape: treated like malformed
+            if name_null:
+                _note('tool_input present but tool_name is null/missing — '
+                      'name the tool you intend to call')
                 continue
-            tool_uses.append(tool_use)
+            tool_uses.append({'tool_name': name,
+                              'tool_input': {} if inp_null else inp})
         except json.JSONDecodeError:
-            malformed += 1
-    return (tool_uses if tool_uses else None), malformed
+            _note('invalid JSON')
+    return (tool_uses if tool_uses else None), malformed, reason
 
 def _emit(logging, trajectory_file, kind, **fields):
     """Emit one structured record (or fall back to plain logging)."""
@@ -569,7 +666,7 @@ def chat_with_agent(
         _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
 
         # Tool use
-        tool_uses, malformed = check_for_tool_uses(response)
+        tool_uses, malformed, malformed_reason = check_for_tool_uses(response)
         # First-turn no-op guard: a reasoning model sometimes ANNOUNCES its
         # plan in prose and stops without emitting any tool-call block
         # (observed 3/10 role self-improve sessions: "I'll start by reading
@@ -593,12 +690,13 @@ def chat_with_agent(
                 msg_history=new_msg_history,
             )
             _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
-            tool_uses, malformed = check_for_tool_uses(response)
+            tool_uses, malformed, malformed_reason = check_for_tool_uses(response)
         retry_tool_use = should_retry_tool_use(response, tool_uses)
         malformed_feedback = 0
         _last_fp = None
         _repeat_count = 0
         repeat_break = False
+        _ctx_retry_count = 0
         while tool_uses or retry_tool_use or malformed:
             # Reserved cost keys (docs/10 §10): per-session token soft stop,
             # checked BEFORE the next tool turn is started (the call that
@@ -645,18 +743,21 @@ def chat_with_agent(
             # the tool budget check above).
             if tool_uses is None and malformed and malformed_feedback < 2:
                 malformed_feedback += 1
-                logging(f"Error: {malformed} malformed tool-call JSON block(s) ignored.")
+                reason_note = f" ({malformed_reason})" if malformed_reason else ""
+                logging(f"Error: {malformed} malformed tool-call JSON block(s) "
+                        f"ignored{reason_note}.")
                 _emit(logging, trajectory_file, "tool_output", tool="<malformed_json>",
-                      output=f"{malformed} malformed tool-call JSON block(s) ignored")
+                      output=f"{malformed} malformed tool-call JSON block(s) ignored{reason_note}")
+                feedback = (f"Error: {malformed} tool-call JSON block(s) in your "
+                            f"last message were malformed{reason_note} and were "
+                            f"IGNORED. Either re-issue the call with valid JSON "
+                            f'("tool_name": "...", "tool_input": {{...}}) or stop '
+                            f"calling tools and give your final answer now.")
                 response, new_msg_history, info = _counting_llm(
-                    msg=(system_msg + f"\n\nError: {malformed} tool-call JSON block(s) "
-                         f"in your last message were malformed (invalid JSON, or missing "
-                         f"tool_name/tool_input) and were IGNORED. Either re-issue the "
-                         f"call with valid JSON or stop calling tools and give your "
-                         f"final answer now."),
+                    msg=(system_msg + "\n\n" + feedback),
                     model=model, msg_history=new_msg_history)
                 _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
-                tool_uses, malformed = check_for_tool_uses(response)
+                tool_uses, malformed, malformed_reason = check_for_tool_uses(response)
                 retry_tool_use = should_retry_tool_use(response, tool_uses)
                 continue
             if tool_uses is None and malformed:
@@ -739,6 +840,35 @@ def chat_with_agent(
             if repeat_break:
                 break
             if retry_tool_use:
+                _ctx_retry_count += 1
+                if _ctx_retry_count >= _CTX_RETRY_LIMIT:
+                    # Consecutive-truncation breaker (field lesson from the
+                    # polyglot round 2026-10-28, go__kindergarten-garden: the
+                    # same long-file write retried until the question budget
+                    # died and the prediction came back BLANK). Force a short
+                    # final-summary turn and record the no_answer outcome;
+                    # the session ends cleanly either way.
+                    logging(f"Error: Output context exceeded {_ctx_retry_count}x "
+                            f"in a row; forcing final summary.")
+                    _emit(logging, trajectory_file, "no_answer",
+                          consecutive_truncations=_ctx_retry_count)
+                    try:
+                        response, new_msg_history, info = _counting_llm(
+                            msg=(system_msg
+                                 + "\n\n# Output context exceeded repeatedly\n"
+                                 "Your last attempts were each cut off mid-JSON: "
+                                 "the response was too long. Do NOT call any tool "
+                                 "and do NOT paste file contents. Reply with a "
+                                 "short final answer only."),
+                            model=model,
+                            msg_history=new_msg_history,
+                        )
+                        _emit(logging, trajectory_file, "output", text=response,
+                              **_output_fields(info))
+                    except Exception as e:
+                        logging(f"Error during final summary turn: {e}")
+                    truncated = True
+                    break
                 logging("Error: Output context exceeded. Please try again.")
                 tool_msgs.append("Error: Output context exceeded. Please try again.")
 
@@ -751,7 +881,7 @@ def chat_with_agent(
             _emit(logging, trajectory_file, "output", text=response, **_output_fields(info))
 
             # Check for next tool use
-            tool_uses, malformed = check_for_tool_uses(response)
+            tool_uses, malformed, malformed_reason = check_for_tool_uses(response)
             retry_tool_use = should_retry_tool_use(response, tool_uses)
 
     except Exception as e:

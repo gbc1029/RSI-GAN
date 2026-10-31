@@ -27,6 +27,16 @@ live under `scripts/dgmh/`.
   `workspace.py` (edit/read confinement), `task_execution.py` (design persistence
   + harness glue + minimal run-dir copy), `task_runner.py`, `checkpoint.py`,
   `scores.py`, `trajectory.py`, `preflight.py`, `context.py`, `access.py`,
+  `issue_keys.py` + `issue_ledger.py` + `issue_checks.py` (cross-outer issue
+  continuity: the closed ``<domain>.<facet>`` vocabulary is the ONLY stable
+  identity a defect has — ``issue_id`` is a per-round handle the framework
+  prefixes with the generation (``g<genid>/i-1``), and every outer boundary folds
+  raises / verdicts / stances into ``ckpt/issues/ledger.json``; the next round
+  receives the open keys as an id-free, prescription-free ``carried_over`` block,
+  so history survives while the incumbent evaluator re-diagnoses instead of
+  re-issuing a stale fix. ``issue_checks.py`` supplies the PER-ISSUE mechanical
+  truth (three states from recorded node facts) that ``verdict_stability``
+  consumes),
   `loop.py`, `tree/`, `reward/`, `cm/` (context-management frozen core —
   block model, primitives, the per-turn seam (``assemble_turn`` DISPATCHES
   only; the pipeline itself is the baseline assembly ``assembly.py`` — one
@@ -56,7 +66,11 @@ live under `scripts/dgmh/`.
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
   `read_trajectory`, `read_session_trajectory`, `list_editable`, `list_components`),
   `design/` (shallow design
-  operators), `deep/` (gated deep gate: `request_source_access` + `register_component` +
+  operators incl. the read-only `get_config` design reader, TWO modes —
+  no argument: the keys view (static/dynamic keys with type/enum/consumer,
+  present vs unset) plus the framework-owned task output-contract field;
+  keyed: that key's value — `prompt` adds the gen-0 seed and
+  prompt_equals_seed, enum-typed dynamic keys add the allowed values), `deep/` (gated deep gate: `request_source_access` + `register_component` +
   `unregister_component` + `update_component`),
   `assembly.py`.
 - `gan/components/` — **opt-in** tool implementations, one tree per role (batch 6):
@@ -71,7 +85,12 @@ live under `scripts/dgmh/`.
   Every entry is a TOOL (a callable `tool_info`/`tool_function` module); the legacy
   `kind` field (`skill`/`eval_point`) may still appear in content and is a
   descriptive tag only.
-- `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `seeds/`.
+- `gan/design/` — **shallow, evolvable**: `schema.py`, `store.py`, `seeds/`. The
+  seed files (`seeds/<role>.md`) are the framework-owned FACTORY DEFAULTS: in
+  NO role's read or write roots (run-invariant, so the set_prompt seed-restore
+  exemption cannot be moved from inside a session); the only agent-facing seed
+  projection is `get_config`'s `seed` field. An existing design config is
+  authoritative and never re-seeded.
 - `gan/roles/`, `gan/build.py`, `gan/summary.py` — evolvable orchestration/glue.
 
 ## Setup
@@ -114,8 +133,8 @@ projections, ledger write gate) live there too: run `venv_nat/bin/python
 scripts/local/run_tool_regression.py` before and after touching `gan/tools/`,
 `gan/registries/`, `gan/framework/{access,task_execution,receipt,loop,
 scores,checkpoint,ledger}.py`, `gan/design/store.py` or the
-design operators — six suites (deep gate / batch-6 unification / batch-8
-isolation / c-dispatch / dynamic-keys / ledger-gate), one subprocess each.
+design operators — seven suites (deep gate / batch-6 unification / batch-8
+isolation / c-dispatch / dynamic-keys / ledger-gate / session-universe), one subprocess each.
 
 ## Offline analysis tools (analysis/)
 
@@ -130,22 +149,26 @@ with a GAN-native data layer.
 - **`gan_scores_extract.py` — score extraction + analysis** (per run:
   `scores_extract.csv` / `REPORT.md` / `significance.txt` / `progress.png`).
   Reuses `analysis/analysis_utils.py` (`save_significance_tests`,
-  `compute_bootstrap_ci`) verbatim. Conventions: **strict** = the harness's
-  exact lowercase string match against the dataset `winner`
-  (`report.json.total` excludes invalid samples when `coverage<1` — crosscheck
-  counts, not denominators); **lenient** = offline verdict re-parse from the
-  raw prediction text with a per-row parse-method audit trail
-  (dict_verdict/verdict_line/response_better/bare/model_exact/…). NOTE since
-  2026-10-27: the ONLINE score of `paper_review` is itself the lenient verdict
-  (`domains/report.py:_LENIENT_VERDICT_DOMAINS`; `report.json.score_mode` says
-  which rule ran, `overall_accuracy_strict` keeps the strict echo), so the
-  offline "strict" column no longer equals `report.json.overall_accuracy` for
-  that domain — it is now the "what strict matching would have said" diagnostic;
-  ground truth
-  is auto-disambiguated by matching every observed `question_id` against the
-  `domains/<domain>/dataset*.csv` files. Per-generation AND per-question tables
-  (systematic-error localization), evaluator `predicted_score` calibration, and
-  the significance file only include runs with n≥2 samples (n=1 runs are noise).
+  `compute_bootstrap_ci`) verbatim. ONE score per run (named exactly `score` —
+  per-row 0/1 + a `method` provenance column), computed by the run's OWN
+  online rule as self-described by `report.json.score_mode`:
+  `docker_resolved` → the broker's container verdicts; `lenient` → verdict
+  regex extraction via the SAME `gan.framework.verdict.parse_verdict`
+  (paper_review; offline == online by construction); anything else
+  (`strict`) → exact lowercase label match (search_arena and the other label
+  domains, the current online rule). Undecided parses count as wrong; the
+  denominator never shrinks. Because the offline score reuses the online
+  rule, `report_crosscheck` (recomputed vs report.json `total_correct`) is a
+  true offline==online probe — a mismatch means implementation drift, not a
+  convention difference. Ground truth is auto-disambiguated by matching every
+  observed `question_id` against the `domains/<domain>/dataset*.csv` files.
+  Per-generation AND per-question tables (systematic-error localization),
+  evaluator `predicted_score` calibration, and the significance file only
+  include runs with n≥2 samples (n=1 runs are noise). The search_arena online
+  rule change (regex extraction, paper-style) is DEFERRED — the draft cascade
+  and landing steps are archived in `docs/17_polyglot小规模实验轮修复.md` §10.5;
+  the offline tool needs NO change when it lands (score_mode dispatch follows
+  the runtime self-description).
 - **`gan_lineage_graph.py` — genealogy graphs + offline lineage audit** (per
   run: `lineage_inner_{lenient,strict}.png`, `lineage_outer_{lenient,strict}.png`,
   `lineage_audit.md`). Imports `analysis/visualize_archive.py:visualize_graph`
@@ -173,7 +196,7 @@ with a GAN-native data layer.
 - **Deep-write recovery (4 layers, so a deep modification can actually land):**
   1. *copy* — `AccessBroker._safe_copy` writes a temp sibling + `os.replace` and only tries `copystat` best-effort, so a refresh can never fail with `Operation not permitted` just because the workspace copy belongs to another uid (the old `shutil.copy2` did).
   2. *backup* — every overwrite (`refresh=true`, session reset, `clear_workspace` at an outer boundary) copies the actually-EDITED files to `workspaces/_backup/<role>/<instance>/<seq>/` **outside** the purged tree, logs `workspace_backup{files,count,reason}`, and names the discarded files in the tool's answer. Nothing a session wrote is deleted silently any more.
-  3. *merge* — each grant snapshots the baseline it copied FROM into `workspace/.gan_base/<rel>`. When the baseline has moved by commit time, `build_patch_from_workspace` runs `git merge-file -p <workspace> <grant-time base> <current repo>`: clean → the merged text becomes the b-side (the edit lands on top of the moved baseline); an unedited stale copy emits **no** diff (it used to emit a silent REVERT); a true same-line conflict keeps the plain diff and is recorded (`patch_baseline_drift` event + `broker.last_patch_report`).
+  3. *merge* — each grant snapshots the baseline it copied FROM into `workspace/.gan_base/<rel>`. When the baseline has moved by commit time, `build_patch_from_workspace` runs `git merge-file -p <workspace> <grant-time base> <current repo>`: clean → the merged text becomes the b-side (the edit lands on top of the moved baseline); an unedited stale copy emits **no** diff (it used to emit a silent REVERT); a true same-line conflict REFUSES the patch and is reported (`patch_baseline_drift` event + `broker.last_patch_report`), and the session receives the refusal as a retryable reason ("refresh=true and redo") on BOTH seats instead of a silent empty patch.
   4. *visibility* — one unified diff per file means a registry JSON written by both `update_component` and `edit_source` lands only ONE write. `gan/patch.py:multi_writer_paths` derives that from the existing op records (no new IPC surface) and both receipts gain `multi_writer{path: [tools]}` + a `same_field_overwrite` event, so a lossy session is auditable.
 - The task agent has **no always-on tools**; its capabilities are all opt-in tools.
 
@@ -230,6 +253,17 @@ with a GAN-native data layer.
 - The planner authors task-side notes via the deep patch channel; the whole committed base is materialized into the task sandbox each generation (`.gan_runtime/knowledge` + `GAN_TASK_KNOWLEDGE_DIR`; per-note/total caps, skips reported).
 - The task agent reads on demand via the opt-in `knowledge` tool. Planner/evaluator read their own (and task-side) notes through the normal access channel (`request_source_access(view)` + `list_dir`/`read_file`) — never an un-audited side door.
 
+### Issue continuity across rounds and outers
+
+- **Two identifiers, two jobs.** `issue_id` is a *per-round handle* (`i-1`, renumbered whenever a round has no parent list to continue — a fresh outer, a branch off `initial`). The framework prefixes it with the generation (`g<genid>/i-1`) in `loop._qualify_issue_ids`, so handles are globally unique; a bare `i-N` echoed by either role is normalized back to the parent's qualified id (`_normalize_issue_refs`) instead of silently becoming `unjudged`. `issue_key` is the *cross-round identity*, drawn from the CLOSED vocabulary in `gan/framework/issue_keys.py` (18 `<domain>.<facet>` keys; `other.new` is the only escape hatch). Measured: A0 re-raised the same cost defect ten times under `i-2, i-4, i-5, i-4, i-1, i-3, i-6, i-1, i-1, i-1`; A6 re-raised its access bug three times under `i-2, i-4, i-2`. Nothing could join those, so every outer re-discovered them.
+- **Cross-outer issues are stripped, and NOT for budget reasons.** The live round-trip list is dropped when the selected parent comes from a different outer because the causal chain is broken there (evaluator's own design, restored parent design and code branch all changed) and its `suggested_fix` was written against that older state. What crosses the boundary is the ledger projection instead — **病史, not 处方**.
+- **`ckpt/issues/ledger.json`** (`gan/framework/issue_ledger.py`, `WriterToken`-guarded) accumulates four observations per key — `raised`, `judged_fixed`, `judged_unfixed`, `stance` — joined in `loop._update_issue_ledger` (the only place that owns both parent and child nodes: the raise lands on the node, the verdict/stance lands on its child). Derived `status` = `open` / `fixed` / `not_actionable`; a raise after a fix **reopens** it.
+- **`carried_over`** (injected only when the live channel is empty, and suppressed by the C2/C4 text ablations) carries **no `issue_id`, no `description`, no `suggested_fix`**: the incumbent evaluator is told to re-detect and re-prescribe. `framework`-owned keys (`access.grant-broken`, `harness.infra`, `process.observability`) are never carried to the planner — it has no operator for them (A6's evaluator said so itself: "根源在文件访问/路径解析层，非 planner 的 prompt/config 算子可直接修复").
+- **Stopping the loop.** `issues.not_actionable_stances` declined stances (`out_of_scope`/`disputed`) with zero confirmed fixes mark a key `not_actionable`, and it stops being injected. Config: `issues.{ledger_enabled,carried_limit,not_actionable_stances}` in `loop.yaml`.
+- **`verdict_stability` = per-issue mechanical truth (2026-10 v2).** `hits / verified`, where each judged issue's truth comes from `gan/framework/issue_checks.py` — three states (`PRESENT`/`ABSENT`/`UNKNOWN`) computed from node facts the framework already records (`report_summary`, `toolset_report`, `harness_rc`, `cost_tokens`, plus the grant-time readability self-check), paired as "present in the parent → absent in the child". Bound by `issue_key`, never by a predicate the evaluator writes. Nine checkers ship: `cost.tokens`, `cost.truncation`, `harness.infra`, `design.contract-format`, `access.grant-broken`, `policy.{accept,reject}-bias`, `policy.constant-output`, plus the PAIR checker `policy.overcorrection` (decision rule inverted AND accuracy worse — a single generation cannot decide it). `UNKNOWN` on either side is excluded (never a miss); a defect already `ABSENT` in the parent is `unsupported` and excluded too. `verified == 0` → `None`, neutral in `F_e`. The old definition — one outer's whole verdict vector against the single shared bit "did the mean score rise?" — is GONE: it scored an honest evaluator 0.0 on A1 (planner disabled, so 19/20 `false` claims were correct, but the score rose anyway). Old supernodes keep an unrecomputable old value, told apart offline by `evaluator_stats.verdict_stability_basis` (`"issue_key_checks"` = new). Diagnostics only, not consumed by fitness: `verdict_verified` / `verdict_hits` / `verdict_unsupported`.
+- **Checker thresholds (`issues.check.*`)** are calibrated, not arbitrary: `bias_share=0.65` (the pilot's real leniency cases sat at 0.67–0.70 accept against a 0.50 truth share, so 0.75 called a real defect fabricated); `min_samples=10` for DISTRIBUTION claims only (at n=2 the shares are {0, 0.5, 1} — pure noise, so the honest answer is `UNKNOWN`); `constant_min_samples=6` for `policy.constant-output` (flatness is exact for the recorded rows, but "the policy always answers X" is still an inference — 25% chance at n=2, ~1.6% at n=6); `acc_tol=0.05`.
+- **Ordering invariant**: at an outer boundary `_update_issue_ledger` MUST run before `_record_supernode` — the supernode reads `verdict_stability` back from the ledger that call just wrote.
+
 ### Instances & scheduling
 
 - *instance* = role + workspace + trajectory. The task agent refreshes every **inner** generation (per `genid`); planner/evaluator every **outer** generation (`loop.py:_refresh_roles`, `*_factory` args from `build.py`).
@@ -245,10 +279,10 @@ with a GAN-native data layer.
 |---|---|
 | `ckpt/` | recovery; per-run git tree `code/`; `code.json` manifest; `design/`; `design_drafts/<role>/outer_<N>_draft.json` (audit-only pre-heal self-design snapshots) |
 | `logs/` | `events.log`, `*_tree.log`, `*.log` |
-| `trajectory/outer_<O>/…` | role trajectories; outer-level files are attempt-keyed `<role>__<attempt>.log` (one per loop instance, assigned at role construction so content + stop records share one file; directly-constructed roles use `<role>.log`; readers merge canonical + attempt siblings, newest first) |
+| `trajectory/outer_<O>/…` | role trajectories; the outer root label is INSTANCE-DERIVED (`outer_` + instance suffix: main `outer_N` → `outer_N`, outer-select eval instances `outer_N_eval` → their own tree — one rule shared by `BaseRole.traj_outer`, `role_process._prepare_paths` and the role broker's ACL write root); outer-level files are attempt-keyed `<role>__<attempt>.log` (one per loop instance, assigned at role construction so content + stop records share one file; directly-constructed roles use `<role>.log`; readers merge canonical + attempt siblings, newest first; outer-select eval rounds archive the evaluated task child through the same `collect` pipeline as `trajectory/outer_<N>_eval/eval_outer<N>_s<M>/task.jsonl` (+ sidecar), advisory on failure) |
 | `scores/scores.jsonl` | decision records (JSONL, one per row) |
 | `runs/<genid>/` | small evidence: `packet.json`, `eval.json`, `feedback_digest.md`, `patch_receipt.json`, `patch_proposed.diff` |
-| `work/<genid>/` | ephemeral, pruned |
+| `work/<genid>/` | ephemeral, pruned (`utils/prune.safe_rmtree`: best-effort sweep, failures RECORDED — `rmtree_failed` event with the survivor list — never raised; root-phase payload extraction normalizes ownership to the run owner so the tree stays cleanable) |
 | `workspaces/<role>/outer_<O>/` | per-role workspaces |
 
 `ckpt/checkpoint.json` = the latest checkpoint, overwritten atomically; outer boundaries also write an immutable `ckpt/outer_<N>.json` (archived as `ckpt/outer_<N>_<ms>.json` when the same outer re-runs). `restore_trees` appends an `op=reset` event instead of truncating the log.
@@ -257,12 +291,13 @@ with a GAN-native data layer.
 
 - Every agent writes structured **JSONL** (one file per instance) via shared `utils/trajectory_log.py`; `gan/framework/trajectory.py` (frozen — redaction is part of the trust anchor) archives + redacts task trajectories and also redacts role sessions (`Role.run`).
 - The visible set is explicit: `AccessContext.trajectory_genids` (evaluator = current + parent; planner = parent; self-improvement = this outer's generations + the direct parent). `read_trajectory` reads visible task generations; `read_session_trajectory` reads the role's own sessions over the declared `AccessContext.session_outers` (self seat: this outer + the previous; other seats never reach it — labels: genid-qualified for the current, `outer_<O>/`-prefixed for extras, ONE rule shared by materialization and the tool fallback).
-- The current generation's task trajectory is archived **before** evaluation.
+- The current generation's task trajectory is archived **before** evaluation; the fixed-root eval round's task trajectory is archived through the same `collect` pipeline when the round completes, under the eval round's OWN tree (`trajectory/outer_<N>_eval/` — planner sessions included), advisory on failure — it is not a decision generation.
+- Rendered decision views mark their cap explicitly (`...[render truncated at max_chars=N]`): a capped VIEW is distinguishable from a short archive (field audit small_1030_095410 — a default-cap read was misread as truncated files). `ts` is authoritative; `time` is UTC for every writer (driver/loop/sandbox TZ views differ by design).
 
 ### Sandboxing & activation
 
 - Each generation runs in a **minimal allowlist copy** `work/<genid>/repo` (agent runtime + domain package, datasets excluded; patched inside the copy when a deep patch exists). Benchmark labels are read by the harness from `repo_root`, passed only via the CLI `--dataset_root` argument to the parent harness — never written into the task child's env/payload; `GAN_DATASET_ROOT` is scrubbed from every child env.
-- **Secure sandbox boundary (fix3-main-sync)**: the GAN loop runs ONLY through the sandboxed driver (`scripts/run_gan.py` / `gan.driver.run_gan_driver`, launched via `sudo` as a normal user with the three `*_SANDBOX_USER` env vars — see README "Environment deployment"); the legacy `--in-process` option is hard-disabled and only ONE `--domains` value is accepted. Every worker is dropped to a dedicated UID (`setpriv --bounding-set=-all --no-new-privs`) inside a bubblewrap namespace (`--unshare-all --unshare-net --cap-drop ALL`, a synthetic credential-free `/etc` from `gan/framework/sandbox_etc.py`), with role/seat-scoped write roots granted and reclaimed via POSIX ACL (root-side brokers reconcile stale ACLs after a crash). Provider credentials never leave the root-side `ParentLLMProxy`: children get scoped `sk-gan-` tokens delivered as sealed memfds (never argv/env), planner/evaluator run as separate seat processes hosted by `gan/framework/role_process.py` (the one sanctioned framework→roles import). Per-domain sandbox profiles in `domains.yaml` are fail-closed (missing/disabled profile or `gpu != none` refuses the run). Resource budgets (cgroup/CPU/mem/pid/disk, #7) remain deferred.
+- **Secure sandbox boundary (fix3-main-sync)**: the GAN loop runs ONLY through the sandboxed driver (`scripts/run_gan.py` / `gan.driver.run_gan_driver`, launched via `sudo` as a normal user with the three `*_SANDBOX_USER` env vars — see README "Environment deployment"); the legacy `--in-process` option is hard-disabled and only ONE `--domains` value is accepted. Every worker is dropped to a dedicated UID (`setpriv --bounding-set=-all --no-new-privs`) inside a bubblewrap namespace (`--unshare-all --unshare-net --cap-drop ALL`, a synthetic credential-free `/etc` from `gan/framework/sandbox_etc.py` — which also projects package-owned `/etc` subtrees (such as `/etc/java-*-openjdk` so OpenJDK's `conf/security` symlinks resolve, and the Debian `alternatives` registry so `/usr/bin/cc` — rustc's linker driver — resolves through the sandbox's read-only `/usr` view)), with role/seat-scoped write roots granted and reclaimed via POSIX ACL (root-side brokers reconcile stale ACLs after a crash). Provider credentials never leave the root-side `ParentLLMProxy`: children get scoped `sk-gan-` tokens delivered as sealed memfds (never argv/env), planner/evaluator run as separate seat processes hosted by `gan/framework/role_process.py` (the one sanctioned framework→roles import). Per-domain sandbox profiles in `domains.yaml` are fail-closed (missing/disabled profile or `gpu != none` refuses the run). Resource budgets (cgroup/CPU/mem/pid/disk, #7) remain deferred.
 - **Cross-process contract (role seat ↔ broker, fix3)**: because a role session runs in a child and its tools call back over IPC, three things are NOT automatic — (a) `role_process._validated_result` validates each role method's return dict by **exact field set**, so a field added to `planner.plan()` / `base_role.self_improve()` / `EvalContext` must be mirrored there or *every* result is rejected (plan -> `planner_failed`/`inner_invalid` with a null score; self-improve -> `self_improve_error` degrading to `kept`, i.e. the role never evolves); (b) `_RemoteBroker` must mirror the broker's ablation flags (`deny_deep`/`deep_view_only`/`shallow_prompt_only`/`disable_shallow`, carried in `broker_info`) or the child's tool-layer checks see all-false and B3/B4 silently no-op; (c) an exception raised in the broker reaches the child only if `_RemoteBroker._rpc`'s name→type map knows it, else it degrades to a generic `RuntimeError` the catcher misses (this is how B1's `SourceAccessDisabled` broke).
 - **Activation**: always-on → `gan/tools/`; opt-in → `gan/components/` (registered, selected by design config). Plumbing (`deep/`, `design/`, `work/common/`) is frozen; only `work/<role>/` and the task components/registry are evolvable.
 
@@ -280,8 +315,9 @@ with a GAN-native data layer.
 - **Permissions = capability by existence (batch 4 axiom)**: reads are physical absence without a grant; writes are not applied without capability. Enforced by what the framework MOVES (`AccessContext` role+seat; REQUIRED no-default on `set_access_context` / `frozen.write_roots` / `frozen.is_allowed` / `AccessBroker.grant` / `code_repo.check_patch|apply_*`; no `legacy` seat; `frozen.any_seat_allows` is the only deliberate union query — classification, never authorization; `AccessBroker` refuses repo-root / self-containing / oversized grants; local check: `scripts/local/test_frozen.py`).
 - **Reserved cost keys & context-management seam (docs/10 phases C/D)**: authority is `gan/framework/cost_keys.py` (`validate_cost_config` shared by schema/set, `effective_all` the ONLY clamp, `cost_keys_applied` events); task budget keys ride the harness stdin payload (never env). Phase-D seam: `agent/llm_withouts._counting_llm` is the single per-turn assembly point — `CMSession` (per-seat, snapshot-loaded) rewrites only what is SENT; per-entry copies keep canonical history + raw trajectory rows untouched; modes `passthrough` (kill switch) / `slice` / `compact_conservative` / `custom`; audit via `cm_violation` / `cm_*` events and the `cm_events.jsonl` sidecar; runtime `cm` savings are DERIVED, never billing.
 - **Planner→evaluator isolation**: every evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) — summary is ops-only (files exited; changed files are an outcome fact owned by `meta_view.task_patch_files`, grant facts ride `ops[].paths`), receipt exposes only outcomes (`receipt.design.ops`), run summary exposes only `run_summary.meta`/`run_summary.receipt` (no `rejected_reason` full text, which quotes the planner's artifacts), feedback digest exposes only `issue_id`/`accepted`/`stance`. A NEW meta key or receipt field is invisible to the evaluator until its projection is extended on purpose (default-deny, mirroring the role access allowlist). The planner responds to issues with a REQUIRED structured stance (`response_kind`: acted / acted_differently / out_of_scope / disputed / deferred) — the evaluator calibrates on decisions, never on persuasion.
-- **Artifact vs rationale (B29, batch 16)**: the ARTIFACT under evolution gets structural facts; the planner's RATIONALE gets nothing. `set_prompt` / `set_config(key="prompt")` record `prompt_change_facts` (chars/lines/prev_*/added_lines/removed_lines/similarity/changed_from_to/sha256_12/empty/equals_seed — numbers and hashes only, never text), and `DesignContext.record` stamps `target_role` for every design record (framework-owned, written after the caller's fields so it cannot be shadowed). Those facts are whitelisted into `build_diff_summary` and `receipt.design.ops`. The prompt TEXT is deliberately not projected: it is audit evidence the evaluator may fetch from the task trajectory (`read_trajectory` archives the child's input message verbatim, redacted only for benchmark/score strings), never an assertion pushed into its decision surface — the isolation is on the PROMPT surface, not on the read surface. This does NOT relax the `respond_issue.feedback` rule: its derived statistics stay banned.
+- **Artifact vs rationale (B29, batch 16)**: the ARTIFACT under evolution gets structural facts; the planner's RATIONALE gets nothing. `set_prompt` / `set_config(key="prompt")` record `prompt_change_facts` (chars/lines/prev_*/added_lines/removed_lines/similarity/char_similarity/char_survival/changed_from_to/sha256_12/empty/equals_seed — numbers and hashes only, never text), and `DesignContext.record` stamps `target_role` for every design record (framework-owned, written after the caller's fields so it cannot be shadowed). Those facts are whitelisted into `build_diff_summary` and `receipt.design.ops`. The prompt TEXT is deliberately not projected: it is audit evidence the evaluator may fetch from the task trajectory (`read_trajectory` archives the child's input message verbatim, redacted only for benchmark/score strings), never an assertion pushed into its decision surface — the isolation is on the PROMPT surface, not on the read surface; the AUTHOR side reads its own draft via `get_config` (same object the R2 gate compares against). This does NOT relax the `respond_issue.feedback` rule: its derived statistics stay banned.
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator must not fit the benchmark score (blind score first, then reveal).
+- **Framework output contract (F4/C1)**: every domain declares the final-answer requirement either structurally (`domains.yaml` `output_contract`, e.g. label vocabulary) or by prediction source (polyglot: the workspace diff is the deliverable; imo_proof: the response IS the proof). `derive_response_contract` reduces that to ONE sentence with THREE consumers — an explicitly labeled "Output contract" section in the task child's instruction (assembled AFTER the role-authored design prompt; travels via `GAN_RESPONSE_CONTRACT`), the format-repair turn's requirement, and a framework-owned `output_contract` field in `get_config`'s keys view (stamped onto the design context by the loop, so the planner SEES the contract at the point of rewriting the task prompt). `GAN_RESPONSE_CONTRACT` must be listed in ALL THREE `_TASK_ENV_NAMES` whitelists it crosses (`gan/framework/task_execution.py` source + the `domains/harness.py` and `domains/task_worker.py` child hops) — an unmirrored key dies silently at that hop (observed live; guard `scripts/local/test_task_env_mirror.py`). The injection is immutable by construction — the contract is not a `set_config` key and lives in no writable surface; a role rewriting a DIFFERENT contract inside its own prompt is NOT blocked (soft constraint: the author has seen the contract, and online scoring always follows the framework rule, so a competing contract is self-defeating).
 
 ## Driver-mode field lessons (v5.1 real-API round)
 

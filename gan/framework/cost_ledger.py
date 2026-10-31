@@ -243,7 +243,10 @@ def gen_session_costs(output_dir: str, outer: Any, genid: Any) -> Dict[str, Opti
     out: Dict[str, Optional[Dict[str, Any]]] = {}
     for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
         out[f"{role}_{seat}"] = session_cost_from_file(
-            paths.session_traj_file(output_dir, outer, genid, role),
+            # seat is REQUIRED under the seat-keyed layout (F5): the legacy
+            # non-seat shape is never written, so omitting it read every
+            # plan/evaluate session cost as None
+            paths.session_traj_file(output_dir, outer, genid, role, seat=seat),
             role=role, seat=seat, outer=outer, genid=genid, output_dir=output_dir)
     return out
 
@@ -251,11 +254,20 @@ def gen_session_costs(output_dir: str, outer: Any, genid: Any) -> Dict[str, Opti
 def self_session_costs(output_dir: str, outer: Any, role: str) -> List[Dict[str, Any]]:
     """A role's OUTER-level self-improvement sessions (canonical + attempt files,
     newest first) — each file is one loop instantiation's session."""
-    d = paths.outer_traj_dir(output_dir, outer)
+    # The self-improve seat's OWN directory under the seat-keyed layout
+    # (F5): outer_traj_dir + bare {role}*.jsonl matched the legacy non-seat
+    # shape and found no file a role process ever wrote.
+    d = paths.role_traj_dir(output_dir, outer, role, "self_improve")
     if not os.path.isdir(d):
         return []
-    files = [os.path.join(d, f"{role}.jsonl")]
-    files += sorted(glob.glob(os.path.join(d, f"{role}__*.jsonl")))
+    # Match the WRITER's names (paths.session_traj_file, genid=None): the
+    # canonical file is `outer.jsonl`, the attempt-keyed sibling is
+    # `outer__<attempt>.jsonl` — a {role}__* glob never matched either (F5).
+    files = [os.path.join(d, "outer.jsonl")]
+    files += sorted(glob.glob(os.path.join(d, "outer__*.jsonl")))
+    # the llm_calls sidecar also ends in .jsonl — never a session itself
+    # (its metrics are merged inside session_cost_from_file)
+    files = [p for p in files if not p.endswith(".llm_calls.jsonl")]
     out: List[Dict[str, Any]] = []
     for p in files:
         if not os.path.isfile(p):
