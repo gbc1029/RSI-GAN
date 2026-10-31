@@ -16,6 +16,7 @@ throwaway copy is the fallback when no code tree is in play.
 """
 from __future__ import annotations
 
+import csv
 import os
 import json
 import shutil
@@ -38,6 +39,38 @@ def _modify_depth(records: List[Dict[str, Any]]) -> int:
     if records:
         return 1          # operator-level (shallow design)
     return 0
+
+
+def _final_output_summary(
+    predictions_path: str,
+    max_rows: int = 50,
+    tail_chars: int = 96,
+) -> Dict[str, Any]:
+    """Bounded, score-free evidence for checking apparent output truncation."""
+    summary: Dict[str, Any] = {
+        "source": "final_predictions.csv", "rows": [], "omitted_rows": 0,
+    }
+    try:
+        with open(predictions_path, "r", encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            fields = list(reader.fieldnames or [])
+            id_col = "Problem ID" if "Problem ID" in fields else next(
+                (name for name in fields if name != "prediction"), None)
+            for index, row in enumerate(reader):
+                if index >= max_rows:
+                    summary["omitted_rows"] += 1
+                    continue
+                value = str(row.get("prediction") or "")
+                summary["rows"].append({
+                    "question_id": (
+                        str(row.get(id_col) or index) if id_col else str(index)),
+                    "blank": not bool(value.strip()),
+                    "chars": len(value),
+                    "tail": value[-tail_chars:],
+                })
+    except Exception as exc:
+        summary["error"] = f"{type(exc).__name__}: {exc}"[:300]
+    return summary
 
 
 # Only a PROPOSED patch that produced no new code commit is a rejection.
@@ -683,6 +716,10 @@ class DomainTaskRunner:
         report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
 
         report_sha = scores.sha256_file(report_path)
+        final_output_summary = None
+        if self.domain == "imo_proof":
+            final_output_summary = _final_output_summary(
+                os.path.join(output_path, "predictions.csv"))
         # copy small evidence out of the ephemeral work dir (which is pruned)
         try:
             evid = paths.runs_dir(self.output_dir, genid)
@@ -741,6 +778,7 @@ class DomainTaskRunner:
                 "invalid_reason": invalid_reason,
                 "toolset_report": toolset_report,
                 "design_stripped": design_stripped or None,
+                "final_output_summary": final_output_summary,
                 # Reserved cost keys of this generation (docs/10 §10): the
                 # effective values that governed the child + the clamp records
                 # (the receipt projects the clamps to the planner).

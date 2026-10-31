@@ -48,7 +48,26 @@ class Evaluator(Role):
                 f"`report_issue` for each problem you find (process / cheating / "
                 f"detail / overfitting)."
             )
-        parts.append(f"\n## Run artifacts (trajectory / results summary)\n```json\n{json.dumps(run_summary, ensure_ascii=False, indent=2)[:6000]}\n```")
+        displayed_summary = dict(run_summary)
+        displayed_meta = dict(displayed_summary.get("meta") or {})
+        final_outputs = displayed_meta.pop("final_output_summary", None)
+        displayed_summary["meta"] = displayed_meta
+        parts.append(
+            f"\n## Run artifacts (trajectory / results summary)\n```json\n"
+            f"{json.dumps(displayed_summary, ensure_ascii=False, indent=2)[:6000]}\n```"
+        )
+        if final_outputs:
+            parts.append(
+                "\n## Final prediction artifact summary\n"
+                "Trajectory rendering may end at a display boundary. Before reporting "
+                "that a final answer is missing or truncated, compare the same "
+                "question_id below. A nonblank artifact whose tail contains a complete "
+                "conclusion is not a truncated submission; report a trajectory-visibility "
+                "limitation instead if relevant. If the row is absent or this summary has "
+                "an error, qualify the claim as unverified and do not assign high severity "
+                "for truncation alone. This summary contains no benchmark scores.\n"
+                f"```json\n{json.dumps(final_outputs, ensure_ascii=False, indent=2)[:12000]}\n```"
+            )
         if parent_feedback and parent_feedback.get("digest"):
             parts.append(
                 "\n## Feedback digest on YOUR previous issues (text; no scores)\n"

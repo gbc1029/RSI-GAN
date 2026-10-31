@@ -73,6 +73,7 @@ _EVALUATOR_META_KEYS = (
     "design_stripped",         # healing record
     "harness_rc", "invalid_reason", "score_status", "imputed",
     "modify_depth",
+    "final_output_summary",
     # deliberately NOT here: "records" (planner rationale), "receipt" (projected
     # separately, see _receipt_for_evaluator), "delta_vs_parent" (selection
     # pressure must not be fittable), "feedback", "run_dir"/"report_path"/
@@ -137,6 +138,49 @@ def stagnation_metric(anchor_child: Optional[float], anchor_parent: Optional[flo
     if anchor_child is not None and anchor_parent is not None:
         return "anchor_points", anchor_child, anchor_parent
     return "benchmark_mean", score_child, score_parent
+
+
+def stagnation_improvement(
+    metric: str,
+    current: Optional[float],
+    previous: Optional[float],
+    anchor_reference: Optional[float],
+    min_anchor_gain: float,
+    epsilon: float,
+) -> Tuple[bool, Optional[float], Optional[float]]:
+    """Judge one inner result and update the outer's accepted anchor level.
+
+    Anchor gains are compared with the last level that reset patience, not the
+    direct parent. Small rebounds therefore cannot reset patience repeatedly;
+    several small gains can still accumulate until they reach the threshold.
+    Domains without a comparable anchor retain the legacy score comparison.
+    """
+    if current is None:
+        return False, anchor_reference, None
+    if metric != "anchor_points":
+        gain = ((current - previous) if previous is not None else None)
+        improved = previous is None or gain > epsilon
+        return improved, anchor_reference, gain
+
+    reference = anchor_reference if anchor_reference is not None else previous
+    gain = ((current - reference) if reference is not None else None)
+    improved = reference is None or gain >= max(0.0, min_anchor_gain)
+    return improved, (current if improved else reference), gain
+
+
+def should_require_deep_probe(
+    no_improve: int,
+    patience: int,
+    attempted: bool,
+    deep_available: bool,
+) -> bool:
+    """Reserve at most one deep probe immediately before stagnation breaks."""
+    return bool(
+        patience > 0
+        and no_improve == patience - 1
+        and not attempted
+        and deep_available
+    )
 
 
 class GanLoop:
@@ -2477,6 +2521,7 @@ class GanLoop:
         I_max = int(cfg.get("loop.inner_max", 3))
         patience = int(cfg.get("loop.stagnation_patience", 2))
         eps = float(cfg.get("loop.stagnation_epsilon", 0.005))
+        min_anchor_gain = float(cfg.get("loop.stagnation_min_anchor_gain", 2.0))
         bl = int(cfg.get("tree.branch_limit", 2))
         dl = int(cfg.get("tree.depth_limit", 5))
         method = cfg.get("tree.selection", "ucb")
@@ -2536,6 +2581,8 @@ class GanLoop:
         for outer in range(start_outer, end_outer + 1):
             no_improve = 0
             outer_improved = False
+            anchor_reference: Optional[float] = None
+            deep_probe_attempted = False
             outer_genids: List[Any] = []
             self.log_event({"type": "outer_start", "outer": outer})
             _outer_t0 = time.time()
@@ -2617,6 +2664,17 @@ class GanLoop:
                 parent_ref = [] if str(parent.genid) == "initial" else [parent.genid]
                 # Ablation projections for the plan session (docs/11).
                 disable_plan = self._ab("disable_planner")
+                deep_available = bool(
+                    not disable_plan
+                    and self.broker is not None
+                    and not bool(getattr(self.broker, "deny_deep", False))
+                    and not bool(getattr(self.broker, "deep_view_only", False))
+                    and not bool(getattr(self.broker, "shallow_prompt_only", False))
+                )
+                require_deep_probe = should_require_deep_probe(
+                    no_improve, patience, deep_probe_attempted, deep_available)
+                if require_deep_probe:
+                    deep_probe_attempted = True
                 plan_feedback = parent_feedback
                 plan_issues = evaluator_issues
                 plan_pred = parent_predicted_score
@@ -2683,6 +2741,15 @@ class GanLoop:
                     self.log_event({"type": "cost_statement_skipped", "seat": "plan",
                                     "genid": str(genid),
                                     "reason": "role signature lacks cost_statement"})
+                if require_deep_probe:
+                    if self._accepts_kwarg(self.planner.plan, "require_deep_patch"):
+                        plan_cost_kwargs["require_deep_patch"] = True
+                    else:
+                        self.log_event({
+                            "type": "deep_probe_skipped", "outer": outer,
+                            "inner": inner, "genid": str(genid),
+                            "reason": "planner signature lacks require_deep_patch",
+                        })
 
                 try:
                     if disable_plan:
@@ -2755,6 +2822,9 @@ class GanLoop:
                 child.meta["planner_commit"] = self._role_commits.get("planner")
                 child.meta["evaluator_commit"] = self._role_commits.get("evaluator")
                 child.meta["source_pool"] = "global" if use_global else "subtree"
+                child.meta["deep_probe_required"] = require_deep_probe
+                child.meta["deep_probe_patch_proposed"] = bool(
+                    plan_result.get("deep_probe_patch_proposed"))
                 if base and self.code_root:
                     # audit: per-generation ref pinned by the patch application
                     self.log_event({"type": "code_branch", "genid": str(genid),
@@ -2767,6 +2837,10 @@ class GanLoop:
 
                 # score / imputation / validity
                 self._finalize_child(child, parent)
+                child.meta["deep_probe_patch_applied"] = bool(
+                    require_deep_probe and child.meta.get("patch_applied"))
+                child.meta["deep_probe_missed"] = bool(
+                    require_deep_probe and not child.meta.get("patch_applied"))
 
                 # archive the current generation's task trajectory BEFORE evaluation,
                 # so the evaluator can read it (current generation).
@@ -2967,8 +3041,13 @@ class GanLoop:
                 anc_child = self._anchor_points(child.genid) if measured else None
                 anc_parent = self._anchor_points(parent.genid) if measured else None
                 metric, cur, prev = stagnation_metric(anc_child, anc_parent, cs, ps)
-                improved = (measured and (cur is not None)
-                            and (prev is None or (cur - prev) > eps))
+                improved = False
+                stagnation_gain = None
+                if measured:
+                    improved, anchor_reference, stagnation_gain = stagnation_improvement(
+                        metric, cur, prev, anchor_reference,
+                        min_anchor_gain=min_anchor_gain, epsilon=eps,
+                    )
                 outer_improved = outer_improved or improved
                 no_improve = 0 if improved else no_improve + 1
                 if cs is not None and ps is not None:
@@ -2979,6 +3058,10 @@ class GanLoop:
                     "genid": genid, "parent_genid": parent.genid, "parents": child.parents,
                     "score": cs, "parent_score": ps, "improved": improved,
                     "improved_metric": metric,
+                    "stagnation_gain": stagnation_gain,
+                    "stagnation_required_gain": (
+                        min_anchor_gain if metric == "anchor_points" else eps),
+                    "stagnation_reference": anchor_reference,
                     "anchor_points": anc_child,
                     "anchor_parent_points": anc_parent,
                     "score_status": child.value.score_status, "coverage": child.value.coverage,
@@ -2986,6 +3069,13 @@ class GanLoop:
                     "valid_parent": child.valid_parent,
                     "no_improve": no_improve, "penalties": packet.penalties,
                     "modify_depth": child.modify_depth,
+                    "deep_probe_required": require_deep_probe,
+                    "deep_probe_patch_proposed": bool(
+                        plan_result.get("deep_probe_patch_proposed")),
+                    "deep_probe_patch_applied": bool(
+                        require_deep_probe and child.meta.get("patch_applied")),
+                    "deep_probe_missed": bool(
+                        require_deep_probe and not child.meta.get("patch_applied")),
                     "cost_tokens": child.value.cost_tokens,
                     "cost_wallclock_s": child.value.cost_wallclock_s,
                     "duration_s": round(time.time() - _inner_t0, 1),

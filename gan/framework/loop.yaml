@@ -22,7 +22,9 @@ loop:
                                 # 得把 inner_max 提到 >=3）。判据是锚点答对数（R4）
                                 # 不是 benchmark.mean，见 docs/11 §3.0b。
   stagnation_epsilon: 0.005     # delta threshold；锚点口径下每次变化是 1 个整题，
-                                # 所以任何 +1 都算改进（eps 实际退化为 0）
+                                # 仅用于没有固定锚点时的 benchmark fallback。
+  stagnation_min_anchor_gain: 2 # outer 内相对上次认可的 anchor 水平至少增加
+                                # 2 个原始点才重置 patience；+1 可累计但不单独重置。
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
   self_improve_max_tool_calls: 5  # tool-call budget for role self-improvement
   plan_max_tool_calls: 6          # tool-call budget for the PLAN seat (planner only;
