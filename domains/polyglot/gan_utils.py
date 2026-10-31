@@ -58,6 +58,21 @@ def load_instance_ids(dataset_root: str) -> List[str]:
             if entry.get("instance_id")]
 
 
+def load_language_map(dataset_root: str) -> Dict[str, str]:
+    """instance_id -> language, for proportional (stratified) anchor draws.
+
+    The GAN sampling layer (``gan/framework/task_execution.ensure_sampling_seed``)
+    allocates BOTH run-persistent anchor cores (main-line ``sampling.anchor_k``
+    and fixed-root ``eval.anchor_k``) across these categories by largest
+    remainder, instead of drawing ids uniformly: a small uniform draw that is
+    then FROZEN for the whole run systematically under-represents small
+    languages (k=9 uniform anchors left cpp unanchored in ~32% of runs).
+    Ids absent from the metadata map to "".
+    """
+    return {str(e["instance_id"]): str(e.get("language") or "")
+            for e in _load_metadata(dataset_root) if e.get("instance_id")}
+
+
 def load_instances(
     dataset_root: str,
     task_list: Optional[List[str]] = None,

@@ -49,7 +49,10 @@ def tool_info():
                 "genid": {"description": "Inner generation id; optional "
                                          "'outer_<O>/' prefix for a previous "
                                          "outer. Omit for all visible outers."},
-                "max_chars": {"type": "integer"},
+                "max_chars": {"type": "integer",
+                              "description": "Render cap in chars. Default 6000; "
+                                             "requests are honored up to 120000 "
+                                             "(ceiling)."},
                 "fetch": {"description": "Materialize one segment by seg_id "
                                         "(any mode: the slice index lists the "
                                         "seg_ids; without it the segment is "

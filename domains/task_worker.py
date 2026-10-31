@@ -7,6 +7,7 @@ import importlib.util
 import inspect
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,11 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # framework-owned output contract (F4/C1). HOP 2 of the child env chain
+    # (worker -> TaskAgent child): mirror of the framework-side whitelist
+    # (gan/framework/task_execution.py:_TASK_ENV_NAMES) — an unmirrored key
+    # dies silently here. Guard: scripts/local/test_task_env_mirror.py.
+    "GAN_RESPONSE_CONTRACT",
     # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
     # audit sidecar (§11.5: rw bind in the sandbox; cwd fallback locally)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
@@ -194,14 +200,55 @@ class _LocalRelay:
             thread.join(timeout=remaining)
 
 
+def _polyglot_git_env() -> dict:
+    """Deterministic git env for the patch-base repo: no user/system config,
+    no network, no gpg. The question sandbox binds /usr ro (git binary
+    available) and grants CWD rw, so everything git needs is local."""
+    return dict(
+        os.environ,
+        GIT_CONFIG_GLOBAL="/dev/null",
+        GIT_CONFIG_SYSTEM="/dev/null",
+        GIT_TERMINAL_PROMPT="0",
+        HOME=os.environ.get("HOME", "/tmp"),
+    )
+
+
+def _polyglot_git(cwd: str, *args: str, check: bool = False) -> "subprocess.CompletedProcess":
+    proc = subprocess.run(
+        ["git", "-C", cwd,
+         "-c", "user.name=patch-base", "-c", "user.email=patch-base@invalid",
+         "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false",
+         *args],
+        env=_polyglot_git_env(), capture_output=True, text=True, check=False,
+    )
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: "
+                           f"{(proc.stderr or proc.stdout).strip()[:200]}")
+    return proc
+
+
 def _polyglot_prepare(inputs: dict) -> None:
     """Materialize the exercise workspace (Arch 2) and arm the write whitelist.
 
     Starter files land at CWD under their REPO-ROOT-RELATIVE paths so the
-    generated diff applies with `patch -p1` at the polyglot-benchmark clone
-    root inside the eval container.
+    generated diff applies with `git apply` at the exercise root inside the
+    eval container. The starter state is committed into a patch-base repo at
+    CWD so the prediction diff is `git diff` against the true bytes: git
+    carries the per-line ``\\ No newline at end of file`` markers (skeleton
+    files without trailing newlines used to GLUE diff lines under the
+    difflib path) and refuses to textualize binary content (a .pyc hunk
+    used to carry NUL bytes that made `git apply` reject the WHOLE patch).
     """
     files = inputs.get("files") or {}
+    # Go offline pin (host toolchain bake 2026-10-29): the exercises are
+    # stdlib-only (go.mod declares no deps) and the sandbox has no network --
+    # make that explicit so nothing ever hangs on a toolchain/proxy fetch.
+    # The build cache already lands in the sandbox-private tmpfs (HOME=/tmp),
+    # outside the solution-pathspec diff; the pin only makes it deterministic
+    # and fail-fast. setdefault: an explicit design/driver value wins.
+    os.environ.setdefault("GOTOOLCHAIN", "local")
+    os.environ.setdefault("GOPROXY", "off")
+    os.environ.setdefault("GOTELEMETRY", "off")
     for rel, content in files.items():
         rel = os.path.normpath(rel).lstrip(os.sep)
         if rel.startswith(".."):
@@ -212,30 +259,131 @@ def _polyglot_prepare(inputs: dict) -> None:
             f.write(content)
     os.environ["GAN_TASK_WRITE_ROOTS"] = json.dumps(
         inputs.get("solution_paths") or [])
+    try:
+        _polyglot_git(os.getcwd(), "init", "-q", check=True)
+        _polyglot_git(os.getcwd(), "add", "-A", check=True)
+        _polyglot_git(os.getcwd(), "commit", "-qm", "patch-base", check=True)
+    except Exception as e:  # noqa: BLE001 -- the base repo is an optimization
+        # its absence only costs the no-newline/binary correctness guarantees;
+        # the patch falls back to the guarded difflib path below (LOUD).
+        _cm_emit({"type": "patch_base_repo_failed", "reason": str(e)[:200]})
+        print(f"[patch] patch-base repo unavailable ({e}); "
+              f"falling back to difflib", flush=True)
+        _remove_patch_base(os.getcwd())
+
+
+# Runtime sidecar files the child itself writes into the workspace view
+# (_cm_events_path): never solution content, excluded from every patch path.
+_RUNTIME_SIDECARS = ("cm_events.jsonl", "cm_events_failed.jsonl")
+
+
+def _remove_patch_base(cwd: str) -> None:
+    shutil.rmtree(os.path.join(cwd, ".git"), ignore_errors=True)
 
 
 def _polyglot_workspace_patch(inputs: dict) -> str:
-    """Unified diff (a/ b/ prefixes) of the workspace vs the starter files."""
+    """Unified diff (a/ b/ prefixes) of the workspace vs the starter files.
+
+    Solution-files-only by eval semantics: the eval container stashes ONLY
+    the metadata solution files (`stash push`), resets --hard, and pops --
+    every other change is discarded there, so anything else in the patch is
+    pure noise at best (a stray package.json then fails the WHOLE patch with
+    "already exists") and patch-rejecting binary hunks at worst (.pyc /
+    cargo target fingerprints). The solution-file pathspec makes such noise
+    structurally impossible.
+    """
     files = inputs.get("files") or {}
+    solution_paths = inputs.get("solution_paths") or []
+    if isinstance(solution_paths, str):
+        try:
+            solution_paths = json.loads(solution_paths)
+        except ValueError:
+            solution_paths = []
+    solution_paths = [os.path.normpath(str(p)).lstrip(os.sep)
+                      for p in solution_paths if str(p).strip()]
     cwd = os.getcwd()
+    if os.path.isdir(os.path.join(cwd, ".git")):
+        # Runtime sidecars (the child's own seam-event sink, _cm_events_path)
+        # are never solution content: exclude them in BOTH scopes so the
+        # unscoped path (empty solution_paths == `git add -A` whole-tree)
+        # cannot leak cm_events.jsonl into the prediction patch.
+        spec = list(solution_paths) or ["."]
+        spec += [f":(exclude){name}" for name in _RUNTIME_SIDECARS]
+        _polyglot_git(cwd, "add", "-A", "--", *spec)
+        proc = _polyglot_git(cwd, "diff", "--cached", "--no-color", "--",
+                             *spec)
+        patch = proc.stdout or ""
+        if "Binary files" in patch or "GIT binary patch" in patch:
+            # A solution file with binary content cannot pass the tests
+            # anyway; keep the patch applicable instead of feeding the eval
+            # side an unappliable pseudo-diff (git diff without --binary
+            # emits an unappliable "Binary files ... differ" stanza).
+            patch = _drop_binary_stanzas(patch)
+            _cm_emit({"type": "binary_solution_file"})
+        return patch
+    # Fallback ONLY when the patch-base repo is unavailable (prepare said so
+    # loudly). Guarded difflib path: solution-files-only, NUL sentinel, and
+    # per-line no-newline markers (the old code marked the end of the FILE
+    # diff, which cannot repair a glued MID-diff line). The audit event is
+    # emitted AFTER the patch build: the sidecar lives in the workspace view,
+    # and emitting first would leak cm_events.jsonl into the very patch being
+    # computed (observed in the local D2b suite once the walk went unscoped).
+    patch = _polyglot_workspace_patch_difflib(files, solution_paths)
+    _cm_emit({"type": "patch_difflib_fallback"})
+    return patch
+
+
+def _drop_binary_stanzas(patch: str) -> str:
+    """Drop whole per-file stanzas whose content is a bare 'Binary files ...
+    differ' pseudo-diff (unappliable without --binary). A solution file with
+    binary content fails its tests anyway; keeping the other stanzas
+    applicable is strictly better than failing the whole patch."""
+    stanzas: list = []
+    cur: list = []
+    for line in patch.split("\n"):
+        if line.startswith("diff --git ") and cur:
+            stanzas.append(cur)
+            cur = []
+        cur.append(line)
+    if cur:
+        stanzas.append(cur)
+    out: list = []
+    for st in stanzas:
+        if any(l.startswith(("Binary files ", "GIT binary patch")) for l in st):
+            continue
+        out.extend(st)
+    return "\n".join(out)
+
+
+def _polyglot_workspace_patch_difflib(files: dict, solution_paths: list) -> str:
+    """Fallback diff (no patch-base repo): difflib over the solution files
+    only, with a NUL sentinel and PER-LINE no-newline markers."""
+    solution_paths = {os.path.normpath(str(p)).lstrip(os.sep)
+                      for p in (solution_paths or [])}
     current: dict = {}
+    cwd = os.getcwd()
     for base, dirs, names in os.walk(cwd):
-        # .gan_runtime/ is the agent RUNTIME (toolset/cm snapshot plus
-        # tools_load_report.json), not the child's work product (first real
-        # hit: A6 polyglot task round 2026-10-27 -- the load report leaked
-        # into every prediction diff). Prune the descent AND the union so
-        # runtime files can never enter the patch on either side.
-        dirs[:] = [d for d in dirs if d != ".gan_runtime"]
+        dirs[:] = [d for d in dirs if d not in (".git", ".gan_runtime")]
         for name in names:
             full = os.path.join(base, name)
             rel = os.path.relpath(full, cwd).replace(os.sep, "/")
-            if rel == ".gan_runtime" or rel.startswith(".gan_runtime/"):
+            if rel in _RUNTIME_SIDECARS:
+                continue  # the child's own seam-event sink, never solution content
+            # Same empty-list semantics as the diff loop below and the git
+            # path above (`git add -A --` with no pathspec): an EMPTY
+            # solution_paths means UNSCOPED, not "collect nothing" — the old
+            # unguarded filter made every starter file read as DELETED
+            # (local D2b leg-2 false deletion patch).
+            if solution_paths and rel not in solution_paths:
                 continue
+            with open(full, "rb") as f:
+                if b"\x00" in f.read(8192):
+                    continue  # binary sentinel: never textualize
             with open(full, "r", encoding="utf-8", errors="replace") as f:
                 current[rel] = f.read()
     diffs: list = []
     for rel in sorted(set(files) | set(current)):
-        if rel == ".gan_runtime" or rel.startswith(".gan_runtime/"):
+        if solution_paths and rel not in solution_paths:
             continue
         old = files.get(rel)
         new = current.get(rel)
@@ -251,10 +399,20 @@ def _polyglot_workspace_patch(inputs: dict) -> str:
             new_lines, new_label = new.splitlines(keepends=True), f"b/{rel}"
         patch = difflib.unified_diff(old_lines, new_lines, fromfile=old_label,
                                      tofile=new_label)
-        text = "".join(patch)
-        if text and not text.endswith("\n"):
-            text += "\n\\ No newline at end of file\n"
-        diffs.append(text)
+        body: list = []
+        for line in patch:
+            if line.startswith(("--- ", "+++ ", "@@ ")):
+                body.append(line if line.endswith("\n") else line + "\n")
+                continue
+            if line.endswith("\n"):
+                body.append(line)
+            else:
+                # the line ITSELF lacks a trailing newline: mark it right
+                # here, where git expects the marker (the previous code
+                # appended ONE marker at the end of the file diff, which
+                # cannot repair a glued mid-diff line)
+                body.append(line + "\n\\ No newline at end of file\n")
+        diffs.append("".join(body))
     return "".join(diffs)
 
 

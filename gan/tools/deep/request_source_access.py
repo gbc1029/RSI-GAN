@@ -74,10 +74,13 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
     discarded = list((getattr(actx.broker, "last_result", None) or {}).get("discarded") or [])
     if dctx is not None:
         dctx.record("request_source_access", paths=granted, intent=intent, reason=reason)
-    # NOTE: denied/missing paths are audited (events.jsonl + broker.last_result) but are
-    # intentionally NOT surfaced here. Telling the agent which paths are frozen would steer
-    # it toward the trust anchor / the gate itself. The agent
-    # only learns what it actually received.
+    # Denied/missing paths ARE surfaced now -- as a CLASS per REQUESTED path
+    # only (outside / readable-but-not-writable-here / no repo match). This
+    # refines the earlier blanket non-disclosure: the agent already named these
+    # paths, so classifying them leaks no NEW repo geography, while ending the
+    # retry loops against grants that can never succeed. Nothing beyond the
+    # requested paths is enumerated, and the trust anchor is never named.
+    denied_note = _denied_note(actx, intent)
     if granted:
         try:
             src_root = actx.broker.src_dir(actx.role, actx.node_id)
@@ -97,12 +100,52 @@ def tool_function(paths=None, intent="view", reason="", refresh=False, **kwargs)
                     f"Edit these copies with `edit_source`. New files you create "
                     f"reach the commit only when a granted path (a parent "
                     f"DIRECTORY) covers them; scratch elsewhere is dropped at "
-                    f"the outer boundary.{kept_note}{disc_note}")
-        return f"Granted {intent} access to: {granted}{where}.{kept_note}{disc_note}"
+                    f"the outer boundary.{kept_note}{disc_note}{denied_note}")
+        return f"Granted {intent} access to: {granted}{where}.{kept_note}{disc_note}{denied_note}"
     if paths:
-        return ("No accessible paths (denied / not in your editable set). "
+        return (f"No accessible paths.{denied_note} "
                 "Call `list_editable` to see which paths you may request.")
     return "No source paths were provided for this request."
+
+
+def _denied_note(actx, intent: str) -> str:
+    """One line per refusal CLASS over the REQUESTED paths (empty when none).
+
+    Buckets come from ``broker.last_result`` (the documented audit surface --
+    no new RPC). ``denied`` paths split by whether a VIEW grant could ever
+    succeed for this seat: a modify request against a readable-but-not-writable
+    path is correctable (re-request view), one outside the role surface is
+    terminal (do not retry).
+    """
+    from gan.framework import frozen
+
+    try:
+        res = dict(getattr(actx.broker, "last_result", None) or {})
+        denied = [str(p) for p in (res.get("denied") or [])]
+        missing = [str(p) for p in (res.get("missing") or [])]
+        outside, readable_only = [], []
+        for rel in denied:
+            try:
+                if (str(intent) == "modify"
+                        and frozen.is_allowed(actx.role, rel, "view", seat=actx.seat)):
+                    readable_only.append(rel)
+                else:
+                    outside.append(rel)
+            except Exception:  # noqa: BLE001 -- classify defensively
+                outside.append(rel)
+        parts = []
+        if outside:
+            parts.append(f" Denied (outside your role's surface -- cannot be granted, "
+                         f"do not retry): {outside}.")
+        if readable_only:
+            parts.append(f" Denied (readable, but {actx.role}/{actx.seat} has no write "
+                         f"root over it -- re-request with intent='view' to read): "
+                         f"{readable_only}.")
+        if missing:
+            parts.append(f" No repo match (check spelling): {missing}.")
+        return "".join(parts)
+    except Exception:  # noqa: BLE001 -- the note must never break the grant answer
+        return ""
 
 
 op_info = tool_info

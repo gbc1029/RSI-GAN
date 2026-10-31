@@ -447,7 +447,11 @@ class RoleProcess:
                                      "shallow_prompt_only": bool(getattr(broker, "shallow_prompt_only", False)),
                                      "disable_shallow": bool(getattr(broker, "disable_shallow", False)),
                                      "prompt_rewrite_min_similarity": float(
-                                         getattr(broker, "prompt_rewrite_min_similarity", 0.0) or 0.0)}
+                                         getattr(broker, "prompt_rewrite_min_similarity", 0.0) or 0.0),
+                                      "prompt_rewrite_min_survival": float(
+                                          getattr(broker, "prompt_rewrite_min_survival", 0.0) or 0.0),
+                                      "prompt_rewrite_max_growth": float(
+                                          getattr(broker, "prompt_rewrite_max_growth", 0.0) or 0.0)}
                                     if broker is not None else None),
                     "role_state": {
                         "attempt_id": self.attempt_id,
@@ -615,7 +619,11 @@ def _dispatch_broker(
             raise PermissionError("build_patch role does not match the role process")
         node = (f"{args[1]}__{expected_seat}" if expected_node is not None
                 else args[1])
-        return broker.build_patch(str(args[0]), node, seat=expected_seat)
+        # The build REPORT rides the result, not a new RPC method: a caller dict
+        # cannot be mutated across the process boundary, and the child needs the
+        # conflict facts to explain a refused patch to the agent.
+        patch = broker.build_patch(str(args[0]), node, seat=expected_seat)
+        return {"patch": patch, "report": dict(broker.last_patch_report)}
     if method == "repo_dir":
         # Which repo root owns this relative path: the child already knows
         # repo_root; this only answers "which of the split roots".
@@ -670,7 +678,9 @@ class _RemoteBroker:
                  repo_root: str, output_dir: str,
                  deny_deep: bool = False, deep_view_only: bool = False,
                  shallow_prompt_only: bool = False, disable_shallow: bool = False,
-                 prompt_rewrite_min_similarity: float = 0.0):
+                 prompt_rewrite_min_similarity: float = 0.0,
+                 prompt_rewrite_min_survival: float = 0.0,
+                 prompt_rewrite_max_growth: float = 0.0):
         self._reader = reader
         self._writer = writer
         self._call_id = call_id
@@ -685,7 +695,13 @@ class _RemoteBroker:
         # prompt-rewrite limit instead of a local default (a flag that is not
         # mirrored silently reads as 0.0 = gate off in the child).
         self.prompt_rewrite_min_similarity = float(prompt_rewrite_min_similarity or 0.0)
+        # R2 survival + growth-cap mirrors (see AccessBroker; not mirrored =>
+        # silently 0.0 in the child = gate off, the B1 lesson).
+        self.prompt_rewrite_min_survival = float(prompt_rewrite_min_survival or 0.0)
+        self.prompt_rewrite_max_growth = float(prompt_rewrite_max_growth or 0.0)
         self.last_result: Dict[str, Any] = {}
+        # Last patch build's three-way-merge / conflict facts (mirrored).
+        self.last_patch_report: Dict[str, Any] = {}
         self.grants = _RemoteGrants(self)
 
     def _rpc(self, method: str, args: list[Any], kwargs: Dict[str, Any]) -> Any:
@@ -738,8 +754,15 @@ class _RemoteBroker:
                            {"seat": seat})
         return list(result or [])
 
-    def build_patch(self, role: str, node_id: Any, *, seat: str) -> str:
-        return str(self._rpc("build_patch", [role, node_id], {"seat": seat}))
+    def build_patch(self, role: str, node_id: Any, *, seat: str,
+                    report: Optional[dict] = None) -> str:
+        result = self._rpc("build_patch", [role, node_id], {"seat": seat})
+        if isinstance(result, dict) and "patch" in result:
+            self.last_patch_report = dict(result.get("report") or {})
+            if report is not None:
+                report.update(self.last_patch_report)
+            return str(result.get("patch") or "")
+        return str(result)
 
     def editable_paths(self, role: str, node_id: Any, seat: str,
                        cap: int = 300) -> dict[str, list[str]]:
@@ -956,7 +979,9 @@ def _worker_main() -> None:
                 if not isinstance(info, dict) or set(info) != {
                         "repo_root", "output_dir", "deny_deep", "deep_view_only",
                         "shallow_prompt_only", "disable_shallow",
-                        "prompt_rewrite_min_similarity"}:
+                        "prompt_rewrite_min_similarity",
+                        "prompt_rewrite_min_survival",
+                        "prompt_rewrite_max_growth"}:
                     raise RoleProcessError("invalid broker info")
                 remote = _RemoteBroker(
                     reader, protocol_writer, call_id,
@@ -966,7 +991,11 @@ def _worker_main() -> None:
                     shallow_prompt_only=bool(info.get("shallow_prompt_only", False)),
                     disable_shallow=bool(info.get("disable_shallow", False)),
                     prompt_rewrite_min_similarity=float(
-                        info.get("prompt_rewrite_min_similarity", 0.0) or 0.0))
+                        info.get("prompt_rewrite_min_similarity", 0.0) or 0.0),
+                    prompt_rewrite_min_survival=float(
+                        info.get("prompt_rewrite_min_survival", 0.0) or 0.0),
+                    prompt_rewrite_max_growth=float(
+                        info.get("prompt_rewrite_max_growth", 0.0) or 0.0))
                 index = _BROKER_POSITION[method]
                 if len(args) > index:
                     args[index] = remote

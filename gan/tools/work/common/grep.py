@@ -3,7 +3,7 @@ import os
 import re
 
 from gan.framework.context import get_access_context
-from gan.framework.workspace import resolve
+from gan.framework.workspace import access_hint, resolve
 
 
 def tool_info():
@@ -37,6 +37,11 @@ def tool_function(pattern, path=".", max_results=100, **kwargs):
         rx = re.compile(pattern)
     except re.error as e:
         return f"Error: bad regex: {e}"
+    if not os.path.exists(root):
+        # A silent "(no matches)" here would be indistinguishable from a real
+        # empty result -- classify the miss instead (grantable / outside / typo).
+        hint = access_hint(actx, root)
+        return hint or f"Error: no such path in your granted workspace: {path}"
     max_results = int(max_results or 100)
 
     files = []

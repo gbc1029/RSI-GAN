@@ -2,7 +2,7 @@
 import os
 
 from gan.framework.context import get_access_context
-from gan.framework.workspace import resolve
+from gan.framework.workspace import access_hint, resolve
 
 # An output cap, mirroring ``grep``'s max_results -- a big
 # directory (a granted component tree, or a mistyped path) must not flood the
@@ -29,8 +29,11 @@ def tool_function(path=".", **kwargs):
         p = resolve(actx, path)
     except ValueError as e:
         return f"Error: {e}"
+    if os.path.isfile(p):
+        return f"Error: {path} is a file -- use read_file."
     if not os.path.isdir(p):
-        return f"Error: not a directory: {path}"
+        hint = access_hint(actx, p)
+        return hint or f"Error: not a directory: {path}"
     try:
         entries = sorted(os.listdir(p))
     except OSError as e:

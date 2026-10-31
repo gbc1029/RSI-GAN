@@ -240,6 +240,10 @@ class DomainTaskRunner:
         self.score_key = self.domain_cfg.get("score_key")
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
+        # Framework-owned final-answer requirement (F4/C1): one derivation,
+        # three consumers — the child's explicit output-contract section, the
+        # format-repair turn, and the planner's get_config visibility field.
+        self.response_contract = tx.derive_response_contract(domain, self.domain_cfg)
 
         # Fail fast (smoke_1022_222630 lesson, see pool_check): the candidate
         # pool (a pinned eval_task_list, the full metadata pool for polyglot,
@@ -456,6 +460,7 @@ class DomainTaskRunner:
             os.environ.copy(), design_path=design_path,
             run_dir=run_dir, config=config,
             code_root=self.code_root, task_brief=self.task_brief,
+            response_contract=self.response_contract,
         )
         patch_applied = patch_applied or patch_applied_copy
 
@@ -714,6 +719,17 @@ class DomainTaskRunner:
                       f"(score will read None/failed): {report_path}")
         score = tx.extract_score(report, self.score_key, self.domain)
         report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
+        # polyglot patch-gate aggregate (counts only): one durable event per
+        # generation so the repaired/rejected rates are greppable in
+        # events.jsonl without opening report.json (the small_1028_0046
+        # audit lesson: a gate failure visible ONLY inside docker logs is
+        # invisible to the loop).
+        if report_summary.get("patch_apply_summary"):
+            try:
+                self._event("question_patch_apply", genid=str(genid),
+                            **report_summary["patch_apply_summary"])
+            except Exception as e:  # noqa: BLE001 -- audit write failure
+                print(f"[WARN] question_patch_apply event write failed: {e}")
 
         report_sha = scores.sha256_file(report_path)
         final_output_summary = None

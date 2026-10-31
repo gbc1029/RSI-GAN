@@ -751,10 +751,17 @@ class _RoleBrokerState:
             self._finish_failed_launch(scope, [], launched=False)
             raise
         outer = int(scope["outer"])
+        # Trajectory write root follows the INSTANCE tag (D1): main "outer_N"
+        # -> "outer_N" (unchanged), suffixed eval-round instances
+        # "outer_N_eval" -> their own tree. Mirrors
+        # BaseRole.traj_outer (the writer) and role_process._prepare_paths
+        # (the pre-creation), so all three resolve the SAME root.
+        traj_root = (f"outer_{instance.split('_', 1)[1]}"
+                     if instance.startswith("outer_") else f"outer_{outer}")
         writable = [
             os.path.join("toolsets", role, instance, seat),
             os.path.join("logs", "roles", role, instance, seat),
-            os.path.join("trajectory", f"outer_{outer}", "roles", role, seat),
+            os.path.join("trajectory", traj_root, "roles", role, seat),
         ]
         if seat != "evaluate":
             writable.insert(0, os.path.join("workspaces", role, f"{instance}__{seat}"))

@@ -8,6 +8,7 @@ import argparse
 import importlib
 import importlib.util
 import json
+import re
 import shutil
 import stat
 import subprocess
@@ -36,6 +37,14 @@ _TASK_ENV_NAMES = {
     "PYTHONDONTWRITEBYTECODE", "PYTHONPATH",
     "GAN_TASK_DESIGN", "GAN_TASK_TOOLS_DIR", "GAN_TOOLS_LOAD_REPORT",
     "GAN_TASK_KNOWLEDGE_DIR", "GAN_TASK_BRIEF",
+    # framework-owned output contract (F4/C1). MIRROR RULE: this whitelist is
+    # HOP 1 of the child env chain (harness -> task_worker); a key added to
+    # the framework-side whitelist (gan/framework/task_execution.py:
+    # _TASK_ENV_NAMES) without being mirrored HERE (and in domains/
+    # task_worker.py, hop 2) dies silently at this filter — observed live as
+    # the contract never reaching the TaskAgent (field audit
+    # smoke_1030_204345). Guard: scripts/local/test_task_env_mirror.py.
+    "GAN_RESPONSE_CONTRACT",
     # context-management snapshot (docs/10 §11 D2/D7) + the child's seam
     # audit sidecar (§11.5: rw-bound host file, folded back by task_runner)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
@@ -66,6 +75,15 @@ _SANDBOX_ETC_OPTIONAL_FILES = {
     "ssl/certs/ca-certificates.crt",
 }
 _SANDBOX_ETC_ALLOWED_DIRS = {"ssl", "ssl/certs"}
+# Projections the root-side builder (gan.framework.sandbox_etc) gained after
+# this mirror existed (smoke_1030_195145 field audit, docs/17 §13): the
+# OpenJDK security subtree (dereferenced real files under java-N-openjdk/) and
+# the Debian alternatives registry (re-created symlinks under alternatives/).
+# The sandbox carries no gan/, so these MUST be mirrored here in lockstep —
+# a builder-side projection without a mirror update fails every nested
+# sandbox preflight ("unsafe directory: alternatives").
+_SANDBOX_ETC_JAVA_RE = re.compile(r"java-\d+-openjdk(/.*)?$")
+_SANDBOX_ETC_ALT_RE = re.compile(r"alternatives(/.*)?$")
 
 
 def _etc_mount_is_read_only(device):
@@ -80,24 +98,29 @@ def _etc_mount_is_read_only(device):
     return False
 
 
-def _require_projected_etc():
-    """Refuse nested sandboxing unless the parent supplied the trusted /etc."""
-    root_info = os.lstat("/etc")
-    if (not stat.S_ISDIR(root_info.st_mode)
-            or stat.S_IMODE(root_info.st_mode) != 0o555
-            or not _etc_mount_is_read_only(root_info.st_dev)):
-        raise RuntimeError("TaskAgent sandbox requires the sanitized /etc projection")
+def _audit_projected_etc_tree(root: str, root_uid: int) -> None:
+    """Fail-closed walk audit of one projected /etc tree.
 
+    Child-side mirror of ``gan.framework.sandbox_etc.validate_sandbox_etc``:
+    the sandbox carries no ``gan/`` (docs/10 §11.0.1), so the allowlist is
+    necessarily duplicated here. ANY new builder-side projection must extend
+    BOTH copies — ``scripts/local/test_sandbox_etc_mirror.py`` builds a real
+    projection and runs this audit as the drift guard (it would have caught
+    both the JDK and the alternatives drift of smoke_1030_195145).
+    """
     observed_files = set()
-    for current, directories, files in os.walk("/etc", followlinks=False):
-        relative_root = os.path.relpath(current, "/etc")
+    for current, directories, files in os.walk(root, followlinks=False):
+        relative_root = os.path.relpath(current, root)
         relative_root = "" if relative_root == "." else relative_root
         for name in directories:
             relative = "/".join(part for part in (relative_root, name) if part)
             info = os.lstat(os.path.join(current, name))
-            if (relative not in _SANDBOX_ETC_ALLOWED_DIRS
+            allowed_dir = (relative in _SANDBOX_ETC_ALLOWED_DIRS
+                           or bool(_SANDBOX_ETC_JAVA_RE.match(relative))
+                           or bool(_SANDBOX_ETC_ALT_RE.match(relative)))
+            if (not allowed_dir
                     or not stat.S_ISDIR(info.st_mode)
-                    or info.st_uid != root_info.st_uid
+                    or info.st_uid != root_uid
                     or stat.S_IMODE(info.st_mode) != 0o555):
                 raise RuntimeError(
                     f"TaskAgent sandbox /etc contains an unsafe directory: {relative}"
@@ -105,18 +128,43 @@ def _require_projected_etc():
         for name in files:
             relative = "/".join(part for part in (relative_root, name) if part)
             info = os.lstat(os.path.join(current, name))
-            if (relative not in (_SANDBOX_ETC_REQUIRED_FILES
-                                | _SANDBOX_ETC_OPTIONAL_FILES)
-                    or not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != root_info.st_uid
-                    or stat.S_IMODE(info.st_mode) != 0o444
-                    or info.st_nlink != 1):
+            if _SANDBOX_ETC_ALT_RE.match(relative):
+                # alternatives entries are re-created SYMLINKS (their targets
+                # live in the sandbox's read-only /usr view); a regular file
+                # here means the projection was tampered with
+                if (not stat.S_ISLNK(info.st_mode)
+                        or info.st_uid != root_uid
+                        or info.st_nlink != 1):
+                    raise RuntimeError(
+                        "TaskAgent sandbox /etc contains an unsafe "
+                        f"alternatives entry: {relative}"
+                    )
+            elif (relative not in (_SANDBOX_ETC_REQUIRED_FILES
+                                   | _SANDBOX_ETC_OPTIONAL_FILES)
+                  and not _SANDBOX_ETC_JAVA_RE.match(relative)):
+                raise RuntimeError(
+                    f"TaskAgent sandbox /etc contains an unsafe file: {relative}"
+                )
+            elif (not stat.S_ISREG(info.st_mode)
+                  or info.st_uid != root_uid
+                  or stat.S_IMODE(info.st_mode) != 0o444
+                  or info.st_nlink != 1):
                 raise RuntimeError(
                     f"TaskAgent sandbox /etc contains an unsafe file: {relative}"
                 )
             observed_files.add(relative)
     if not _SANDBOX_ETC_REQUIRED_FILES <= observed_files:
         raise RuntimeError("TaskAgent sandbox /etc projection is incomplete")
+
+
+def _require_projected_etc():
+    """Refuse nested sandboxing unless the parent supplied the trusted /etc."""
+    root_info = os.lstat("/etc")
+    if (not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_IMODE(root_info.st_mode) != 0o555
+            or not _etc_mount_is_read_only(root_info.st_dev)):
+        raise RuntimeError("TaskAgent sandbox requires the sanitized /etc projection")
+    _audit_projected_etc_tree("/etc", root_info.st_uid)
 
     fd = os.open(_SANDBOX_ETC_MARKER,
                  os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)

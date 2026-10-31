@@ -57,6 +57,8 @@ class AccessBroker:
         shallow_prompt_only: bool = False,
         disable_shallow: bool = False,
         prompt_rewrite_min_similarity: float = 0.0,
+        prompt_rewrite_min_survival: float = 0.0,
+        prompt_rewrite_max_growth: float = 0.0,
         max_files: int = 500,
         max_bytes: int = 50 * 1024 * 1024,
         roots: Optional[Any] = None,
@@ -88,6 +90,11 @@ class AccessBroker:
         # the DESIGN tool layer (like B4), carried here so the role CHILD can
         # read it through broker_info; 0.0 = gate off.
         self.prompt_rewrite_min_similarity = float(prompt_rewrite_min_similarity or 0.0)
+        # R2 survival semantics (survival = matched chars / previous length) +
+        # the explicit per-write growth cap (0 = off). Mirrored to the child
+        # through broker_info exactly like the legacy similarity key.
+        self.prompt_rewrite_min_survival = float(prompt_rewrite_min_survival or 0.0)
+        self.prompt_rewrite_max_growth = float(prompt_rewrite_max_growth or 0.0)
         self.max_files = int(max_files)
         self.max_bytes = int(max_bytes)
         self.grants: Dict[tuple, List[Dict[str, Any]]] = {}
@@ -590,6 +597,14 @@ class AccessBroker:
             "role": role,
             "node_id": str(node_id),
             "paths": granted,
+            # GRANT-TIME SELF-CHECK (issue_checks: access.grant-broken). A grant
+            # that "succeeds" while the workspace copy is unreadable is a silent
+            # framework defect -- the 2026-10 pilot showed `request_source_access`
+            # returning success while `read_file` then said "not a file", which
+            # blocked the evaluator's whole answer-bias audit. Verifying HERE, in
+            # the same call that made the copy, turns that into a recorded fact
+            # instead of an agent's unverifiable complaint.
+            "unreadable": self._unreadable_grants(granted, src_root),
             "skipped": skipped,
             "discarded": discarded,
             "backup_dir": backup_dir if discarded else None,
@@ -608,6 +623,30 @@ class AccessBroker:
                             "discarded": discarded,
                             "backup_dir": backup_dir if discarded else None}
         return granted
+
+    def _unreadable_grants(self, granted: List[str], src_root: str) -> List[str]:
+        """Granted paths that are NOT readable in the workspace right now.
+
+        Best-effort by design (this is an audit fact, never a failure): a path
+        is reported when it is absent from the workspace or cannot be opened.
+        Directories count as readable when they can be listed.
+        """
+        bad: List[str] = []
+        for rel in granted or []:
+            try:
+                d = self._safe_join(src_root, rel)
+            except ValueError:
+                bad.append(rel)
+                continue
+            try:
+                if os.path.isdir(d):
+                    os.listdir(d)
+                else:
+                    with open(d, "rb") as f:
+                        f.read(1)
+            except Exception:  # noqa: BLE001 -- absence/unreadable == the defect
+                bad.append(rel)
+        return bad
 
     def granted_paths(self, role: str, node_id: Any, intent: Optional[str] = None) -> List[str]:
         """Return granted paths, optionally filtered by grant intent."""
@@ -655,23 +694,26 @@ class AccessBroker:
 
     def read_trajectory(self, role: str, node_id: Any, genid: Any,
                         max_chars: int, *, seat: str) -> str:
-        from gan.framework.trajectory import read
+        from gan.framework.trajectory import TRAJ_RENDER_MAX_CHARS, read
         allowed = self._trajectory_scopes.get((str(role), str(node_id)), [])
         if str(genid) not in {str(g) for g in allowed}:
             raise PermissionError("generation is not visible to this role session")
-        return read(self.output_dir, genid, max_chars=min(int(max_chars), 6000),
+        # Ceiling 120000 = TEMPORARY MITIGATION for the legacy silent 6000
+        # clamp (docs/17 §15); the complete fix is offset/pagination over RPC.
+        return read(self.output_dir, genid,
+                    max_chars=min(int(max_chars), TRAJ_RENDER_MAX_CHARS),
                     role="task")
 
     def read_session_trajectory(self, role: str, node_id: Any, outer: Any,
                                 genid: Any, max_chars: int, *, seat: str) -> str:
-        from gan.framework.trajectory import read_session
+        from gan.framework.trajectory import TRAJ_RENDER_MAX_CHARS, read_session
         if seat != "self_improve":
             raise PermissionError("session trajectories require self_improve seat")
         expected = str(node_id).split("__", 1)[0]
         if expected != f"outer_{outer}":
             raise PermissionError("session outer does not match the role instance")
         return read_session(self.output_dir, outer, genid, role,
-                            min(int(max_chars), 6000))
+                            min(int(max_chars), TRAJ_RENDER_MAX_CHARS))
 
     def session_trajectory_index(self, role: str, node_id: Any, outer: Any,
                                  *, seat: str) -> List[Dict[str, Any]]:
@@ -682,22 +724,28 @@ class AccessBroker:
             raise PermissionError("session outer does not match the role instance")
         return outer_session_index(self.output_dir, outer, role)
 
-    def build_patch(self, role: str, node_id: Any, *, seat: str) -> str:
+    def build_patch(self, role: str, node_id: Any, *, seat: str,
+                    report: Optional[Dict[str, Any]] = None) -> str:
+        """Build the session's patch; ``report`` (optional) receives the
+        three-way-merge / conflict facts so a caller can turn a refusal into an
+        actionable message instead of an unexplained empty patch."""
         from gan.patch import build_patch_from_workspace
-        report: Dict[str, Any] = {}
+        facts: Dict[str, Any] = {}
         try:
-            patch = build_patch_from_workspace(self, role, node_id, report=report)
+            patch = build_patch_from_workspace(self, role, node_id, report=facts)
         finally:
             # Three-way merges against a moved baseline and genuine conflicts are
             # commit-time FACTS: keep them on the broker (audit) instead of
             # widening the role-result contract, which is validated by exact
             # field set across the process boundary.
-            self.last_patch_report = report
-        if report.get("merged") or report.get("conflicts"):
-            conflicts = report.get("conflicts") or []
+            self.last_patch_report = facts
+        if report is not None:
+            report.update(facts)
+        if facts.get("merged") or facts.get("conflicts"):
+            conflicts = facts.get("conflicts") or []
             self.log_event({
                 "type": "patch_baseline_drift", "role": role, "node_id": str(node_id),
-                "merged": report.get("merged") or [],
+                "merged": facts.get("merged") or [],
                 # markers are the only human-readable trace of a same-region
                 # clash (the patch itself is refused, never written corrupt)
                 "conflicts": [{"path": (c or {}).get("path"),

@@ -77,6 +77,7 @@ class Planner(Role):
         shallow_prompt_only: bool = False,
         disable_shallow: bool = False,
         require_deep_patch: bool = False,
+        carried_over: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -128,6 +129,21 @@ class Planner(Role):
                 "\n## Diff summary (what changed last round, sanitized)\n"
                 f"```json\n{json.dumps(parent_feedback.get('diff_summary'), ensure_ascii=False)[:1500]}\n```"
             )
+        if carried_over:
+            # Cross-outer ledger projection (gan/framework/issue_ledger.py).
+            # CONTEXT ONLY: no issue_id (those are per-round handles and would
+            # collide), no description/suggested_fix (the old prescription was
+            # written against an older design+code; the incumbent evaluator
+            # re-detects the defect and re-prescribes it).
+            parts.append(
+                "\n## Carried-over open issues from earlier outer generations "
+                "(context only -- NOT issues to respond to)\n"
+                "These defects were raised in a previous outer and are still open. "
+                "Do NOT call `respond_issue` for them and do not copy their older "
+                "prescriptions; use them to avoid re-trying a fix that already "
+                "failed. The evaluator re-detects and re-prescribes them itself.\n"
+                f"```json\n{json.dumps(carried_over, ensure_ascii=False, indent=2)[:1200]}\n```"
+            )
         if parent_predicted_score is not None or parent_benchmark_score is not None:
             parts.append(
                 "\n## Selected parent calibration\n"
@@ -161,13 +177,22 @@ class Planner(Role):
         tool_repeat_limit: Optional[int] = None,
         cost_statement: str = "",
         require_deep_patch: bool = False,
+        response_contract: Optional[str] = None,
+        carried_over: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
 
         task_design = config if isinstance(config, dict) else {}
         plan_ctx = PlanContext(config=task_design, node_id=node_id, output_dir=self.output_dir)
-        design_ctx = DesignContext(role="task", config=task_design, node_id=node_id)
+        # F4/C1: the framework's output contract rides the design context so
+        # the AUTHOR sees it at the point of rewriting the task prompt
+        # (soft constraint: known to exist; not a set_config-writable key).
+        oc = ({"text": str(response_contract),
+               "source": "framework; read-only, outside set_config keys"}
+              if response_contract else None)
+        design_ctx = DesignContext(role="task", config=task_design, node_id=node_id,
+                                   output_contract=oc)
         tok_plan = set_plan_context(plan_ctx)
         tok_design = set_design_context(design_ctx)
         akey = self.access_key(node_id)
@@ -206,27 +231,50 @@ class Planner(Role):
                     if broker is not None else False,
                     disable_shallow=bool(getattr(broker, "disable_shallow", False))
                     if broker is not None else False,
-                    require_deep_patch=require_deep_patch),
+                    require_deep_patch=require_deep_patch,
+                    carried_over=carried_over),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
             _absorb_run_flags()
 
-            def _build_patch() -> str:
+            def _build_patch() -> tuple[str, str]:
+                """Return ``(patch, refusal)``.
+
+                ``refusal`` is non-empty when the build itself said NO: the
+                session's workspace and the committed baseline changed the SAME
+                region, so ``build_patch_from_workspace`` refuses rather than
+                emit a valid-looking diff that reverts the other side. Treated
+                like a validation rejection so the agent is TOLD (and can retry
+                with ``refresh=true``) instead of silently losing its edit.
+                """
                 if broker is None:
-                    return ""
+                    return "", ""
                 if not has_deep_write(design_ctx.records + plan_ctx.records):
-                    return ""
+                    return "", ""
                 # No catch — a patch-BUILD failure must never masquerade as
                 # a legitimate empty patch. Any failure (unreadable workspace /
                 # repo file, a builder defect) propagates and fails the session;
                 # the loop then marks the generation planner_failed (B-level)
                 # instead of applying a semantically wrong diff.
+                report: dict = {}
                 if hasattr(broker, "build_patch"):
-                    return broker.build_patch("planner", akey, seat="plan")
-                return build_patch_from_workspace(broker, "planner", akey)
+                    patch = broker.build_patch("planner", akey, seat="plan",
+                                               report=report)
+                else:
+                    patch = build_patch_from_workspace(broker, "planner", akey,
+                                                      report=report)
+                conflicts = report.get("conflicts") or []
+                if not conflicts:
+                    return patch, ""
+                return "", (
+                    "# Patch refused (baseline moved)\n"
+                    "Your workspace copy and the committed baseline both changed the same "
+                    "region of: " + ", ".join(str(c.get("path")) for c in conflicts)
+                    + ". Re-request those paths with request_source_access(refresh=true) "
+                    "and redo the edit on the fresh baseline.")
 
-            patch_str = _build_patch()
-            if require_deep_patch and not patch_str:
+            patch_str, refusal = _build_patch()
+            if require_deep_patch and not patch_str and not refusal:
                 hist = self.run(
                     "# Deep probe not yet satisfied\n"
                     "No task-source diff was produced. Inspect the task source and "
@@ -237,14 +285,16 @@ class Planner(Role):
                     tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
                 _absorb_run_flags()
                 attempts += 1
-                patch_str = _build_patch()
+                patch_str, refusal = _build_patch()
             last_hash = None
             for attempt in range(patch_retry_k + 1):
-                patch_str = _build_patch()
-                if not patch_str or not self.code_root:
+                patch_str, refusal = _build_patch()
+                if refusal:
+                    ok, reason = False, refusal
+                elif not patch_str or not self.code_root:
                     rejected = None
                     break
-                if broker is not None and hasattr(broker, "check_patch"):
+                elif broker is not None and hasattr(broker, "check_patch"):
                     ok, reason = broker.check_patch(patch_str, role="planner", seat="plan")
                 else:
                     ok, reason = code_repo.check_patch(
@@ -253,7 +303,7 @@ class Planner(Role):
                     rejected = None
                     break
                 rejected = reason
-                h = hash(patch_str)
+                h = hash(patch_str or reason)
                 if h == last_hash or attempt >= patch_retry_k:
                     exhausted = True
                     break

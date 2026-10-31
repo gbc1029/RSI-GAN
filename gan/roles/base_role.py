@@ -174,6 +174,18 @@ class Role(AgentSystem):
                 self.outer = int(str(instance).split("_")[1])
             except (IndexError, ValueError):
                 self.outer = None
+        # Trajectory-root label derived from the FULL instance tag (D1, field
+        # audit small_1030_095410): main instances "outer_N" -> "N" (the
+        # historical layout), suffixed instances "outer_N_eval" (outer-select
+        # eval rounds) -> "N_eval", so the eval round's planner/evaluator
+        # sessions and the archived task child land in their own
+        # trajectory/outer_N_eval/ tree instead of the main-line seat dir.
+        # Writers (session_trajectory) and the self seat's own-session read
+        # face (session_outers) both resolve through this label.
+        self.traj_outer = None
+        if instance and str(instance).startswith("outer_"):
+            label = str(instance).split("_", 1)[1]
+            self.traj_outer = label or None
         self.prompt_text = prompt_text or ""
         # B46 step-1 gate: design saves go through the run's WriterToken
         # (threaded from build_gan_loop; None keeps read-only stores working).
@@ -211,7 +223,8 @@ class Role(AgentSystem):
 
     def session_trajectory(self, genid: Any = None) -> str:
         """JSONL trajectory file for one session (outer-level if genid is None)."""
-        return paths.session_traj_file(self.output_dir, self.outer, genid, self.role,
+        outer_label = self.traj_outer if self.traj_outer is not None else self.outer
+        return paths.session_traj_file(self.output_dir, outer_label, genid, self.role,
                                        attempt=getattr(self, "attempt_id", None),
                                        seat=self.seat)
 
@@ -365,30 +378,52 @@ class Role(AgentSystem):
                           role=self.role)
         if cm_session is not None:
             chat_kwargs["cm"] = cm_session
-        hist, info = chat_with_agent(
-            full_msg,
-            model=self.model,
-            msg_history=msg_history or [],
-            logging=self.log,
-            tools_available=tools_available,
-            tools_dir=self.tools_dir,
-            max_tool_calls=max_tool_calls,
-            # Reserved cost key (docs/10 §10): explicit arg > the loop's
-            # instance stamp > None (unlimited, pre-C behavior).
-            max_total_tokens=(token_budget if token_budget is not None
-                              else getattr(self, "session_token_budget", None)),
-            trajectory_file=path,
-            reasoning_effort=self.reasoning_effort,
-            api_key=proxy_token,
-            load_report_path=load_report_path,
-            # Per-CALL budget. Resolution order: explicit arg -> the
-            # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
-            # -> the dispatch default (agent.llm_withtools, 600).
-            tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
-                            else getattr(self, "tool_timeout_s", None)),
-            return_info=True,
-            **chat_kwargs,
-        )
+        # Session-scoped log target (docs/17 §16): `self.log` is bound at
+        # CONSTRUCTION to the outer-level attempt-keyed file, so free-text
+        # logging() calls inside the chat loop (budget stops, malformed-JSON
+        # notices, truncation breakers...) used to land in the attempt sibling
+        # while the session's structured records went to the per-generation
+        # gen_<N>.jsonl -- one session's evidence split across two files, and
+        # the sibling mixed every session of the instance (field audit
+        # smoke_1030_204345). Rebind for exactly this chat call so content +
+        # stop records share ONE file (the attempt-keying contract, extended
+        # to per-generation sessions); out-of-session logs keep going to the
+        # instance file. Safe under the parallel self-improve threads: they
+        # run on DIFFERENT role instances (seat write surfaces are disjoint).
+        # The self seat passes the same file -> no-op. Bonus: in-session logs
+        # now ride the session file's redaction pass below.
+        _prev_trajectory_file = self.trajectory_file
+        _log_rebound = bool(path) and path != _prev_trajectory_file
+        if _log_rebound:
+            self.trajectory_file = path
+        try:
+            hist, info = chat_with_agent(
+                full_msg,
+                model=self.model,
+                msg_history=msg_history or [],
+                logging=self.log,
+                tools_available=tools_available,
+                tools_dir=self.tools_dir,
+                max_tool_calls=max_tool_calls,
+                # Reserved cost key (docs/10 §10): explicit arg > the loop's
+                # instance stamp > None (unlimited, pre-C behavior).
+                max_total_tokens=(token_budget if token_budget is not None
+                                  else getattr(self, "session_token_budget", None)),
+                trajectory_file=path,
+                reasoning_effort=self.reasoning_effort,
+                api_key=proxy_token,
+                load_report_path=load_report_path,
+                # Per-CALL budget. Resolution order: explicit arg -> the
+                # instance attribute the loop stamps (``loop.tool_call_timeout_s``)
+                # -> the dispatch default (agent.llm_withtools, 600).
+                tool_timeout_s=(tool_timeout_s if tool_timeout_s is not None
+                                else getattr(self, "tool_timeout_s", None)),
+                return_info=True,
+                **chat_kwargs,
+            )
+        finally:
+            if _log_rebound:
+                self.trajectory_file = _prev_trajectory_file
         self._merge_load_report(load_report_path)
         # expose the last run's outcome (truncated/tool_calls) to callers
         self.last_run_info = info
@@ -480,12 +515,14 @@ class Role(AgentSystem):
         # Own-session visibility (read_session_trajectory face): this outer +
         # the previous outer (L65 ruling) — declared here like
         # trajectory_genids, never derived inside the tool. None (no outer
-        # yet) keeps the tool's legacy current-outer derivation.
+        # yet) keeps the tool's legacy current-outer derivation. Labels are
+        # the instance-derived trajectory labels (D1): main "N", eval rounds
+        # "N_eval"; a suffixed (eval-round) instance reads ONLY its own tree.
         session_outers = None
-        if isinstance(self.outer, int):
-            session_outers = {self.outer}
-            if self.outer > 1:
-                session_outers.add(self.outer - 1)
+        if self.traj_outer is not None:
+            session_outers = {self.traj_outer}
+            if isinstance(self.outer, int) and self.outer > 1:
+                session_outers.add(str(self.outer - 1))
         tok_access = (set_access_context(broker, self.role, self.access_key("self"),
                                          trajectory_genids=trajectory_genids,
                                          seat="self_improve",
@@ -514,24 +551,44 @@ class Role(AgentSystem):
                             tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
             _absorb_run_flags()
 
-            def _build_patch() -> str:
+            def _build_patch() -> tuple[str, str]:
+                """Return ``(patch, refusal)``.
+
+                Non-empty ``refusal`` means the build said NO: the workspace and
+                the committed baseline changed the SAME region, so the builder
+                refuses instead of emitting a diff that reverts the other side.
+                """
                 if broker is None or not has_deep_write(dctx.records):
-                    return ""
+                    return "", ""
                 # No catch — a patch build failure propagates (session ->
                 # <role>_failed), never masquerades as a legitimate empty patch.
-                return build_patch_from_workspace(broker, self.role, self.access_key("self"))
+                report: dict = {}
+                patch = build_patch_from_workspace(broker, self.role,
+                                                   self.access_key("self"),
+                                                   report=report)
+                conflicts = report.get("conflicts") or []
+                if not conflicts:
+                    return patch, ""
+                return "", (
+                    "# Patch refused (baseline moved)\n"
+                    "Your workspace copy and the committed baseline both changed the same "
+                    "region of: " + ", ".join(str(c.get("path")) for c in conflicts)
+                    + ". Re-request those paths with request_source_access(refresh=true) "
+                    "and redo the edit on the fresh baseline.")
 
             last_hash = None
             for attempt in range(patch_retry_k + 1):
-                patch_str = _build_patch()
-                if not patch_str or not self.code_root:
+                patch_str, refusal = _build_patch()
+                if refusal:
+                    ok, reason = False, refusal
+                elif not patch_str or not self.code_root:
                     rejected = None
                     break
                 # Seat mode: the projected code view has no git metadata by
                 # design (the authoritative per-run tree stays parent-only),
                 # so validation must ride the role-broker RPC to the real
                 # tree — same dispatch as the planner plan seat.
-                if broker is not None and hasattr(broker, "check_patch"):
+                elif broker is not None and hasattr(broker, "check_patch"):
                     ok, reason = broker.check_patch(patch_str, role=self.role,
                                                     seat="self_improve")
                 else:
@@ -542,7 +599,7 @@ class Role(AgentSystem):
                     rejected = None
                     break
                 rejected = reason
-                h = hash(patch_str)
+                h = hash(patch_str or reason)
                 if h == last_hash or attempt >= patch_retry_k:
                     exhausted = True
                     break

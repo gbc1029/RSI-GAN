@@ -303,6 +303,10 @@ class _TaskBrokerState:
                 "PYTHONDONTWRITEBYTECODE",
             } or key.startswith("LC_")
         }
+        # Bare `python` must resolve inside the sandbox: prepend the bound
+        # venv bin (same prefix as the bwrap bind; docs/18 §7/§12).
+        env["PATH"] = tx._child_path_with_venv_bin(
+            env, str(self.config["python_prefix"]))
         env.update({
             "HOME": "/tmp",
             "PYTHONPATH": run_dir,
@@ -342,6 +346,9 @@ class _TaskBrokerState:
         task_brief = str(self.config.get("task_brief") or "")
         if task_brief:
             env["GAN_TASK_BRIEF"] = task_brief
+        response_contract = str(self.config.get("response_contract") or "")
+        if response_contract:
+            env["GAN_RESPONSE_CONTRACT"] = response_contract
 
         try:
             # Harness-side sampling (only for domains that score in the harness
