@@ -30,6 +30,7 @@ import os
 
 from gan.framework.context import get_access_context
 from gan.framework.trajectory import outer_session_index, read_session, session_label
+from agent.tools.clip import clip_head
 
 
 def tool_info():
@@ -297,8 +298,11 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
             broker.read_session_trajectory(role, actx.node_id, o, g, cap,
                                            seat=actx.seat) for _l, o, g in pairs
         )
+        # Counted aggregate clip (docs/17 §17): the header lists every visible
+        # session; the marker makes the cap visible instead of a silent
+        # `blob[:cap]` that read as "short archive".
         return extra + note + (f"# your sessions (outers={outers}): "
-                               f"{[p[0] for p in pairs]}\n{blob[:cap]}")
+                               f"{[p[0] for p in pairs]}\n{clip_head(blob, cap)}")
 
     if not output_dir:
         return "Error: parent trajectory root is unavailable"
@@ -376,7 +380,7 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
                     meta = (f"# segment {seg_id} kind={seg['kind']}"
                             + (f" tool={seg['tool']}" if seg.get("tool") else "")
                             + f" chars={seg['chars']}")
-                    return f"{meta}\n{block.text[:cap]}"
+                    return f"{meta}\n{clip_head(block.text, cap)}"
         src = dict(entries).get(addr)
         if src is None:
             return f"Error: segment '{fetch}' not in the visible sessions."
@@ -386,7 +390,7 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         meta = (f"# segment {seg_id} kind={entry['kind']}"
                 + (f" tool={entry['tool']}" if entry.get("tool") else "")
                 + f" chars={entry['chars']}")
-        return f"{meta}\n{entry['text'][:cap]}"
+        return f"{meta}\n{clip_head(entry['text'], cap)}"
 
     if genid is not None:
         try:
@@ -413,7 +417,7 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         read_session(output_dir, o, g, role, cap) for _l, o, g in pairs
     )
     return note + (f"# your sessions (outers={outers}): "
-                   f"{[p[0] for p in pairs]}\n{blob[:cap]}")
+                   f"{[p[0] for p in pairs]}\n{clip_head(blob, cap)}")
 
 
 op_info = tool_info

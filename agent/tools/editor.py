@@ -1,6 +1,16 @@
 from pathlib import Path
 import subprocess
 
+from agent.tools.clip import clip_head_tail
+
+# view-mode char cap (docs/17 §17): param-driven default, hard ceiling —
+# long files page through `view_range` (lines); max_chars only bounds giant
+# LINES/whole-file reads. Total budget == the outer table entry for
+# editor/edit_source (40k), so the outer layer never double-fires below it.
+EDITOR_VIEW_DEFAULT_CHARS = 10_000
+EDITOR_VIEW_CEILING = 40_000
+_DIR_LISTING_CHARS = 5_000  # directory listings stay metadata-sized
+
 def tool_info():
     return {
         "name": "editor",
@@ -8,7 +18,8 @@ def tool_info():
 * State is persistent across command calls and discussions with the user
 * If `path` is a file, `view` displays the result of applying `cat -n`. If `path` is a directory, `view` lists non-hidden files and directories up to 2 levels deep
 * The `create` command cannot be used if the specified `path` already exists as a file
-* If a `command` generates a long output, it will be truncated and marked with `<response clipped>`
+* If a `command` generates a long output, it will be clipped and marked with a counted `[clipped: ...]` marker (showing kept/omitted char counts)
+* `view` on a file accepts `max_chars` (default 10000, clamped to 40000); for long files prefer `view_range` line windows
 * The `undo_edit` command will revert the last edit made to the file at `path`
 \nNotes for using the `str_replace` command:
 * The `old_str` parameter should match EXACTLY one or more consecutive lines from the original file. Be mindful of whitespaces!
@@ -48,6 +59,10 @@ def tool_info():
                         "type": "integer"
                     },
                     "type": "array"
+                },
+                "max_chars": {
+                    "description": "Optional `view`-only char cap for the returned content. Default 10000; requests are clamped to 40000 (ceiling). For long files prefer `view_range` (line window) over a bigger cap.",
+                    "type": "integer"
                 }
             },
             "required": ["command", "path"]
@@ -72,10 +87,14 @@ class FileHistory:
 file_history = FileHistory()
 
 def maybe_truncate(content: str, max_length: int = 10000) -> str:
-    """Truncate long content and add marker."""
-    if len(content) > max_length:
-        return content[:max_length // 2] + "\n<response clipped>\n" + content[-max_length // 2:]
-    return content
+    """Truncate long content head+tail with a COUNTED marker (docs/17 §17).
+
+    Split keeps both ends (function starts + current state); total kept is
+    ``max_length`` — unchanged budget from the previous half/half split, the
+    marker only gained the omitted/total counts so the agent can tell a
+    clipped view from a short file.
+    """
+    return clip_head_tail(content, max_length // 2, max_length - max_length // 2)
 
 def validate_path(path: str, command: str):
     """Validate file path and command combination."""
@@ -100,9 +119,10 @@ def validate_path(path: str, command: str):
     
     return path_obj
 
-def format_output(content: str, path: str, init_line: int = 1) -> str:
+def format_output(content: str, path: str, init_line: int = 1,
+                  max_length: int = 10000) -> str:
     """Format output with line numbers."""
-    content = maybe_truncate(content)
+    content = maybe_truncate(content, max_length)
     content = content.expandtabs()
     numbered_lines = [
         f"{i + init_line:6}\t{line}"
@@ -110,13 +130,14 @@ def format_output(content: str, path: str, init_line: int = 1) -> str:
     ]
     return f"Here's the result of running `cat -n` on {path}:\n" + "\n".join(numbered_lines) + "\n"
 
-def tool_function(command, path, file_text=None, view_range=None, old_str=None, new_str=None, insert_line=None):
+def tool_function(command, path, file_text=None, view_range=None, old_str=None,
+                  new_str=None, insert_line=None, max_chars=None):
     """Main tool function that handles different file operations."""
     try:
         path_obj = validate_path(path, command)
-        
+
         if command == "view":
-            return view_file(path_obj, view_range)
+            return view_file(path_obj, view_range, max_chars)
             
         elif command == "create":
             if not file_text:
@@ -160,12 +181,18 @@ def write_file(path: Path, content: str):
     except Exception as e:
         raise ValueError(f"Failed to write file: {e}")
 
-def view_file(path: Path, view_range=None) -> str:
+def view_file(path: Path, view_range=None, max_chars=None) -> str:
     """View file or directory contents."""
+    if max_chars is not None and not isinstance(max_chars, int):
+        raise ValueError("`max_chars` must be an integer.")
+    cap = EDITOR_VIEW_DEFAULT_CHARS if max_chars is None \
+        else max(1, min(int(max_chars), EDITOR_VIEW_CEILING))
     if path.is_dir():
         if view_range:
             raise ValueError("The `view_range` parameter is not allowed when `path` points to a directory.")
-        
+        if max_chars is not None:
+            raise ValueError("The `max_chars` parameter is only allowed when `path` points to a file.")
+
         try:
             # Use find command to list files and directories up to 2 levels deep
             result = subprocess.run(
@@ -175,33 +202,33 @@ def view_file(path: Path, view_range=None) -> str:
             )
             if result.stderr:
                 return f"Error listing directory: {result.stderr}"
-            return f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{maybe_truncate(result.stdout, max_length=5000)}"
+            return f"Here's the files and directories up to 2 levels deep in {path}, excluding hidden items:\n{maybe_truncate(result.stdout, max_length=_DIR_LISTING_CHARS)}"
         except Exception as e:
             raise ValueError(f"Failed to list directory: {e}")
-    
+
     content = read_file(path)
-    
+
     if view_range:
         if len(view_range) != 2 or not all(isinstance(i, int) for i in view_range):
             raise ValueError("Invalid `view_range`. It should be a list of two integers.")
-            
+
         lines = content.split("\n")
         n_lines = len(lines)
         start, end = view_range
-        
+
         if start < 1 or start > n_lines:
             raise ValueError(f"Invalid `view_range`: {view_range}. First element should be within range [1, {n_lines}]")
-            
+
         if end != -1:
             if end > n_lines:
                 raise ValueError(f"Invalid `view_range`: {view_range}. Second element should not exceed {n_lines}")
             if end < start:
                 raise ValueError(f"Invalid `view_range`: {view_range}. Second element should be larger or equal to first")
-                
+
         content = "\n".join(lines[start-1:end if end != -1 else None])
-        return format_output(content, str(path), start)
-    
-    return format_output(content, str(path))
+        return format_output(content, str(path), start, max_length=cap)
+
+    return format_output(content, str(path), max_length=cap)
 
 def replace_text(path: Path, old_str: str, new_str: str) -> str:
     """Replace text in file."""

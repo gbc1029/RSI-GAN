@@ -2,8 +2,15 @@
 import os
 import re
 
+from agent.tools.clip import clip_head
 from gan.framework.context import get_access_context
 from gan.framework.workspace import access_hint, resolve
+
+# Char cap on the assembled output: max_results bounds LINES, this bounds
+# CHARS (one minified 500k-char line passes a line-count cap untouched).
+# == the chat loop's DEFAULT outer budget, so the inner cut (with its
+# tailored "narrow it" advice) always fires before the outer one.
+_GREP_OUT_CAP = 16_000
 
 
 def tool_info():
@@ -11,14 +18,17 @@ def tool_info():
         "name": "grep",
         "description": (
             "Regex search inside YOUR granted source workspace (workspace src only). "
-            "Returns matching lines as 'path:lineno: line'."
+            "Returns matching lines as 'path:lineno: line'. Up to max_results "
+            "matches (default 100) and 16000 chars; narrow the pattern/path if "
+            "the output is clipped."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "pattern": {"type": "string"},
                 "path": {"type": "string"},
-                "max_results": {"type": "integer"},
+                "max_results": {"type": "integer",
+                                "description": "Max matches (lines). Default 100."},
             },
             "required": ["pattern"],
         },
@@ -54,6 +64,7 @@ def tool_function(pattern, path=".", max_results=100, **kwargs):
 
     root_dir = root if os.path.isdir(root) else os.path.dirname(root)
     hits = []
+    truncated_lines = False
     for fp in files:
         try:
             with open(fp, "r", encoding="utf-8", errors="replace") as f:
@@ -62,10 +73,19 @@ def tool_function(pattern, path=".", max_results=100, **kwargs):
                         rel = os.path.relpath(fp, root_dir)
                         hits.append(f"{rel}:{i}: {line.rstrip()}")
                         if len(hits) >= max_results:
-                            return "\n".join(hits)
+                            truncated_lines = True
+                            break
         except OSError:
             continue
-    return "\n".join(hits) if hits else "(no matches)"
+        if truncated_lines:
+            break
+    if not hits:
+        return "(no matches)"
+    text = "\n".join(hits)
+    if truncated_lines:
+        text += (f"\n...[stopped at max_results={max_results} matches; "
+                 f"narrow the pattern/path for more]")
+    return clip_head(text, _GREP_OUT_CAP)
 
 
 op_info = tool_info

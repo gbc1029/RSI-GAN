@@ -26,7 +26,29 @@ from utils import trajectory_log
 #         merged into the tool result (visible to the agent, absent from
 #         stdout/stderr mixing).
 _TOOL_CALL_TIMEOUT_S = 600          # default per-call budget (roles; task passes its own)
-_TOOL_OUTPUT_CAP = 16_000           # chars, tool return text
+_TOOL_OUTPUT_CAP = 16_000           # chars, DEFAULT tool return budget
+# Per-tool delivery ceilings (docs/17 §17, 方案一). The OUTER layer is the
+# framework's context-budget POLICY: keyed by tool name, values are PERMISSION
+# ceilings (>= every inner cap of that tool, so the outer cut never fires
+# below a tool's declared ceiling), never tuned defaults — the tuned defaults
+# live in the tools. Self-held constants: the task sandbox has no ``gan/`` to
+# import from; the trajectory-family value mirrors the frozen
+# ``TRAJ_RENDER_MAX_CHARS`` and is pinned by the guard test
+# (scripts/local/test_tool_output_cap_alignment.py).
+TOOL_OUTPUT_CEILING = 120_000       # trajectory family == TRAJ_RENDER_MAX_CHARS
+# Outer-layer marker token (single source with the guard test; distinct from
+# the tools' inner "[clipped: ...]" so double cuts stay attributable).
+_OUTER_TAG = "truncated by output budget"
+_TOOL_OUTPUT_CAPS = {
+    "read_trajectory": TOOL_OUTPUT_CEILING,
+    "read_session_trajectory": TOOL_OUTPUT_CEILING,
+    "ctx_fetch": TOOL_OUTPUT_CEILING,   # frozen cm face: no inner cap BY DESIGN
+    "read_file": 40_000,                # == read_file.READ_FILE_MAX_CEILING
+    "get_config": 40_000,               # prompt (20k) + seed (~6k) JSON envelope
+    "edit_source": 40_000,              # editor view ceiling (same agent core)
+    "editor": 40_000,
+    "knowledge": 20_000,                # == its inner cap == cost-key authority
+}
 _WEDGE_DISABLE_LIMIT = 2            # wedges per tool before it is disabled for the session
 _TOOL_EXECUTOR = None               # lazily built module-level executor (thread reuse)
 
@@ -241,13 +263,27 @@ def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
         audit["tool_stderr"] = errd
 
     text = result if isinstance(result, str) else str(result)
-    if len(text) > _TOOL_OUTPUT_CAP:
+    cap = _TOOL_OUTPUT_CAPS.get(tool_name, _TOOL_OUTPUT_CAP)
+    if len(text) > cap:
         audit["truncated"] = True
         audit["original_chars"] = len(text)
-        text = (text[:_TOOL_OUTPUT_CAP]
-                + f"\n...[truncated: {len(text)} chars total, showing first "
-                  f"{_TOOL_OUTPUT_CAP}; use read_file/grep with tighter bounds]")
+        text = _outer_clip(text, cap)
     return text, audit
+
+
+def _outer_clip(text: str, cap: int) -> str:
+    """Outer-layer cut + budget marker, in ONE place (guard-testable).
+
+    The marker token differs from the tools' inner ``[clipped: ...]`` so an
+    audit can attribute which layer fired; the advice line is deliberately
+    NEUTRAL — the task child has no ``read_file``/``grep`` (its surfaces are
+    editor/bash/knowledge), and roles reach big content through
+    ``read_trajectory``/``ctx_fetch`` instead of re-reading files.
+    """
+    return (text[:cap]
+            + f"\n...[{_OUTER_TAG}: showing first {cap} of {len(text)} chars "
+              f"(budget {cap}); re-issue with a narrower window "
+              f"(max_chars/view_range/grep pattern) where supported]")
 
 def get_tooluse_prompt(tool_infos=[]):
     """

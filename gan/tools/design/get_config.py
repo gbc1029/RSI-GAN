@@ -16,7 +16,9 @@ author->own-draft).
 """
 import json
 
+from agent.tools.clip import clip_head
 from gan.framework.context import get_design_context
+from gan.tools.design.set_prompt import PROMPT_MAX_CHARS
 
 
 def _seed_prompt(role: str):
@@ -74,8 +76,12 @@ def tool_info():
             "declared (read-only, outside set_config keys); (b) "
             "get_config(key=\"...\") -> that key's value; for \"prompt\" this "
             "includes the generation-0 seed (write it back verbatim to roll "
-            "back a drifted prompt) and prompt_equals_seed; for enum-typed "
-            "dynamic keys it includes the allowed enum values. Read-only."),
+            "back a drifted prompt) and prompt_equals_seed. The prompt VALUE "
+            f"is presented clipped to {PROMPT_MAX_CHARS} chars when longer "
+            "(marked with shown/total counts; the seed is ALWAYS shown "
+            "verbatim, and the rewrite gate compares unclipped source "
+            "values); for enum-typed dynamic keys it includes the allowed "
+            "enum values. Read-only."),
         "input_schema": {"type": "object",
                          "properties": {"key": {"type": "string",
                                                 "description": "config key to read (e.g. \"prompt\")"}},
@@ -107,6 +113,18 @@ def tool_function(key=None):
         return f"Error: unknown config key '{key}' (readable keys: {known})"
     payload = {"role": ctx.role, "key": key, "value": cfg.get(key)}
     if key == "prompt":
+        # PRESENTATION-ONLY clip (docs/17 §17): the stored value is untouched
+        # and every comparison stays on SOURCE values (prompt_equals_seed and
+        # the R2 rewrite gate both use cfg values, never this view), so a
+        # clipped read can never corrupt what the gate compares. The clip cap
+        # is the WRITE side's own limit (PROMPT_MAX_CHARS, one source) --
+        # reads and writes cannot drift. The seed is NEVER clipped: it is the
+        # "write it back verbatim" rollback path. Before this clip a prompt
+        # near the cap + the seed rode the JSON past the chat loop's 16k
+        # default cut -- mid-JSON, parse-breaking.
+        value = cfg.get(key)
+        if isinstance(value, str) and len(value) > PROMPT_MAX_CHARS:
+            payload["value"] = clip_head(value, PROMPT_MAX_CHARS)
         # The rewrite-gate context travels with the prompt read, not with
         # every keys view (the seed is prompt-specific, ~6k chars).
         seed = _seed_prompt(ctx.role)

@@ -1118,3 +1118,110 @@ x86_64-linux-gnu-gcc-13），`open(...,"w")` 跟随三层链接把宿主机编�
 - **待真实 run 确认**：① stop 型缺标签场景出现中性文案（含标签假设）且模型
   整块重发而非缩块；② `no_answer` 事件带 finish_reason/completion_tokens；
   ③ 混合场景（截断→成功→截断）计数从 1 起算。
+
+## 17. 工具输出截断对齐（两层 cap 校准，方案一，2026-10-31，离线验证）
+
+### 17.1 问题回顾（small_1031_110220 审计收尾；§15.1 的端到端失败实锤）
+
+两套互不引用的截断面（工具内层 + `llm_withtools` 外层 `_TOOL_OUTPUT_CAP=16k`）
+叠加出八处错位：① 轨迹渲染上限 §15.1 已提到 120k，但 seat 路径实得仍被外层盲切
+回 16k（评估器请求 120k 的 85,122 字符 blob 只见 16k）；② `knowledge` 内层 20k
+（= cost 键权威）被外层 16k 击穿；③ `ctx_fetch` 无内层 cap（frozen cm 面）→ 16k
+中段盲切，且 view 已置 full（付全款拿部分货）；④ `get_config(key="prompt")`
+prompt+seed（~20k+6k）无内层 → **JSON 中段被切**；⑤ `read_file` marker
+`...[truncated]` 无省略量/总数；⑥ 外层建议 "use read_file/grep with tighter
+bounds" 对 task child 无效（registry 无 read_file/grep）；⑦
+`read_session_trajectory` 四处静默 `[:cap]`（多文件聚合 ×2、fetch 段 ×2）读作
+"短档案"；⑧ 外层 cap 不在任何 tool_info 中声明。
+
+### 17.2 设计裁定
+
+- **两层保留**：内层 = 语义层（参数化默认值、按工具形态裁剪），外层 = 兜底层
+  （无内层 cap 的工具与未来工具）。不变式 **outer ≥ inner（取等）** 做成守卫断言。
+- **外层 per-tool 表 = 许可上限，不是调优值**：keyed by tool name，值是框架的
+  上下文预算授权（进化的内层只能收窄自己，越界被外层诚实 marker 可见拦截）；
+  调优默认值留在工具内。全系统仅 4 个值：**16k（缺省）/ 20k（笔记与 prompt）/
+  40k（文件族）/ 120k（轨迹族）**。
+- **裁剪数学 + marker 格式单源**：`agent/tools/clip.py`（task 沙箱与 role seat
+  均携带 `agent/`）；两层 marker token 刻意可归因——内层 `[clipped: ...]`、外层
+  `[truncated by output budget: ...]`；外层建议文案中性化（去掉指向 task 不存在
+  的工具）。
+- **自持常量 + 镜像守卫**：task 沙箱无 `gan/`，外层表自持在
+  `agent/llm_withtools.py`，`TOOL_OUTPUT_CEILING` 由守卫测试钉死等于冻结的
+  `TRAJ_RENDER_MAX_CHARS`（MIRROR RULE：漂移 = 测试红，不是静默失配）。
+- **ctx_fetch 内层例外（已声明）**：cm core frozen（STDLIB-ONLY 快照交付），
+  内层不动；交付诚实性由外层 marker 承担。
+- **prompt 闭环只补读侧**：写侧 20k 上限**已存在**——`set_prompt.PROMPT_MAX_CHARS`
+  与 `prompt_write_error()` 是 P-a 共享咽喉点，`set_config(key="prompt")` 已调用
+  同一咽喉（无漂移可能）；本轮仅给 `get_config` 的 prompt 值级加呈现层 clip，
+  **import 同一常量**（读写同源），seed 永不裁，`prompt_equals_seed`/R2 门仍在
+  源值上比较（裁剪不可能腐蚀比较）。
+- **bash 头尾复合**：头 12k + 尾 4k = 16k（== 外层默认预算，内层先切且带计数）——
+  评测/构建 verdict 在尾部，纯头切会藏掉最需要的行。
+- **editor view 参数化**：`max_chars`（默认 10k = 历史值，上限 40k = 外层表项）；
+  长文件仍走 `view_range` 行窗；目录视图 5k 不变。
+
+### 17.3 实现清单（file-by-file）
+
+| 文件 | 改动 |
+|---|---|
+| `agent/tools/clip.py`（新） | `clip_head` / `clip_head_tail` + 单源 marker token |
+| `agent/llm_withtools.py` | `TOOL_OUTPUT_CEILING` + `_TOOL_OUTPUT_CAPS`（8 表项）+ `_outer_clip()`（可归因 marker + 中性建议）+ `cap` 按 tool_name 取值 |
+| `agent/tools/bash.py` | 成功输出 `clip_head_tail(12k, 4k)`；tool_info 声明 16k 复合上限；超时尾部 `TAIL_CHARS=2000` 不变 |
+| `agent/tools/editor.py` | `maybe_truncate` 换计数头尾 marker；`view` 加 `max_chars`（10k/40k 钳制，目录/非 view 拒绝该参数）；`format_output` 线程化 cap；tool_info 同步 |
+| `gan/tools/work/common/read_file.py` | `READ_FILE_MAX_CEILING=40k` 参数钳制 + 计数 marker；tool_info 声明默认 8k/上限 40k |
+| `gan/tools/work/common/grep.py` | `_GREP_OUT_CAP=16k` 字符 cap（`max_results=100` 行数不变）+ 早退改聚合 + 行数 marker + 计数裁剪；tool_info 声明 |
+| `gan/tools/work/common/read_trajectory.py` | fetch 两处静默 `[:cap]` → `clip_head`（meta 已带 total） |
+| `gan/tools/work/common/read_session_trajectory.py` | 四处静默 `[:cap]` → `clip_head`（聚合语义 = 请求的 max_chars + 诚实计数，默认调用量不变） |
+| `gan/tools/design/get_config.py` | prompt 值级 clip（`PROMPT_MAX_CHARS` 单源 import）+ tool_info 声明；keys 视图不变 |
+| `gan/components/task/tools/knowledge.py` | cap+1 探针改全量读（marker total = 笔记真实大小）+ 计数 marker + tool_info 声明 20k |
+| `gan/framework/cm/faces.py` 等 frozen | **不动**（ctx_fetch 例外由外层承担） |
+
+### 17.4 显式契约变更（行为面）
+
+1. `read_file(max_chars=None)` 语义从"不裁"变为"默认 8k"（读取工具永远有界；
+   旧"不裁"实为外层 16k 盲切）。
+2. bash 大输出从"直通、外层盲切 16k 头部"变为"头 12k + 尾 4k + 计数 marker"。
+3. grep 命中 `max_results` 早退改为聚合输出 + 行数 marker + 字符 cap。
+4. knowledge 读从 cap+1 探针改全量读（marker 计数真实；materialization 端
+   cost 键已把单笔记限在 20k，全量读有界）。
+5. 轨迹 seat 读请求 ≤120k 时**全量送达**（§15.1 的目标首次端到端成立）。
+
+### 17.5 验证（离线）
+
+- 新守卫 `scripts/local/test_tool_output_cap_alignment.py` **26/26**（外层键集
+  精确匹配 + 逐对 outer≥inner、120k 镜像、knowledge==cost 键、prompt 读写同源
+  + `prompt_write_error` 咽喉 + 三 seed<20k、双层 marker 正则、裁剪数学边界 +
+  bash/grep/editor 预算取等）。
+- 七套件全 PASS（`batch6` V5 断言、`c-dispatch` C2 断言随新 marker token 更新；
+  `test_bash_tool_one_shot` 大输出断言随复合裁剪契约更新）；`test_frozen`、
+  `test_d123_fixes` 27、`test_truncation_feedback`、`test_truncation_and_append`
+  17 全 PASS；`py_compile` 十文件通过。
+
+### 17.6 defer（仅记档，本轮不做）
+
+- **方案二（轨迹读 seat 接线·薄）**：seat RPC 增加 index/fetch 方法（位置参数，
+  §15.1 已背书"不动 role_state/broker_info 精确键集"），slice 面不依赖 CM session
+  即可在 seat 工作。
+- **方案三（CM seat 接线·厚）**：`cm_session`/`session_cm_mode`/
+  `session_token_budget` 三戳跨 IPC（同一位置参数方向），slice 面、ctx faces、
+  `cm_assembly`/METHODS 在 seat 复活——`cost.cm_mode` 配置进化面随之生效。
+- **bash/edit 同不可变**：task 的 `skills/{bash,editor}.py` 是 agent-owned 纯
+  re-export（编辑主体 = planner 的 deep 通道；task 自身工作区无 `gan/` 不可达）。
+  结构解 = loader 层 core 引用（白名单仅 `agent/tools/*.py`）+ 删 stub；
+  最小过渡 = 加入 `TRUST_ANCHOR` **且** `list_editable` 加锚过滤（否则声明面
+  ≠ 执行面），代价是锚双语义（其"Currently redundant"注释失真）。二者取舍
+  已论证，未定案。
+- **cost-key 化预算面**：外层表项若需 agent 界内可调，唯一合宪通道是 validated
+  cost key（roles 走 design context 进程内读、task 走 payload），本轮不需要。
+- **`tool_output_cap_mismatch` advisory**：in-run 可进化内层 cap = 零，无触发者；
+  未来组件树出现内层 cap 时再启用（组装期软失败告警，`cm_module_unresolved` 同型）。
+
+### 17.7 待真实 run 确认
+
+① 评估器/规划器 seat 请求 `max_chars=120000` 的轨迹读**全量送达**（工具结果
+无外层 `[truncated by output budget]` 标记，`tool_output_truncated` 事件缺失或
+`original_chars` 与实际一致）；② `get_config(key="prompt")` 在近上限 prompt 下
+返回的 JSON 可解析且带计数 marker、seed 全文在位；③ bash 大输出的尾部
+verdict/summary 行可见；④ `ctx_fetch(form="full")` 大 traj_seg 块实得字符数 ==
+`ctx_index` 报告的 chars。

@@ -27,6 +27,7 @@ from gan.framework.trajectory import read  # passthrough full-read path
                                            # (import lost in the 2d0a19a
                                            # dispatch rewrite — fixed in the
                                            # docs/10 §15 batch, pre-existing)
+from agent.tools.clip import clip_head
 
 
 def tool_info():
@@ -208,7 +209,10 @@ def _serve_fetch(output_dir, fetch, allowed, genid_param, cap, sess):
                 meta = (f"# segment {seg_id} kind={seg['kind']}"
                         + (f" tool={seg['tool']}" if seg.get("tool") else "")
                         + f" chars={seg['chars']}")
-                return f"{meta}\n{block.text[:cap]}"
+                # Counted clip (docs/17 §17): the meta line already carries the
+                # segment's total chars; the marker adds the shown count so a
+                # capped fetch is distinguishable from a short segment.
+                return f"{meta}\n{clip_head(block.text, cap)}"
     path = _traj_path(output_dir, genid)
     if fname and os.path.basename(path or "") != fname:
         return f"Error: segment '{seg_id}' not in the visible files."
@@ -218,7 +222,7 @@ def _serve_fetch(output_dir, fetch, allowed, genid_param, cap, sess):
     meta = (f"# segment {seg_id} kind={entry['kind']}"
             + (f" tool={entry['tool']}" if entry.get("tool") else "")
             + f" chars={entry['chars']}")
-    return f"{meta}\n{entry['text'][:cap]}"
+    return f"{meta}\n{clip_head(entry['text'], cap)}"
 
 
 def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
