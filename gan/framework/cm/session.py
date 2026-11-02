@@ -884,7 +884,16 @@ class CMSession:
         return {
             "forms": dict(self.view.forms),
             "rules": dict(self.view.rules),
-            "texts": [_msg_text(m) for m in (msgs or [])],
+            # (value, carrier_key, had_text, had_content): restoration must
+            # also undo a key the attempt ADDED (``content`` grafted onto an
+            # entry that carries ``text`` would otherwise survive, because
+            # ``_msg_text`` prefers ``content``).
+            "texts": [(_msg_text(m),
+                       ("content" if isinstance(m.get("content"), str)
+                        else "text" if isinstance(m.get("text"), str) else None),
+                       isinstance(m.get("text"), str),
+                       isinstance(m.get("content"), str))
+                      for m in (msgs or []) if isinstance(m, dict)],
             "counters": (self.ops_total, self.ops_applied, self.ops_refused,
                          self.violations, self.est_chars_saved),
             "refs": set(self._recorded_refs),
@@ -910,11 +919,12 @@ class CMSession:
         for i, entry in enumerate(msgs or []):
             if i >= len(texts) or not isinstance(entry, dict):
                 continue
-            original = texts[i]
-            if original is None or _msg_text(entry) == original:
-                continue
-            key = "text" if isinstance(entry.get("text"), str) else "content"
-            entry[key] = original
+            value, key, had_text, had_content = texts[i]
+            for carrier, had in (("text", had_text), ("content", had_content)):
+                if not had and carrier in entry:
+                    entry.pop(carrier, None)   # the attempt ADDED this carrier
+            if key is not None and entry.get(key) != value:
+                entry[key] = value
 
     def _reconcile_turn(self, msgs: List[Dict[str, Any]],
                         snap: Optional[Dict[str, Any]]
@@ -949,8 +959,8 @@ class CMSession:
         if pinned_broken:
             out.append(("pinned_form", pinned_broken))
         if snap is not None:
-            before = snap.get("texts") or []
-            after = [_msg_text(m) for m in (msgs or [])]
+            before = [t[0] for t in (snap.get("texts") or [])]
+            after = [_msg_text(m) for m in (msgs or []) if isinstance(m, dict)]
             if before != after:
                 moved = [f"msgs[{i}]" for i, (a, b) in enumerate(zip(before, after))
                          if a != b]
