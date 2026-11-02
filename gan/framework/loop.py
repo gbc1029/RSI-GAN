@@ -731,7 +731,9 @@ class GanLoop:
     # -- cost ledger (phases A/B, docs/10 §9) -------------------------------
     def _record_session_cost(self, role: str, seat: str, outer: Any,
                              genid: Any = None,
-                             cm_session: Any = None) -> Optional[Dict[str, Any]]:
+                             cm_session: Any = None,
+                             cm_summary: Optional[Dict[str, Any]] = None
+                             ) -> Optional[Dict[str, Any]]:
         """Settled-session cost record (A5): append to
         ``logs/cost_sessions.jsonl`` + a ``cost_session`` event.
 
@@ -759,10 +761,18 @@ class GanLoop:
                 rec = recs[0] if recs else None
             if rec is None:
                 return None
-            if cm_session is not None:
+            # The summary arrives EITHER as a live session object (in-process)
+            # OR as the dict a cross-process seat published on the event
+            # channel -- one shape, two transports (``cm_wiring.summary_of``).
+            cm_sum = cm_summary
+            if cm_sum is None and cm_session is not None:
                 try:
                     cm_sum = cm_session.summary()
-                    if cm_sum and cm_sum.get("turns"):
+                except Exception:  # noqa: BLE001 -- audit-only enrichment
+                    cm_sum = None
+            if cm_sum is not None:
+                try:
+                    if cm_sum.get("turns"):
                         # The whitelist is the cost record's CONTRACT: a field
                         # absent from it is lost from cost_sessions.jsonl even
                         # though the session reported it. assembly_* /
@@ -1172,6 +1182,99 @@ class GanLoop:
                           event_path=paths.events_path(self.output_dir),
                           event_type="cm_traj_materialize_failed")
             except Exception:  # noqa: BLE001 -- audit sink unavailable
+                pass
+
+    # -- seat CM session: object (in-process) or descriptor (cross-process) --
+    def _seat_cm_install(self, role_obj: Any, role: str,
+                         keys: Optional[Dict[str, Any]], *, seat: str,
+                         outer: Any = None, genid: Any = None,
+                         traj_genids: Any = None,
+                         session_role: Optional[str] = None,
+                         session_outers: Any = None) -> None:
+        """Put THIS seat's context-management session in place.
+
+        Two shapes, one decision (``role_obj.cm_crossing``):
+
+        * in-process — build the ``CMSession`` object and materialize the seat's
+          trajectories into it (the pre-wiring behaviour, unchanged);
+        * cross-process (``RoleProcess``) — a ``CMSession`` cannot cross the IPC
+          boundary (the seam is consumed mid-conversation in the child), so the
+          parent stamps a JSON DESCRIPTOR (clamped keys + named stems + the
+          trajectory files the child can actually open) and the child builds the
+          session in its own namespace. Before this existed the loop assigned
+          ``role_obj.cm_session`` onto the PROXY, where no child could see it:
+          every planner/evaluator seat ran without a seam (CM-01).
+
+        ``keys is None`` (no design keys) keeps today's "no seam" semantics in
+        both shapes. Advisory end to end: a failure leaves the seat seam-free
+        and SPEAKS — it never fails the generation.
+        """
+        from gan.framework import cm_wiring
+        instance = getattr(role_obj, "instance", None)
+        try:
+            role_obj.session_cm_mode = (keys or {}).get("cm_mode")
+        except Exception:  # noqa: BLE001 -- advisory stamp
+            pass
+        if getattr(role_obj, "cm_crossing", False):
+            try:
+                files = self._traj_materialization_files(
+                    traj_genids, outer=outer, session_role=session_role,
+                    session_outers=session_outers)
+                kept, skipped = cm_wiring.child_visible_traj(
+                    files, output_dir=self.output_dir, role=role,
+                    instance=instance, seat=seat, outer=outer)
+                if skipped:
+                    # Visibility is the PARENT's decision: a trajectory this
+                    # seat may read in the loop is not necessarily one its
+                    # sandbox can open (the seat binds only its own tree).
+                    # Dropping it silently would make "not visible" and "not
+                    # readable" indistinguishable in the audit.
+                    soft_fail(
+                        f"{len(skipped)} trajectory file(s) outside the "
+                        f"{role}/{seat} seat bind are not materialized: "
+                        f"{skipped[:4]}",
+                        event_path=paths.events_path(self.output_dir),
+                        event_type="cm_traj_skipped", role=role, seat=seat,
+                        labels=list(skipped)[:20])
+                role_obj.cm_descriptor = cm_wiring.descriptor(
+                    role, keys, seat=seat, instance=instance, genid=genid,
+                    session_cm_mode=(keys or {}).get("cm_mode"),
+                    traj_files=kept)
+            except Exception as e:  # noqa: BLE001 -- advisory, must SPEAK
+                try:
+                    role_obj.cm_descriptor = None
+                except Exception:  # noqa: BLE001 -- proxy attribute refused
+                    pass
+                soft_fail(f"cm descriptor build failed ({role}/{seat}): {e}",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="cm_session_failed", role=role, seat=seat)
+            return
+        role_obj.cm_session = self._build_cm_session(
+            role, keys, outer=outer, seat=seat, instance=instance, genid=genid)
+        self._materialize_traj(role_obj.cm_session, traj_genids, outer=outer,
+                               session_role=session_role,
+                               session_outers=session_outers)
+
+    def _seat_cm_summary(self, role_obj: Any) -> Optional[Dict[str, Any]]:
+        """The settled CM summary for ONE seat call, transport-agnostic.
+
+        in-process reads the session object; a cross-process seat published
+        ``cm_session_summary`` on the event channel and the proxy stashed it.
+        ONE summary shape either way (``CMSession.summary``) — the cost record
+        and the receipt must not depend on which transport ran."""
+        from gan.framework import cm_wiring
+        return cm_wiring.summary_of(role_obj)
+
+    def _seat_cm_clear(self, role_obj: Any) -> None:
+        """Drop BOTH shapes after the call (no stamp leak across seats).
+
+        ``last_cm_summary`` goes too: a settled summary must never be
+        re-attributed to the NEXT seat call (the proxy also clears it before
+        every call, this is the second lock on the same door)."""
+        for attr in ("cm_session", "cm_descriptor", "last_cm_summary"):
+            try:
+                setattr(role_obj, attr, None)
+            except Exception:  # noqa: BLE001 -- advisory
                 pass
 
     def _task_budget_keys(self, parent: Any) -> Optional[Dict[str, Any]]:
@@ -3139,9 +3242,9 @@ class GanLoop:
                 # Context-management session for THIS plan call (docs/10 §11
                 # D11); cleared right after the call (no stamp leak into
                 # self-improve), like ``session_token_budget``.
-                self.planner.cm_session = self._build_cm_session("planner", plan_ck,
-                                                                 outer=outer)
-                self._materialize_traj(self.planner.cm_session, parent_ref)
+                self._seat_cm_install(self.planner, "planner", plan_ck,
+                                      seat="plan", outer=outer, genid=genid,
+                                      traj_genids=parent_ref)
                 self._emit_cost_keys_applied("planner", "plan", genid,
                                              plan_ck, plan_clamps)
 
@@ -3198,7 +3301,7 @@ class GanLoop:
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to planner_failed
                 except Exception as e:
-                    self.planner.cm_session = None  # no stamp leak
+                    self._seat_cm_clear(self.planner)  # no stamp leak
                     self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
@@ -3208,13 +3311,11 @@ class GanLoop:
                 self._normalize_plan_issue_refs(plan_result, parent_feedback)
                 # Settled plan session -> cost ledger (A5). Success-only: a
                 # planner_failed round has no settled session to record.
-                _plan_cm = getattr(self.planner, "cm_session", None)
-                plan_cm_summary = (_plan_cm.summary()
-                                   if _plan_cm is not None else None)
+                plan_cm_summary = self._seat_cm_summary(self.planner)
                 plan_cost_rec = self._record_session_cost(
                     "planner", "plan", outer, genid,
-                    cm_session=_plan_cm)
-                self.planner.cm_session = None  # no stamp leak (§11 D11)
+                    cm_summary=plan_cm_summary)
+                self._seat_cm_clear(self.planner)
 
                 try:
                     child = self.task_runner(plan=plan_result, parent=parent, genid=genid,
@@ -3328,9 +3429,10 @@ class GanLoop:
                 self._emit_cost_keys_applied("evaluator", "evaluate", genid,
                                              eval_ck, eval_clamps)
                 # Context-management session for THIS evaluate call (§11 D11).
-                self.evaluator.cm_session = self._build_cm_session("evaluator", eval_ck,
-                                                                   outer=outer)
-                self._materialize_traj(self.evaluator.cm_session, [genid] + parent_ref)
+                self._seat_cm_install(self.evaluator, "evaluator", eval_ck,
+                                      seat="evaluate", outer=outer,
+                                      genid=genid,
+                                      traj_genids=[genid] + parent_ref)
                 cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair,
                                                            own_budget=eval_ck.get("evaluate_token_budget"))
                 eval_cost_kwargs: Dict[str, Any] = {}
@@ -3390,7 +3492,7 @@ class GanLoop:
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to evaluator_failed
                 except Exception as e:
-                    self.evaluator.cm_session = None  # no stamp leak
+                    self._seat_cm_clear(self.evaluator)  # no stamp leak
                     child.valid_parent = False
                     child.meta["invalid"] = True
                     child.meta["invalid_reason"] = "evaluator_failed"
@@ -3403,13 +3505,11 @@ class GanLoop:
                     self._save_checkpoint("inner", outer, inner)
                     continue
                 # Settled evaluate session -> cost ledger (A5).
-                _eval_cm = getattr(self.evaluator, "cm_session", None)
-                eval_cm_summary = (_eval_cm.summary()
-                                   if _eval_cm is not None else None)
-                eval_cost_rec = self._record_session_cost(
+                eval_cm_summary = self._seat_cm_summary(self.evaluator)
+                self._record_session_cost(
                     "evaluator", "evaluate", outer, genid,
-                    cm_session=_eval_cm)
-                self.evaluator.cm_session = None  # no stamp leak (§11 D11)
+                    cm_summary=eval_cm_summary)
+                self._seat_cm_clear(self.evaluator)
 
                 # Issue identity (framework-owned): namespace this round's ids by
                 # generation so a later round/outer can never collide with them,
@@ -3631,18 +3731,21 @@ class GanLoop:
                         # slice 前端档位归座 (docs/10 §11.5): the self seat
                         # follows the role's OWN self-design (no leak from the
                         # plan/evaluate stamps above).
-                        role_obj.session_cm_mode = ck_si.get("cm_mode")
-                        role_obj.cm_session = self._build_cm_session(role, ck_si, outer=outer)
-                        # self seat additionally materializes its OWN session
-                        # files (the read_session_trajectory face) over the
-                        # declared universe: this outer + the previous outer
+                        # The self seat additionally materializes its OWN
+                        # session files (the read_session_trajectory face) over
+                        # the declared universe: this outer + the previous outer
                         # (L65 ruling — "self improve should read the previous
-                        # outer's trajectory").
-                        self._materialize_traj(role_obj.cm_session, si_refs,
-                                               outer=outer, session_role=role,
-                                               session_outers=([outer - 1]
-                                                               if isinstance(outer, int)
-                                                               and outer > 1 else []))
+                        # outer's trajectory"). Under a cross-process seat the
+                        # previous outer's tree is NOT inside the seat bind, so
+                        # the parent drops it (and says so) instead of shipping
+                        # a file the child cannot open.
+                        self._seat_cm_install(
+                            role_obj, role, ck_si, seat="self_improve",
+                            outer=outer, traj_genids=si_refs,
+                            session_role=role,
+                            session_outers=([outer - 1]
+                                            if isinstance(outer, int)
+                                            and outer > 1 else []))
                     except Exception as e:  # noqa: BLE001 -- advisory stamp
                         # A swallowed degradation must SPEAK (no-silent-fail
                         # rule, AGENTS.md): without this event the session's
@@ -3651,7 +3754,7 @@ class GanLoop:
                                   event_path=paths.events_path(self.output_dir),
                                   event_type="cm_session_failed", role=role,
                                   seat="self_improve")
-                        role_obj.cm_session = None
+                        self._seat_cm_clear(role_obj)
                     _si_res = role_obj.self_improve(
                         recent={**recent_payload, "receipt": prev_receipt},
                         broker=self.broker,
@@ -3659,11 +3762,9 @@ class GanLoop:
                         tool_repeat_limit=self.tool_repeat_limit,
                         trajectory_genids=si_refs,
                         patch_retry_k=self.patch_retry_k)
-                    if isinstance(_si_res, dict)                             and getattr(role_obj, "cm_session", None) is not None:
-                        try:
-                            _si_res["cm_summary"] = role_obj.cm_session.summary()
-                        except Exception:  # noqa: BLE001 -- audit-only
-                            pass
+                    _si_cm_summary = self._seat_cm_summary(role_obj)
+                    if isinstance(_si_res, dict) and _si_cm_summary is not None:
+                        _si_res["cm_summary"] = _si_cm_summary
                     session_results[role] = _si_res
                     # Settled self-improve session -> cost ledger (A5). Thread
                     # safety: trajectory_log.append is locked and list.append
@@ -3671,14 +3772,11 @@ class GanLoop:
                     # trajectory files (seat-disjoint by SEAT_WRITE).
                     self._record_session_cost(
                         role, "self_improve", outer, None,
-                        cm_session=getattr(role_obj, "cm_session", None))
+                        cm_summary=_si_cm_summary)
                 except Exception as e:  # noqa: BLE001 -- classified after join
                     session_errors[role] = e
                 finally:
-                    try:
-                        role_obj.cm_session = None
-                    except Exception:  # noqa: BLE001 -- advisory stamp
-                        pass
+                    self._seat_cm_clear(role_obj)
 
             # A3/A4/A5 + E freeze_evaluator: filter the self-improve workers.
             skip_planner_si = (self._ab("disable_self_improve")
