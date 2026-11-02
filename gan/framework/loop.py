@@ -2873,17 +2873,74 @@ class GanLoop:
 
         Legacy fallback: a node without a recorded code commit falls back to
         HEAD (behavior identical to the pre-branch time-line; audited).
+
+        The parent's own commit is the lineage answer, but it is NOT the whole
+        working state: a role self-improvement commits ON TOP of the task tip
+        and belongs to the RUN, not to any task node. Returning the bare parent
+        silently reverted every earlier self-improvement at the next parent
+        switch (measured 2026-11-02 verify_deep_v4: planner's f5ad5a5 — a new
+        tool plus its registry entry — vanished in outer 2, which then produced
+        an empty patch and the exit heal reported the name as "not
+        registered"). ``_carry_role_commits`` re-attaches only the role commits
+        that sit directly above the parent.
         """
         from gan.framework import code_repo
         head = code_repo.current_commit(self._task_root())
         if str(parent.genid) == "initial":
+            # The outer-entry pin already contains every earlier role commit.
             return code_repo.outer_base_ref_name(outer)
         sha = (parent.meta or {}).get("code_commit") or (parent.meta or {}).get("task_code_commit")
         if not sha:
             self.log_event({"type": "code_lineage_legacy", "outer": outer,
                             "parent_genid": str(parent.genid), "fallback_base": head})
             return head
-        return sha
+        return self._carry_role_commits(str(sha), outer)
+
+    def _carry_role_commits(self, parent_commit: str, outer: int) -> str:
+        """Lift a task-node base to the newest ROLE-ONLY tip above it.
+
+        A candidate tip is accepted only when BOTH hold:
+
+        1. it is a descendant of ``parent_commit`` (same blood line), and
+        2. every commit in ``parent_commit..tip`` is a role self-improvement
+           commit (recorded in ``_role_commits`` or carrying the
+           ``self-improve <role>`` subject).
+
+        Condition 2 is what makes this safe. The raw outer-entry HEAD is NOT an
+        acceptable base: parent selection routinely picks an EARLIER node (LCB
+        favours the least-visited one), and the entry HEAD then also carries the
+        later task generations — using it would hand the child a base that
+        lineage says belongs to someone else (gen0 selected, gen1's changes
+        included). When no candidate qualifies the parent commit is returned
+        unchanged, so this can only ADD role commits, never move backwards or
+        mix siblings.
+        """
+        if not parent_commit or not self._role_commits:
+            return parent_commit
+        task_root = self._task_root()
+        if not task_root:
+            return parent_commit
+        from gan.framework import code_repo
+        role_set = {str(v) for v in self._role_commits.values() if v}
+        best, best_n = parent_commit, 0
+        for tip in sorted(role_set):
+            if tip == parent_commit:
+                continue
+            if not code_repo.is_ancestor(task_root, parent_commit, tip):
+                continue
+            rows = code_repo.rev_range_with_subject(task_root, parent_commit, tip)
+            if not rows:
+                continue  # empty range or git could not look: stay conservative
+            if not all(sha in role_set or subject.startswith("self-improve ")
+                       for sha, subject in rows):
+                continue
+            if len(rows) > best_n:
+                best, best_n = tip, len(rows)
+        if best != parent_commit:
+            self.log_event({"type": "code_base_with_roles", "outer": outer,
+                            "parent_commit": parent_commit, "base": best,
+                            "role_commits": best_n})
+        return best
 
     def _align_code_base(self, parent: Any, outer: int, genid: Any) -> Optional[str]:
         """Checkout the selected parent's code state before planning; resync workspace.

@@ -249,8 +249,32 @@ with a GAN-native data layer.
   stays where it is — `DesignStore.save` is atomic (tmp + `os.replace`), so the
   heal's re-save opens no new torn-file window.
 
-### Knowledge base (pull-based)
+### Code base lineage (task commits + role commits share one tree)
 
+- **Blood line = the selected node's own commit**, but the *working* base is
+  that commit plus the role self-improvements stacked directly above it:
+  `loop._carry_role_commits`. A self-improve commit belongs to the RUN, not to
+  any task node, so returning the bare parent silently reverted every earlier
+  self-upgrade at the next parent switch (measured 2026-11-02 `verify_deep_v4`:
+  planner's `f5ad5a5` — a 125-line tool plus its registry entry — vanished in
+  outer 2, which then produced an `empty_patch` and the exit heal reported the
+  name as "not registered"). Only `checkpoint.code.commit` was carrying it, and
+  only the RESUME path reads that.
+- **The lift is conditional, and the condition is what makes it safe**: a
+  candidate tip is accepted only when it is a descendant of the parent AND every
+  commit in `parent..tip` is a role commit (`_role_commits` or the
+  `self-improve <role>` subject). Using the raw outer-entry HEAD would be wrong:
+  LCB routinely selects an EARLIER node, and the entry HEAD then also carries
+  the later task generations — a base that lineage says belongs to someone else.
+  Unqualified ranges leave the base untouched, so this can only ADD role
+  commits, never move backwards or mix sibling lines. Audited as
+  `code_base_with_roles{parent_commit,base,role_commits}`; guard
+  `scripts/local/test_role_base_carry.py` (18 checks incl. the gen0-selected
+  leak and the sibling-line case).
+- Node `meta["code_commit"]` still records the TASK commit only, so the lineage
+  graph and ref reconciliation are unchanged by the carry.
+
+### Knowledge base (pull-based)
 - `gan/components/<role>/knowledge/*.md` are **data** — not registry entries, no `name=stem` contract, never executed.
 - The planner authors task-side notes via the deep patch channel; the whole committed base is materialized into the task sandbox each generation (`.gan_runtime/knowledge` + `GAN_TASK_KNOWLEDGE_DIR`; per-note/total caps, skips reported).
 - The task agent reads on demand via the opt-in `knowledge` tool. Planner/evaluator read their own (and task-side) notes through the normal access channel (`request_source_access(view)` + `list_dir`/`read_file`) — never an un-audited side door.
