@@ -338,7 +338,8 @@ def _add_empty_parents(command, path, created):
         created.add(item)
 
 
-def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
+def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None,
+                     cm_events_path=None):
     """Create a fail-closed Bubblewrap command for one TaskAgent question."""
     bwrap = shutil.which("bwrap")
     if not bwrap:
@@ -438,14 +439,20 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
     # agent/ is bound unconditionally for every domain. The context-management
     # snapshot lives under .gan_runtime/cm (GAN_CM_CORE) — delivered by the
     # same ro-bind above, still no gan/ (docs/10 §11.0.1).
-    # Task-child CM audit sidecar (docs/10 §11.5): a rw BIND (the tmpfs
-    # /workspace dies with the sandbox, so the sidecar must be a host file)
-    # so task_runner can ingest the seam events after the child exits. The
-    # host file is pre-created by assemble_task_env (a --bind source must
-    # exist before the namespace is built).
-    cm_events_host = os.path.join(run_root, "cm_events.jsonl")
-    if os.path.isfile(cm_events_host):
-        command.extend(["--bind", cm_events_host, "/workspace/cm_events.jsonl"])
+    # Task-child CM audit sidecar (docs/10 §11.5): a rw BIND, because the
+    # tmpfs /workspace dies with the sandbox and the parent ingests the events
+    # after the child exits.
+    #
+    # The bind source MUST be a file this process owns: the sandbox root here
+    # is the STAGE copy (``stage_root``), while the ingested sidecar lives in
+    # the run dir — and the run dir itself is bound READ-ONLY into the
+    # sandbox. Binding the run-dir file was the CM-02 bug: the source did not
+    # exist under ``stage_root``, the bind was skipped, and the child silently
+    # created /workspace/cm_events.jsonl inside the tmpfs — every append
+    # "succeeded" and the ingested sidecar stayed empty. Staging the file and
+    # copying it back is the same contract the trajectory already uses.
+    if cm_events_path:
+        command.extend(["--bind", cm_events_path, "/workspace/cm_events.jsonl"])
     command.extend([
         # Expose only this question's trajectory file, never outputs/ or other
         # questions' trajectories, which may themselves contain benchmark data.
@@ -545,13 +552,19 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
                             symlinks=False)
         staged_trajectory = os.path.join(stage_root, "trajectory.jsonl")
         shutil.copy2(trajectory_source, staged_trajectory)
+        # CM seam sidecar: stage an EMPTY file (owned by the sandbox uid, in
+        # this process's /tmp), bind it, and copy the child's lines back to
+        # the run dir afterwards. The name is fixed (paths.CM_EVENTS_NAME).
+        staged_cm_events = os.path.join(stage_root, "cm_events.jsonl")
+        with open(staged_cm_events, "w", encoding="utf-8"):
+            pass
 
         with tempfile.TemporaryFile(mode="w+b") as result_file:
             result_fd = result_file.fileno()
             payload["result_fd"] = result_fd
             proc = subprocess.run(
                 _sandbox_command(stage_root, "./task_agent.py", staged_trajectory,
-                                 proxy_socket),
+                                 proxy_socket, cm_events_path=staged_cm_events),
                 input=json.dumps(payload, ensure_ascii=False, default=str),
                 text=True,
                 stdout=subprocess.PIPE,
@@ -560,6 +573,25 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
                 timeout=QUESTION_TIMEOUT,
                 pass_fds=(result_fd,),
             )
+            # Fold the child's seam events back to the run dir BEFORE any
+            # returncode judgement: a failed question's seam activity is
+            # evidence too. A copy-back failure is reported (the run dir file
+            # is the parent's only ingest channel) and never fatal.
+            try:
+                host_cm_events = os.path.join(run_root, "cm_events.jsonl")
+                with open(staged_cm_events, "r", encoding="utf-8") as handle:
+                    staged_lines = handle.read()
+                if staged_lines.strip():
+                    # APPEND, never overwrite: one harness process answers
+                    # several questions and every question's sidecar is staged
+                    # separately, so a copyfile would keep only the last one.
+                    with open(host_cm_events, "a", encoding="utf-8") as handle:
+                        handle.write(staged_lines)
+                        if not staged_lines.endswith("\n"):
+                            handle.write("\n")
+            except OSError as exc:
+                print(f"[cm] sidecar copy-back failed ({exc}); this question's "
+                      "seam events are not ingested", flush=True)
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
                 raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")

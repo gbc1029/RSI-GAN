@@ -829,6 +829,21 @@ class GanLoop:
         try:
             task = cost_ledger.task_cost_for_gen(self.output_dir, genid)
             sess = cost_ledger.gen_session_costs(self.output_dir, outer, genid)
+            # Prefer the SETTLED records the loop already wrote over a
+            # trajectory re-derivation: the trajectory only carries CM events
+            # for the paths that sink them there, while the settled record
+            # carries ``session.summary()`` from EITHER transport (in-process
+            # object or the seat child's published event). Re-deriving here
+            # dropped the ``cm`` node, so cost.json read exactly like a run
+            # with no seam at all.
+            for key, role, seat in (("planner_plan", "planner", "plan"),
+                                    ("evaluator_evaluate", "evaluator", "evaluate")):
+                settled = next(
+                    (r for r in self._session_costs
+                     if r.get("role") == role and r.get("seat") == seat
+                     and str(r.get("genid")) == str(genid)), None)
+                if settled is not None:
+                    sess[key] = settled
             task_traj = cost_ledger.task_trajectory_cost(self.output_dir, outer, genid)
             task_cm = cost_ledger.task_cm_summary(self.output_dir, genid)
             payload: Dict[str, Any] = {

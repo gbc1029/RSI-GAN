@@ -382,7 +382,12 @@ def compact(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     keys = ("role", "seat", "outer", "genid", "attempt", "llm_calls",
             "tool_calls", "tool_outputs", "prompt_tokens", "completion_tokens",
             "reasoning_tokens", "total_tokens", "wallclock_s",
-            "llm_calls_failed", "llm_retry_total", "llm_time_s")
+            "llm_calls_failed", "llm_retry_total", "llm_time_s",
+            # The session's CM node (mode/turns/ops/violations/assembly).
+            # Dropping it here made cost.json's planner_plan /
+            # evaluator_evaluate read exactly like a run with no seam at all,
+            # even though cost_sessions.jsonl carried it.
+            "cm")
     out = {k: record.get(k) for k in keys if record.get(k) is not None}
     return out or None
 

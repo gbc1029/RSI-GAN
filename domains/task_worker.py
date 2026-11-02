@@ -457,17 +457,57 @@ def _cm_events_path():
     return os.path.join(os.getcwd(), "cm_events.jsonl")
 
 
+# Last-resort durable channel for a FAILED sidecar append. The sidecar lives
+# in the (read-only for the sandbox uid) run tree; its one write exception is
+# granted by ``_TaskRunLease._grant``. If that ever stops working, the failure
+# must still be recoverable from the host -- the WORK DIR is pruned and the
+# cwd is a tmpfs, so the ONLY durable, host-readable channel this process
+# holds is the task trajectory (bound read-write by the harness and archived
+# by the framework). Set from the payload before the session is built.
+_CM_FALLBACK_PATH = None
+
+
+def _trajectory_note(record):
+    """One diagnostic row on the TASK TRAJECTORY (durable on the host).
+
+    The seam's own sink can be the thing that is broken (that is exactly the
+    failure class CM-02 came from: the child's appends landed in a tmpfs the
+    parent can never read). The trajectory is bound read-write and copied
+    back, so it is the child's only host-readable channel — use it for
+    diagnosis ONLY (never seam content). Readers ignore unknown kinds."""
+    if not _CM_FALLBACK_PATH:
+        return
+    try:
+        with open(_CM_FALLBACK_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dict(record), ensure_ascii=False,
+                              default=str) + "\n")
+    except OSError:
+        pass
+
+
+def _cm_failure_record(target, exc, fallback_landed):
+    """One trajectory row describing a dead audit sink (never seam content).
+
+    The trajectory readers ignore unknown ``kind`` values, so a diagnostic
+    row costs nothing structurally and makes "the sidecar stayed empty"
+    explainable after the fact (it used to be indistinguishable from "the
+    generation had no seam at all" -- CM-02)."""
+    return {"kind": "cm_emit_failed", "target": str(target),
+            "error": str(exc)[:200],
+            "sibling_landed": bool(fallback_landed)}
+
+
 def _cm_emit(event):
     """Audit sink for the child's seam events (cm_view/cm_violation/...):
     appended to the sidecar and folded into events.jsonl by task_runner.
     The sink must never break the session — but a failed append is not
-    silent either: the line is preserved in a sibling fallback file and
-    echoed to stderr (when the durable channel itself fails, these two are
-    the only channels left in-process; the fallback file shares the work
-    dir's lifetime, so it is best-effort by design)."""
+    silent either: the line is preserved in a sibling fallback file, a
+    diagnostic row lands on the TASK TRAJECTORY (durable on the host), and
+    the failure is echoed to stderr."""
     line = json.dumps(dict(event), ensure_ascii=False, default=str)
+    target = _cm_events_path()
     try:
-        with open(_cm_events_path(), "a", encoding="utf-8") as f:
+        with open(target, "a", encoding="utf-8") as f:
             f.write(line + "\n")
         return
     except OSError as e:
@@ -482,6 +522,13 @@ def _cm_emit(event):
         print(f"[cm] sidecar append failed ({e}); event line "
               + (f"preserved at {fallback}" if landed else "follows")
               + f": {line[:300]}", flush=True)
+        if _CM_FALLBACK_PATH:
+            try:
+                with open(_CM_FALLBACK_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(_cm_failure_record(target, e, landed),
+                                      ensure_ascii=False) + "\n")
+            except OSError:
+                pass  # both durable channels are gone; stderr is all that is left
 
 
 def _degrade(reason: str, consequence: str = "; running without seam") -> None:
@@ -509,6 +556,19 @@ def _build_cm_session():
     a GAN generation — recorded for exactly that reason."""
 
     core = os.environ.get("GAN_CM_CORE") or ""
+    # Sink self-check (once): which path the seam events will go to, and
+    # whether the environment agrees. The sidecar line only lands WHEN the
+    # sink works, so the trajectory carries the same fact unconditionally.
+    _sink = _cm_events_path()
+    _trajectory_note({
+        "kind": "cm_sink_check",
+        "env": os.environ.get("GAN_CM_EVENTS"),
+        "chosen": _sink,
+        "cwd": os.getcwd(),
+        "exists": os.path.isfile(_sink),
+        "core_env": core,
+        "core_isdir": os.path.isdir(core),
+    })
     if not os.path.isdir(core):
         alt = os.path.join(os.getcwd(), ".gan_runtime", "cm")
         if os.path.isdir(alt):
@@ -635,6 +695,10 @@ def _run_agent_child(result_fd: int) -> None:
     # kwargs -- only when the artifact's __init__ accepts it; a modified
     # artifact dropping the seam degrades to the pre-D behaviour (the design
     # snapshot + the cm_view absence are the offline cross-check).
+    global _CM_FALLBACK_PATH
+    _CM_FALLBACK_PATH = (payload.get("trajectory_path")
+                         if isinstance(payload.get("trajectory_path"), str)
+                         else None)
     cm_session = _build_cm_session()
     if cm_session is not None:
         try:
