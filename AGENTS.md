@@ -61,9 +61,13 @@ live under `scripts/dgmh/`.
   stats; policy failures ride ``policy_report`` → ``recent["cm_policy"]``
   into both self-improve prompts (mirror of the assembly report channel);
   the agent-owned assembly receives the P2 ``SessionPortal``
-  (narrowed facade) and named-assembly turns are reconciled at turn end
-  (P1 snapshot/reconcile/restore — also the backstop for attribute-level
-  escapes); in-process p/e seats resolve the SAME named slots
+  (narrowed facade) and agent-owned turns are reconciled at turn end
+  (P1 snapshot/reconcile/restore on BOTH the named-assembly branch and the
+  custom policy tail — also the backstop for attribute-level escapes: a
+  ``_s``-escape on the policy path is caught, restored, contract-struck;
+  the baseline stages' refs are folded before the policy snapshot so the
+  reconcile does not false-positive on their form changes — docs/19 §12.18);
+  in-process p/e seats resolve the SAME named slots
   workspace-first at session build (``loop._resolve_cm_module(seat)``, no
   sort-order discovery — an unresolved claim is a loud
   ``cm_module_unresolved`` and custom degrades to the slice preset with
