@@ -197,6 +197,20 @@ class AccessBroker:
             except OSError:
                 # metadata is cosmetic here; never fail a grant over it
                 pass
+            # The workspace root carries a DEFAULT ACL for the role, but a
+            # default ACL is masked by the creating process's umask: the loop
+            # runs at 0o077, so copyfile's 0666 lands as 0600 and the inherited
+            # ``u:<role>:rwx`` entry becomes ``#effective:---``. The role then
+            # cannot even READ its own granted copy -- measured 2026-11-02
+            # (verify_deep_v3: `_read_lines(b_file)` PermissionError killed the
+            # planner self-improve seat; `sudo -u rsi_gan_planner head` on the
+            # workspace copy = Permission denied). Set the group bits
+            # EXPLICITLY (which rewrites the ACL mask) so the inherited role
+            # entry stays effective, without touching ownership.
+            try:
+                os.chmod(tmp, 0o660)
+            except OSError:
+                pass
             os.replace(tmp, dst)
         finally:
             if os.path.exists(tmp):
