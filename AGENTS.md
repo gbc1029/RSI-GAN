@@ -45,13 +45,26 @@ live under `scripts/dgmh/`.
   and ``resolve()`` also loads the P2 NAMED agent-owned assembly (``cost.cm_assembly``
   design key → ``gan/components/<role>/cm/<stem>.py``, delivered as
   ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the
-  child env pins are static; load-once per session, per-turn exec budget,
-  2-strike wedge breaker, fail-open to the preset — every fallback leaves
-  durable events + ``degraded``/``assembly_disabled`` cm_view stats; the P3
-  in-process p/e seats resolve the SAME named slots workspace-first at
-  session build (``loop._resolve_cm_module``, no sort-order discovery — an
-  unresolved claim is a loud ``cm_module_unresolved`` and custom degrades to
-  the slice preset with its keys rewritten), with per-path sys.modules keys
+  child env pins are static; load-once per session, and the per-turn exec
+  budget covers LOAD+execute — module-level code is agent code, so a
+  top-level hang is a load-phase timeout, never a session hung outside
+  every budget; failure semantics: the assembly is FIRST-failure-latched
+  per session plus a loop-level fingerprint latch (clamped keys + module
+  bytes, released when either changes), the POLICY keeps the 2-strike
+  wedge breaker, fail-open to the preset — every fallback leaves durable
+  events (with ``phase``) + ``degraded``/``assembly_disabled`` cm_view
+  stats; the agent-owned assembly receives the P2 ``SessionPortal``
+  (narrowed facade) and named-assembly turns are reconciled at turn end
+  (P1 snapshot/reconcile/restore — also the backstop for attribute-level
+  escapes); in-process p/e seats resolve the SAME named slots
+  workspace-first at session build (``loop._resolve_cm_module(seat)``, no
+  sort-order discovery — an unresolved claim is a loud
+  ``cm_module_unresolved`` and custom degrades to the slice preset with
+  its keys rewritten), while DRIVER-mode p/e seats build the session in
+  the CHILD from the parent-computed descriptor (``role_state.cm``,
+  protocol 2 → ``cm_wiring.build_from_descriptor``; stems resolve
+  child-side, workspace ``outer_<O>__<seat>`` first then committed), with
+  per-path sys.modules keys
   for the parallel self-improve threads and a preflight pool gate; named
   modules may export a ``METHODS`` dict of custom methods (harvested
   all-or-nothing with ``cm_methods_refused``, assembly > policy shadowing,
@@ -60,7 +73,15 @@ live under `scripts/dgmh/`.
   runner, trajectory index (``materialize_traj`` snapshots the seat's visible
   trajectories as pinned ``traj_seg`` blocks — one scan per session; the
   read tools and the ``ctx_`` faces share that single genid-qualified
-  address space); STDLIB-ONLY import contract because it is
+  address space); the seat layer bounds what the budgets cannot (CM-03
+  residual): an INACTIVITY watchdog (``loop.role_inactivity_timeout_s``,
+  no-frame based; a kill converges as ``planner_failed``/``evaluator_failed``
+  and is deliberately NOT a CM latch signal) plus a post-session hygiene
+  restart when the session summary reports leaked worker threads
+  (``thread_leaks``/``thread_leak_delta`` — conditional fields, absence =
+  clean); the task seat latches a failed named assembly for the REST of the
+  generation (harness-injected ``GAN_CM_ASSEMBLY_DISABLED`` — the agent
+  child is per-question); STDLIB-ONLY import contract because it is
   snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
@@ -313,7 +334,7 @@ with a GAN-native data layer.
 ### Data flow and boundaries
 
 - **Permissions = capability by existence (batch 4 axiom)**: reads are physical absence without a grant; writes are not applied without capability. Enforced by what the framework MOVES (`AccessContext` role+seat; REQUIRED no-default on `set_access_context` / `frozen.write_roots` / `frozen.is_allowed` / `AccessBroker.grant` / `code_repo.check_patch|apply_*`; no `legacy` seat; `frozen.any_seat_allows` is the only deliberate union query — classification, never authorization; `AccessBroker` refuses repo-root / self-containing / oversized grants; local check: `scripts/local/test_frozen.py`).
-- **Reserved cost keys & context-management seam (docs/10 phases C/D)**: authority is `gan/framework/cost_keys.py` (`validate_cost_config` shared by schema/set, `effective_all` the ONLY clamp, `cost_keys_applied` events); task budget keys ride the harness stdin payload (never env). Phase-D seam: `agent/llm_withouts._counting_llm` is the single per-turn assembly point — `CMSession` (per-seat, snapshot-loaded) rewrites only what is SENT; per-entry copies keep canonical history + raw trajectory rows untouched; modes `passthrough` (kill switch) / `slice` / `compact_conservative` / `custom`; audit via `cm_violation` / `cm_*` events and the `cm_events.jsonl` sidecar; runtime `cm` savings are DERIVED, never billing.
+- **Reserved cost keys & context-management seam (docs/10 phases C/D)**: authority is `gan/framework/cost_keys.py` (`validate_cost_config` shared by schema/set, `effective_all` the ONLY clamp, `cost_keys_applied` events); task budget keys ride the harness stdin payload (never env). Phase-D seam: `agent/llm_withtools._counting_llm` is the single per-turn assembly point — `CMSession` (per-seat, snapshot-loaded) rewrites only what is SENT; per-entry copies keep canonical history + raw trajectory rows untouched; modes `passthrough` (kill switch) / `slice` / `compact_conservative` / `custom`; audit via `cm_violation` / `cm_*` events and the `cm_events.jsonl` sidecar; runtime `cm` savings are DERIVED, never billing.
 - **Planner→evaluator isolation**: every evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) — summary is ops-only (files exited; changed files are an outcome fact owned by `meta_view.task_patch_files`, grant facts ride `ops[].paths`), receipt exposes only outcomes (`receipt.design.ops`), run summary exposes only `run_summary.meta`/`run_summary.receipt` (no `rejected_reason` full text, which quotes the planner's artifacts), feedback digest exposes only `issue_id`/`accepted`/`stance`. A NEW meta key or receipt field is invisible to the evaluator until its projection is extended on purpose (default-deny, mirroring the role access allowlist). The planner responds to issues with a REQUIRED structured stance (`response_kind`: acted / acted_differently / out_of_scope / disputed / deferred) — the evaluator calibrates on decisions, never on persuasion.
 - **Artifact vs rationale (B29, batch 16)**: the ARTIFACT under evolution gets structural facts; the planner's RATIONALE gets nothing. `set_prompt` / `set_config(key="prompt")` record `prompt_change_facts` (chars/lines/prev_*/added_lines/removed_lines/similarity/char_similarity/char_survival/changed_from_to/sha256_12/empty/equals_seed — numbers and hashes only, never text), and `DesignContext.record` stamps `target_role` for every design record (framework-owned, written after the caller's fields so it cannot be shadowed). Those facts are whitelisted into `build_diff_summary` and `receipt.design.ops`. The prompt TEXT is deliberately not projected: it is audit evidence the evaluator may fetch from the task trajectory (`read_trajectory` archives the child's input message verbatim, redacted only for benchmark/score strings), never an assertion pushed into its decision surface — the isolation is on the PROMPT surface, not on the read surface; the AUTHOR side reads its own draft via `get_config` (same object the R2 gate compares against). This does NOT relax the `respond_issue.feedback` rule: its derived statistics stay banned.
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator must not fit the benchmark score (blind score first, then reveal).
@@ -406,7 +427,10 @@ non-repeatable:
 - Active design docs outside that consolidation: `docs/9_多域评测设计.md`,
   `docs/10_成本反馈闭环设计.md`, `docs/11_消融实验设计.md` (ablation matrix +
   switch→consumer authority, incl. §3.1 new-sandbox execution-position map)
-  (and `docs/cost_tem.md`).
+  (and `docs/cost_tem.md`); `docs/19_CM问题与解决.md` (CM audit ledger +
+  §12 batch records — the authority for CM done/open status; still open
+  there: the `outer=2` real-round acceptance, CM-06/07 residuals, F5
+  anti-tamper user-deferred, T3 process isolation deferred).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license
