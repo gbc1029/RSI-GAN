@@ -48,12 +48,19 @@ live under `scripts/dgmh/`.
   child env pins are static; load-once per session, and the per-turn exec
   budget covers LOAD+execute — module-level code is agent code, so a
   top-level hang is a load-phase timeout, never a session hung outside
-  every budget; failure semantics: the assembly is FIRST-failure-latched
-  per session plus a loop-level fingerprint latch (clamped keys + module
-  bytes, released when either changes), the POLICY keeps the 2-strike
-  wedge breaker, fail-open to the preset — every fallback leaves durable
+  every budget; failure semantics (docs/19 §12.17, UNIFORM for both
+  agent-owned module kinds): load-once per session with the failure cached
+  (a mid-session edit must not change the seam; load-once caches the
+  MODULE — apply/assemble still run every turn), ONE strike disables the
+  module for the session (load crash, load timeout, or run failure — a
+  crash on byte-identical retries is deterministic), plus a loop-level
+  kind-keyed fingerprint latch (clamped keys + module bytes, released when
+  either changes; descriptor flags ``assembly_disabled``/``policy_disabled``,
+  both ADDITIVE), fail-open to the preset — every fallback leaves durable
   events (with ``phase``) + ``degraded``/``assembly_disabled`` cm_view
-  stats; the agent-owned assembly receives the P2 ``SessionPortal``
+  stats; policy failures ride ``policy_report`` → ``recent["cm_policy"]``
+  into both self-improve prompts (mirror of the assembly report channel);
+  the agent-owned assembly receives the P2 ``SessionPortal``
   (narrowed facade) and named-assembly turns are reconciled at turn end
   (P1 snapshot/reconcile/restore — also the backstop for attribute-level
   escapes); in-process p/e seats resolve the SAME named slots
