@@ -178,11 +178,15 @@ class GanLoop:
         # the once-per-outer self_improve) without any outer-boundary plumbing.
         # The TASK seat is session-scoped inside ``CMSession`` (one failed
         # attempt per generation): its session is built by the task runner,
-        # whose config path the loop does not own.
-        self._cm_assembly_latch: Dict[tuple, Dict[str, Any]] = {}
-        # Last settled "your assembly failed" facts per role (docs/19 §12.14
+        # whose config path the loop does not own. (p/e latch table moved to
+        # the kind-keyed `_cm_agent_latch`, docs/19 §12.17.)
+        # Last settled "your CM module failed" facts per role (docs/19 §12.14
         # feedback): the next self-improve session reads them as a to-do.
         self._cm_assembly_report: Dict[str, Dict[str, Any]] = {}
+        self._cm_policy_report: Dict[str, Dict[str, Any]] = {}
+        # kind-keyed fingerprint latch (docs/19 §12.17): one table for BOTH
+        # agent-owned CM modules; entry shape {kind: {fp, stem, reason, ...}}.
+        self._cm_agent_latch: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
         self.task_runner = task_runner
         # Separate runner for the fixed-root evaluation (docs/14 §5.5). It is
         # pinned to the run-persistent EVALUATION question set (held-out val
@@ -1254,9 +1258,13 @@ class GanLoop:
         except Exception:  # noqa: BLE001 -- advisory stamp
             pass
         try:
-            latched = self._cm_latch_consume(role, seat, keys, outer)
+            latched = self._cm_latch_consume(role, seat, keys, outer,
+                                             kind="assembly")
+            latched_pol = self._cm_latch_consume(role, seat, keys, outer,
+                                                 kind="policy")
         except Exception:  # noqa: BLE001 -- advisory: never fail the seat
             latched = False
+            latched_pol = False
         if getattr(role_obj, "cm_crossing", False):
             try:
                 files = self._traj_materialization_files(
@@ -1281,7 +1289,8 @@ class GanLoop:
                 role_obj.cm_descriptor = cm_wiring.descriptor(
                     role, keys, seat=seat, instance=instance, genid=genid,
                     session_cm_mode=(keys or {}).get("cm_mode"),
-                    traj_files=kept, assembly_disabled=latched)
+                    traj_files=kept, assembly_disabled=latched,
+                    policy_disabled=latched_pol)
             except Exception as e:  # noqa: BLE001 -- advisory, must SPEAK
                 try:
                     role_obj.cm_descriptor = None
@@ -1298,19 +1307,26 @@ class GanLoop:
                 role_obj.cm_session.assembly_disabled = True
             except Exception:  # noqa: BLE001 -- advisory stamp
                 pass
+        if latched_pol and role_obj.cm_session is not None:
+            try:
+                role_obj.cm_session.policy_disabled = True
+            except Exception:  # noqa: BLE001 -- advisory stamp
+                pass
         self._materialize_traj(role_obj.cm_session, traj_genids, outer=outer,
                                session_role=session_role,
                                session_outers=session_outers, seat=seat)
 
     def _cm_latch_fingerprint(self, role: str, seat: str,
                               keys: Optional[Dict[str, Any]],
-                              outer: Any = None) -> str:
-        """Fingerprint of what an assembly CONFIGURATION would deliver.
+                              outer: Any = None,
+                              kind: str = "assembly") -> str:
+        """Fingerprint of what an agent-owned CM module CONFIGURATION would
+        deliver (kind = "assembly" | "policy").
 
         Effective ``cm_*`` keys + the bytes of the module that would be
-        resolved (workspace-first, then committed). Both the design keys and
-        the module are agent-editable; a change in either means "a different
-        attempt is worth one try", so the latch releases."""
+        resolved (seat-suffixed workspace first, then committed). Both the
+        design keys and the module are agent-editable; a change in either
+        means "a different attempt is worth one try", so the latch releases."""
         import hashlib
         import json as _json
         from gan.framework import cm_wiring
@@ -1318,7 +1334,8 @@ class GanLoop:
             cm_keys = {k: v for k, v in (keys or {}).items()
                        if isinstance(k, str) and k.startswith("cm_")}
             settings = _json.dumps(cm_keys, sort_keys=True, default=str)
-            stem = cm_keys.get("cm_assembly")
+            stem = cm_keys.get("cm_assembly" if kind == "assembly"
+                               else "cm_policy")
             blobs = []
             workspace_roots: List[str] = []
             try:
@@ -1361,56 +1378,69 @@ class GanLoop:
 
     def _cm_latch_consume(self, role: str, seat: str,
                           keys: Optional[Dict[str, Any]],
-                          outer: Any = None) -> bool:
-        """True when this seat must start with its assembly DISABLED."""
-        latch = self._cm_assembly_latch.get((role, seat))
+                          outer: Any = None,
+                          kind: str = "assembly") -> bool:
+        """True when this seat must start with the named module DISABLED
+        (kind = "assembly" | "policy"; docs/19 §12.17)."""
+        stem_key = "cm_assembly" if kind == "assembly" else "cm_policy"
+        slot = self._cm_agent_latch.get((role, seat), {})
+        latch = slot.get(kind)
         if not latch:
             return False
-        if not (keys or {}).get("cm_assembly"):
+        if not (keys or {}).get(stem_key):
             return False
-        fingerprint = self._cm_latch_fingerprint(role, seat, keys, outer)
+        fingerprint = self._cm_latch_fingerprint(role, seat, keys, outer, kind)
         if fingerprint and fingerprint == latch.get("fp"):
             return True
         # the configuration changed -> the module deserves one fresh try
-        self._cm_assembly_latch.pop((role, seat), None)
-        soft_fail(f"cm assembly latch released ({role}/{seat}): the "
+        slot.pop(kind, None)
+        if not slot:
+            self._cm_agent_latch.pop((role, seat), None)
+        soft_fail(f"cm {kind} latch released ({role}/{seat}): the "
                   f"configuration changed",
                   event_path=paths.events_path(self.output_dir),
-                  event_type="cm_assembly_released", role=role, seat=seat,
+                  event_type=f"cm_{kind}_released", role=role, seat=seat,
                   stem=latch.get("stem"))
         return False
 
     def _cm_latch_record(self, role: str, seat: str,
                          keys: Optional[Dict[str, Any]],
                          summary: Optional[Dict[str, Any]],
-                         outer: Any = None) -> None:
-        """Latch a seat whose assembly failed at least once this call, and
-        keep the actionable report for the next self-improve session."""
-        report = (summary or {}).get("assembly_report")
+                         outer: Any = None,
+                         kind: str = "assembly") -> None:
+        """Latch a seat whose agent-owned module (kind) failed at least once
+        this call, and keep the actionable report for the next self-improve
+        session."""
+        report_key = "assembly_report" if kind == "assembly" else "policy_report"
+        stem_key = "cm_assembly" if kind == "assembly" else "cm_policy"
+        fail_key = "assembly_failures" if kind == "assembly" else "policy_failures"
+        report_store = (self._cm_assembly_report if kind == "assembly"
+                        else self._cm_policy_report)
+        report = (summary or {}).get(report_key)
         if report:
-            self._cm_assembly_report[role] = {
+            report_store[role] = {
                 **report, "seat": seat,
-                "latched": (role, seat) in self._cm_assembly_latch,
+                "latched": kind in self._cm_agent_latch.get((role, seat), {}),
             }
-        if not summary or not summary.get("assembly_failures"):
+        if not summary or not summary.get(fail_key):
             return
-        if not (keys or {}).get("cm_assembly"):
+        if not (keys or {}).get(stem_key):
             return
-        if (role, seat) in self._cm_assembly_latch:
+        slot = self._cm_agent_latch.setdefault((role, seat), {})
+        if kind in slot:
             return
-        report = summary.get("assembly_report") or {}
-        entry = {"fp": self._cm_latch_fingerprint(role, seat, keys, outer),
-                 "stem": keys.get("cm_assembly"),
+        entry = {"fp": self._cm_latch_fingerprint(role, seat, keys, outer, kind),
+                 "stem": keys.get(stem_key),
                  "reason": str(report.get("last_error") or "")[:160],
                  "phase": report.get("phase"), "where": report.get("where")}
         if not entry["fp"]:
             return
-        self._cm_assembly_latch[(role, seat)] = entry
-        soft_fail(f"cm assembly latched for {role}/{seat} "
+        slot[kind] = entry
+        soft_fail(f"cm {kind} latched for {role}/{seat} "
                   f"({entry['stem']}: {entry['reason']}) — it will not be "
                   f"re-attempted until its configuration changes",
                   event_path=paths.events_path(self.output_dir),
-                  event_type="cm_assembly_latched", role=role, seat=seat,
+                  event_type=f"cm_{kind}_latched", role=role, seat=seat,
                   **{k: entry[k] for k in ("stem", "reason", "phase", "where")})
 
     def _seat_cm_summary(self, role_obj: Any, *,
@@ -1432,7 +1462,10 @@ class GanLoop:
         summary = cm_wiring.summary_of(role_obj)
         if role and seat:
             try:
-                self._cm_latch_record(role, seat, keys, summary, outer)
+                self._cm_latch_record(role, seat, keys, summary, outer,
+                                      kind="assembly")
+                self._cm_latch_record(role, seat, keys, summary, outer,
+                                      kind="policy")
             except Exception:  # noqa: BLE001 -- advisory bookkeeping
                 pass
         return summary
@@ -3829,6 +3862,8 @@ class GanLoop:
                         payload["cost_statement"] = self._cost_statement_self(role, outer)
                         if self._cm_assembly_report.get(role):
                             payload["cm_assembly"] = self._cm_assembly_report[role]
+                        if self._cm_policy_report.get(role):
+                            payload["cm_policy"] = self._cm_policy_report[role]
                         # Injection fact (B2, self seat): same bytes audit the
                         # plan/evaluate statements get (docs/10 §11.5 gap fix).
                         if payload["cost_statement"]:

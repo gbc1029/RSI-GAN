@@ -72,6 +72,7 @@ NO_WORKSPACE_SEATS = frozenset({("evaluator", "evaluate")})
 DESCRIPTOR_FIELDS = frozenset({
     "keys", "seat", "genid", "session_cm_mode",
     "assembly_stem", "policy_stem", "traj_files", "assembly_disabled",
+    "policy_disabled",
 })
 
 
@@ -226,6 +227,7 @@ def descriptor(role: str, keys: Optional[Dict[str, Any]], *,
                session_cm_mode: Any = None,
                traj_files: Optional[List[Tuple[str, str]]] = None,
                assembly_disabled: bool = False,
+               policy_disabled: bool = False,
                ) -> Optional[Dict[str, Any]]:
     """Build the JSON descriptor the seat child needs (parent side).
 
@@ -255,8 +257,10 @@ def descriptor(role: str, keys: Optional[Dict[str, Any]], *,
         # The loop's failure latch (docs/19 §12.14): the module stays
         # configured (so every cm_view still carries assembly_disabled) but it
         # is not loaded this session — it will be re-attempted as soon as its
-        # configuration (keys or bytes) changes.
+        # configuration (keys or bytes) changes. ``policy_disabled`` is the
+        # same contract for the custom-mode policy (docs/19 §12.17).
         "assembly_disabled": bool(assembly_disabled),
+        "policy_disabled": bool(policy_disabled),
     }
 
 
@@ -272,14 +276,16 @@ def check_descriptor(value: Any) -> List[str]:
     if not isinstance(value, dict):
         return [f"cm descriptor must be an object or null (got {type(value).__name__})"]
     out: List[str] = []
-    # ``assembly_disabled`` is a purely ADDITIVE flag (the loop's failure
-    # latch): a descriptor built before it existed is still valid, so it is
-    # optional while every other field stays required (strict on purpose).
-    missing = sorted((DESCRIPTOR_FIELDS - {"assembly_disabled"}) - set(value))
+    # ``assembly_disabled``/``policy_disabled`` are purely ADDITIVE flags
+    # (the loop's failure latch): a descriptor built before either existed is
+    # still valid, so both are optional while every other field stays
+    # required (strict on purpose).
+    missing = sorted((DESCRIPTOR_FIELDS - {"assembly_disabled",
+                                           "policy_disabled"}) - set(value))
     extra = sorted(set(value) - DESCRIPTOR_FIELDS)
-    if "assembly_disabled" in value and not isinstance(
-            value.get("assembly_disabled"), bool):
-        out.append("cm descriptor assembly_disabled must be a bool")
+    for flag in ("assembly_disabled", "policy_disabled"):
+        if flag in value and not isinstance(value.get(flag), bool):
+            out.append(f"cm descriptor {flag} must be a bool")
     if missing:
         out.append(f"cm descriptor missing {missing}")
     if extra:
@@ -436,6 +442,10 @@ def build_from_descriptor(value: Dict[str, Any], *, role: str, output_dir: str,
         # Latched by the parent: keep the claim (``assembly_disabled`` still
         # shows on every cm_view) but do not load/re-run the module.
         session.assembly_disabled = True
+    if session is not None and value.get("policy_disabled"):
+        # Same latch contract for the custom-mode policy (docs/19 §12.17):
+        # the claim stays (policy_path set), the module never loads.
+        session.policy_disabled = True
     if session is not None:
         files = [(label, path) for label, path in (value.get("traj_files") or [])]
         kept, skipped = child_visible_traj(
