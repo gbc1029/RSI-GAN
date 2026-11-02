@@ -763,12 +763,20 @@ class GanLoop:
                 try:
                     cm_sum = cm_session.summary()
                     if cm_sum and cm_sum.get("turns"):
+                        # The whitelist is the cost record's CONTRACT: a field
+                        # absent from it is lost from cost_sessions.jsonl even
+                        # though the session reported it. assembly_* /
+                        # traj_segments used to be dropped, so a run with a
+                        # configured named assembly read exactly like one
+                        # without it (both had no assembly fields at all).
                         rec["cm"] = {k: cm_sum[k] for k in
                                      ("mode", "turns", "blocks", "ops_total",
                                       "ops_applied", "ops_refused",
                                       "policy_failures", "policy_disabled",
                                       "violations", "est_chars_saved",
-                                      "emit_failures")
+                                      "emit_failures",
+                                      "assembly_active", "assembly_failures",
+                                      "assembly_disabled", "traj_segments")
                                      if k in cm_sum}
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass
@@ -966,39 +974,75 @@ class GanLoop:
                         "genid": str(genid), "keys": dict(keys or {}),
                         "clamped": list(clamps or [])})
 
-    def _resolve_cm_module(self, role: str, stem: Any,
+    def _cm_workspace_root(self, role: str, seat: Optional[str] = None,
+                           instance: Optional[str] = None,
                            outer: Any = None) -> Optional[str]:
+        """The role's live workspace ``src`` root for ONE seat (or None).
+
+        SEAT-KEYED (CM-07): the granted workspace directory is
+        ``workspaces/<role>/<instance>__<seat>`` — ``role_process._prepare_paths``
+        creates it and ``role_broker.launch`` grants it. The pre-fix resolver
+        probed ``workspaces/<role>/outer_<O>``, which no seat ever writes, so
+        workspace-first resolution could NEVER hit and every named module
+        silently came from the committed tree.
+
+        ``seat is None`` keeps the LEGACY node shape (``outer_<O>``) for
+        direct-construction callers and unit tests that build a loop without a
+        seat; every production call site passes a seat. The evaluate seat has
+        no workspace at all (``frozen.SEAT_WRITE`` is empty and
+        ``role_broker`` binds no workspace for it), so probing would only
+        create an ungranted directory.
+        """
+        from gan.framework import cm_wiring
+        if self.broker is None:
+            return None
+        node = None
+        if seat is not None and instance:
+            if (role, seat) in cm_wiring.NO_WORKSPACE_SEATS:
+                return None
+            node = cm_wiring.workspace_node(instance, seat)
+        elif seat is None and outer is not None:
+            node = f"outer_{outer}"
+        if not node:
+            return None
+        try:
+            return self.broker.src_dir(role, node)
+        except Exception:  # noqa: BLE001 -- advisory; committed fallback applies
+            return None
+
+    def _resolve_cm_module(self, role: str, stem: Any, outer: Any = None,
+                           *, seat: Optional[str] = None,
+                           instance: Optional[str] = None) -> Optional[str]:
         """Resolve a design-named CM module
         (``cost.cm_policy`` / ``cost.cm_assembly``) to a loadable path —
-        WORKSPACE-FIRST (the role's live self-edit surface for this outer),
+        WORKSPACE-FIRST (the role's live self-edit surface for this seat),
         committed tree second, the same rule ``list_components`` and the deep
         tools scan with. Resolved ONCE at session build; the session runs
         that version all session long (no mid-session hot reload). No
         sort-order discovery: the named slot is the only form for in-process
         roles — an unnamed or unresolvable claim degrades LOUDLY (the caller
-        emits ``cm_module_unresolved``)."""
-        if not isinstance(stem, str) or not stem.strip():
+        emits ``cm_module_unresolved``).
+
+        The stem is VALIDATED before it is joined into a path
+        (``cm_wiring.stem_problem``): a design value such as ``../x`` must not
+        become a filesystem probe. Shared implementation with the seat child
+        (``cm_wiring.resolve_stem``) so the parent's resolution and the child's
+        can never disagree about the ORDER, only about the namespace."""
+        from gan.framework import cm_wiring
+        if cm_wiring.stem_problem(stem) is not None:
             return None
-        stem = stem.strip()
-        rel = os.path.join("gan", "components", role, "cm", stem + ".py")
-        if outer is not None and self.broker is not None:
-            try:
-                cand = os.path.join(self.broker.src_dir(role, f"outer_{outer}"),
-                                    rel)
-                if os.path.isfile(cand):
-                    return cand
-            except Exception:  # noqa: BLE001 -- advisory resolution; the
-                # committed-tree fallback below still applies
-                pass
-        cm_root = self._roles_root()
-        if cm_root:
-            cand = os.path.join(cm_root, rel)
-            if os.path.isfile(cand):
-                return cand
-        return None
+        inst = instance if instance is not None else (
+            f"outer_{outer}" if outer is not None else None)
+        workspace_root = self._cm_workspace_root(role, seat, inst, outer)
+        path, _tried = cm_wiring.resolve_stem(
+            role, stem, committed_root=self._roles_root(),
+            workspace_root=workspace_root)
+        return path
 
     def _build_cm_session(self, role: str, keys: Optional[Dict[str, Any]],
-                          outer: Any = None) -> Any:
+                          outer: Any = None, *, seat: Optional[str] = None,
+                          instance: Optional[str] = None,
+                          genid: Any = None) -> Any:
         """Per-session context-management session (docs/10 §11 D11): built from
         this role's ALREADY-CLAMPED effective ``cm_*`` keys; events ride the
         framework event stream (role-attributed). Advisory: any failure
@@ -1014,49 +1058,51 @@ class GanLoop:
         degrades to the slice preset — the keys' ``cm_mode`` is rewritten
         too, so the degrade says what it actually runs (rewriting only a
         local variable would leave the session building ``custom`` and
-        failing on the missing policy every turn)."""
+        failing on the missing policy every turn).
+
+        Resolution/normalization live in ``cm_wiring.resolve_named`` — the
+        SAME function the seat child runs (``build_from_descriptor``), so the
+        parent's in-process session and the child's session can never disagree
+        about order or degrade semantics, only about the namespace they probe.
+        ``seat``/``instance`` are optional for direct-construction callers
+        (``seat=None`` = legacy ``outer_<O>`` workspace node)."""
         if keys is None:
             return None
         try:
             from gan.framework.cm import build_session
+            from gan.framework import cm_wiring
             cm_keys = {k: v for k, v in keys.items()
                        if isinstance(k, str) and k.startswith("cm_")}
-            # Named slots: resolve claims against the role's OWN tree.
-            assembly_path = None
-            named_asm = cm_keys.get("cm_assembly")
-            if isinstance(named_asm, str) and named_asm.strip():
-                assembly_path = self._resolve_cm_module(role, named_asm, outer)
-                if assembly_path is None:
-                    soft_fail(
-                        f"cm_assembly={named_asm.strip()!r} unresolved for "
-                        f"{role} (no workspace/committed module); the "
-                        "baseline preset runs instead",
-                        event_path=paths.events_path(self.output_dir),
-                        event_type="cm_module_unresolved", role=role,
-                        kind="assembly", stem=named_asm.strip())
-            policy_path = None
-            if cm_keys.get("cm_mode") == "custom":
-                named_pol = cm_keys.get("cm_policy")
-                if isinstance(named_pol, str) and named_pol.strip():
-                    policy_path = self._resolve_cm_module(role, named_pol, outer)
-                if policy_path is None:
-                    stem = (named_pol.strip()
-                            if isinstance(named_pol, str) and named_pol.strip()
-                            else None)
-                    soft_fail(
-                        f"cm_mode=custom without a resolvable policy for "
-                        f"{role} (stem={stem!r}); degrading to the slice "
-                        "preset for this session",
-                        event_path=paths.events_path(self.output_dir),
-                        event_type="cm_module_unresolved", role=role,
-                        kind="policy", stem=stem)
-                    # The degrade CLAIMS the slice preset — the keys must say
-                    # it too, or apply_keys would still build a custom
-                    # session whose every turn fails on the missing policy.
-                    cm_keys = dict(cm_keys)
-                    cm_keys["cm_mode"] = "slice"
-            session = build_session(cm_keys, policy_path=policy_path,
-                                    assembly_path=assembly_path)
+            inst = instance if instance is not None else (
+                f"outer_{outer}" if outer is not None else None)
+            resolved = cm_wiring.resolve_named(
+                role, cm_keys, committed_root=self._roles_root(),
+                workspace_root=self._cm_workspace_root(role, seat, inst, outer))
+            for prob in resolved["problems"]:
+                kind = prob.get("kind")
+                if kind == "assembly":
+                    msg = (f"cm_assembly={prob.get('stem')!r} unresolved for "
+                           f"{role} ({prob.get('reason')}); the baseline "
+                           "preset runs instead")
+                else:
+                    msg = (f"cm_mode=custom without a resolvable policy for "
+                           f"{role} (stem={prob.get('stem')!r}, "
+                           f"{prob.get('reason')}); degrading to the slice "
+                           "preset for this session")
+                soft_fail(msg, event_path=paths.events_path(self.output_dir),
+                          event_type="cm_module_unresolved", role=role,
+                          kind=kind, stem=prob.get("stem"),
+                          reason=prob.get("reason"),
+                          tried=list(prob.get("tried") or []))
+            if any(p.get("kind") == "policy" for p in resolved["problems"]):
+                # The degrade CLAIMS the slice preset — the keys must say it
+                # too, or apply_keys would still build a custom session whose
+                # every turn fails on the missing policy.
+                cm_keys = dict(cm_keys)
+                cm_keys["cm_mode"] = "slice"
+            session = build_session(cm_keys,
+                                    policy_path=resolved["policy_path"],
+                                    assembly_path=resolved["assembly_path"])
             session.emit = (lambda r: (lambda e: self.log_event(
                 {**e, "role": r})))(role)
             return session
