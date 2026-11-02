@@ -317,7 +317,11 @@ class Planner(Role):
                      max_tool_calls: int = 30, trajectory_genids: Optional[List[Any]] = None,
                      patch_retry_k: int = 2, tool_repeat_limit: Optional[int] = None):
         from gan.framework.trajectory import outer_session_index
-        sessions = outer_session_index(self.output_dir, self.outer, "planner")
+        # seat="self_improve": the self seat writes OUTER-level files, so the
+        # prompt must list ITS OWN sessions (not the plan/evaluate ones).
+        sessions = outer_session_index(self.output_dir,
+                                       getattr(self, "traj_outer", None) or self.outer,
+                                       "planner", seat="self_improve")
         sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
         rr = render_receipt((recent or {}).get("receipt"))
         cost_stmt = str((recent or {}).get("cost_statement") or "")

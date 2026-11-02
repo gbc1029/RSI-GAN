@@ -171,6 +171,11 @@ def child_visible_traj(files: Iterable[Any], *, output_dir: str, role: str,
     """
     root = os.path.realpath(seat_traj_dir(output_dir, role, instance, seat,
                                           outer=outer))
+    # A SECOND read-only root is bound for the self seat: the PREVIOUS outer's
+    # own-session dir (docs/19 §12.11 decision Q1). Materializing "your last
+    # outer" needs exactly that mount, so the filter accepts the same subtree
+    # under any outer_<O> — nothing else.
+    outers_root = os.path.join(os.path.realpath(output_dir), "trajectory")
     kept: List[Tuple[str, str]] = []
     skipped: List[str] = []
     for item in files or []:
@@ -181,7 +186,14 @@ def child_visible_traj(files: Iterable[Any], *, output_dir: str, role: str,
         if not label or not path:
             continue
         real = os.path.realpath(str(path))
-        if real == root or real.startswith(root + os.sep):
+        inside = real == root or real.startswith(root + os.sep)
+        if not inside and seat == "self_improve" and real.startswith(outers_root + os.sep):
+            rest = real[len(outers_root) + 1:].split(os.sep)
+            if len(rest) >= 2 and rest[0].startswith("outer_"):
+                tail = os.sep.join(rest[1:])
+                inside = tail.startswith(
+                    os.sep.join(("roles", role, seat)) + os.sep)
+        if inside:
             if os.path.isfile(real):
                 kept.append((str(label), str(path)))
                 continue

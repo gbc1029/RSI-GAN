@@ -293,24 +293,40 @@ def read(output_dir: str, genid: Any, max_chars: int = 6000, role: str = "task",
                    expose_reasoning=expose_reasoning)
 
 
-def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: int = 6000) -> str:
+def read_session(output_dir: str, outer: Any, genid: Any, role: str, max_chars: int = 6000,
+                 *, seat: Any = None) -> str:
     """Read a role's own session trajectory for a given outer/genid.
 
-    A quarantined (unredactable) session is NEVER served: an explicit refusal
-    replaces its content (fail-closed)."""
+    ``seat`` selects the file shape (self seat = outer-level files, plan/
+    evaluate = per-generation files); ``None`` keeps the legacy inference for
+    direct callers. A quarantined (unredactable) session is NEVER served: an
+    explicit refusal replaces its content (fail-closed)."""
     if genid is not None:
-        return _read_gen_session(output_dir, outer, genid, role, max_chars)
-    return _read_outer_sessions(output_dir, outer, role, max_chars)
+        return _read_gen_session(output_dir, outer, genid, role, max_chars, seat=seat)
+    return _read_outer_sessions(output_dir, outer, role, max_chars, seat=seat)
 
 
 def _read_gen_session(output_dir: str, outer: Any, genid: Any, role: str,
-                      max_chars: int) -> str:
+                      max_chars: int, *, seat: Any = None) -> str:
     """Per-generation session read (genid-keyed files; attempt id irrelevant).
 
     Reasoning is PINNED OFF for role sessions regardless of the loop.yaml
     flag: planner/evaluator never read their own (or each other's) CoT."""
-    seat = ("plan" if role == "planner" else
-            "evaluate" if role == "evaluator" else None)
+    seat = seat if seat is not None else _SEAT_FOR_ROLE.get(role)
+    if seat == "self_improve":
+        # The self seat writes OUTER-level files, so a genid address can only
+        # name a file (``outer__<attempt>`` / ``outer``). Match by name, else
+        # merge that outer's own sessions.
+        wanted = str(genid)
+        files = [row["path"] for row in seat_session_files(output_dir, outer, role,
+                                                           seat=seat)
+                 if not row.get("quarantined")
+                 and os.path.basename(row["path"]).split(".jsonl", 1)[0] == wanted]
+        if files:
+            parts = [trajectory_log.read_all(p) for p in files]
+            return _render("\n".join(t for t in parts if t.strip()), max_chars,
+                           expose_reasoning=False)
+        return _read_outer_sessions(output_dir, outer, role, max_chars, seat=seat)
     path = paths.session_traj_file(output_dir, outer, genid, role, seat=seat)
     if not os.path.isfile(path):
         # Legacy layout (pre-seat runs): the genid-keyed file may sit directly
@@ -361,16 +377,19 @@ def _outer_session_files(output_dir: str, outer: Any, role: str) -> List[str]:
 
 
 def _read_outer_sessions(output_dir: str, outer: Any, role: str,
-                         max_chars: int) -> str:
+                         max_chars: int, *, seat: Any = None) -> str:
     """Render a role's OUTER-level sessions: canonical + attempt files, newest
     first. Quarantined-only attempts are reported explicitly (fail-closed).
     Reasoning PINNED OFF: role sessions never expose CoT (see read_session)."""
-    files = _outer_session_files(output_dir, outer, role)
-    d = paths.outer_traj_dir(output_dir, outer)
-    quarantined = sorted(glob.glob(os.path.join(d, f"{role}*.jsonl.unredacted-*")))
-    quarantined += sorted(glob.glob(os.path.join(
-        paths.role_traj_dir(output_dir, outer, role, "self_improve"),
-        "outer*.jsonl.unredacted-*")))
+    seat = seat if seat is not None else _SEAT_FOR_ROLE.get(role)
+    rows = [row for row in seat_session_files(output_dir, outer, role, seat=seat)]
+    files = [row["path"] for row in rows if not row.get("quarantined")]
+    if seat != "self_improve":
+        # plan/evaluate write PER-GENERATION files; their "own sessions" are
+        # those, not the legacy outer-level role file (which never exists in a
+        # seat-keyed run).
+        files = sorted(files, key=os.path.getmtime, reverse=True)
+    quarantined = [row["path"] for row in rows if row.get("quarantined")]
     if not files:
         if quarantined:
             return ("[unavailable] this session trajectory could not be redacted and was "
@@ -385,44 +404,117 @@ def _read_outer_sessions(output_dir: str, outer: Any, role: str,
                    expose_reasoning=False)
 
 
-def outer_session_index(output_dir: str, outer: Any, role: str) -> List[Dict[str, Any]]:
+_SEAT_FOR_ROLE = {"planner": "plan", "evaluator": "evaluate"}
+
+
+def declared_session_outers(seat: Any, traj_outer: Any, outer: Any) -> Any:
+    """ONE rule for the own-session outer set a seat may read (docs/19 §12.11).
+
+    Consumers must not re-derive it: ``base_role`` stamps it onto the
+    ``AccessContext`` and ``AccessBroker`` validates requests against it, so a
+    seat can read exactly the outers the framework declared (never the agent's
+    request). The self seat also reads the previous outer (L65); every other
+    seat reads only its own."""
+    if traj_outer is None:
+        return None
+    outers = {str(traj_outer)}
+    if str(seat) == "self_improve" and isinstance(outer, int) and outer > 1:
+        outers.add(str(outer - 1))
+    return frozenset(outers)
+
+
+def seat_session_files(output_dir: str, outer: Any, role: str, *,
+                       seat: Any = None) -> List[Dict[str, Any]]:
+    """The seat's OWN session files as rows ``{path, genid, name, bytes,
+    quarantined}`` — the single source for BOTH the tool's fallback and the
+    read tool's own-session face.
+
+    Two shapes, because the two seats write different things:
+    - ``self_improve``: OUTER-level files (``outer.jsonl`` / ``outer__<attempt>.jsonl``,
+      one per loop instantiation — no genid).
+    - ``plan`` / ``evaluate``: PER-GENERATION files (``gen_<genid>.jsonl``).
+    The legacy layout (``outer_<O>/<genid>/<role>.jsonl``, pre-seat runs) is
+    enumerated too and deduped, so an old run keeps reading.
+    """
+    seat = seat if seat is not None else _SEAT_FOR_ROLE.get(role)
+    return _seat_session_files(output_dir, outer, role, seat)
+
+
+def _seat_session_files(output_dir: str, outer: Any, role: str,
+                        seat: Any) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not seat:
+        return rows
+
+    def add(path: str, *, genid: Any, name: str, quarantined: bool = False) -> None:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        rows.append({"path": path, "genid": genid, "name": name,
+                     "bytes": size, "quarantined": bool(quarantined)})
+
+    if seat == "self_improve":
+        seat_dir = paths.role_traj_dir(output_dir, outer, role, "self_improve")
+        for p in _outer_session_files(output_dir, outer, role):
+            add(p, genid=None, name=os.path.basename(p))
+        seen_names = {row["name"] for row in rows}
+        for q in sorted(glob.glob(os.path.join(seat_dir, "outer*.jsonl.unredacted-*"))):
+            name = os.path.basename(q).split(".jsonl", 1)[0] + ".jsonl"
+            if name not in seen_names:
+                add(q, genid=None, name=name, quarantined=True)
+        legacy_dir = paths.outer_traj_dir(output_dir, outer)
+        for q in sorted(glob.glob(os.path.join(legacy_dir, f"{role}*.jsonl.unredacted-*"))):
+            name = os.path.basename(q).split(".jsonl", 1)[0] + ".jsonl"
+            if name not in seen_names:
+                add(q, genid=None, name=name, quarantined=True)
+        return rows
+
+    # plan / evaluate: per-generation session files, seat layout first
+    seat_dir = paths.role_traj_dir(output_dir, outer, role, seat)
+    seen_genids: set = set()
+    if os.path.isdir(seat_dir):
+        for p in sorted(glob.glob(os.path.join(seat_dir, "gen_*.jsonl"))):
+            genid = os.path.basename(p)[4:-6]
+            seen_genids.add(genid)
+            add(p, genid=genid, name=os.path.basename(p))
+        for q in sorted(glob.glob(os.path.join(seat_dir, "gen_*.jsonl.unredacted-*"))):
+            genid = os.path.basename(q).split(".jsonl", 1)[0][4:]
+            if genid not in seen_genids:
+                seen_genids.add(genid)
+                add(q, genid=genid, name=f"gen_{genid}.jsonl", quarantined=True)
+    legacy_dir = paths.outer_traj_dir(output_dir, outer)
+    if os.path.isdir(legacy_dir):
+        for entry in sorted(os.listdir(legacy_dir)):
+            sub = os.path.join(legacy_dir, entry)
+            if entry == "roles" or not os.path.isdir(sub):
+                continue
+            p = os.path.join(sub, f"{role}.jsonl")
+            if os.path.isfile(p):
+                if entry not in seen_genids:
+                    seen_genids.add(entry)
+                    add(p, genid=entry, name=f"{role}.jsonl")
+            elif glob.glob(p + ".unredacted-*") and entry not in seen_genids:
+                seen_genids.add(entry)
+                add(p, genid=entry, name=f"{role}.jsonl", quarantined=True)
+    return rows
+
+
+def outer_session_index(output_dir: str, outer: Any, role: str, *,
+                        seat: Any = None) -> List[Dict[str, Any]]:
     """List this outer's per-inner session files for a role (genid + size).
 
     Quarantined (unredactable) sessions are reported explicitly with
     ``quarantined: True`` instead of silently vanishing from the list."""
-    out: List[Dict[str, Any]] = []
-    seat = "plan" if role == "planner" else "evaluate"
-    # BOTH layouts are enumerated and merged: the sandboxed seat layout
-    # (``roles/<role>/<seat>/gen_<genid>.jsonl``) and the legacy layout
-    # (``outer_<O>/<genid>/<role>.jsonl``). A run writes ONE of them, but an
-    # empty seat dir (created by a path probe) must never shadow the populated
-    # legacy one -- hence merge + dedup instead of an early return.
-    seat_dir = paths.role_traj_dir(output_dir, outer, role, seat)
-
-    def _seen(genid: Any) -> bool:
-        return any(str(row.get("genid")) == str(genid) for row in out)
-
-    if os.path.isdir(seat_dir):
-        for path in sorted(glob.glob(os.path.join(seat_dir, "gen_*.jsonl"))):
-            name = os.path.basename(path)
-            out.append({"genid": name[4:-6], "bytes": os.path.getsize(path)})
-        for path in sorted(glob.glob(os.path.join(seat_dir, "gen_*.jsonl.unredacted-*"))):
-            name = os.path.basename(path).split(".jsonl", 1)[0]
-            if not _seen(name[4:]):
-                out.append({"genid": name[4:], "quarantined": True})
-    d = paths.outer_traj_dir(output_dir, outer)
-    if os.path.isdir(d):
-        for name in sorted(os.listdir(d)):
-            sub = os.path.join(d, name)
-            if os.path.isdir(sub) and name != "roles":
-                p = os.path.join(sub, f"{role}.jsonl")
-                if os.path.isfile(p):
-                    if not _seen(name):
-                        out.append({"genid": name, "bytes": os.path.getsize(p)})
-                elif glob.glob(p + ".unredacted-*"):
-                    if not _seen(name):
-                        out.append({"genid": name, "quarantined": True})
-    return out
+    return [
+        {"genid": row["genid"], "name": row["name"], "bytes": row["bytes"],
+         "quarantined": True}
+        if row.get("quarantined") else
+        {"genid": row["genid"], "name": row["name"], "bytes": row["bytes"]}
+        if row.get("name") else
+        {"genid": row["genid"], "bytes": row["bytes"]}
+        for row in seat_session_files(output_dir, outer, role, seat=seat)
+    ]
 
 
 def session_label(current_outer: Any, outer: Any, genid: Any, filename: str) -> str:
@@ -435,11 +527,15 @@ def session_label(current_outer: Any, outer: Any, genid: Any, filename: str) -> 
     outer gets an outer-prefixed form (``outer_<O>/<genid>/<file>``) so one
     session's address space stays unique across outers."""
     prefix = "" if str(outer) == str(current_outer) else f"outer_{outer}/"
+    if genid is None:
+        # OUTER-level session file (the self seat: one file per loop instance,
+        # no genid). The file NAME is the address; the prefix keeps outers apart.
+        return f"{prefix}{filename}"
     return f"{prefix}{genid}/{filename}"
 
 
 def session_universe(output_dir: str, role: str, current_outer: Any,
-                     extra_outers: Any = None) -> List[Tuple[str, str]]:
+                     extra_outers: Any = None, *, seat: Any = None) -> List[Tuple[str, str]]:
     """The seat's OWN-session visible universe as ``(label, path)`` pairs —
     the single definition served to BOTH consumers: trajectory materialization
     (``loop._traj_materialization_files``) and the read_session_trajectory
@@ -456,16 +552,27 @@ def session_universe(output_dir: str, role: str, current_outer: Any,
     for o in [current_outer] + list(extra_outers or []):
         if o is None:
             continue
-        d = paths.outer_traj_dir(output_dir, o)
-        genids = [str(e["genid"]) for e in outer_session_index(output_dir, o, role)
-                  if not e.get("quarantined")]
-        genids.sort(key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
-        for g in genids:
-            p = os.path.join(d, g, f"{role}.jsonl")
-            label = session_label(current_outer, o, g, f"{role}.jsonl")
-            if os.path.isfile(p) and label not in seen:
-                seen.add(label)
-                out.append((label, p))
+        # The resolver owns BOTH shapes (seat-keyed and legacy). Rebuilding the
+        # path here was the bug: it always produced the LEGACY
+        # ``outer_<O>/<genid>/<role>.jsonl`` even when the run wrote the seat
+        # layout, so the file never existed and every seat materialized 0
+        # segments (docs/19 §12.12 F1).
+        rows = seat_session_files(output_dir, o, role, seat=seat)
+        rows.sort(key=lambda r: (0, int(str(r.get("genid"))))
+                  if r.get("genid") is not None and str(r.get("genid")).isdigit()
+                  else (1, str(r.get("genid") or "")))
+        for row in rows:
+            if row.get("quarantined"):
+                continue
+            path = row["path"]
+            if not os.path.isfile(path):
+                continue
+            label = session_label(current_outer, o, row.get("genid"),
+                                  os.path.basename(path))
+            if label in seen:
+                continue
+            seen.add(label)
+            out.append((label, path))
     return out
 
 

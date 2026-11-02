@@ -252,7 +252,11 @@ class Evaluator(Role):
         from gan.framework.trajectory import outer_session_index
         digests = (recent or {}).get("digests") or []
         digest_text = "\n\n".join(str(d)[:2000] for d in digests[-3:]) or "(no digests yet)"
-        sessions = outer_session_index(self.output_dir, self.outer, "evaluator")
+        # seat="self_improve": the self seat writes OUTER-level files, so the
+        # prompt must list ITS OWN sessions (not the plan/evaluate ones).
+        sessions = outer_session_index(self.output_dir,
+                                       getattr(self, "traj_outer", None) or self.outer,
+                                       "evaluator", seat="self_improve")
         sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
         rr = render_receipt((recent or {}).get("receipt"))
         cost_stmt = str((recent or {}).get("cost_statement") or "")

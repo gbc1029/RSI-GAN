@@ -1139,7 +1139,8 @@ class GanLoop:
 
     def _traj_materialization_files(self, genids: Any, outer: Any = None,
                                     session_role: Optional[str] = None,
-                                    session_outers: Any = None
+                                    session_outers: Any = None,
+                                    seat: Optional[str] = None
                                     ) -> List[Tuple[str, str]]:
         """The seat's visible trajectory files as ``(label, path)`` pairs —
         the SAME set the read tools serve. Task generations ride the seat's
@@ -1165,9 +1166,12 @@ class GanLoop:
         for g in (genids or []):
             _add(trajectory._session_file(self.output_dir, g, "task"), g)
         if session_role and outer is not None:
+            # SEAT-AWARE (docs/19 §12.11): the self seat reads its own
+            # OUTER-level files, plan/evaluate read their per-generation ones;
+            # the resolver owns both shapes, so no path is rebuilt here.
             for label, path in trajectory.session_universe(
                     self.output_dir, session_role, outer,
-                    extra_outers=session_outers):
+                    extra_outers=session_outers, seat=seat):
                 if label not in seen:
                     seen.add(label)
                     out.append((label, path))
@@ -1175,7 +1179,8 @@ class GanLoop:
 
     def _materialize_traj(self, cm_session: Any, genids: Any, outer: Any = None,
                           session_role: Optional[str] = None,
-                          session_outers: Any = None) -> None:
+                          session_outers: Any = None,
+                          seat: Optional[str] = None) -> None:
         """Snapshot the seat's visible trajectories into its CM session (one
         scan; the read tools' index face and the ctx faces then share the
         same address space). Advisory: a failure leaves the session without
@@ -1186,7 +1191,8 @@ class GanLoop:
         try:
             files = self._traj_materialization_files(genids, outer=outer,
                                                      session_role=session_role,
-                                                     session_outers=session_outers)
+                                                     session_outers=session_outers,
+                                                     seat=seat)
             if files:
                 cm_session.materialize_traj(files)
         except Exception as e:  # noqa: BLE001 -- advisory, must speak
@@ -1234,7 +1240,7 @@ class GanLoop:
             try:
                 files = self._traj_materialization_files(
                     traj_genids, outer=outer, session_role=session_role,
-                    session_outers=session_outers)
+                    session_outers=session_outers, seat=seat)
                 kept, skipped = cm_wiring.child_visible_traj(
                     files, output_dir=self.output_dir, role=role,
                     instance=instance, seat=seat, outer=outer)
@@ -1268,7 +1274,7 @@ class GanLoop:
             role, keys, outer=outer, seat=seat, instance=instance, genid=genid)
         self._materialize_traj(role_obj.cm_session, traj_genids, outer=outer,
                                session_role=session_role,
-                               session_outers=session_outers)
+                               session_outers=session_outers, seat=seat)
 
     def _seat_cm_summary(self, role_obj: Any) -> Optional[Dict[str, Any]]:
         """The settled CM summary for ONE seat call, transport-agnostic.

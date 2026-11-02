@@ -29,7 +29,8 @@ import glob
 import os
 
 from gan.framework.context import get_access_context
-from gan.framework.trajectory import outer_session_index, read_session, session_label
+from gan.framework.trajectory import (outer_session_index, read_session,
+                                      session_label, session_universe)
 from agent.tools.clip import clip_head
 
 
@@ -154,37 +155,35 @@ def _quarantine_note(labels):
             "events.jsonl session_redaction_failed): " + ", ".join(labels))
 
 
-def _session_entries(output_dir, current_outer, outers, role, genid):
+def _session_entries(output_dir, current_outer, outers, role, genid,
+                     *, seat=None):
     """The visible session files as ``(label, path)`` pairs.
 
-    Labels come from ``trajectory.session_label`` — the ONE label rule shared
-    with trajectory materialization (genid-qualified for the current outer,
-    outer-prefixed for other declared outers) so this fallback and the
-    session's materialized index address the same files identically.
-    ``genid`` may carry an ``outer_<O>/`` prefix; a bare genid narrows to the
-    CURRENT outer only. Canonical + attempt siblings per genid, newest first
-    (mirrors trajectory.read_session)."""
-    try:
-        req_outer, req_genid = _parse_genid_ref(genid, current_outer)
-    except ValueError:
-        raise
-    scan_outers = [str(req_outer)] if req_genid is not None \
-        else [str(o) for o in outers]
-    out = []
-    for o in scan_outers:
-        d = os.path.join(output_dir, "trajectory", f"outer_{o}")
-        if req_genid is not None:
-            genids = [req_genid]
-        else:
-            genids = [str(e["genid"])
-                      for e in outer_session_index(output_dir, o, role)]
-        for g in genids:
-            for p in sorted(glob.glob(os.path.join(d, g, f"{role}*.jsonl")),
-                            reverse=True):
-                if os.path.isfile(p):
-                    out.append((session_label(current_outer, o, g,
-                                              os.path.basename(p)), p))
-    return out
+    Built from ``trajectory.session_universe`` — the ONE resolver shared with
+    trajectory materialization, so this fallback and the session's
+    materialized index address the same files identically (the hand-rolled
+    legacy glob that used to live here rebuilt paths that a seat-keyed run
+    never writes: docs/19 §12.12 F1). ``genid`` may carry an ``outer_<O>/``
+    prefix; a bare genid narrows to the CURRENT outer only."""
+    req_outer, req_genid = _parse_genid_ref(genid, current_outer)
+    extras = [o for o in ([req_outer] if req_genid is not None
+                          else list(outers))
+              if str(o) != str(current_outer)]
+    pairs = session_universe(output_dir, role, current_outer,
+                             extra_outers=extras, seat=seat)
+    if req_genid is None:
+        return pairs
+    # genid narrowing: a label is ``<genid>/<file>`` (or
+    # ``outer_<O>/<genid>/<file>``) for per-generation seats and a bare file
+    # name for the self seat, whose files are outer-level.
+    want = str(req_genid)
+    keep = []
+    for label, path in pairs:
+        head = label.split("/")[0]
+        if head == want or (head.startswith("outer_") and
+                            label.split("/")[1:2] == [want]):
+            keep.append((label, path))
+    return keep
 
 
 def _active_traj_session():
@@ -279,19 +278,41 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
                 req_outer, req_genid = _parse_genid_ref(genid, outer)
             except ValueError as e:
                 return f"Error: {e}"
-            blob = broker.read_session_trajectory(role, actx.node_id, req_outer,
-                                                  req_genid, cap, seat=actx.seat)
+            try:
+                blob = broker.read_session_trajectory(
+                    role, actx.node_id, req_outer, req_genid, cap,
+                    seat=actx.seat)
+            except PermissionError as e:
+                # A refusal is DATA, not an exception the agent has to decode
+                # (docs/19 §12.11: every out-of-set request is refused and the
+                # refusal is reported).
+                return (f"Error: {e}\n"
+                        f"(your session may read outers: {outers})")
             if not blob:
                 return f"No session trajectory for genid {genid}."
             where = "" if str(req_outer) == str(outer) else f" (outer_{req_outer})"
             return extra + note + f"# your session genid={req_genid}{where}\n{blob}"
         pairs = []
-        for o in outers:
-            idx = broker.session_trajectory_index(role, actx.node_id, o,
-                                                  seat=actx.seat)
-            for e in (idx or []):
-                pairs.append((session_label(outer, o, e["genid"], f"{role}.jsonl"),
-                              o, e["genid"]))
+        try:
+            for o in outers:
+                idx = broker.session_trajectory_index(role, actx.node_id, o,
+                                                      seat=actx.seat)
+                for e in (idx or []):
+                    if e.get("quarantined"):
+                        continue
+                    # Two row shapes, because the two seats write differently:
+                    # the self seat's files are OUTER-level (name-addressed),
+                    # plan/evaluate's are per-generation (genid-addressed).
+                    if e.get("name") and e.get("genid") is None:
+                        pairs.append((session_label(outer, o, None, e["name"]),
+                                      o, None))
+                    else:
+                        pairs.append((session_label(outer, o, e["genid"],
+                                                    f"{role}.jsonl"),
+                                      o, e["genid"]))
+        except PermissionError as e:
+            return (f"Error: {e}\n"
+                    f"(your session may read outers: {outers})")
         if not pairs:
             return "No session trajectories in your visible outers yet."
         blob = "\n\n".join(
@@ -307,7 +328,8 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
     if not output_dir:
         return "Error: parent trajectory root is unavailable"
     try:
-        entries = _session_entries(output_dir, outer, outers, role, genid)
+        entries = _session_entries(output_dir, outer, outers, role, genid,
+                                   seat=getattr(actx, "seat", None))
     except ValueError as e:
         return f"Error: {e}"
     labels = {label for label, _p in entries}

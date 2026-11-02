@@ -383,6 +383,70 @@ def _walk_tree(root_fd: int, visit: Any) -> None:
     visit(root_fd, os.fstat(root_fd))
 
 
+def _traj_label(instance: Any, outer: Any) -> str:
+    """The instance-derived trajectory label (``2`` main, ``2_eval`` eval round).
+
+    ONE rule shared with ``BaseRole.traj_outer`` and
+    ``role_process._prepare_paths`` so all three resolve the same tree."""
+    text = str(instance or "")
+    if text.startswith("outer_"):
+        return text.split("_", 1)[1]
+    return str(outer)
+
+
+def _seat_mounts(role: str, seat: str, instance: Any, outer: Any) -> Tuple[List[str], List[str]]:
+    """The seat's (writable, readonly) output-relative mount roots.
+
+    Pure (no filesystem access) so the allocation is assertable offline. The
+    readonly half carries exactly two things (docs/19 §12.11 decisions):
+    - the self seat's PREVIOUS-outer own-session directory, so CM can
+      materialize "read your own last outer" (the tool could already read it
+      through the broker; materialization needs a real mount);
+    - the evaluate seat's workspace copy: its LOGICAL read roots include the
+      task source but ``SEAT_WRITE`` is empty, so it gets a read-only view
+      instead of the planner's writable one.
+    """
+    writable = [
+        os.path.join("toolsets", role, instance, seat),
+        os.path.join("logs", "roles", role, instance, seat),
+        os.path.join("trajectory", f"outer_{_traj_label(instance, outer)}",
+                     "roles", role, seat),
+    ]
+    if seat != "evaluate":
+        writable.insert(0, os.path.join("workspaces", role, f"{instance}__{seat}"))
+    if seat == "self_improve":
+        writable.append(os.path.join("ckpt", "design", role))
+    readonly: List[str] = []
+    if seat == "evaluate":
+        readonly.append(os.path.join("workspaces", role, f"{instance}__{seat}"))
+    if seat == "self_improve":
+        try:
+            o = int(outer)
+        except (TypeError, ValueError):
+            o = 0
+        if o > 1:
+            readonly.append(os.path.join("trajectory", f"outer_{o - 1}", "roles",
+                                         role, seat))
+    return writable, readonly
+
+
+def _grant_tree_readonly(root_fd: int, setfacl: str, owner_uid: int, role_uid: int,
+                         allowed_uids: set) -> None:
+    """Read-only counterpart of ``_grant_tree``: ``r-x`` for the seat uid.
+
+    Directories also get a DEFAULT entry so files that appear later (a deep
+    ``request_source_access(view)`` grant copies into the evaluate workspace
+    AFTER launch) are readable without a second ACL pass."""
+    def grant(fd: int, info: os.stat_result) -> None:
+        if info.st_uid not in allowed_uids:
+            raise RuntimeError("role readonly tree contains an unexpected owner")
+        if stat.S_ISDIR(info.st_mode):
+            _setfacl(setfacl, fd, "-m", f"u:{role_uid}:r-x,d:u:{role_uid}:r-x")
+        else:
+            _setfacl(setfacl, fd, "-m", f"u:{role_uid}:r--")
+    _walk_tree(root_fd, grant)
+
+
 def _grant_tree(root_fd: int, setfacl: str, owner_uid: int, role_uid: int,
                 allowed_uids: set[int]) -> None:
     def grant(fd: int, info: os.stat_result) -> None:
@@ -751,22 +815,11 @@ class _RoleBrokerState:
             self._finish_failed_launch(scope, [], launched=False)
             raise
         outer = int(scope["outer"])
-        # Trajectory write root follows the INSTANCE tag (D1): main "outer_N"
-        # -> "outer_N" (unchanged), suffixed eval-round instances
-        # "outer_N_eval" -> their own tree. Mirrors
-        # BaseRole.traj_outer (the writer) and role_process._prepare_paths
-        # (the pre-creation), so all three resolve the SAME root.
-        traj_root = (f"outer_{instance.split('_', 1)[1]}"
-                     if instance.startswith("outer_") else f"outer_{outer}")
-        writable = [
-            os.path.join("toolsets", role, instance, seat),
-            os.path.join("logs", "roles", role, instance, seat),
-            os.path.join("trajectory", traj_root, "roles", role, seat),
-        ]
-        if seat != "evaluate":
-            writable.insert(0, os.path.join("workspaces", role, f"{instance}__{seat}"))
-        if seat == "self_improve":
-            writable.append(os.path.join("ckpt", "design", role))
+        # Trajectory write root follows the INSTANCE tag (D1); ``_traj_label``
+        # is the ONE rule shared with BaseRole.traj_outer and
+        # role_process._prepare_paths, so all three resolve the SAME root and
+        # the mount allocation is a pure, assertable table.
+        writable, readonly = _seat_mounts(role, seat, instance, outer)
 
         try:
             output_fd = _open_dir(output_dir)
@@ -794,6 +847,7 @@ class _RoleBrokerState:
         # projection root; all projected files remain read-only.
         _setfacl(str(cfg["setfacl"]), runtime_fd, "-m", f"u:{role_uid}:r-x")
         writable_fds: List[int] = []
+        readonly_dir_fds: List[int] = []
         readonly_file_fds: List[int] = []
         secret_fds: List[int] = []
         traverse_entries: List[Tuple[int, Tuple[int, int, int]]] = []
@@ -811,6 +865,23 @@ class _RoleBrokerState:
                 fd = _open_beneath(output_fd, relative, allowed_uids)
                 writable_fds.append(fd)
                 _grant_tree(fd, str(cfg["setfacl"]), owner_uid, role_uid, allowed_uids)
+                parent_fds = _open_parent_dirs(output_fd, relative, allowed_uids)
+                traverse_entries.extend(
+                    self._acquire_traverse(parent_fds, str(cfg["setfacl"]), role_uid)
+                )
+            for relative in readonly:
+                # Read-only counterpart. The evaluate workspace is created by
+                # _prepare_paths before launch; the self seat's PREVIOUS-outer
+                # tree exists only when that outer actually ran a self session
+                # (a resumed/aborted outer may never have written one). A
+                # missing optional root is SKIPPED (advisory, like every other
+                # trajectory-shape gap) rather than failing the launch.
+                if not os.path.isdir(os.path.join(output_dir, relative)):
+                    continue
+                rfd = _open_beneath(output_fd, relative, allowed_uids)
+                readonly_dir_fds.append(rfd)
+                _grant_tree_readonly(rfd, str(cfg["setfacl"]), owner_uid, role_uid,
+                                     allowed_uids)
                 parent_fds = _open_parent_dirs(output_fd, relative, allowed_uids)
                 traverse_entries.extend(
                     self._acquire_traverse(parent_fds, str(cfg["setfacl"]), role_uid)
@@ -879,6 +950,9 @@ class _RoleBrokerState:
             for relative, fd in zip(writable, writable_fds):
                 _add_empty_parents(command, os.path.join(output_dir, relative), created)
                 command.extend(["--bind", f"/proc/self/fd/{fd}", os.path.join(output_dir, relative)])
+            for relative, fd in zip(readonly, readonly_dir_fds):
+                _add_empty_parents(command, os.path.join(output_dir, relative), created)
+                command.extend(["--ro-bind", f"/proc/self/fd/{fd}", os.path.join(output_dir, relative)])
             command.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"])
             proxy_socket = str(cfg["proxy_socket"])
             _add_empty_parents(command, proxy_socket, created)
@@ -905,7 +979,8 @@ class _RoleBrokerState:
                 str(cfg["python"]), "-m", "gan.framework.role_process", "--worker",
             ])
             pass_fds = tuple([
-                output_fd, runtime_fd, *writable_fds, *readonly_file_fds, *secret_fds,
+                output_fd, runtime_fd, *writable_fds, *readonly_dir_fds,
+                *readonly_file_fds, *secret_fds,
             ])
             process = subprocess.Popen(
                 _setpriv_command(str(cfg["setpriv"]), role_uid, role_gid, command),
@@ -924,7 +999,7 @@ class _RoleBrokerState:
             self._traverse_by_pid[process.pid] = traverse_entries
             self._mark_active(scope, process.pid)
             traverse_entries = []
-            return process, [output_fd, runtime_fd, *writable_fds]
+            return process, [output_fd, runtime_fd, *writable_fds, *readonly_dir_fds]
         except Exception as launch_error:
             reclaim_errors = []
             if process is not None and process.poll() is None:
@@ -934,7 +1009,7 @@ class _RoleBrokerState:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=5)
-            for fd in writable_fds:
+            for fd in writable_fds + readonly_dir_fds:
                 try:
                     _reclaim_tree(fd, str(cfg["setfacl"]), owner_uid, owner_gid, role_uid)
                 except Exception as exc:
@@ -944,7 +1019,7 @@ class _RoleBrokerState:
                     self._release_output_acl(role, output_fd, role_uid)
                 except Exception as exc:
                     reclaim_errors.append(str(exc))
-            for fd in [output_fd, runtime_fd, *writable_fds,
+            for fd in [output_fd, runtime_fd, *writable_fds, *readonly_dir_fds,
                        *readonly_file_fds, *secret_fds]:
                 try:
                     os.close(fd)
