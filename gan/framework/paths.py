@@ -169,21 +169,28 @@ def cost_sessions_path(output_dir: str) -> str:
     return os.path.join(logs_dir(output_dir), "cost_sessions.jsonl")
 
 
-# The task child's CM seam sidecar name. FIXED (not per-generation): the
-# broker pins the child env statically, the harness binds it as
-# ``/workspace/cm_events.jsonl``, and the run-tree ACL lease grants write
-# permission to exactly this one name (see ``_TaskRunLease._grant``).
+# The task child's CM seam sidecar name. FIXED: the broker pins the child env
+# statically and the harness binds it as ``/workspace/cm_events.jsonl``.
 CM_EVENTS_NAME = "cm_events.jsonl"
 
 
-def cm_events_path(run_dir: str) -> str:
-    """The task child's CM seam-event sidecar (docs/10 §11.5): pre-created by
-    ``assemble_task_env`` under the (ephemeral) run dir, rw-bound into the
-    sandbox at ``/workspace/cm_events.jsonl``, appended by the child's session
-    emit sink and folded into ``logs/events.jsonl`` (role=task attribution)
-    by ``DomainTaskRunner._ingest_cm_events``. Not an output-dir path — it
-    lives and dies with the pruned work dir."""
-    return os.path.join(run_dir, CM_EVENTS_NAME)
+def task_cm_events_path(run_dir: str, run_id: str) -> str:
+    """Host path of the task child's CM seam-event sidecar (docs/10 §11.5).
+
+    It lives in the harness OUTPUT tree (``<run_dir>/outputs/<run_id>/``),
+    not next to the run-dir inputs, and that placement is FORCED by the
+    sandbox: inside the harness namespace the run dir is a ``--ro-bind``
+    while the output tree is a rw ``--bind``. The harness stages the sidecar
+    (owned by the sandbox uid), binds it at ``/workspace/cm_events.jsonl``,
+    and appends the child's lines back HERE after every question. Writing
+    them next to the run dir was impossible by construction — the write
+    failed with EROFS and the failure was invisible because the harness's
+    stderr is discarded on a successful question (CM-02).
+
+    Lives and dies with the pruned work dir; excluded from every patch
+    (``_RUNTIME_SIDECARS``) because the output tree is the polyglot workspace.
+    """
+    return os.path.join(run_dir, "outputs", run_id, CM_EVENTS_NAME)
 
 
 def tree_path(output_dir: str, name: str) -> str:

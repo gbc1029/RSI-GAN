@@ -473,7 +473,8 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None,
 
 
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
-                         reasoning_effort=None, cost_overrides=None):
+                         reasoning_effort=None, cost_overrides=None,
+                         cm_events_target=None):
     # Private run ancestors deliberately remain non-traversable to the
     # sandbox uid. Bubblewrap also cannot reliably open bind sources through
     # /proc/self/fd, so stage only the allowlisted inputs in a private /tmp
@@ -573,18 +574,21 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
                 timeout=QUESTION_TIMEOUT,
                 pass_fds=(result_fd,),
             )
-            # Fold the child's seam events back to the run dir BEFORE any
+            # Fold the child's seam events into the OUTPUT tree BEFORE any
             # returncode judgement: a failed question's seam activity is
-            # evidence too. A copy-back failure is reported (the run dir file
-            # is the parent's only ingest channel) and never fatal.
+            # evidence too. This is the only sandbox-writable host tree, and
+            # the parent ingests exactly this path afterwards; a write
+            # failure is reported and never fatal.
             try:
-                host_cm_events = os.path.join(run_root, "cm_events.jsonl")
+                if not cm_events_target:
+                    raise OSError("no cm_events_target configured")
                 with open(staged_cm_events, "r", encoding="utf-8") as handle:
                     staged_lines = handle.read()
                 if staged_lines.strip():
                     # APPEND, never overwrite: one harness process answers
                     # several questions and every question's sidecar is staged
                     # separately, so a copyfile would keep only the last one.
+                    host_cm_events = os.path.abspath(cm_events_target)
                     with open(host_cm_events, "a", encoding="utf-8") as handle:
                         handle.write(staged_lines)
                         if not staged_lines.endswith("\n"):
@@ -623,10 +627,16 @@ def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
     inputs = format_input_dict(row)
     _t0 = time.time()
     if sandbox_task_agent:
-        prediction = _run_sandboxed_agent(model, inputs, agent_path, chat_history_path,
-                                          proxy_socket, proxy_token,
-                                          reasoning_effort=reasoning_effort,
-                                          cost_overrides=cost_overrides)
+        prediction = _run_sandboxed_agent(
+            model, inputs, agent_path, chat_history_path,
+            proxy_socket, proxy_token,
+            reasoning_effort=reasoning_effort,
+            cost_overrides=cost_overrides,
+            # The OUTPUT tree (parent of agent_evals) is the only tree that
+            # is read-write INSIDE the sandbox namespace, so the seam sidecar
+            # is folded back there, never next to the run-dir inputs.
+            cm_events_target=os.path.join(os.path.dirname(evals_folder),
+                                          "cm_events.jsonl"))
         print(f"[timing] question {question_id}: {time.time() - _t0:.1f}s "
               f"(budget {QUESTION_TIMEOUT}s, {'blank' if not str(prediction).strip() else 'prediction produced'})",
               flush=True)

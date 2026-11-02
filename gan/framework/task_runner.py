@@ -242,7 +242,7 @@ class DomainTaskRunner:
         except Exception as e:  # noqa: BLE001 -- audit write failure: stderr covers
             print(f"[WARN] {event_type} event write failed: {e}")
 
-    def _ingest_cm_events(self, run_dir: str, genid: Any) -> None:
+    def _ingest_cm_events(self, run_dir: str, run_id: str, genid: Any) -> None:
         """Fold the child's CM seam-event sidecar into events.jsonl (docs/10
         §11.5): each line is re-emitted with role=task attribution so the
         per-generation cost record and the offline reconcilers see the seam
@@ -252,7 +252,9 @@ class DomainTaskRunner:
         the file, so absence/emptiness means the child had no seam at all)
         and gets its own event. The sidecar dies with the pruned work dir
         either way."""
-        sidecar = paths.cm_events_path(run_dir)
+        # The sidecar is written by the harness into the OUTPUT tree (the
+        # only path that is read-write inside the sandbox namespace).
+        sidecar = paths.task_cm_events_path(run_dir, run_id)
         if not os.path.isfile(sidecar):
             self._event("cm_events_ingest_empty", genid=str(genid),
                         reason="sidecar file missing (child never created "
@@ -599,7 +601,7 @@ class DomainTaskRunner:
         # Context-management audit exit (docs/10 §11.5): fold the child's
         # seam events into events.jsonl on EVERY post-harness path (the child
         # may have run a seam session even when scoring later failed).
-        self._ingest_cm_events(run_dir, genid)
+        self._ingest_cm_events(run_dir, run_id, genid)
         # Persist per-question failure diagnostics into runs/<genid>/: the work
         # dir is pruned at generation end, so anything left only under an
         # outputs/<run_id>/agent_evals directory dies before it can be read.

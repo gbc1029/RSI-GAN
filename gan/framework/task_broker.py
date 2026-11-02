@@ -301,8 +301,10 @@ class _TaskBrokerState:
             # timeout (observed: every driver-mode round ran the task child
             # with NO seam at all; the worker's cwd fallback pointed at the
             # scratch tmpfs, where ``.gan_runtime`` does not exist). Paths
-            # mirror assemble_task_env; the sidecar is pre-created
-            # parent-side BEFORE this launch, so the rw-bind source exists.
+            # mirror assemble_task_env. The sidecar itself is NOT pre-created
+            # anywhere: the harness stages it in its own sandbox and folds the
+            # child's lines back into the output tree (the only tree that is
+            # read-write inside the namespace).
             "GAN_CM_CORE": "/workspace/.gan_runtime/cm",
             "GAN_CM_EVENTS": "/workspace/cm_events.jsonl",
             # Agent-owned CM modules are delivered under FIXED names, so the
