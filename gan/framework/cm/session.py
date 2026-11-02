@@ -60,13 +60,14 @@ from .blocks import (Block, Universe, View, cut, placeholder, estimate_tokens,
 WINDOW_K_FLOOR = 1
 _NOTE_PREFIX = "[gan:note]"
 _WARN_RATIO = 0.8      # budget_checkpoint warns at 80% of an active budget
-_POLICY_STRIKES = 2    # C1-class wedge breaker: 2 failures -> disabled
-# The assembly seam has its OWN knob (docs/19 §12.14): one failed attempt is
-# enough to stop re-attempting IN THIS SESSION (the module is deterministic,
-# and a retry can leak a worker thread). The framework ALSO latches at the
-# loop level (fingerprint-keyed), so a session that starts over does not
-# re-attempt a module that has not changed.
-_ASSEMBLY_STRIKES = 1
+# Agent-owned CM modules (assembly / policy) share ONE strike rule (docs/19
+# §12.17): the module is load-once per session, so a retry of the same bytes
+# is deterministic waste — and a timed-out retry leaks ANOTHER worker thread.
+# One failure (load crash, load timeout, or a run-phase failure) latches the
+# module for the session; the CROSS-session fingerprint latch owns the
+# "a fixed module deserves one fresh try" decision. The success-resets-
+# strikes rule died with the per-turn policy reload.
+_AGENT_MODULE_STRIKES = 1
 _KIND_FOR_ROLE = {"tool": "tool_output"}
 # view artifacts carry this marker prefix (placeholder/template/excerpt
 # suffix) — history entries showing it are re-bound to their block, never
@@ -96,6 +97,61 @@ def _foreign_thread_count() -> int:
             continue
         n += 1
     return n
+
+
+class _ModuleLoad:
+    """Load-once state for ONE agent-owned CM module (assembly / policy).
+
+    Shared machinery (docs/19 §12.17): the module is loaded ONCE per
+    session, under the SAME exec budget as its execution — module-level
+    code is agent code, so a top-level hang is a load-phase timeout and a
+    top-level crash is a load-phase failure; BOTH are strike-counted
+    (byte-identical retries are deterministic waste). The cache holds
+    FAILURE too: a mid-session edit must not change the seam. The cache
+    holds the MODULE, never a run result — apply/assemble still execute
+    every turn.
+
+    ``loader(path, exec_ms)`` is the side's timed loader; it raises the
+    side's ``timeout_exc`` on budget overrun and lets load crashes
+    propagate — the classification (crash vs timeout) is what the session
+    strikes on, uniformly for both kinds."""
+
+    __slots__ = ("kind", "path", "loader", "timeout_exc",
+                 "result", "failed", "error", "timed_out")
+
+    def __init__(self, kind: str, path: Optional[str], loader: Callable,
+                 timeout_exc: type) -> None:
+        self.kind = kind
+        self.path = path
+        self.loader = loader
+        self.timeout_exc = timeout_exc
+        self.result: Optional[Tuple[Any, Dict[str, Callable], List[str]]] = None
+        self.failed = False
+        self.error = ""
+        self.timed_out = False
+
+    @property
+    def armed(self) -> bool:
+        return self.path is not None
+
+    def ensure(self, exec_ms: int
+               ) -> Optional[Tuple[Any, Dict[str, Callable], List[str]]]:
+        """Load once (timed). Returns the loader result, or None with
+        ``failed``/``error``/``timed_out`` set (the failure is cached)."""
+        if self.failed:
+            return None
+        if self.result is not None:
+            return self.result
+        try:
+            self.result = self.loader(self.path, exec_ms)
+        except self.timeout_exc as e:
+            self.failed = True
+            self.timed_out = True
+            self.error = str(e)[:160]
+        except Exception as e:  # noqa: BLE001 -- classified by the caller
+            self.failed = True
+            self.error = str(e)[:160]
+        return self.result
 
 
 def _parse_view_marker(content: str) -> Optional[str]:
@@ -490,9 +546,15 @@ class CMSession:
     _assembly_last_error: Dict[str, Any] = field(default_factory=dict,
                                                  repr=False, compare=False)
     _portal_cache: Any = field(default=None, repr=False, compare=False)
-    _named_fn: Optional[Callable] = field(default=None, repr=False,
-                                          compare=False)
-    _named_failed: bool = field(default=False, repr=False, compare=False)
+    # load-once state, one instance per agent-owned CM module kind (docs/19
+    # §12.17): caches the MODULE (success AND failure) — apply/assemble still
+    # run every turn.
+    _assembly_load: Optional["_ModuleLoad"] = field(default=None, repr=False,
+                                                    compare=False)
+    _policy_load: Optional["_ModuleLoad"] = field(default=None, repr=False,
+                                                  compare=False)
+    _policy_last_error: Dict[str, Any] = field(default_factory=dict,
+                                               repr=False, compare=False)
     _assembly_ignored: bool = field(default=False, repr=False, compare=False)
     _turn_degraded: bool = field(default=False, repr=False, compare=False)
     _view_emitted_turn: Optional[int] = field(default=None, repr=False,
@@ -598,6 +660,18 @@ class CMSession:
                     "phase": self._assembly_last_error.get("phase"),
                     "where": str(self._assembly_last_error.get("where") or ""),
                 }
+        # policy_report (docs/19 §12.17): same contract as assembly_report —
+        # actionable "fix this module" facts for the NEXT self-improve
+        # session; absence = the policy has never failed.
+        if self.policy_path and self._policy_last_error:
+            out["policy_report"] = {
+                "stem": os.path.basename(str(self.policy_path)).split(".")[0],
+                "failures": self.policy_failures,
+                "disabled": self.policy_disabled,
+                "last_error": str(self._policy_last_error.get("error") or "")[:160],
+                "phase": self._policy_last_error.get("phase"),
+                "where": str(self._policy_last_error.get("where") or ""),
+            }
         if self.traj_index is not None:
             out["traj_segments"] = len(self.traj_segments)
         return out
@@ -849,44 +923,36 @@ class CMSession:
         return fn(self, msgs, outgoing, tokens_used, budget)
 
     def _load_named(self) -> Optional[Callable]:
-        """Load the named assembly ONCE per session; the result is cached
-        INCLUDING failure (no mid-session hot reload — a self_improve
-        session editing its own assembly must not change its own seam
-        mid-flight). The load runs under the SAME per-turn budget as the
-        execution (CM-03: module-level code is agent code — ``exec_module``
-        executes it before ``assemble`` is ever called), so a top-level hang
-        becomes a load-phase ``AssemblyTimeout`` instead of a session hung
-        outside every budget. A load failure speaks exactly once
-        (``cm_assembly_fallback``) and the baseline preset runs for the
-        whole session; ``summary()`` shows ``assembly_active: false``."""
+        """Load the named assembly ONCE per session (docs/19 §12.17): the
+        load runs under the SAME exec budget as the execution, the cache
+        holds success AND failure, and a mid-session edit must not change
+        the seam. A load failure — CRASH or timeout, both strike-counted
+        (byte-identical retries are deterministic waste; a crash used to
+        speak once and never strike, so the feedback loop could not tell
+        the author) — fails the session open to the baseline preset;
+        ``summary()`` shows ``assembly_active: false`` and the failure
+        facts ride ``assembly_report``."""
         if self.assembly_path is None:
             return None
-        if self._named_fn is None and not self._named_failed:
-            try:
-                fn, methods, method_problems = assembly.timed_load_assembly(
-                    self.assembly_path, self.assembly_exec_ms)
-                self._named_fn = fn
-                self._merge_methods(methods, method_problems,
-                                    source="assembly")
-            except assembly.AssemblyTimeout as e:
-                # CM-03: the module's TOP-LEVEL code hit the exec budget.
-                # Strike-counted (one failure latches the session — the
-                # load is deterministic, a retry would leak another worker
-                # thread) + fail-open to the preset, exactly like a run-
-                # phase failure; the leaked thread shows up in the session's
-                # leak counters.
-                self._named_failed = True
-                self._note_assembly_failure(str(e)[:160], phase="load",
-                                            timed_out=True)
-                self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
-                            "mode": self.mode, "to": self.mode,
-                            "reason": str(e)[:160]})
-            except Exception as e:  # noqa: BLE001 -- fail-open, loudly, once
-                self._named_failed = True
-                self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
-                            "mode": self.mode, "to": self.mode,
-                            "reason": str(e)[:160]})
-        return self._named_fn
+        if self._assembly_load is None:
+            self._assembly_load = _ModuleLoad(
+                "assembly", self.assembly_path,
+                assembly.timed_load_assembly, assembly.AssemblyTimeout)
+        st = self._assembly_load
+        first = st.result is None and not st.failed
+        result = st.ensure(self.assembly_exec_ms)
+        if st.failed and result is None:
+            # one strike, one event pair — crash and timeout alike
+            self._note_assembly_failure(st.error, phase="load",
+                                        timed_out=st.timed_out)
+            self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                        "mode": self.mode, "to": self.mode,
+                        "reason": st.error})
+            return None
+        fn, methods, method_problems = result
+        if first:
+            self._merge_methods(methods, method_problems, source="assembly")
+        return fn
 
     def _merge_methods(self, methods: Dict[str, Callable],
                        problems: List[str], source: str) -> None:
@@ -1077,7 +1143,7 @@ class CMSession:
                     "struck": self._assembly_strikes,
                     "where": where,
                     "fallback": self.mode})
-        if self._assembly_strikes >= _ASSEMBLY_STRIKES:
+        if self._assembly_strikes >= _AGENT_MODULE_STRIKES:
             self.assembly_disabled = True
             self._emit({"type": "cm_assembly_disabled", "turn": self.turn,
                         "strikes": self._assembly_strikes})
@@ -1204,26 +1270,53 @@ class CMSession:
 
     # -- policy segment -----------------------------------------------------------
     def run_policy(self) -> List[Dict[str, Any]]:
-        """Run the custom policy module (fail-open; wedge breaker)."""
+        """Run the custom policy module (fail-open; ONE-strike latch).
+
+        The module is loaded ONCE per session (``_ModuleLoad``; cached with
+        its failure — a mid-session edit must not change the seam) and
+        ``apply`` executes EVERY turn under the per-turn budget: load-once
+        caches the MODULE, never the run result (docs/19 §12.17). One
+        failure — load crash, load timeout, or a run-phase failure —
+        disables the policy for the session; the failure facts ride
+        ``policy_report`` for the next self-improve session."""
         if self.policy_disabled:
             return [{"op": "policy", "ok": False,
                      "error": "policy disabled for this session"}]
-        from .failopen import (PolicyMissing, PolicyTimeout,
-                               run_policy as _run_policy_module)
+        if self.policy_path is None:
+            # configuration signal, NOT a module failure: the build rewrites
+            # custom when nothing is deliverable, so this is only reachable
+            # by direct construction. Nothing struck, nothing latched.
+            return [{"op": "policy", "ok": False,
+                     "error": "no policy configured for this session"}]
+        from .failopen import (PolicyTimeout, apply_policy as _apply_policy,
+                               timed_load_policy as _timed_load_policy)
+        if self._policy_load is None:
+            self._policy_load = _ModuleLoad(
+                "policy", self.policy_path,
+                _timed_load_policy, PolicyTimeout)
+        st = self._policy_load
+        first = st.result is None and not st.failed
+        result = st.ensure(self.policy_exec_ms)
+        if st.failed and result is None:
+            self._note_policy_failure(st.error, phase="load",
+                                      timed_out=st.timed_out)
+            return [{"op": "policy", "ok": False, "error": "policy failed"}]
+        apply_fn, methods, method_problems = result
+        if first and not self._methods_policy_done:
+            # assembly registrations take precedence (shadowed policy names
+            # refuse with a recorded reason)
+            self._methods_policy_done = True
+            self._merge_methods(methods, method_problems, source="policy")
         handle = ViewHandle(self, "policy")
         try:
-            records, over_ms, methods, method_problems = \
-                _run_policy_module(self.policy_path, handle,
-                                   self.policy_exec_ms)
+            records, over_ms = _apply_policy(apply_fn, handle,
+                                             self.policy_exec_ms)
+        except PolicyTimeout as e:
+            self._note_policy_failure(str(e)[:160], phase="timeout",
+                                      timed_out=True, exc=e)
+            return [{"op": "policy", "ok": False, "error": "policy failed"}]
         except Exception as e:  # noqa: BLE001 -- fail-open, never break the session
-            # CM-03: the budget covers load+apply, so a module-level hang
-            # surfaces here as a timeout (leak counted), a missing/crashed
-            # module as a load-stage failure, anything else as run-stage.
-            phase = ("timeout" if isinstance(e, PolicyTimeout)
-                     else "load" if isinstance(e, PolicyMissing)
-                     else "run")
-            self._note_policy_failure(str(e)[:160], phase=phase,
-                                      timed_out=isinstance(e, PolicyTimeout))
+            self._note_policy_failure(str(e)[:160], phase="run", exc=e)
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         if over_ms:
             self._emit({"type": "cm_policy_overrun", "turn": self.turn,
@@ -1243,31 +1336,35 @@ class CMSession:
                 self._note_policy_failure("policy returned a non-dict record")
                 return [{"op": "policy", "ok": False,
                          "error": "policy returned a non-dict record"}]
-        self._policy_strikes = 0
-        # Harvest the policy's METHODS once per session (a crashing first
-        # turn leaves the flag unset — the next successful load retries);
-        # assembly registrations take precedence (shadowed policy names
-        # refuse with a recorded reason).
-        if not self._methods_policy_done:
-            self._methods_policy_done = True
-            self._merge_methods(methods, method_problems, source="policy")
         return records
 
     def _note_policy_failure(self, error: str, phase: str = "run",
-                             timed_out: bool = False) -> None:
-        """One policy failure: count + emit, and disable after 2 strikes
-        (C1-class wedge breaker; docs/10 §5.2 分三). ``phase`` distinguishes
-        load-stage from run-stage from budget-timeout failures (CM-03: the
-        budget covers load+apply, so a module-level hang surfaces as
-        phase="timeout"); ``timed_out`` marks the leaked worker thread in
-        the session's leak counters."""
+                             exc: Any = None, timed_out: bool = False) -> None:
+        """One policy failure: count + emit + ONE-strike latch (docs/19
+        §12.17 — the module is load-once, so byte-identical retries are
+        deterministic waste; the success-resets-strikes rule died with the
+        per-turn reload). ``phase`` distinguishes load/run/timeout;
+        ``timed_out`` marks the leaked worker thread. The failure facts
+        ride ``policy_report`` for the next self-improve session."""
         self.policy_failures += 1
         self._policy_strikes += 1
         if timed_out:
             self.thread_leaks += 1
+        where = ""
+        if exc is not None and phase == "run":
+            try:
+                import traceback
+                frames = traceback.extract_tb(exc.__traceback__)
+                if frames:
+                    where = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+            except Exception:  # noqa: BLE001 -- diagnostics only
+                where = ""
+        self._policy_last_error = {"error": str(error), "phase": phase,
+                                   "where": where}
         self._emit({"type": "cm_policy_failed", "turn": self.turn,
-                    "phase": phase, "error": error})
-        if self._policy_strikes >= _POLICY_STRIKES:
+                    "phase": phase, "error": error, "where": where,
+                    "struck": self._policy_strikes})
+        if self._policy_strikes >= _AGENT_MODULE_STRIKES:
             self.policy_disabled = True
             self._emit({"type": "cm_policy_disabled", "turn": self.turn,
                         "strikes": self._policy_strikes})
