@@ -265,17 +265,25 @@ def build_gan_loop(
     # The loop's per-instantiation attempt id rides along so the role binds its
     # OUTER-level trajectory file to the attempt-keyed name at construction
     # (session content and stop records share one file; see loop._refresh_roles).
+    # CM-03 L2-01: seat-call inactivity watchdog (loop.role_inactivity_
+    # timeout_s). Must exceed the longest legit frame gap: LLM calls are
+    # capped by llm_client_timeout_s (600), tools by tool_call_timeout_s
+    # (600); the default gives 50% headroom over both.
+    role_inactivity_timeout_s = cfg.get("loop.role_inactivity_timeout_s", 900)
+
     def _planner_factory(outer: int, attempt: str, instance: Optional[str] = None):
         return RoleProcess("planner", p_model, output_dir,
                            instance=(instance or f"outer_{outer}"),
                            code_root=code_root, attempt_id=attempt,
-                           reasoning_effort=p_effort)
+                           reasoning_effort=p_effort,
+                           inactivity_timeout_s=role_inactivity_timeout_s)
 
     def _evaluator_factory(outer: int, attempt: str, instance: Optional[str] = None):
         return RoleProcess("evaluator", e_model, output_dir,
                            instance=(instance or f"outer_{outer}"),
                            code_root=code_root, attempt_id=attempt,
-                           reasoning_effort=e_effort)
+                           reasoning_effort=e_effort,
+                           inactivity_timeout_s=role_inactivity_timeout_s)
 
     runner = DomainTaskRunner(
         repo_root=repo_root,

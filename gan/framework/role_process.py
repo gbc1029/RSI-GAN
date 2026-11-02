@@ -38,6 +38,94 @@ class RoleProcessError(RuntimeError):
     """The role worker failed or violated its IPC contract."""
 
 
+class RoleWorkerTimeout(RoleProcessError):
+    """Seat-call inactivity watchdog fired (CM-03 L2-01): the worker child
+    produced no frame for ``loop.role_inactivity_timeout_s`` and was torn
+    down; the call converges through the seat's failure path
+    (planner_failed/evaluator_failed/self_improve degraded). The NEXT invoke
+    restarts the worker through the existing seat-switch path.
+
+    Deliberately NOT a CM latch signal: after load-in-budget (docs/19
+    §12.16) a CM module cannot hang the call, so a watchdog kill is almost
+    certainly non-CM (tool deadlock, LLM relay stall, child bug) — auto-
+    latching the assembly would mis-attribute and poison the evolution
+    feedback (user-confirmed decision)."""
+
+
+class _InvokeWatchdog:
+    """Inactivity monitor for ONE seat call (CM-03 L2-01).
+
+    No total wall clock: the child sends frames continuously while it works
+    (events, broker replies), so "no frame for N seconds" is the honest
+    no-progress signal — long but legitimate LLM/tool waits keep touching
+    it. On expiry the monitor SHUTS DOWN the channel socket, which unblocks
+    the pending buffered read; ``_invoke`` converts that into
+    :class:`RoleWorkerTimeout` and the existing unhealthy-worker teardown
+    stops the process. Monitor-side only: it never mutates role state."""
+
+    def __init__(self, proxy: "RoleProcess", seat: str, method: str,
+                 call_id: int, timeout_s: Optional[float],
+                 cm_assembly_stem: Optional[str]) -> None:
+        self._proxy = proxy
+        self._seat = seat
+        self._method = method
+        self._call_id = call_id
+        self._timeout = (float(timeout_s)
+                         if timeout_s and float(timeout_s) > 0 else None)
+        self._cm_assembly_stem = cm_assembly_stem
+        # GIL-atomic attribute: the monitor only reads it, the reader thread
+        # only overwrites it — no lock needed for a monotonic timestamp.
+        self._last = time.monotonic()
+        self._stop = threading.Event()
+        self._fired = False
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def fired(self) -> bool:
+        return self._fired
+
+    def touch(self) -> None:
+        self._last = time.monotonic()
+
+    def start(self) -> None:
+        if self._timeout is None or self._proxy._socket is None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="role-inactivity-watchdog", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            idle = time.monotonic() - self._last
+            if idle < self._timeout:
+                continue
+            self._fired = True
+            self._proxy._log_worker_event(
+                "role_session_timeout", seat=self._seat,
+                method=self._method, call_id=self._call_id,
+                idle_s=round(idle, 1), timeout_s=self._timeout,
+                # diagnosis only (user decision: NO auto-latch from a kill)
+                cm_assembly_stem=self._cm_assembly_stem,
+                action="channel_closed_worker_stopped")
+            # Unblock the pending buffered read: shutdown() unblocks a
+            # blocked recv even while makefile io_refs are held (plain
+            # close() would not). The process teardown then happens on
+            # _invoke's unhealthy-worker path.
+            sock = self._proxy._socket
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+
 def _json_bytes(value: Any) -> bytes:
     try:
         raw = json.dumps(
@@ -211,6 +299,7 @@ class RoleProcess:
         code_root: Optional[str] = None,
         attempt_id: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        inactivity_timeout_s: Optional[float] = None,
     ):
         if role not in _ROLE_METHODS:
             raise ValueError(f"unsupported role process: {role}")
@@ -223,6 +312,10 @@ class RoleProcess:
         # Thinking-intensity knob (same models.yaml entry as ``model``);
         # threaded into the child via the init message -- never env.
         self.reasoning_effort = reasoning_effort
+        # CM-03 L2-01: seat-call inactivity watchdog (loop.role_inactivity_
+        # timeout_s; None/<=0 disables — in-process/test proxies never set
+        # it). The ONLY outer bound on a hung seat call.
+        self.inactivity_timeout_s = inactivity_timeout_s
         self.tool_timeout_s: Optional[int] = None
         # CM descriptor for the NEXT call (set by the loop per seat call) and
         # the CM summary the last call PUBLISHED (event channel). Both are
@@ -484,13 +577,33 @@ class RoleProcess:
                         "cm": cm_descriptor,
                     },
                 })
+                watchdog = _InvokeWatchdog(
+                    self, seat, method, call_id, self.inactivity_timeout_s,
+                    (cm_descriptor or {}).get("assembly_stem")
+                    if isinstance(cm_descriptor, dict) else None)
+                watchdog.start()
                 while True:
                     try:
                         reply = _read_message(self._reader)
                     except EOFError as exc:
+                        if watchdog.fired:
+                            raise RoleWorkerTimeout(
+                                f"role seat call {method!r} produced no frame "
+                                f"for {self.inactivity_timeout_s}s; worker "
+                                f"stopped (CM-03 watchdog)") from exc
                         code = self._process.poll() if self._process is not None else None
                         raise RoleProcessError(
                             f"role worker exited during {method} (exit={code})") from exc
+                    except (OSError, ValueError) as exc:
+                        # the watchdog's channel shutdown surfaces here on the
+                        # buffered read; a NON-fired failure keeps the previous
+                        # behavior (raw propagate)
+                        if watchdog.fired:
+                            raise RoleWorkerTimeout(
+                                f"role seat call {method!r} hit the inactivity "
+                                f"watchdog; worker stopped (CM-03)") from exc
+                        raise
+                    watchdog.touch()
                     if reply.get("type") == "event":
                         self._handle_event(reply)
                         continue
@@ -521,12 +634,50 @@ class RoleProcess:
                     self.assembly_report = report
                     result = _validated_result(method, reply["result"])
                     call_succeeded = True
+                    self._maybe_hygiene_restart(seat, method)
                     return result
             finally:
+                watchdog.stop()
                 if not call_succeeded and not worker_healthy:
                     self._stop_worker()
                 if session_started:
                     broker.end_session(self.role, session_node)
+
+    def _maybe_hygiene_restart(self, seat: str, method: str) -> None:
+        """CM-03 T2 (docs/19 §12.16): a session whose agent CM code hit the
+        exec budget leaks its worker thread until the worker PROCESS dies
+        (Python cannot kill threads), and module-SPAWNED threads never even
+        pass through a budget. The result and summary are already in hand,
+        so the hygiene restart is POST-DELIVERY: stop + start the seat
+        worker, killing every thread it hosts. A restart failure never
+        retro-affects the delivered call — the worker state resets and the
+        NEXT invoke re-runs the restart through the seat-switch path (and
+        fails the seat only if the relaunch itself fails:
+        role_worker_restart_denied). Latch-bounded upstream (assembly first
+        failure latches the session; policy wedges after 2), so this fires
+        at most a couple of times per seat segment."""
+        summary = self.last_cm_summary
+        if not isinstance(summary, dict):
+            return
+        try:
+            leaked = (int(summary.get("thread_leaks") or 0) > 0
+                      or int(summary.get("thread_leak_delta") or 0) > 0)
+        except (TypeError, ValueError):
+            return
+        if not leaked:
+            return
+        self._log_worker_event(
+            "role_worker_restart", seat=seat, method=method,
+            reason="cm_thread_leak",
+            thread_leaks=summary.get("thread_leaks"),
+            thread_leak_delta=summary.get("thread_leak_delta"))
+        try:
+            self._stop_worker()
+            self._start_worker(seat)
+        except Exception as exc:  # noqa: BLE001 -- the delivered result stands
+            self._log_worker_event("role_worker_restart_denied", seat=seat,
+                                   reason="cm_thread_leak",
+                                   detail=str(exc)[:300])
 
     def _log_worker_event(self, event_type: str, **fields: Any) -> None:
         try:
