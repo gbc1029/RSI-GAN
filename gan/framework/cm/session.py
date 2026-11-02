@@ -1014,7 +1014,32 @@ class CMSession:
             self._portal_cache = SessionPortal(self)
         return self._portal_cache
 
-    def _snapshot_turn(self, msgs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def record_refs(self, records: List[Dict[str, Any]]) -> None:
+        """Fold the refs of already-produced stage records into the
+        recorded-refs set (docs/19 §12.18).
+
+        The policy-path P1 reconcile runs BEFORE ``finalize_turn``
+        (``count_ops``), so form changes made by the baseline stages
+        (``window_defaults`` drop placeholders, ``dedup_prefix``) would read
+        as unrecorded at snapshot time — count_ops only records their refs
+        at closure. Mirrors count_ops's condition exactly (ok + not already
+        handle-audited); the later re-recording is an idempotent set
+        update."""
+        for rec in records:
+            if (isinstance(rec, dict) and rec.get("ok")
+                    and not rec.get("_audited")):
+                refs = rec.get("refs") or []
+                if refs:
+                    self._recorded_refs.update(str(r) for r in refs)
+
+    def _snapshot_turn(self, msgs: Optional[List[Dict[str, Any]]] = None
+                       ) -> Dict[str, Any]:
+        """Snapshot the turn-mutable state (rollback target for P1).
+
+        ``msgs=None`` (the policy path without a canonical reference) skips
+        the canonical-texts layer: the view/counters/refs protection still
+        applies — only the msgs-rewrite question is unanswerable without the
+        list."""
         return {
             "forms": dict(self.view.forms),
             "rules": dict(self.view.rules),
@@ -1022,15 +1047,25 @@ class CMSession:
             # also undo a key the attempt ADDED (``content`` grafted onto an
             # entry that carries ``text`` would otherwise survive, because
             # ``_msg_text`` prefers ``content``).
-            "texts": [(_msg_text(m),
-                       ("content" if isinstance(m.get("content"), str)
-                        else "text" if isinstance(m.get("text"), str) else None),
-                       isinstance(m.get("text"), str),
-                       isinstance(m.get("content"), str))
-                      for m in (msgs or []) if isinstance(m, dict)],
+            "texts": None if msgs is None else [
+                (_msg_text(m),
+                 ("content" if isinstance(m.get("content"), str)
+                  else "text" if isinstance(m.get("text"), str) else None),
+                 isinstance(m.get("text"), str),
+                 isinstance(m.get("content"), str))
+                for m in (msgs or []) if isinstance(m, dict)],
             "counters": (self.ops_total, self.ops_applied, self.ops_refused,
                          self.violations, self.est_chars_saved),
             "refs": set(self._recorded_refs),
+            # pinned FLAG of every block existing at snapshot time (docs/19
+            # §12.18: the restore surface covers the pre-existing pins — a
+            # crashed attempt's pin/unpin of an EXISTING block is undone).
+            # Blocks the attempt REGISTERED (note blocks are auto-pinned)
+            # stay as-is: the universe is add-only, and a note's block and
+            # its ``notes`` entry must stay consistent (notes persist by
+            # design — scratchpad semantics).
+            "pinned_state": {bid: block.pinned
+                             for bid, block in self.universe.blocks.items()},
         }
 
     def _restore_turn(self, snap: Optional[Dict[str, Any]],
@@ -1048,8 +1083,21 @@ class CMSession:
              self.violations, self.est_chars_saved)
         self._recorded_refs.clear()
         self._recorded_refs.update(snap.get("refs") or ())
+        # pinned flags of blocks that EXISTED at snapshot time (docs/19
+        # §12.18): the attempt's pin/unpin of a pre-existing block is undone;
+        # blocks it registered (note blocks) stay as-is — the universe is
+        # add-only and note blocks must keep their auto-pin.
+        pinned_state = snap.get("pinned_state") or {}
+        for bid, was_pinned in pinned_state.items():
+            block = self.universe.blocks.get(bid)
+            if block is not None:
+                block.pinned = bool(was_pinned)
         # canonical: put the original text back where the attempt rewrote it
-        texts = snap.get("texts") or []
+        # (``texts is None`` = the snapshot carried no canonical reference —
+        # the policy path without ``msgs``; the layer is simply skipped)
+        texts = snap.get("texts")
+        if texts is None:
+            return
         for i, entry in enumerate(msgs or []):
             if i >= len(texts) or not isinstance(entry, dict):
                 continue
@@ -1061,7 +1109,8 @@ class CMSession:
                 entry[key] = value
 
     def _reconcile_turn(self, msgs: List[Dict[str, Any]],
-                        snap: Optional[Dict[str, Any]]
+                        snap: Optional[Dict[str, Any]],
+                        check_closure: bool = True
                         ) -> List[Tuple[str, List[str]]]:
         """The three seam-contract questions (docs/19 §12.14).
 
@@ -1069,6 +1118,12 @@ class CMSession:
         2. a pinned block may only be ``full`` (or ``dedup``: the prefix-elision
            form, which loses only the repeated header);
         3. the canonical history must be untouched.
+
+        ``check_closure=False`` (the POLICY path) skips the turn-closure
+        question: a policy's ops are closed by ``assemble_custom``'s
+        ``finalize_turn`` AFTER ``run_policy`` returns, so asking "did this
+        turn close through the post segment" inside the policy would
+        false-positive on every legitimate op (docs/19 §12.18).
         """
         out: List[Tuple[str, List[str]]] = []
         recorded = set(self._recorded_refs)
@@ -1080,20 +1135,22 @@ class CMSession:
         # Turn closure: a turn that CHANGED the view must have closed through
         # the post segment (``finalize_turn``) — otherwise the ops happened and
         # the audit never counted them (docs/19 §12.14, S2: the documented
-        # handle API invites this).
-        before_forms = (snap or {}).get("forms") or {}
-        changed_now = {bid for bid, form in self.view.forms.items()
-                       if before_forms.get(bid, "full") != form}
-        if changed_now and self._view_emitted_turn != self.turn:
-            out.append(("unclosed_turn", sorted(changed_now)))
+        # handle API invites this). SKIPPED for the policy path (see above).
+        if check_closure:
+            before_forms = (snap or {}).get("forms") or {}
+            changed_now = {bid for bid, form in self.view.forms.items()
+                           if before_forms.get(bid, "full") != form}
+            if changed_now and self._view_emitted_turn != self.turn:
+                out.append(("unclosed_turn", sorted(changed_now)))
         pinned_broken = sorted(
             block.block_id for block in self.universe.blocks.values()
             if block.pinned
             and self.view.form_of(block.block_id) not in ("full", "dedup"))
         if pinned_broken:
             out.append(("pinned_form", pinned_broken))
-        if snap is not None:
-            before = [t[0] for t in (snap.get("texts") or [])]
+        snap_texts = (snap or {}).get("texts")
+        if snap_texts is not None:
+            before = [t[0] for t in snap_texts]
             after = [_msg_text(m) for m in (msgs or []) if isinstance(m, dict)]
             if before != after:
                 moved = [f"msgs[{i}]" for i, (a, b) in enumerate(zip(before, after))
@@ -1269,16 +1326,28 @@ class CMSession:
         return ops.budget_query(self.budget_reader, tokens_used, budget)
 
     # -- policy segment -----------------------------------------------------------
-    def run_policy(self) -> List[Dict[str, Any]]:
-        """Run the custom policy module (fail-open; ONE-strike latch).
+    def run_policy(self, msgs: Optional[List[Dict[str, Any]]] = None
+                   ) -> List[Dict[str, Any]]:
+        """Run the custom policy module (fail-open; ONE-strike latch; P1
+        snapshot/reconcile/restore — docs/19 §12.17/§12.18).
 
         The module is loaded ONCE per session (``_ModuleLoad``; cached with
         its failure — a mid-session edit must not change the seam) and
         ``apply`` executes EVERY turn under the per-turn budget: load-once
-        caches the MODULE, never the run result (docs/19 §12.17). One
-        failure — load crash, load timeout, or a run-phase failure —
-        disables the policy for the session; the failure facts ride
-        ``policy_report`` for the next self-improve session."""
+        caches the MODULE, never the run result. One failure — load crash,
+        load timeout, or a run-phase failure — disables the policy for the
+        session; the failure facts ride ``policy_report`` for the next
+        self-improve session.
+
+        P1 parity with the named-assembly branch: the turn-mutable state is
+        snapshotted BEFORE ``apply`` and RESTORED when the attempt fails or
+        violates the seam contract (a crashed policy's half-applied
+        session-level ops must not persist; a ``_s``-escape must be caught).
+        ``msgs`` (the canonical history, passed by ``assemble_custom``)
+        enables the canonical-texts layer; without it the snapshot covers
+        view/counters/refs only. The closure question is structurally
+        delegated to ``finalize_turn`` (the caller invokes it right after
+        this returns) — see ``_reconcile_turn(check_closure=False)``."""
         if self.policy_disabled:
             return [{"op": "policy", "ok": False,
                      "error": "policy disabled for this session"}]
@@ -1308,15 +1377,25 @@ class CMSession:
             self._methods_policy_done = True
             self._merge_methods(methods, method_problems, source="policy")
         handle = ViewHandle(self, "policy")
+        # P1: snapshot BEFORE apply; restore on any failure/violation. A
+        # LOCAL variable — the turn-level P1 snapshot of the named branch
+        # must stay untouched (nested portal.run_policy restores to
+        # pre-policy, which is exactly the right granularity there).
+        snap = self._snapshot_turn(msgs)
         try:
             records, over_ms = _apply_policy(apply_fn, handle,
                                              self.policy_exec_ms)
         except PolicyTimeout as e:
+            # known shared race: the leaked worker still holds the handle
+            # (T2 hygiene restart owns the residual; T3 closes it)
+            self._restore_turn(snap, msgs)
             self._note_policy_failure(str(e)[:160], phase="timeout",
-                                      timed_out=True, exc=e)
+                                      timed_out=True, exc=e, restored=True)
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         except Exception as e:  # noqa: BLE001 -- fail-open, never break the session
-            self._note_policy_failure(str(e)[:160], phase="run", exc=e)
+            self._restore_turn(snap, msgs)
+            self._note_policy_failure(str(e)[:160], phase="run", exc=e,
+                                      restored=True)
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         if over_ms:
             self._emit({"type": "cm_policy_overrun", "turn": self.turn,
@@ -1324,7 +1403,9 @@ class CMSession:
         if not isinstance(records, list):
             # A non-list return is a policy failure like any other (failopen
             # contract): strike-counted, emitted, fail-open.
-            self._note_policy_failure("policy returned a non-list")
+            self._restore_turn(snap, msgs)
+            self._note_policy_failure("policy returned a non-list",
+                                      phase="contract", restored=True)
             return [{"op": "policy", "ok": False,
                      "error": "policy returned a non-list"}]
         for rec in records:
@@ -1333,19 +1414,37 @@ class CMSession:
                 # the wedge breaker: one policy failure, strike-counted,
                 # emitted, fail-open — never a seam crash with only a log
                 # line.
-                self._note_policy_failure("policy returned a non-dict record")
+                self._restore_turn(snap, msgs)
+                self._note_policy_failure("policy returned a non-dict record",
+                                          phase="contract", restored=True)
                 return [{"op": "policy", "ok": False,
                          "error": "policy returned a non-dict record"}]
+        # P1 reconcile on the SUCCESS route: the three questions answerable
+        # before closure (unrecorded_view / pinned_form / canonical_mutated).
+        # Closure itself is finalize_turn's job (check_closure=False).
+        violations = self._reconcile_turn(msgs, snap, check_closure=False)
+        if violations:
+            # mirror the named branch's order: the violation EVENTS land
+            # first (durable), then the counters roll back with the restore
+            self._note_violations(violations)
+            self._restore_turn(snap, msgs)
+            self._note_policy_failure(
+                "policy violated the seam contract: "
+                + ",".join(kind for kind, _refs in violations),
+                phase="contract", restored=True)
+            return [{"op": "policy", "ok": False, "error": "policy failed"}]
         return records
 
     def _note_policy_failure(self, error: str, phase: str = "run",
-                             exc: Any = None, timed_out: bool = False) -> None:
+                             exc: Any = None, timed_out: bool = False,
+                             restored: bool = False) -> None:
         """One policy failure: count + emit + ONE-strike latch (docs/19
         §12.17 — the module is load-once, so byte-identical retries are
         deterministic waste; the success-resets-strikes rule died with the
-        per-turn reload). ``phase`` distinguishes load/run/timeout;
-        ``timed_out`` marks the leaked worker thread. The failure facts
-        ride ``policy_report`` for the next self-improve session."""
+        per-turn reload). ``phase`` distinguishes load/run/timeout/contract;
+        ``timed_out`` marks the leaked worker thread; ``restored`` marks a
+        P1 rollback (docs/19 §12.18). The failure facts ride
+        ``policy_report`` for the next self-improve session."""
         self.policy_failures += 1
         self._policy_strikes += 1
         if timed_out:
@@ -1363,7 +1462,8 @@ class CMSession:
                                    "where": where}
         self._emit({"type": "cm_policy_failed", "turn": self.turn,
                     "phase": phase, "error": error, "where": where,
-                    "struck": self._policy_strikes})
+                    "struck": self._policy_strikes,
+                    "state_restored": bool(restored)})
         if self._policy_strikes >= _AGENT_MODULE_STRIKES:
             self.policy_disabled = True
             self._emit({"type": "cm_policy_disabled", "turn": self.turn,

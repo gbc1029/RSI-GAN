@@ -130,7 +130,13 @@ def assemble_custom(session, msgs, outgoing,
     records += session.window_defaults()
     if session.system_prefix:
         records += session.dedup_prefix(msgs)
-    records += session.run_policy()
+    # fold the baseline stages' refs BEFORE the policy snapshot: the policy
+    # reconcile runs before count_ops, so the stages' form changes must be
+    # explainable at snapshot time (docs/19 §12.18)
+    session.record_refs(records)
+    # msgs rides along: the policy's P1 snapshot gains the canonical-texts
+    # layer (docs/19 §12.18 — run_policy restores the turn state on failure)
+    records += session.run_policy(msgs)
     return session.finalize_turn(msgs, outgoing, out_block, records)
 
 
