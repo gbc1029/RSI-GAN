@@ -1320,20 +1320,34 @@ class GanLoop:
             settings = _json.dumps(cm_keys, sort_keys=True, default=str)
             stem = cm_keys.get("cm_assembly")
             blobs = []
-            workspace_root = None
+            workspace_roots: List[str] = []
             try:
-                if self.output_dir and role and outer is not None:
+                if self.output_dir and role and outer is not None and seat:
                     # workspace-first then committed: BOTH are agent-editable,
-                    # so a change in either must release the latch.
-                    workspace_root = os.path.join(
+                    # so a change in either must release the latch. The live
+                    # workspace is SEAT-SUFFIXED (``outer_<O>__<seat>/src`` --
+                    # the same key _prepare_paths/role_broker create); the
+                    # legacy unsuffixed layout is kept as a fallback so an
+                    # old run's latch still releases.
+                    workspace_roots.append(os.path.join(
                         self.output_dir, "workspaces", role,
-                        "outer_%s" % outer, "src")
+                        "outer_%s__%s" % (outer, seat), "src"))
+                    workspace_roots.append(os.path.join(
+                        self.output_dir, "workspaces", role,
+                        "outer_%s" % outer, "src"))
             except Exception:  # noqa: BLE001 -- advisory
-                workspace_root = None
-            paths = cm_wiring.candidate_paths(
-                role, stem if isinstance(stem, str) and stem.strip() else None,
-                committed_root=getattr(self, "code_root", None),
-                workspace_root=workspace_root)
+                workspace_roots = []
+            paths: List[str] = []
+            seen: set = set()
+            for ws_root in workspace_roots:
+                for path in cm_wiring.candidate_paths(
+                        role,
+                        stem if isinstance(stem, str) and stem.strip() else None,
+                        committed_root=getattr(self, "code_root", None),
+                        workspace_root=ws_root) or []:
+                    if path not in seen:
+                        seen.add(path)
+                        paths.append(path)
             for path in paths or []:
                 try:
                     with open(path, "rb") as fh:
