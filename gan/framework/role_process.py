@@ -531,6 +531,7 @@ class RoleProcess:
             session_started = False
             call_succeeded = False
             worker_healthy = False
+            watchdog: Optional[_InvokeWatchdog] = None
             try:
                 if broker is not None and hasattr(broker, "begin_session"):
                     broker.begin_session(self.role, session_node)
@@ -637,7 +638,8 @@ class RoleProcess:
                     self._maybe_hygiene_restart(seat, method)
                     return result
             finally:
-                watchdog.stop()
+                if watchdog is not None:
+                    watchdog.stop()
                 if not call_succeeded and not worker_healthy:
                     self._stop_worker()
                 if session_started:
