@@ -30,6 +30,11 @@ _TASK_ENV_NAMES = {
     # audit sidecar (§11.5: rw bind in the sandbox; cwd fallback locally)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
                       "GAN_CM_EVENTS",
+    # CM-03 generation latch (docs/19 §12.16): HARNESS-ORIGINATED (an earlier
+    # question of this generation failed its named assembly; the snapshot is
+    # fixed per generation) — honored in _build_cm_session, never supplied
+    # by the parent.
+    "GAN_CM_ASSEMBLY_DISABLED",
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -649,12 +654,26 @@ def _build_cm_session():
                  f"baseline preset runs instead")
 
     try:
-        return cmcore.build_session(keys, policy_path=policy_path,
-                                    assembly_path=assembly_path,
-                                    emit=_cm_emit)
+        session = cmcore.build_session(keys, policy_path=policy_path,
+                                       assembly_path=assembly_path,
+                                       emit=_cm_emit)
     except Exception as e:  # noqa: BLE001 -- fail-open
         _degrade(f"session build failed ({e})")
         return None
+    # CM-03 generation latch (docs/19 §12.16): the harness saw a
+    # ``cm_assembly_failed`` in an EARLIER question of this generation and
+    # the snapshot is fixed for the whole generation — re-attempting the
+    # module per question cannot change the outcome, it only re-burns the
+    # exec budget and leaks another worker thread. Keep the design claim
+    # (assembly_path stays) but never load: every cm_view then carries
+    # ``assembly_disabled=true``, so the latch is loud, never silent.
+    if os.environ.get("GAN_CM_ASSEMBLY_DISABLED") == "1":
+        session.assembly_disabled = True
+        _cm_emit({"type": "cm_assembly_latched",
+                  "reason": "harness generation latch: an earlier question "
+                            "of this generation produced "
+                            "cm_assembly_failed"})
+    return session
 
 
 def _run_agent_child(result_fd: int) -> None:

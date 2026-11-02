@@ -49,6 +49,12 @@ _TASK_ENV_NAMES = {
     # audit sidecar (§11.5: rw-bound host file, folded back by task_runner)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
                       "GAN_CM_EVENTS",
+    # CM-03 generation latch (docs/19 §12.16): HARNESS-ORIGINATED, never
+    # parent-supplied — this process sets it after a question's seam events
+    # showed a named-assembly failure (the snapshot is fixed for the whole
+    # generation, so re-attempting per question cannot change the outcome).
+    # Listed so the hop-1 audit face shows everything that crosses it.
+    "GAN_CM_ASSEMBLY_DISABLED",
     # timeout plumbing (consumers: QUESTION_TIMEOUT above, agent/llm.py
     # per-call client budget). The thinking-intensity knob does NOT ride the
     # env: it is threaded explicitly (CLI --reasoning_effort -> payload).
@@ -472,9 +478,31 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None,
     return command
 
 
+# CM-03 generation latch (docs/19 §12.16): set when ANY question of this
+# harness process produced a ``cm_assembly_failed`` seam event. The CM
+# snapshot is fixed for the whole generation (module bytes cannot change),
+# so later questions in the same generation must not re-attempt the named
+# assembly — each attempt would burn the exec budget and leak a worker
+# thread for an outcome that cannot differ. The flag crosses to the agent
+# child as ``GAN_CM_ASSEMBLY_DISABLED=1``; the child honors it at session
+# build (``task_worker._build_cm_session``).
+_CM_ASSEMBLY_LATCH = False
+
+
+def _cm_latch_scan(staged_lines: str) -> bool:
+    """True when staged seam-event lines show a named-assembly failure.
+
+    The trigger matches the p/e latch (``assembly_failures > 0``): only
+    strike-counted failures latch. A plain load failure speaks once as
+    ``cm_assembly_fallback`` and is CHEAP to retry (no budget burn, no
+    leaked thread), so it deliberately does not latch here."""
+    return '"cm_assembly_failed"' in (staged_lines or "")
+
+
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
                          reasoning_effort=None, cost_overrides=None,
                          cm_events_target=None):
+    global _CM_ASSEMBLY_LATCH
     # Private run ancestors deliberately remain non-traversable to the
     # sandbox uid. Bubblewrap also cannot reliably open bind sources through
     # /proc/self/fd, so stage only the allowlisted inputs in a private /tmp
@@ -508,6 +536,12 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
         if cost_overrides.get("token_budget") is not None:
             payload["token_budget"] = int(cost_overrides["token_budget"])
     child_env = _task_child_env(os.environ)
+    # CM-03 generation latch: an earlier question of THIS generation failed
+    # its named assembly — later questions get the latch flag (the child
+    # keeps the design claim but never loads the module; every cm_view then
+    # reads assembly_disabled=true, so the latch is loud, not silent).
+    if _CM_ASSEMBLY_LATCH:
+        child_env["GAN_CM_ASSEMBLY_DISABLED"] = "1"
 
     # The result channel is an anonymous temporary file. Only the trusted
     # task_worker receives its fd; the TaskAgent child is spawned later with
@@ -579,6 +613,7 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
             # evidence too. This is the only sandbox-writable host tree, and
             # the parent ingests exactly this path afterwards; a write
             # failure is reported and never fatal.
+            staged_lines = ""
             try:
                 if not cm_events_target:
                     raise OSError("no cm_events_target configured")
@@ -596,6 +631,14 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
             except OSError as exc:
                 print(f"[cm] sidecar copy-back failed ({exc}); this question's "
                       "seam events are not ingested", flush=True)
+            # CM-03 generation latch feed: a named-assembly failure in ANY
+            # question of this generation latches the assembly for every
+            # LATER question of the same harness process (read the staged
+            # lines even when the copy-back failed — the evidence exists).
+            if _cm_latch_scan(staged_lines) and not _CM_ASSEMBLY_LATCH:
+                _CM_ASSEMBLY_LATCH = True
+                print("[cm] assembly latched for the rest of this "
+                      "generation (cm_assembly_failed seen)", flush=True)
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
                 raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
