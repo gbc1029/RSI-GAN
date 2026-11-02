@@ -799,7 +799,11 @@ class GanLoop:
                                       "violations", "est_chars_saved",
                                       "emit_failures",
                                       "assembly_active", "assembly_failures",
-                                      "assembly_disabled", "traj_segments")
+                                      "assembly_disabled", "traj_segments",
+                                      # CM-03 leak observability: a leaked
+                                      # worker thread must not vanish from
+                                      # the cost record (absence = clean).
+                                      "thread_leaks", "thread_leak_delta")
                                      if k in cm_sum}
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass

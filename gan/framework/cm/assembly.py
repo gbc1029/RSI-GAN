@@ -364,6 +364,31 @@ def load_assembly(path: str) -> Tuple[Callable, Dict[str, Callable], List[str]]:
     return fn, methods, method_problems
 
 
+def timed_load_assembly(path: str, exec_ms: int) -> Tuple[Callable, Dict[str, Callable], List[str]]:
+    """Load a named assembly module under the SAME per-turn budget as its
+    execution (CM-03: module-level code IS agent code — ``exec_module`` runs
+    it before ``assemble`` is ever called, so a top-level hang must not sit
+    outside every budget and hang the session unbounded).
+
+    A module-level hang becomes :class:`AssemblyTimeout` (load phase) —
+    strike-counted, fail-open — instead of a hung session. The worker
+    thread leaks exactly like a timed-out ``assemble`` (Python cannot kill
+    threads; CM-03 owns that) and is named ``cm_exec`` so the session's
+    leak observability can tell it apart from framework pools."""
+    import time as _time
+    t0 = _time.monotonic()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="cm_exec")
+    future = pool.submit(load_assembly, path)
+    try:
+        return future.result(timeout=max(exec_ms, 1) / 1000.0)
+    except concurrent.futures.TimeoutError as e:
+        future.cancel()
+        raise AssemblyTimeout(f"assembly load exceeded {exec_ms}ms") from e
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
                  outgoing: str, tokens_used: int, budget: Optional[int],
                  exec_ms: int) -> Tuple[List[Dict[str, Any]], str]:
@@ -380,7 +405,8 @@ def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
     session with it."""
     import time as _time
     t0 = _time.monotonic()
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="cm_exec")
     future = pool.submit(fn, session, msgs, outgoing, tokens_used, budget)
     try:
         result = future.result(timeout=max(exec_ms, 1) / 1000.0)

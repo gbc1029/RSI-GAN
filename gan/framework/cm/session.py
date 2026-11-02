@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import copy
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -73,6 +74,28 @@ _KIND_FOR_ROLE = {"tool": "tool_output"}
 # every call, so object identity does not survive a turn).
 _VIEW_MARKER_PREFIX = "[block "
 _DEDUP_MARKER = "[gan:system prompt deduplicated]"
+
+# Framework-owned thread names in a seat child: the tool executor keeps the
+# stdlib default (``ThreadPoolExecutor-*``) and the CM exec pools are
+# explicitly named ``cm_exec`` (assembly/failopen runners). Anything else
+# alive is either a module-SPAWNED thread (agent code) or another framework
+# subsystem — the session-build-baselined census of this set is the leak
+# signal for self-spawned threads; exact exec-pool leaks are counted
+# separately (``thread_leaks``, timeout-driven). Advisory in in-process
+# mode (parallel sessions share one process census), authoritative in the
+# seat child (one session's census per worker process).
+_FOREIGN_THREAD_EXCLUDE = ("ThreadPoolExecutor", "cm_exec")
+
+
+def _foreign_thread_count() -> int:
+    n = 0
+    for t in threading.enumerate():
+        if not t.is_alive() or t is threading.main_thread():
+            continue
+        if t.name.startswith(_FOREIGN_THREAD_EXCLUDE):
+            continue
+        n += 1
+    return n
 
 
 def _parse_view_marker(content: str) -> Optional[str]:
@@ -436,6 +459,15 @@ class CMSession:
     violations: int = 0
     est_chars_saved: int = 0
     emit_failures: int = 0
+    # CM-03 leak observability: an exec-budget timeout leaks its worker
+    # thread (Python cannot kill threads). ``thread_leaks`` counts the
+    # timed-out load/apply/assemble jobs this session produced; the
+    # ``_thread_baseline`` census catches module-SPAWNED threads, which
+    # never pass through an exec budget at all. Both surface in
+    # ``summary()`` as CONDITIONAL fields (absence = clean) and drive the
+    # seat proxy's post-session hygiene restart (docs/19 CM-03 residual).
+    thread_leaks: int = 0
+    _thread_baseline: int = field(default=0, repr=False, compare=False)
     _policy_strikes: int = 0
     _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
     # Named-assembly bookkeeping (audit fields materialize WITH the
@@ -488,6 +520,11 @@ class CMSession:
                                              compare=False)
 
     # ------------------------------------------------------------------- config
+    def __post_init__(self) -> None:
+        """Anchor the foreign-thread census at session build (CM-03 leak
+        observability; see ``_foreign_thread_count``)."""
+        self._thread_baseline = _foreign_thread_count()
+
     def apply_keys(self, keys: Dict[str, Any]) -> None:
         """Type-guarded application of ALREADY-CLAMPED effective values."""
         mode = keys.get("cm_mode")
@@ -531,6 +568,18 @@ class CMSession:
             # Conditional audit field (absence = a healthy sink): a session
             # whose event sink dropped lines must not read as fully audited.
             out["emit_failures"] = self.emit_failures
+        # CM-03 leak observability: conditional audit fields (absence =
+        # clean). ``thread_leaks`` counts exec-budget timeouts whose worker
+        # thread leaked (load/apply/assemble); ``thread_leak_delta`` catches
+        # module-SPAWNED threads via the foreign-thread census (never passes
+        # through an exec budget). Advisory in in-process mode, authoritative
+        # in the seat child; both drive the seat proxy's post-session hygiene
+        # restart.
+        if self.thread_leaks:
+            out["thread_leaks"] = self.thread_leaks
+        delta = _foreign_thread_count() - self._thread_baseline
+        if delta > 0:
+            out["thread_leak_delta"] = delta
         if self.assembly_path:
             out["assembly_active"] = self.assembly_active
             out["assembly_failures"] = self.assembly_failures
@@ -790,7 +839,9 @@ class CMSession:
                 # replays (idempotent — the violation path already restored).
                 self._restore_turn(snap, msgs)
                 self._note_assembly_failure(str(e)[:160], phase=phase,
-                                            exc=e)
+                                            exc=e,
+                                            timed_out=isinstance(
+                                                e, assembly.AssemblyTimeout))
                 self._turn_degraded = True
                 # fall through: the preset re-runs on the CLEAN state (sticky
                 # forms make the replay safe); this turn's cm_view carries
@@ -801,18 +852,35 @@ class CMSession:
         """Load the named assembly ONCE per session; the result is cached
         INCLUDING failure (no mid-session hot reload — a self_improve
         session editing its own assembly must not change its own seam
-        mid-flight). A load failure speaks exactly once
+        mid-flight). The load runs under the SAME per-turn budget as the
+        execution (CM-03: module-level code is agent code — ``exec_module``
+        executes it before ``assemble`` is ever called), so a top-level hang
+        becomes a load-phase ``AssemblyTimeout`` instead of a session hung
+        outside every budget. A load failure speaks exactly once
         (``cm_assembly_fallback``) and the baseline preset runs for the
         whole session; ``summary()`` shows ``assembly_active: false``."""
         if self.assembly_path is None:
             return None
         if self._named_fn is None and not self._named_failed:
             try:
-                fn, methods, method_problems = \
-                    assembly.load_assembly(self.assembly_path)
+                fn, methods, method_problems = assembly.timed_load_assembly(
+                    self.assembly_path, self.assembly_exec_ms)
                 self._named_fn = fn
                 self._merge_methods(methods, method_problems,
                                     source="assembly")
+            except assembly.AssemblyTimeout as e:
+                # CM-03: the module's TOP-LEVEL code hit the exec budget.
+                # Strike-counted (one failure latches the session — the
+                # load is deterministic, a retry would leak another worker
+                # thread) + fail-open to the preset, exactly like a run-
+                # phase failure; the leaked thread shows up in the session's
+                # leak counters.
+                self._named_failed = True
+                self._note_assembly_failure(str(e)[:160], phase="load",
+                                            timed_out=True)
+                self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                            "mode": self.mode, "to": self.mode,
+                            "reason": str(e)[:160]})
             except Exception as e:  # noqa: BLE001 -- fail-open, loudly, once
                 self._named_failed = True
                 self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
@@ -975,7 +1043,8 @@ class CMSession:
                         "kind": kind, "refs": list(refs)[:20]})
 
     def _note_assembly_failure(self, error: str, phase: str = "run",
-                               exc: Any = None) -> None:
+                               exc: Any = None,
+                               timed_out: bool = False) -> None:
         """One assembly turn failure: count + emit + latch.
 
         ONE failure is enough to stop re-attempting IN THIS SESSION (the
@@ -984,9 +1053,14 @@ class CMSession:
         ``assembly_disabled: true`` until the session ends. The framework's
         loop-level LATCH (fingerprint-keyed, docs/19 §12.14) additionally
         stops the NEXT sessions from re-attempting a module that has not
-        changed."""
+        changed. ``phase`` distinguishes load-stage (module top level) from
+        run-stage (``assemble``) from contract refusals; ``timed_out``
+        marks the leaked worker thread in the session's leak counters
+        (CM-03)."""
         self.assembly_failures += 1
         self._assembly_strikes += 1
+        if timed_out:
+            self.thread_leaks += 1
         where = ""
         if exc is not None and phase == "run":
             try:
@@ -1134,14 +1208,22 @@ class CMSession:
         if self.policy_disabled:
             return [{"op": "policy", "ok": False,
                      "error": "policy disabled for this session"}]
-        from .failopen import run_policy as _run_policy_module
+        from .failopen import (PolicyMissing, PolicyTimeout,
+                               run_policy as _run_policy_module)
         handle = ViewHandle(self, "policy")
         try:
             records, over_ms, methods, method_problems = \
                 _run_policy_module(self.policy_path, handle,
                                    self.policy_exec_ms)
         except Exception as e:  # noqa: BLE001 -- fail-open, never break the session
-            self._note_policy_failure(str(e)[:160])
+            # CM-03: the budget covers load+apply, so a module-level hang
+            # surfaces here as a timeout (leak counted), a missing/crashed
+            # module as a load-stage failure, anything else as run-stage.
+            phase = ("timeout" if isinstance(e, PolicyTimeout)
+                     else "load" if isinstance(e, PolicyMissing)
+                     else "run")
+            self._note_policy_failure(str(e)[:160], phase=phase,
+                                      timed_out=isinstance(e, PolicyTimeout))
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         if over_ms:
             self._emit({"type": "cm_policy_overrun", "turn": self.turn,
@@ -1171,13 +1253,20 @@ class CMSession:
             self._merge_methods(methods, method_problems, source="policy")
         return records
 
-    def _note_policy_failure(self, error: str) -> None:
+    def _note_policy_failure(self, error: str, phase: str = "run",
+                             timed_out: bool = False) -> None:
         """One policy failure: count + emit, and disable after 2 strikes
-        (C1-class wedge breaker; docs/10 §5.2 分三)."""
+        (C1-class wedge breaker; docs/10 §5.2 分三). ``phase`` distinguishes
+        load-stage from run-stage from budget-timeout failures (CM-03: the
+        budget covers load+apply, so a module-level hang surfaces as
+        phase="timeout"); ``timed_out`` marks the leaked worker thread in
+        the session's leak counters."""
         self.policy_failures += 1
         self._policy_strikes += 1
+        if timed_out:
+            self.thread_leaks += 1
         self._emit({"type": "cm_policy_failed", "turn": self.turn,
-                    "error": error})
+                    "phase": phase, "error": error})
         if self._policy_strikes >= _POLICY_STRIKES:
             self.policy_disabled = True
             self._emit({"type": "cm_policy_disabled", "turn": self.turn,

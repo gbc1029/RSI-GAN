@@ -92,30 +92,46 @@ def load_policy(path: str):
 
 def run_policy(path: Optional[str], handle: Any, exec_ms: int
                ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any], List[str]]:
-    """Execute the policy's apply() under the execution budget.
+    """Execute the policy's load + apply() under ONE execution budget.
 
     Returns ``(records, over_ms, methods, method_problems)`` — the
     ``METHODS`` harvest rides the successful load (the caller merges it
     once per session). Raises on crash/timeout (the session's wedge breaker
-    counts the failure and fails open)."""
+    counts the failure and fails open).
+
+    CM-03: the LOAD runs inside the same timed job as ``apply``. Module
+    top-level code IS agent code (``exec_module`` executes it every turn —
+    the policy reloads per turn), so a top-level ``while True`` must hit the
+    budget like any apply-loop instead of hanging the session outside every
+    timing boundary. The timeout therefore covers load+apply; the failure
+    surfaces as :class:`PolicyTimeout` either way. The worker thread leaks
+    exactly like a timed-out apply (Python cannot kill threads; CM-03 owns
+    that) and is named ``cm_exec`` so the session's leak observability can
+    tell it apart from framework pools."""
     if not path:
         raise PolicyMissing("no policy path configured")
-    module, methods, method_problems = load_policy(path)
-    apply_fn = getattr(module, "apply", None)
-    if not callable(apply_fn):
-        raise PolicyMissing("policy module exposes no apply(ctx)")
     import time as _time
     t0 = _time.monotonic()
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(apply_fn, handle)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="cm_exec")
+
+    def _load_and_apply() -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+        module, methods, method_problems = load_policy(path)
+        apply_fn = getattr(module, "apply", None)
+        if not callable(apply_fn):
+            raise PolicyMissing("policy module exposes no apply(ctx)")
+        return apply_fn(handle), methods, method_problems
+
+    future = pool.submit(_load_and_apply)
     try:
-        records = future.result(timeout=max(exec_ms, 1) / 1000.0)
+        records, methods, method_problems = \
+            future.result(timeout=max(exec_ms, 1) / 1000.0)
     except concurrent.futures.TimeoutError as e:
         future.cancel()
         # Same rule as the assembly runner: the budget bounds THIS TURN.
         # ``with`` would block on ``shutdown(wait=True)`` for the hung policy
         # module, so the timeout could not end the turn.
-        raise PolicyTimeout(f"policy exceeded {exec_ms}ms") from e
+        raise PolicyTimeout(f"policy exceeded {exec_ms}ms (load+apply)") from e
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     over_ms = max(0, int((_time.monotonic() - t0) * 1000) - exec_ms)
