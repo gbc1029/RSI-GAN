@@ -325,6 +325,9 @@ class Planner(Role):
         sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
         rr = render_receipt((recent or {}).get("receipt"))
         cost_stmt = str((recent or {}).get("cost_statement") or "")
+        # docs/19 §12.14 feedback: a failed assembly is a to-do for THIS
+        # session (stem + where + reason); measured facts, never text dumps.
+        cm_rep = (recent or {}).get("cm_assembly") or {}
         instruction = (
             "Improve YOURSELF (the planner's own design) using only design operators "
             "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
@@ -336,6 +339,9 @@ class Planner(Role):
             "the long run. "
             "Do not repeat the same tool call; when done, stop.\n"
             f"\n## Your session trajectories this outer (use read_session_trajectory)\n{sess_line}\n"
+            + ((f"\n## Your context-manager assembly (framework-measured; fix it with "
+                f"`request_source_access` + `edit_source`)\n"
+                f"{json.dumps(cm_rep, ensure_ascii=False)}\n") if cm_rep else "")
             + (("\n" + rr + "\n") if rr else "")
             + ((f"\n{cost_stmt}\n") if cost_stmt else "")
             + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k not in ('receipt', 'cost_statement')}, ensure_ascii=False)[:2000]}"

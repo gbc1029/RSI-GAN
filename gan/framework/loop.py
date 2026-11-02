@@ -180,6 +180,9 @@ class GanLoop:
         # attempt per generation): its session is built by the task runner,
         # whose config path the loop does not own.
         self._cm_assembly_latch: Dict[tuple, Dict[str, Any]] = {}
+        # Last settled "your assembly failed" facts per role (docs/19 §12.14
+        # feedback): the next self-improve session reads them as a to-do.
+        self._cm_assembly_report: Dict[str, Dict[str, Any]] = {}
         self.task_runner = task_runner
         # Separate runner for the fixed-root evaluation (docs/14 §5.5). It is
         # pinned to the run-persistent EVALUATION question set (held-out val
@@ -1363,7 +1366,14 @@ class GanLoop:
                          keys: Optional[Dict[str, Any]],
                          summary: Optional[Dict[str, Any]],
                          outer: Any = None) -> None:
-        """Latch a seat whose assembly failed at least once this call."""
+        """Latch a seat whose assembly failed at least once this call, and
+        keep the actionable report for the next self-improve session."""
+        report = (summary or {}).get("assembly_report")
+        if report:
+            self._cm_assembly_report[role] = {
+                **report, "seat": seat,
+                "latched": (role, seat) in self._cm_assembly_latch,
+            }
         if not summary or not summary.get("assembly_failures"):
             return
         if not (keys or {}).get("cm_assembly"):
@@ -3799,6 +3809,8 @@ class GanLoop:
                                for r in cost_ledger.self_session_costs(self.output_dir, outer, role)]
                         payload["costs"] = {"own_sessions": [r for r in own if r]}
                         payload["cost_statement"] = self._cost_statement_self(role, outer)
+                        if self._cm_assembly_report.get(role):
+                            payload["cm_assembly"] = self._cm_assembly_report[role]
                         # Injection fact (B2, self seat): same bytes audit the
                         # plan/evaluate statements get (docs/10 §11.5 gap fix).
                         if payload["cost_statement"]:

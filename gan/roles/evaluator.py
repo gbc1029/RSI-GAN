@@ -267,6 +267,10 @@ class Evaluator(Role):
         # compact records only — no free text, no other role's costs).
         costs = (recent or {}).get("costs") or {}
         costs_json = json.dumps(costs, ensure_ascii=False) if costs else ""
+        # docs/19 §12.14 feedback: an assembly that FAILED is a to-do for the
+        # next session (stem + where + reason), measured facts only.
+        cm_rep = (recent or {}).get("cm_assembly") or {}
+        cm_json = json.dumps(cm_rep, ensure_ascii=False) if cm_rep else ""
         instruction = (
             "Improve YOURSELF (the evaluator's own design) using only design operators "
             "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
@@ -283,6 +287,9 @@ class Evaluator(Role):
             + ((f"\n{cost_stmt}\n") if cost_stmt else "")
             + ((f"\n## Recent costs (per-session, framework-measured; your own sessions)\n"
                 f"{costs_json}\n") if costs_json else "")
+            + ((f"\n## Your context-manager assembly (framework-measured; fix it with "
+                f"`request_source_access` + `edit_source`)\n"
+                f"{cm_json}\n") if cm_json else "")
             + f"\n## Feedback digests\n{digest_text}"
         )
         # Scaffold (design context, self-seat access, session run, patch retry
