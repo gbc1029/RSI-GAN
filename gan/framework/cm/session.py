@@ -43,6 +43,7 @@ type-guards (the harness pass-through posture).
 """
 from __future__ import annotations
 
+import copy
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -59,6 +60,12 @@ WINDOW_K_FLOOR = 1
 _NOTE_PREFIX = "[gan:note]"
 _WARN_RATIO = 0.8      # budget_checkpoint warns at 80% of an active budget
 _POLICY_STRIKES = 2    # C1-class wedge breaker: 2 failures -> disabled
+# The assembly seam has its OWN knob (docs/19 §12.14): one failed attempt is
+# enough to stop re-attempting IN THIS SESSION (the module is deterministic,
+# and a retry can leak a worker thread). The framework ALSO latches at the
+# loop level (fingerprint-keyed), so a session that starts over does not
+# re-attempt a module that has not changed.
+_ASSEMBLY_STRIKES = 1
 _KIND_FOR_ROLE = {"tool": "tool_output"}
 # view artifacts carry this marker prefix (placeholder/template/excerpt
 # suffix) — history entries showing it are re-bound to their block, never
@@ -106,6 +113,157 @@ def _msg_text(m: Any) -> Optional[str]:
     return None
 
 
+_LEGAL_ROLES = ("system", "user", "assistant", "tool")
+
+
+def _validate_sent_history(history: Any) -> Optional[str]:
+    """P0 (docs/19 §12.14): the SENT history must be a list of message dicts.
+
+    The shape check alone (list) let ``[None]`` reach the LLM payload while
+    ``assembly_failures`` stayed 0 — a silent contract break that surfaces as
+    a confusing "model/task quality" failure. Element-level validation turns
+    it into the same loud fallback a crash gets."""
+    if not isinstance(history, list):
+        return f"sent history is {type(history).__name__}, not a list"
+    for i, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            return f"history[{i}] is {type(entry).__name__}, not a message dict"
+        role = entry.get("role")
+        if not isinstance(role, str) or not role:
+            return f"history[{i}] carries no role"
+        if role not in _LEGAL_ROLES:
+            return f"history[{i}] role {role!r} is not a chat role"
+        for key in ("text", "content"):
+            if key in entry and entry[key] is not None \
+                    and not isinstance(entry[key], str):
+                return (f"history[{i}][{key!r}] is {type(entry[key]).__name__}, "
+                        f"not text")
+    return None
+
+
+class _ViewRead:
+    """READ-ONLY projection of the persistent view (P2 portal surface).
+
+    Authors may inspect the view; they may not write it. ``set`` simply does
+    not exist here (the presets keep the real object)."""
+
+    __slots__ = ("_v",)
+
+    def __init__(self, view: Any):
+        object.__setattr__(self, "_v", view)
+
+    def form_of(self, block_id: str) -> str:
+        return self._v.form_of(block_id)
+
+    @property
+    def forms(self) -> Dict[str, str]:
+        return dict(self._v.forms)
+
+    @property
+    def rules(self) -> Dict[str, str]:
+        return dict(self._v.rules)
+
+    def __getattr__(self, name: str) -> Any:
+        from .assembly import AssemblyError
+        raise AssemblyError(
+            f"view.{name} is not available on the assembly surface: view is a "
+            f"READ-ONLY projection (use the primitives to change it)")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        from .assembly import AssemblyError
+        raise AssemblyError("the view is READ-ONLY for assemblies")
+
+
+class _UniverseRead:
+    """READ-ONLY projection of the block universe (P2 portal surface).
+
+    ``get``/``ordered``/iteration return COPIES: a block object carries
+    mutable fields (``pinned``, ``msg_index``), so handing the live objects
+    would re-open the write surface through the back door."""
+
+    __slots__ = ("_u",)
+
+    def __init__(self, universe: Any):
+        object.__setattr__(self, "_u", universe)
+
+    def get(self, block_id: str) -> Any:
+        block = self._u.blocks.get(str(block_id))
+        return copy.copy(block) if block is not None else None
+
+    def ordered(self) -> List[Any]:
+        return [copy.copy(b) for b in self._u.ordered()]
+
+    def __iter__(self):
+        return iter(self.ordered())
+
+    def __len__(self) -> int:
+        return len(self._u.blocks)
+
+    def __getattr__(self, name: str) -> Any:
+        from .assembly import AssemblyError
+        raise AssemblyError(
+            f"universe.{name} is not available on the assembly surface: "
+            f"universe is a READ-ONLY projection (blocks are framework-owned)")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        from .assembly import AssemblyError
+        raise AssemblyError("the block universe is READ-ONLY for assemblies")
+
+
+class SessionPortal:
+    """P2 (docs/19 §12.14): the object an AGENT-OWNED assembly receives.
+
+    The published authoring surface is the session's PRIMITIVE METHODS
+    (``cm/assembly.py`` composes exactly those) plus clamped parameters as
+    READ-ONLY values. Everything else — the mutable ``view``/``universe``,
+    the audit post segment (``emit_view``/``count_ops``), the internal
+    bookkeeping — is refused here, so "it cannot bypass the rules" becomes
+    true by construction instead of by convention. The parameter NAME stays
+    ``session`` (signature unchanged); only the object narrows.
+
+    Escape (``type(portal)``, a captured closure) is still possible — that is
+    the malicious tier, and the P1 turn reconciliation backstops it.
+    """
+
+    __slots__ = ("_s",)
+
+    _METHODS = frozenset({
+        "register_history", "register_outgoing", "budget_checkpoint",
+        "window_defaults", "conservative_compaction", "dedup_prefix",
+        "run_policy", "call_method", "finalize_turn", "render",
+    })
+    _PARAMS = frozenset({
+        "mode", "system_prefix", "window_k", "drop_floor_chars",
+        "min_compact_save", "note_cap_chars", "max_ops_per_turn",
+        "assembly_exec_ms", "policy_exec_ms", "turn",
+    })
+
+    def __init__(self, session: Any):
+        object.__setattr__(self, "_s", session)
+
+    def __getattr__(self, name: str) -> Any:
+        from .assembly import AssemblyError
+        if name in self._METHODS:
+            return getattr(self._s, name)
+        if name in self._PARAMS:
+            return getattr(self._s, name)
+        if name == "view":
+            return _ViewRead(self._s.view)
+        if name == "universe":
+            return _UniverseRead(self._s.universe)
+        raise AssemblyError(
+            f"{name!r} is not part of the assembly surface "
+            f"(allowed methods: {sorted(self._METHODS)}; "
+            f"read-only parameters: {sorted(self._PARAMS)}; "
+            f"view/universe are read-only projections)")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        from .assembly import AssemblyError
+        raise AssemblyError(
+            f"{name!r} is read-only on the assembly surface (clamping is "
+            f"framework-owned)")
+
+
 class ViewHandle:
     """The primitive facade handed to BOTH faces (agent ctx_* tools and the
     assembly-time custom policy). Face membership decides what is callable
@@ -122,8 +280,19 @@ class ViewHandle:
 
     def _audit(self, rec: Dict[str, Any]) -> Dict[str, Any]:
         """Policy-face refusals are violations wherever they happen (the
-        wedge breaker counts them via the session, not only in the seam)."""
-        if self.face == "policy" and not rec.get("ok"):
+        wedge breaker counts them via the session, not only in the seam).
+
+        Successful MUTATING ops also publish their refs to the session's
+        recorded-refs set: the P1 turn reconciliation must be able to explain
+        a non-full form even when the caller forgot to thread the record
+        through ``finalize_turn`` (or when the op happened inside a custom
+        METHOD, whose own record carries no refs)."""
+        if rec.get("ok"):
+            refs = rec.get("refs") or []
+            if refs:
+                self._s._recorded_refs.update(str(r) for r in refs)
+            return rec
+        if self.face == "policy":
             self._s.note_violation(rec)
         return rec
 
@@ -275,7 +444,20 @@ class CMSession:
     assembly_active: bool = False    # the named assembly produced >= 1 turn
     assembly_failures: int = 0
     assembly_disabled: bool = False  # wedge-broken for the session
+    assembly_violations: int = 0     # seam-contract violations this session
     _assembly_strikes: int = 0
+    # P1 turn reconciliation (docs/19 §12.14): turn-start snapshot + the op
+    # refs the post segment recorded. Named-assembly turns only (presets never
+    # populate them: they cannot touch these surfaces).
+    _turn_snapshot: Optional[Dict[str, Any]] = field(default=None, repr=False,
+                                                     compare=False)
+    # Forms are STICKY across turns, so a block substituted on turn 2 is still
+    # non-full on turn 3 without a new record. The reconciliation therefore
+    # needs the CUMULATIVE set of recorded refs, not just this turn's.
+    _recorded_refs: set = field(default_factory=set, repr=False, compare=False)
+    _assembly_last_error: Dict[str, Any] = field(default_factory=dict,
+                                                 repr=False, compare=False)
+    _portal_cache: Any = field(default=None, repr=False, compare=False)
     _named_fn: Optional[Callable] = field(default=None, repr=False,
                                           compare=False)
     _named_failed: bool = field(default=False, repr=False, compare=False)
@@ -353,6 +535,20 @@ class CMSession:
             out["assembly_active"] = self.assembly_active
             out["assembly_failures"] = self.assembly_failures
             out["assembly_disabled"] = self.assembly_disabled
+            out["assembly_violations"] = self.assembly_violations
+            # Actionable "fix this module" facts for the NEXT session (rl:
+            # stem + where + reason). Absence is meaningful: the module has
+            # never failed, so there is nothing to act on.
+            if self._assembly_last_error or self.assembly_violations:
+                out["assembly_report"] = {
+                    "stem": os.path.basename(str(self.assembly_path)).split(".")[0],
+                    "failures": self.assembly_failures,
+                    "violations": self.assembly_violations,
+                    "disabled": self.assembly_disabled,
+                    "last_error": str(self._assembly_last_error.get("error") or "")[:160],
+                    "phase": self._assembly_last_error.get("phase"),
+                    "where": str(self._assembly_last_error.get("where") or ""),
+                }
         if self.traj_index is not None:
             out["traj_segments"] = len(self.traj_segments)
         return out
@@ -548,16 +744,38 @@ class CMSession:
         named = None if self.assembly_disabled else self._load_named()
         if named is not None:
             self._view_emitted_turn = None
+            # P1: the LAST LEGAL STATE (end of the previous turn) is the
+            # rollback target — never a blank view (that would silently undo
+            # earlier turns' compaction, changing the pin window and the
+            # dedup accounting). Everything the failed attempt does is undone
+            # except the block universe, which is add-only by contract (its
+            # extra blocks are unreferenced and never sent).
+            snap = self._snapshot_turn(msgs)
             try:
-                result = assembly.run_assembly(named, self, msgs, outgoing,
-                                               tokens_used, budget,
-                                               self.assembly_exec_ms)
+                # P2: the agent-owned assembly gets the PORTAL, not the live
+                # session (the published primitive surface + read-only
+                # parameters; ``emit_view``/``count_ops``/state fields are
+                # refused). The parameter name stays ``session``.
+                result = assembly.run_assembly(
+                    named, self._portal(), msgs, outgoing, tokens_used, budget,
+                    self.assembly_exec_ms)
                 if not (isinstance(result, tuple) and len(result) == 2
                         and isinstance(result[0], list)
                         and isinstance(result[1], str)):
                     raise assembly.AssemblyError(
                         "assembly returned a non-(history, msg) result")
+                problem = _validate_sent_history(result[0])
+                if problem:
+                    raise assembly.AssemblyError(problem)
+                violations = self._reconcile_turn(msgs, snap)
+                if violations:
+                    self._note_violations(violations)
+                    self._restore_turn(snap, msgs)
+                    raise assembly.AssemblyError(
+                        "assembly violated the seam contract: "
+                        + ",".join(kind for kind, _refs in violations))
                 self.assembly_active = True
+                self._turn_snapshot = None
                 if self._view_emitted_turn != self.turn:
                     # audit completeness is framework-owned: an assembly
                     # that skips the finalize_turn post segment still gets
@@ -567,11 +785,16 @@ class CMSession:
             except Exception as e:  # noqa: BLE001 -- fail-open, never break the seam
                 phase = ("contract" if isinstance(e, assembly.AssemblyError)
                          else "run")
-                self._note_assembly_failure(str(e)[:160], phase=phase)
+                # A crashed or violating attempt may have mutated state before
+                # it raised: go back to the turn-start state BEFORE the preset
+                # replays (idempotent — the violation path already restored).
+                self._restore_turn(snap, msgs)
+                self._note_assembly_failure(str(e)[:160], phase=phase,
+                                            exc=e)
                 self._turn_degraded = True
-                # fall through: the preset re-runs on the current state
-                # (sticky forms make the replay safe); this turn's cm_view
-                # carries degraded=true
+                # fall through: the preset re-runs on the CLEAN state (sticky
+                # forms make the replay safe); this turn's cm_view carries
+                # degraded=true
         return fn(self, msgs, outgoing, tokens_used, budget)
 
     def _load_named(self) -> Optional[Callable]:
@@ -650,18 +873,127 @@ class CMSession:
             return err
         return self._invoke_method(name, kwargs, callee=self._method_face)
 
-    def _note_assembly_failure(self, error: str, phase: str = "run") -> None:
-        """One assembly turn failure: count + emit + strike; 2 strikes
-        disable the named assembly for the session (C1-class wedge breaker)
-        — the preset then runs directly and every subsequent ``cm_view``
-        carries ``assembly_disabled: true`` until the session ends."""
+    # -- P1: turn snapshots, reconciliation, rollback ---------------------
+    def _portal(self) -> "SessionPortal":
+        """The P2 façade handed to the named assembly (cached per session)."""
+        if self._portal_cache is None:
+            self._portal_cache = SessionPortal(self)
+        return self._portal_cache
+
+    def _snapshot_turn(self, msgs: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "forms": dict(self.view.forms),
+            "rules": dict(self.view.rules),
+            "texts": [_msg_text(m) for m in (msgs or [])],
+            "counters": (self.ops_total, self.ops_applied, self.ops_refused,
+                         self.violations, self.est_chars_saved),
+            "refs": set(self._recorded_refs),
+        }
+
+    def _restore_turn(self, snap: Optional[Dict[str, Any]],
+                      msgs: List[Dict[str, Any]]) -> None:
+        """Undo everything the failed attempt did, back to the last legal state."""
+        if not snap:
+            return
+        self.view.forms.clear()
+        self.view.forms.update(snap.get("forms") or {})
+        self.view.rules.clear()
+        self.view.rules.update(snap.get("rules") or {})
+        (self.ops_total, self.ops_applied, self.ops_refused, self.violations,
+         self.est_chars_saved) = snap.get("counters") or (
+             self.ops_total, self.ops_applied, self.ops_refused,
+             self.violations, self.est_chars_saved)
+        self._recorded_refs.clear()
+        self._recorded_refs.update(snap.get("refs") or ())
+        # canonical: put the original text back where the attempt rewrote it
+        texts = snap.get("texts") or []
+        for i, entry in enumerate(msgs or []):
+            if i >= len(texts) or not isinstance(entry, dict):
+                continue
+            original = texts[i]
+            if original is None or _msg_text(entry) == original:
+                continue
+            key = "text" if isinstance(entry.get("text"), str) else "content"
+            entry[key] = original
+
+    def _reconcile_turn(self, msgs: List[Dict[str, Any]],
+                        snap: Optional[Dict[str, Any]]
+                        ) -> List[Tuple[str, List[str]]]:
+        """The three seam-contract questions (docs/19 §12.14).
+
+        1. every non-full form must be explained by a recorded op;
+        2. a pinned block may only be ``full`` (or ``dedup``: the prefix-elision
+           form, which loses only the repeated header);
+        3. the canonical history must be untouched.
+        """
+        out: List[Tuple[str, List[str]]] = []
+        recorded = set(self._recorded_refs)
+        unexplained = sorted(
+            bid for bid, form in self.view.forms.items()
+            if form != "full" and bid not in recorded)
+        if unexplained:
+            out.append(("unrecorded_view", unexplained))
+        # Turn closure: a turn that CHANGED the view must have closed through
+        # the post segment (``finalize_turn``) — otherwise the ops happened and
+        # the audit never counted them (docs/19 §12.14, S2: the documented
+        # handle API invites this).
+        before_forms = (snap or {}).get("forms") or {}
+        changed_now = {bid for bid, form in self.view.forms.items()
+                       if before_forms.get(bid, "full") != form}
+        if changed_now and self._view_emitted_turn != self.turn:
+            out.append(("unclosed_turn", sorted(changed_now)))
+        pinned_broken = sorted(
+            block.block_id for block in self.universe.blocks.values()
+            if block.pinned
+            and self.view.form_of(block.block_id) not in ("full", "dedup"))
+        if pinned_broken:
+            out.append(("pinned_form", pinned_broken))
+        if snap is not None:
+            before = snap.get("texts") or []
+            after = [_msg_text(m) for m in (msgs or [])]
+            if before != after:
+                moved = [f"msgs[{i}]" for i, (a, b) in enumerate(zip(before, after))
+                         if a != b]
+                out.append(("canonical_mutated", moved[:8]))
+        return out
+
+    def _note_violations(self, violations: List[Tuple[str, List[str]]]) -> None:
+        """Count + emit each seam-contract violation (never silent)."""
+        for kind, refs in violations:
+            self.assembly_violations += 1
+            self._emit({"type": "cm_assembly_violation", "turn": self.turn,
+                        "kind": kind, "refs": list(refs)[:20]})
+
+    def _note_assembly_failure(self, error: str, phase: str = "run",
+                               exc: Any = None) -> None:
+        """One assembly turn failure: count + emit + latch.
+
+        ONE failure is enough to stop re-attempting IN THIS SESSION (the
+        module is deterministic; a retry can leak a worker thread). The
+        preset then runs directly and every subsequent ``cm_view`` carries
+        ``assembly_disabled: true`` until the session ends. The framework's
+        loop-level LATCH (fingerprint-keyed, docs/19 §12.14) additionally
+        stops the NEXT sessions from re-attempting a module that has not
+        changed."""
         self.assembly_failures += 1
         self._assembly_strikes += 1
+        where = ""
+        if exc is not None and phase == "run":
+            try:
+                import traceback
+                frames = traceback.extract_tb(exc.__traceback__)
+                if frames:
+                    where = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+            except Exception:  # noqa: BLE001 -- diagnostics only
+                where = ""
+        self._assembly_last_error = {"error": str(error), "phase": phase,
+                                     "where": where}
         self._emit({"type": "cm_assembly_failed", "turn": self.turn,
                     "phase": phase, "error": error,
                     "struck": self._assembly_strikes,
+                    "where": where,
                     "fallback": self.mode})
-        if self._assembly_strikes >= _POLICY_STRIKES:
+        if self._assembly_strikes >= _ASSEMBLY_STRIKES:
             self.assembly_disabled = True
             self._emit({"type": "cm_assembly_disabled", "turn": self.turn,
                         "strikes": self._assembly_strikes})
@@ -866,6 +1198,9 @@ class CMSession:
             self.ops_applied += 1
             self.est_chars_saved += saved
             saved_total += saved
+            # P1: the reconciliation compares the view against EXACTLY what the
+            # post segment recorded (cumulative: forms are sticky).
+            self._recorded_refs.update(str(r) for r in (rec.get("refs") or []))
         self.ops_refused += max(0, len(records) - len(capped))
         return saved_total
 

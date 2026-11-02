@@ -71,7 +71,7 @@ NO_WORKSPACE_SEATS = frozenset({("evaluator", "evaluate")})
 # like "CM built nothing this session" instead of an error).
 DESCRIPTOR_FIELDS = frozenset({
     "keys", "seat", "genid", "session_cm_mode",
-    "assembly_stem", "policy_stem", "traj_files",
+    "assembly_stem", "policy_stem", "traj_files", "assembly_disabled",
 })
 
 
@@ -126,6 +126,25 @@ def seat_traj_dir(output_dir: str, role: str, instance: Any, seat: str,
     trajectory subtree the seat child can both see and write)."""
     return os.path.join(output_dir, "trajectory", traj_root(instance, outer),
                         "roles", role, seat)
+
+
+def candidate_paths(role: str, stem: Any, *, committed_root: Optional[str] = None,
+                    workspace_root: Optional[str] = None) -> List[str]:
+    """Every path a design-named module COULD live at (no existence filter).
+
+    The loop's assembly LATCH fingerprints the resolved bytes: both the live
+    workspace copy and the committed tree are agent-editable, so both are
+    candidates (a change in either must release the latch)."""
+    cand = clean_stem(stem)
+    if cand is None:
+        return []
+    rel = os.path.join("gan", "components", role, "cm", cand + ".py")
+    out: List[str] = []
+    if workspace_root:
+        out.append(os.path.join(workspace_root, rel))
+    if committed_root:
+        out.append(os.path.join(committed_root, rel))
+    return out
 
 
 def resolve_stem(role: str, stem: Any, *,
@@ -206,6 +225,7 @@ def descriptor(role: str, keys: Optional[Dict[str, Any]], *,
                seat: str, instance: Any = None, genid: Any = None,
                session_cm_mode: Any = None,
                traj_files: Optional[List[Tuple[str, str]]] = None,
+               assembly_disabled: bool = False,
                ) -> Optional[Dict[str, Any]]:
     """Build the JSON descriptor the seat child needs (parent side).
 
@@ -232,6 +252,11 @@ def descriptor(role: str, keys: Optional[Dict[str, Any]], *,
                         if isinstance(pol, str) and pol.strip() else None),
         "traj_files": [[str(label), str(path)]
                        for label, path in (traj_files or [])],
+        # The loop's failure latch (docs/19 §12.14): the module stays
+        # configured (so every cm_view still carries assembly_disabled) but it
+        # is not loaded this session — it will be re-attempted as soon as its
+        # configuration (keys or bytes) changes.
+        "assembly_disabled": bool(assembly_disabled),
     }
 
 
@@ -247,8 +272,14 @@ def check_descriptor(value: Any) -> List[str]:
     if not isinstance(value, dict):
         return [f"cm descriptor must be an object or null (got {type(value).__name__})"]
     out: List[str] = []
-    missing = sorted(DESCRIPTOR_FIELDS - set(value))
+    # ``assembly_disabled`` is a purely ADDITIVE flag (the loop's failure
+    # latch): a descriptor built before it existed is still valid, so it is
+    # optional while every other field stays required (strict on purpose).
+    missing = sorted((DESCRIPTOR_FIELDS - {"assembly_disabled"}) - set(value))
     extra = sorted(set(value) - DESCRIPTOR_FIELDS)
+    if "assembly_disabled" in value and not isinstance(
+            value.get("assembly_disabled"), bool):
+        out.append("cm descriptor assembly_disabled must be a bool")
     if missing:
         out.append(f"cm descriptor missing {missing}")
     if extra:
@@ -401,6 +432,10 @@ def build_from_descriptor(value: Dict[str, Any], *, role: str, output_dir: str,
     session = build_session(keys, policy_path=resolved["policy_path"],
                             assembly_path=resolved["assembly_path"],
                             emit=emit)
+    if session is not None and value.get("assembly_disabled"):
+        # Latched by the parent: keep the claim (``assembly_disabled`` still
+        # shows on every cm_view) but do not load/re-run the module.
+        session.assembly_disabled = True
     if session is not None:
         files = [(label, path) for label, path in (value.get("traj_files") or [])]
         kept, skipped = child_visible_traj(

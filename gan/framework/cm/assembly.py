@@ -370,18 +370,32 @@ def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
     """Execute one agent assembly under its per-turn execution budget
     (worker thread; same class as the policy runner). Emits
     ``cm_assembly_overrun`` when the wall exceeded the budget (the result is
-    still honored if it arrived — the budget is advisory for terminating
-    code, binding only through the timeout). Raises on crash/timeout: the
-    session's wedge breaker counts the failure and re-runs the preset."""
+    still honored if it arrived). Raises on crash/timeout: the session counts
+    the failure and re-runs the preset.
+
+    THE BUDGET BOUNDS THE TURN: on timeout the pool is shut down WITHOUT
+    waiting, so a hanging assembly cannot block the chat loop (it used to:
+    ``with`` implies ``shutdown(wait=True)``). The worker itself may keep
+    running — termination is CM-03's job, this is only about not dragging the
+    session with it."""
     import time as _time
     t0 = _time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, session, msgs, outgoing, tokens_used, budget)
-        try:
-            result = future.result(timeout=max(exec_ms, 1) / 1000.0)
-        except concurrent.futures.TimeoutError as e:
-            future.cancel()
-            raise AssemblyTimeout(f"assembly exceeded {exec_ms}ms") from e
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(fn, session, msgs, outgoing, tokens_used, budget)
+    try:
+        result = future.result(timeout=max(exec_ms, 1) / 1000.0)
+    except concurrent.futures.TimeoutError as e:
+        future.cancel()
+        # The budget must bound THIS TURN, not just the decision: a
+            # ``with`` block would run ``shutdown(wait=True)`` on exit and
+            # silently wait for the hung worker (measured: a 3s assembly with
+            # exec_ms=200 blocked the seam 4.16s). Shutting down without
+            # waiting lets the turn proceed; the worker may leak (Python
+        # cannot kill threads — CM-03 owns that, this only stops it from
+        # dragging the session).
+        raise AssemblyTimeout(f"assembly exceeded {exec_ms}ms") from e
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     over_ms = max(0, int((_time.monotonic() - t0) * 1000) - exec_ms)
     if over_ms:
         session._emit({"type": "cm_assembly_overrun", "turn": session.turn,

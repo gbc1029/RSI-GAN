@@ -106,13 +106,18 @@ def run_policy(path: Optional[str], handle: Any, exec_ms: int
         raise PolicyMissing("policy module exposes no apply(ctx)")
     import time as _time
     t0 = _time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(apply_fn, handle)
-        try:
-            records = future.result(timeout=max(exec_ms, 1) / 1000.0)
-        except concurrent.futures.TimeoutError as e:
-            future.cancel()
-            raise PolicyTimeout(f"policy exceeded {exec_ms}ms") from e
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(apply_fn, handle)
+    try:
+        records = future.result(timeout=max(exec_ms, 1) / 1000.0)
+    except concurrent.futures.TimeoutError as e:
+        future.cancel()
+        # Same rule as the assembly runner: the budget bounds THIS TURN.
+        # ``with`` would block on ``shutdown(wait=True)`` for the hung policy
+        # module, so the timeout could not end the turn.
+        raise PolicyTimeout(f"policy exceeded {exec_ms}ms") from e
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     over_ms = max(0, int((_time.monotonic() - t0) * 1000) - exec_ms)
     if records is None:
         records = []
