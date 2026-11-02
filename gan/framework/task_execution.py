@@ -1991,6 +1991,50 @@ class _TaskRunLease:
 
         _task_walk_tree(self.run_fd, grant_read)
         _task_walk_tree(self.output_fd, grant_write)
+        self._grant_cm_sidecar()
+
+    def _grant_cm_sidecar(self) -> None:
+        """The ONE write exception inside the read-only run tree (CM-02).
+
+        The run tree is deliberately read-only for the sandbox uid (the
+        sandboxed preflight even asserts that a NEW file cannot be created
+        there). The CM seam sidecar is the single file that must be APPENDED
+        by the child and then read back by the parent, so it needs one
+        user-ACL entry with ``rw-``. Why that is safe:
+
+        * the name is fixed (``paths.CM_EVENTS_NAME``), so no path is
+          attacker-chosen;
+        * it is pre-created by ``assemble_task_env`` and owned by the run
+          owner, and this grant only ADDS ``rw-`` to that one inode (a new
+          file in the run tree still cannot be created — the probe stays
+          valid);
+        * its content is excluded from every patch (``_RUNTIME_SIDECARS`` in
+          ``domains/task_worker.py``), never scored, and it dies with the
+          pruned work dir.
+
+        Before this grant every child append failed with EACCES: the seam
+        still RAN, but its audit channel was empty, and
+        ``cm_events_ingest_empty`` could not distinguish that from "the
+        generation had no seam at all" (CM-02).
+        """
+        from gan.framework import paths as _paths
+        name = _paths.CM_EVENTS_NAME
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(name, flags, dir_fd=self.run_fd)
+        except FileNotFoundError:
+            return  # this launch delivered no sidecar (nothing to grant)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid:
+                raise RuntimeError(
+                    "cm events sidecar has an unexpected owner or type")
+            if info.st_nlink != 1:
+                raise RuntimeError(
+                    "cm events sidecar was hard-linked during ACL grant")
+            _task_setfacl(self.setfacl, fd, "-m", f"u:{self.sandbox_uid}:rw-")
+        finally:
+            os.close(fd)
 
     def close(self, *, strict: bool = True) -> None:
         if self.closed:

@@ -169,6 +169,13 @@ def cost_sessions_path(output_dir: str) -> str:
     return os.path.join(logs_dir(output_dir), "cost_sessions.jsonl")
 
 
+# The task child's CM seam sidecar name. FIXED (not per-generation): the
+# broker pins the child env statically, the harness binds it as
+# ``/workspace/cm_events.jsonl``, and the run-tree ACL lease grants write
+# permission to exactly this one name (see ``_TaskRunLease._grant``).
+CM_EVENTS_NAME = "cm_events.jsonl"
+
+
 def cm_events_path(run_dir: str) -> str:
     """The task child's CM seam-event sidecar (docs/10 §11.5): pre-created by
     ``assemble_task_env`` under the (ephemeral) run dir, rw-bound into the
@@ -176,7 +183,7 @@ def cm_events_path(run_dir: str) -> str:
     emit sink and folded into ``logs/events.jsonl`` (role=task attribution)
     by ``DomainTaskRunner._ingest_cm_events``. Not an output-dir path — it
     lives and dies with the pruned work dir."""
-    return os.path.join(run_dir, "cm_events.jsonl")
+    return os.path.join(run_dir, CM_EVENTS_NAME)
 
 
 def tree_path(output_dir: str, name: str) -> str:
