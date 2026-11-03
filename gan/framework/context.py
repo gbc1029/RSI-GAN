@@ -73,6 +73,9 @@ class EvalContext:
     # (blind + reveal). Mirrors the plan/self receipts' budget flags.
     token_budget_exhausted: bool = False
     truncated: bool = False
+    # Blind challenge proposals. Producer/node metadata is stamped by the
+    # framework after the evaluator result; the role only supplies the claim.
+    challenges: List[Dict[str, Any]] = field(default_factory=list)
 
     def add_issue(self, issue: Dict[str, Any]) -> None:
         self.issues.append(issue)
@@ -82,6 +85,22 @@ class EvalContext:
             "issue_id": issue_id, "fixed": bool(fixed), "evidence": evidence or "",
             "judged_by": "evaluator",
         })
+
+    def configure_challenges(self, *, domain: Optional[str], allowed_qids,
+                             max_k: int, blind_only: bool) -> None:
+        self._challenge_domain = str(domain or "")
+        self._challenge_allowed_qids = frozenset(
+            str(qid) for qid in (allowed_qids or []))
+        self._challenge_max_k = int(max_k)
+        self._challenge_blind_only = bool(blind_only)
+
+    def challenge_config(self) -> Dict[str, Any]:
+        return {
+            "domain": getattr(self, "_challenge_domain", ""),
+            "allowed_qids": getattr(self, "_challenge_allowed_qids", frozenset()),
+            "max_k": getattr(self, "_challenge_max_k", 0),
+            "blind_only": getattr(self, "_challenge_blind_only", False),
+        }
 
 
 def set_eval_context(ctx: EvalContext):

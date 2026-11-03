@@ -119,13 +119,19 @@ def _validated_result(method: str, value: Any) -> Any:
             "eval_point_results", "weaknesses", "token_budget_exhausted",
             "truncated",
         }
-        _exact_keys(value, fields, "evaluate result")
+        challenge_fields = fields | {"challenges"}
+        if set(value) == fields:
+            value = dict(value)
+            value["challenges"] = []
+        elif set(value) != challenge_fields:
+            _exact_keys(value, challenge_fields, "evaluate result")
         score = value["predicted_score"]
         if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
             raise RoleProcessError("evaluate predicted_score must be numeric or null")
         _dict_list(value["issues"], "evaluate issues")
         _dict_list(value["fix_verdicts"], "evaluate fix_verdicts")
         _dict_list(value["eval_point_results"], "evaluate eval_point_results")
+        _dict_list(value["challenges"], "evaluate challenges")
         if not isinstance(value["penalties"], dict):
             raise RoleProcessError("evaluate penalties must be an object")
         if (not isinstance(value["weaknesses"], list)
@@ -141,7 +147,13 @@ def _validated_result(method: str, value: Any) -> Any:
             "token_budget_exhausted", "deep_probe_required",
             "deep_probe_patch_proposed",
         }
-        _exact_keys(value, fields, "plan result")
+        deep_fields = {"deep_probe_required", "deep_probe_patch_proposed"}
+        legacy_fields = fields - deep_fields
+        if set(value) == legacy_fields:
+            value = dict(value)
+            value.update({name: False for name in deep_fields})
+        else:
+            _exact_keys(value, fields, "plan result")
         _dict_list(value["records"], "plan records")
         _dict_list(value["responses"], "plan responses")
         if not isinstance(value["config"], dict):

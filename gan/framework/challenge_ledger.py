@@ -81,6 +81,24 @@ def _text(value: Any, field: str) -> str:
     return value
 
 
+def validate_candidate(item: Mapping[str, Any], *, allowed_qids: Iterable[Any],
+                       seen_qids: Iterable[Any] = ()) -> Dict[str, str]:
+    """Validate one blind candidate without mutating or revealing ledger state."""
+    if not isinstance(item, Mapping):
+        raise ChallengeError("each challenge must be an object")
+    forbidden = _FORBIDDEN.intersection(item)
+    if forbidden:
+        raise ChallengeError("blind challenge contains revealed field(s): "
+                             + ", ".join(sorted(forbidden)))
+    row = {field: _text(item.get(field), field) for field in _REQUIRED}
+    allowed = {str(qid) for qid in allowed_qids}
+    if row["qid"] not in allowed:
+        raise ChallengeError(f"challenge qid is not an allowed train qid: {row['qid']}")
+    if row["qid"] in {str(qid) for qid in seen_qids}:
+        raise ChallengeError(f"duplicate challenge qid: {row['qid']}")
+    return row
+
+
 def _lock_key(outer: Any, parent_node: Any, evaluator_version: Any) -> str:
     return f"{outer}:{parent_node}:{evaluator_version}"
 
@@ -116,17 +134,7 @@ def lock(
     payload: List[Dict[str, str]] = []
     seen_qids = set()
     for item in items:
-        if not isinstance(item, Mapping):
-            raise ChallengeError("each challenge must be an object")
-        forbidden = _FORBIDDEN.intersection(item)
-        if forbidden:
-            raise ChallengeError("blind challenge contains revealed field(s): "
-                                 + ", ".join(sorted(forbidden)))
-        row = {field: _text(item.get(field), field) for field in _REQUIRED}
-        if row["qid"] not in allowed:
-            raise ChallengeError(f"challenge qid is not an allowed train qid: {row['qid']}")
-        if row["qid"] in seen_qids:
-            raise ChallengeError(f"duplicate challenge qid: {row['qid']}")
+        row = validate_candidate(item, allowed_qids=allowed, seen_qids=seen_qids)
         seen_qids.add(row["qid"])
         payload.append(row)
     existing = locks.get(key)
@@ -193,5 +201,5 @@ def consume_for_child(data: Dict[str, Any], *, parent_node: Any,
 __all__ = [
     "LEDGER_VERSION", "DOMAIN", "STATUS_LOCKED", "STATUS_RESERVED",
     "STATUS_CONSUMED", "ChallengeError", "empty", "load", "save", "lock",
-    "reserve_for_child", "consume_for_child",
+    "validate_candidate", "reserve_for_child", "consume_for_child",
 ]

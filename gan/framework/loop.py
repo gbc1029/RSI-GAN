@@ -2794,6 +2794,7 @@ class GanLoop:
                 # just the trajectory replay) for the four shipped eval points;
                 # audit-file only, no evaluator-projection key is added.
                 "eval_point_results": list(getattr(ctx, "eval_point_results", []) or []),
+                "challenges": list(getattr(ctx, "challenges", []) or []),
             }
             d = paths.runs_dir(self.output_dir, child.genid)
             os.makedirs(d, exist_ok=True)
