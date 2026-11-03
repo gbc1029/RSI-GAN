@@ -120,6 +120,11 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
         "type": "int", "min": 1, "max": 50, "default": 4,
         "consumer": "cm seam (default pin window; framework floor is the min)",
     },
+    "cm_head_tail_keep": {
+        "type": "int", "min": 1, "max": 2000, "default": 600,
+        "consumer": ("cm render (head_tail form per-side keep, session-wide; "
+                     "excerpt form retired — docs/19 §12.21)"),
+    },
     "cm_drop_floor_chars": {
         "type": "int", "min": 0, "max": 100_000, "default": 400,
         "consumer": "cm seam invariant (blocks smaller than this are never dropped/compacted)",

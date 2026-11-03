@@ -20,30 +20,34 @@ list must not advertise them):
 ``boundary``     RETAINED vocabulary: question-boundary marker, no materializing
                  code path in v1 (multi-question sessions only, docs/10 §11.4)
 ``derived``      compaction product; id ``derived:<op>:<n>``, refs its sources
-                 (merge/template materialize it — docs/10 §15; excerpt/
-                 first_last stay form-level. register_derived is NOT on any
+                 (merge/template materialize it — docs/10 §15; first_last
+                 stays form-level. register_derived is NOT on any
                  face, so no caller can fabricate derived text — no-
                  fabrication by construction. A derived block becomes PINNED
                  the moment it is consumed as a source of a higher derived
                  block: consumed nodes never re-compact, keeping the lineage
                  a tree, not a DAG)
 
-View forms: ``full`` | ``head_tail`` | ``excerpt`` | ``placeholder`` | ``template``.
+View forms: ``full`` | ``head_tail`` | ``placeholder`` | ``template``.
 Rendering is PURE: every form derives from the block's own text or is a
 content-free placeholder — no new content can enter a view (§5.2 不变量 1).
+The single source of every form's SENT TEXT is ``bake()``; the single
+source of every saving number is ``form_saving()`` (docs/19 §12.21).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-FORMS = ("full", "head_tail", "excerpt", "placeholder", "template", "dedup",
+FORMS = ("full", "head_tail", "placeholder", "template", "dedup",
          "derived_host")
 KINDS = ("turn_output", "tool_output", "traj_seg", "kb_note", "note",
          "boundary", "derived")
 
-HEAD_TAIL_KEEP = 400    # chars kept on each side for head_tail
-EXCERPT_KEEP = 600      # chars kept on each side for excerpt
+HEAD_TAIL_KEEP = 600    # default per-side keep for the head_tail form (the
+# session key cm_head_tail_keep overrides it; excerpt form retired — docs/19
+# §12.21)
+HEAD_TAIL_KEEP_MAX = 2000  # clamp ceiling for cm_head_tail_keep (cost_keys)
 MIN_COMPACT_SAVE = 200  # refuse compaction that saves less than this
 PLACEHOLDER_OVERHEAD = 128  # ~ chars a placeholder line costs (declared
 # approximation, drop-floor guard; recalibrated for the enriched line, no
@@ -75,31 +79,49 @@ def placeholder(block: "Block", rule: str) -> str:
             f"kind={block.kind}, source={block.source}, reason={rule}]")
 
 
-def excerpt_saving(block: "Block") -> int:
-    return max(0, block.chars - len(cut(block.text, EXCERPT_KEEP)))
-
-
-def render_form(block: "Block", form: str, rule: str = "") -> str:
-    """Render one block in a view form (pure; no new content).
-
-    Form semantics (docs/10 form 语义声明): placeholder = eviction event
-    (the reason tag says why); template = catalog card (metadata + the
-    source address instead of content — never claims a loss). Both are
-    sticky and restore via fetch(full)."""
+def bake(block: "Block", form: str, rule: str = "", keep: Optional[int] = None,
+         host_text: Optional[str] = None) -> str:
+    """THE definition of one block's sent text in a view form — render and
+    saved accounting both consume this; no second copy of any formula may
+    exist (docs/19 §12.21). Pure; no new content beyond the declared
+    in-band lines. ``keep`` matters only for head_tail (session key
+    ``cm_head_tail_keep``, default HEAD_TAIL_KEEP); ``host_text`` is the
+    resolved derived text for the derived_host form."""
+    rule = str(rule)[:60]
     if form == "full":
         return block.text
     if form == "head_tail":
-        return cut(block.text, HEAD_TAIL_KEEP)
-    if form == "excerpt":
-        return cut(block.text, EXCERPT_KEEP)
+        return (cut(block.text, keep if keep is not None else HEAD_TAIL_KEEP)
+                + f"\n[block {block.block_id} head_tail: {rule or 'view'}]")
     if form == "placeholder":
-        return placeholder(block, rule or "view form")
+        return placeholder(block, rule)
     if form == "template":
         meta = block.to_meta()
         return (f"[block {block.block_id} template: kind={meta['kind']}, "
                 f"chars={meta['chars']}, source={meta['source']}, "
-                f"reason={str(rule)[:60] or 'view'}]")
+                f"reason={rule or 'view'}]")
+    if form == "derived_host":
+        return ((host_text or "")
+                + f"\n[block {block.block_id} derived_host: {rule}]")
     raise ValueError(f"invalid form {form!r}")
+
+
+def form_saving(block: "Block", form: str, rule: str = "",
+                keep: Optional[int] = None,
+                host_text: Optional[str] = None) -> int:
+    """Actual chars the elision saves vs full, BY DEFINITION: the exact
+    sent-text delta through bake() (includes the render suffix and the rule
+    length). The ONLY saving helper — per-form copies are forbidden
+    (docs/19 §12.21)."""
+    return max(0, block.chars - len(bake(block, form, rule, keep=keep,
+                                         host_text=host_text)))
+
+
+def render_form(block: "Block", form: str, rule: str = "",
+                keep: Optional[int] = None) -> str:
+    """Render one block in a view form — thin delegate to bake() (the
+    single source). Exported for tests/audit only, no runtime caller."""
+    return bake(block, form, rule, keep=keep)
 
 
 @dataclass

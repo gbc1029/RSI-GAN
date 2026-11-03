@@ -91,16 +91,16 @@ def assemble_compact_conservative(session, msgs, outgoing,
                                   tokens_used: int = 0,
                                   budget: Optional[int] = None
                                   ) -> Tuple[List[Dict[str, Any]], str]:
-    """``compact_conservative`` preset — excerpt tier before the window.
+    """``compact_conservative`` preset — head_tail tier before the window.
 
-    History turns older than the pin window whose mechanical excerpt
-    actually saves >= MIN_COMPACT_SAVE chars become EXCERPTS (head+tail
-    kept) instead of the slice preset's whole-turn placeholder. The excerpt
-    pass runs BEFORE the window pass because the window skips
-    already-substituted blocks (sticky forms): an excerpted turn is not
-    placeholder-dropped on top of its excerpt (the compaction target is the
-    old USER turn, which carries the embedded tool outputs in this chat
-    protocol)."""
+    History turns older than the pin window whose mechanical trim actually
+    saves >= MIN_COMPACT_SAVE chars become head_tail-trimmed (head+tail kept
+    at the session ``cm_head_tail_keep``) instead of the slice preset's
+    whole-turn placeholder. The trim pass runs BEFORE the window pass because
+    the window skips already-substituted blocks (sticky forms): a trimmed
+    turn is not placeholder-dropped on top of its trim (the compaction target
+    is the old USER turn, which carries the embedded tool outputs in this
+    chat protocol)."""
     session.register_history(msgs)
     out_block = session.register_outgoing(outgoing)
     records: List[Dict[str, Any]] = []

@@ -51,9 +51,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import assembly
 from . import ops
-from .blocks import (Block, Universe, View, cut, placeholder, estimate_tokens,
-                       excerpt_saving, EXCERPT_KEEP, HEAD_TAIL_KEEP,
-                       MIN_COMPACT_SAVE)
+from .blocks import (Block, Universe, View, bake, form_saving,
+                       HEAD_TAIL_KEEP, HEAD_TAIL_KEEP_MAX, MIN_COMPACT_SAVE)
 
 # Framework floor (docs/10 §5.2.3: K 是带框架下限的键) — the clamping
 # authority owns the ranges; this is the hard invariant this layer adds.
@@ -312,7 +311,8 @@ class SessionPortal:
         "run_policy", "call_method", "finalize_turn", "render",
     })
     _PARAMS = frozenset({
-        "mode", "system_prefix", "window_k", "drop_floor_chars",
+        "mode", "system_prefix", "window_k", "head_tail_keep",
+        "drop_floor_chars",
         "min_compact_save", "note_cap_chars", "max_ops_per_turn",
         "assembly_exec_ms", "policy_exec_ms", "turn",
     })
@@ -403,7 +403,8 @@ class ViewHandle:
     def view_state(self) -> Dict[str, Any]:
         if err := self._gate("view_state"):
             return err
-        return ops.view_state(self._s.universe, self._s.view)
+        return ops.view_state(self._s.universe, self._s.view,
+                              head_tail_keep=self._s.head_tail_keep)
 
     def budget_query(self, tokens_used: Optional[int] = None,
                      budget: Optional[int] = None) -> Dict[str, Any]:
@@ -415,7 +416,8 @@ class ViewHandle:
     def fetch(self, block_id: str, form: str = "full") -> Dict[str, Any]:
         if err := self._gate("fetch"):
             return err
-        return self._audit(ops.fetch(self._s.universe, self._s.view, block_id, form))
+        return self._audit(ops.fetch(self._s.universe, self._s.view, block_id,
+                                     form, keep=self._s.head_tail_keep))
 
     def pin(self, block_id: str, note: str = "") -> Dict[str, Any]:
         if err := self._gate("pin"):
@@ -438,13 +440,15 @@ class ViewHandle:
         if err := self._gate("compact"):
             return err
         return self._audit(ops.compact(self._s.universe, self._s.view, list(block_ids),
-                           strategy, self._s.drop_floor_chars, self._s.turn))
+                           strategy, self._s.drop_floor_chars, self._s.turn,
+                           keep=self._s.head_tail_keep))
 
     def substitute(self, block_id: str, form: str) -> Dict[str, Any]:
         if err := self._gate("substitute"):
             return err
         return self._audit(ops.substitute(self._s.universe, self._s.view, block_id, form,
-                              "policy", self._s.drop_floor_chars))
+                              "policy", self._s.drop_floor_chars,
+                              keep=self._s.head_tail_keep))
 
     def order(self, block_ids: List[str]) -> Dict[str, Any]:
         if err := self._gate("order"):
@@ -494,6 +498,8 @@ class CMSession:
     preset with a loud ``cm_assembly_fallback`` event, never silently)."""
     mode: str = "passthrough"
     window_k: int = 4
+    head_tail_keep: int = HEAD_TAIL_KEEP  # session-wide head_tail notch
+    # (cost key cm_head_tail_keep; excerpt form retired — docs/19 §12.21)
     drop_floor_chars: int = 400
     max_ops_per_turn: int = 32
     policy_exec_ms: int = 200
@@ -599,6 +605,9 @@ class CMSession:
         k = keys.get("cm_window_k")
         if type(k) is int and k >= WINDOW_K_FLOOR:
             self.window_k = k
+        v = keys.get("cm_head_tail_keep")
+        if type(v) is int and 1 <= v <= HEAD_TAIL_KEEP_MAX:
+            self.head_tail_keep = v
         v = keys.get("cm_drop_floor_chars")
         if type(v) is int and v >= 0:
             self.drop_floor_chars = v
@@ -1078,6 +1087,12 @@ class CMSession:
             return
         self.view.forms.clear()
         self.view.forms.update(snap.get("forms") or {})
+        # legacy normalization (docs/19 §12.21): the excerpt form retired —
+        # an old snapshot may still carry it; head_tail at the session keep
+        # is the closest surviving semantic.
+        for _bid, _f in list(self.view.forms.items()):
+            if _f == "excerpt":
+                self.view.forms[_bid] = "head_tail"
         self.view.rules.clear()
         self.view.rules.update(snap.get("rules") or {})
         (self.ops_total, self.ops_applied, self.ops_refused, self.violations,
@@ -1297,9 +1312,10 @@ class CMSession:
 
     def conservative_compaction(self) -> List[Dict[str, Any]]:
         """compact_conservative adds: history turns older than the pin window
-        whose mechanical excerpt actually saves >= MIN_COMPACT_SAVE chars
-        become EXCERPTS (head+tail kept) instead of the slice mode's
-        whole-turn placeholder.
+        whose mechanical head_tail trim actually saves >= MIN_COMPACT_SAVE
+        chars become head_tail-trimmed (head+tail kept at the session
+        ``cm_head_tail_keep``) instead of the slice mode's whole-turn
+        placeholder.
 
         Erratum (docs/10 §11.5): the compaction target is the old USER turn —
         this chat protocol embeds tool outputs in the next user message, so a
@@ -1317,11 +1333,13 @@ class CMSession:
                 continue
             if self.view.form_of(block.block_id) != "full":
                 continue  # already substituted in an earlier turn (sticky)
-            if excerpt_saving(block) < MIN_COMPACT_SAVE:
-                continue  # the excerpt would save nothing: leave to the window
+            if form_saving(block, "head_tail", rule="compacted:first_last",
+                           keep=self.head_tail_keep) < MIN_COMPACT_SAVE:
+                continue  # the trim would save nothing: leave to the window
             out.append(ops.compact(self.universe, self.view,
                                    [block.block_id], "first_last",
-                                   self.drop_floor_chars, self.turn))
+                                   self.drop_floor_chars, self.turn,
+                                   keep=self.head_tail_keep))
         return out
 
     def budget_snapshot(self, tokens_used: Optional[int] = None,
@@ -1589,11 +1607,10 @@ class CMSession:
                 if f"[block {block.block_id} " in content:
                     continue  # already baked in an earlier turn (idempotent)
                 if form == "placeholder":
-                    new_text = placeholder(block, rule or "view")
-                elif form in ("excerpt", "head_tail"):
-                    keep = EXCERPT_KEEP if form == "excerpt" else HEAD_TAIL_KEEP
-                    new_text = (cut(block.text, keep)
-                                + f"\n[block {block.block_id} {form}: {rule or 'view'}]")
+                    new_text = bake(block, "placeholder", rule or "view")
+                elif form == "head_tail":
+                    new_text = bake(block, "head_tail", rule or "view",
+                                    keep=self.head_tail_keep)
                 elif form == "derived_host":
                     # the host span renders the DERIVED text IN FULL (the
                     # merge/template already did the compressing). The baked
@@ -1604,23 +1621,18 @@ class CMSession:
                               if rule.startswith("derived=") else None)
                     if dblock is None:
                         continue  # unreachable (universe add-only): stay raw
-                    new_text = (dblock.text
-                                + f"\n[block {block.block_id} derived_host: {rule}]")
+                    new_text = bake(block, "derived_host", rule,
+                                    host_text=dblock.text)
                 elif form == "dedup":
                     if self.system_prefix and new_content.startswith(self.system_prefix):
                         new_text = _DEDUP_MARKER + new_content[len(self.system_prefix):]
                     else:
                         continue
-                else:  # template — catalog CARD, not an eviction event: the
-                    # line keeps metadata + the source address instead of
-                    # content and never claims a loss; restorable via
-                    # fetch(full) like every non-full form (docs/10 form
-                    # 语义声明, docs/19 §12.20)
-                    meta = block.to_meta()
-                    new_text = (f"[block {block.block_id} template: "
-                                f"kind={meta['kind']}, chars={meta['chars']}, "
-                                f"source={meta['source']}, "
-                                f"reason={rule or 'view'}]")
+                else:  # template — catalog CARD, not an eviction event (the
+                    # line never claims a loss); restorable via fetch(full)
+                    # like every non-full form (docs/10 form 语义声明,
+                    # docs/19 §12.20/§12.21)
+                    new_text = bake(block, "template", rule or "view")
                 if form == "dedup":
                     new_content = new_text  # prefix elision (anchored at head)
                 elif block.text and block.text in new_content:
@@ -1629,7 +1641,8 @@ class CMSession:
                     # the span drifted (result embedded with decorations): a
                     # whole-message placeholder keeps the view honest without
                     # fabricating anything
-                    new_content = placeholder(block, f"span-drift:{rule or form}")
+                    new_content = bake(block, "placeholder",
+                                       f"span-drift:{rule or form}")
                     break
             if new_content != content:
                 shallow = dict(m)

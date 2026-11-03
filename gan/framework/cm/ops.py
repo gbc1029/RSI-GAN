@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from .blocks import (Block, Universe, View, cut, excerpt_saving, placeholder,
+from .blocks import (Block, Universe, View, bake, cut, form_saving,
                        PLACEHOLDER_OVERHEAD, MIN_COMPACT_SAVE,
                        DERIVED_PIECE_KEEP, estimate_tokens)
 
@@ -63,24 +63,32 @@ def drop(universe: Universe, view: View, block_id: str, rule: str,
         return {"op": "drop", "refs": [block_id], "ok": False,
                 "error": f"below drop floor ({floor_chars})"}
     view.set(block_id, "placeholder", rule or "drop")
+    # ⑤ (docs/19 §12.21): a block not bound to canonical history never
+    # renders, so eliding it saves nothing — saved counts render-visible
+    # blocks only (the same口径 as render's msg_index skip).
+    saved = (form_saving(block, "placeholder", rule or "drop")
+             if block.msg_index is not None else 0)
     return {"op": "drop", "refs": [block_id], "ok": True,
-            "rule": rule or "drop",
-            "saved": max(0, block.chars - len(placeholder(block, rule)))}
+            "rule": rule or "drop", "saved": saved}
 
 
 def substitute(universe: Universe, view: View, block_id: str, form: str,
-               rule: str, floor_chars: int) -> Dict[str, Any]:
+               rule: str, floor_chars: int,
+               keep: Optional[int] = None) -> Dict[str, Any]:
+    """``keep`` = the session's head_tail notch (``cm_head_tail_keep``),
+    threaded explicitly by the caller — primitives stay session-free
+    (docs/19 §12.21)."""
     block = universe.get(block_id)
     if block is None:
         return {"op": "substitute", "refs": [block_id], "ok": False,
                 "error": "unknown block"}
-    if form not in ("full", "head_tail", "excerpt", "placeholder", "template"):
+    if form not in ("full", "head_tail", "placeholder", "template"):
         return {"op": "substitute", "refs": [block_id], "ok": False,
                 "error": f"invalid form {form!r}"}
     if form == "placeholder" and block.pinned:
         return {"op": "substitute", "refs": [block_id], "ok": False,
                 "error": "pinned block"}
-    if form in ("placeholder", "head_tail", "excerpt", "template") \
+    if form in ("placeholder", "head_tail", "template") \
             and block.chars < floor_chars:
         return {"op": "substitute", "refs": [block_id], "ok": False,
                 "error": f"below drop floor ({floor_chars})"}
@@ -88,17 +96,22 @@ def substitute(universe: Universe, view: View, block_id: str, form: str,
         view.set(block_id, "full", rule or "restore")
         return {"op": "substitute", "refs": [block_id], "ok": True,
                 "rule": rule or "restore", "saved": 0}
-    saved = max(0, block.chars - len(cut(block.text, 600))) \
-        if form in ("excerpt", "head_tail") else 0
+    # saved = the ACTUAL sent-text delta through bake() (single source, incl.
+    # the render suffix); a block not bound to history never renders → saves
+    # nothing (⑤, docs/19 §12.21).
+    saved = (form_saving(block, form, rule or "substitute", keep=keep)
+             if block.msg_index is not None else 0)
     view.set(block_id, form, rule or "substitute")
     return {"op": "substitute", "refs": [block_id], "ok": True,
             "rule": rule or "substitute", "saved": saved, "form": form}
 
 
 def compact(universe: Universe, view: View, block_ids: List[str],
-            strategy: str, floor_chars: int, turn: int) -> Dict[str, Any]:
-    """Mechanical compaction (NO LLM). ``excerpt``/``first_last`` stay
-    form-level (single-block strategies — the sticky excerpt achieves them).
+            strategy: str, floor_chars: int, turn: int,
+            keep: Optional[int] = None) -> Dict[str, Any]:
+    """Mechanical compaction (NO LLM). ``first_last`` stays form-level (a
+    single-block strategy writing the sticky head_tail form at the session
+    keep; the ``excerpt`` strategy/form retired — docs/19 §12.21).
     ``merge``/``template`` materialize a DERIVED block whose text is built
     HERE from the sources only — register_derived is not on any face, so
     no-fabrication holds by construction (docs/10 §15).
@@ -109,10 +122,15 @@ def compact(universe: Universe, view: View, block_ids: List[str],
     placeholder; stale references to consumed derived sources are re-pointed
     the same way (one view representation per piece of content). A derived
     source is PINNED on consumption — consumed nodes never re-compact, the
-    lineage stays a tree, not a DAG. Validate first, mutate only on success."""
-    if strategy not in ("excerpt", "first_last", "merge", "template"):
+    lineage stays a tree, not a DAG. saved is the VIEW DELTA through bake()
+    over render-visible blocks only (⑤); the GATE runs on a nominal rule
+    (the derived id does not exist yet), the recorded saved is exact.
+    Validate first, mutate only on success."""
+    if strategy not in ("first_last", "merge", "template"):
+        hint = (" (retired docs/19 §12.21; use 'first_last')"
+                if strategy == "excerpt" else "")
         return {"op": "compact", "refs": list(block_ids), "ok": False,
-                "error": f"unknown strategy {strategy!r}"}
+                "error": f"unknown strategy {strategy!r}{hint}"}
     if not block_ids:
         return {"op": "compact", "refs": [], "ok": False, "error": "no refs"}
     if len(set(block_ids)) != len(block_ids):
@@ -138,16 +156,18 @@ def compact(universe: Universe, view: View, block_ids: List[str],
             return {"op": "compact", "refs": list(block_ids), "ok": False,
                     "error": f"below drop floor ({floor_chars})"}
         blocks.append(block)
-    if strategy in ("excerpt", "first_last"):
+    if strategy == "first_last":
+        saved = 0
         for block in blocks:
-            saving = excerpt_saving(block)
+            saving = form_saving(block, "head_tail",
+                                 rule=f"compacted:{strategy}", keep=keep)
             if saving < MIN_COMPACT_SAVE:
                 return {"op": "compact", "refs": list(block_ids), "ok": False,
                         "error": ("compaction saves nothing "
                                   f"({block.block_id} saves {saving})")}
             saved += saving
         for block in blocks:
-            view.set(block.block_id, "excerpt", f"compacted:{strategy}")
+            view.set(block.block_id, "head_tail", f"compacted:{strategy}")
         return {"op": "compact", "refs": list(block_ids), "ok": True,
                 "rule": f"compacted:{strategy}", "saved": saved}
 
@@ -176,8 +196,15 @@ def compact(universe: Universe, view: View, block_ids: List[str],
                          f"head={clip_diag(seg_lines[0], 110)!r} "
                          f"tail={clip_diag(seg_lines[-1], 110)!r}")
         derived_text = "\n".join(lines)
-    saved = sum(b.chars for b in blocks) - len(derived_text)
-    if saved < MIN_COMPACT_SAVE:
+    # view-delta gate over render-visible blocks (⑤): nominal rules (the
+    # derived id does not exist yet)
+    bound = [b for b in blocks if b.msg_index is not None]
+    before = sum(len(bake(b, "full")) for b in bound)
+    nominal_after = (len(bake(host, "derived_host", "derived=x",
+                              host_text=derived_text))
+                     + sum(len(bake(b, "placeholder", "merged-into:x"))
+                           for b in bound if b is not host))
+    if before - nominal_after < MIN_COMPACT_SAVE:
         return {"op": "compact", "refs": list(block_ids), "ok": False,
                 "error": "compaction saves nothing"}
 
@@ -188,11 +215,19 @@ def compact(universe: Universe, view: View, block_ids: List[str],
     for b in blocks:
         if b.kind == "derived":
             b.pinned = True   # consumed node: never re-compact (tree, not DAG)
-    view.set(host.block_id, "derived_host", f"derived={dblock.block_id}")
-    for b in blocks:
-        if b.block_id != host.block_id and b.msg_index is not None:
-            view.set(b.block_id, "placeholder",
-                     f"merged-into:{dblock.block_id}")
+    rule_host = f"derived={dblock.block_id}"
+    rule_ph = f"merged-into:{dblock.block_id}"
+    view.set(host.block_id, "derived_host", rule_host)
+    for b in bound:
+        if b is not host:
+            view.set(b.block_id, "placeholder", rule_ph)
+    # exact recorded saved: the real view delta with the REAL rules (bake
+    # single source; render-visible blocks only)
+    saved = (before
+             - len(bake(host, "derived_host", rule_host,
+                        host_text=derived_text))
+             - sum(len(bake(b, "placeholder", rule_ph))
+                   for b in bound if b is not host))
     if consumed:
         # former hosts / pointers of a consumed derived re-point to the
         # newest representation (one view representation per content)
@@ -340,13 +375,18 @@ def index_blocks(universe: Universe, kinds: Optional[List[str]] = None,
     return out
 
 
-def view_state(universe: Universe, view: View) -> Dict[str, Any]:
+def view_state(universe: Universe, view: View,
+               head_tail_keep: Optional[int] = None) -> Dict[str, Any]:
     """Forms + rule tags (docs/19 §12.19): the rule tags carry the pin
     annotations and the op reasons — the agent's read surface for what it
-    pinned and why (the write came from ``ctx_pin``'s note)."""
+    pinned and why (the write came from ``ctx_pin``'s note). The session's
+    head_tail notch rides along additively (docs/19 §12.21)."""
     forms = {bid: view.form_of(bid) for bid in universe.blocks}
-    return {"op": "view_state", "ok": True, "forms": forms,
-            "rules": dict(view.rules)}
+    out = {"op": "view_state", "ok": True, "forms": forms,
+           "rules": dict(view.rules)}
+    if head_tail_keep is not None:
+        out["head_tail_keep"] = head_tail_keep
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +438,7 @@ def budget_query(reader: Any, tokens_used: Optional[int] = None,
 
 
 def fetch(universe: Universe, view: View, block_id: str,
-          form: str = "full") -> Dict[str, Any]:
+          form: str = "full", keep: Optional[int] = None) -> Dict[str, Any]:
     """Materialize a block into the view (None≠0: restoring costs future
     tokens but never fabricates) — fetch-forms other than full substitute."""
     block = universe.get(block_id)
@@ -409,4 +449,4 @@ def fetch(universe: Universe, view: View, block_id: str,
         view.set(block_id, "full", "fetch")
         return {"op": "fetch", "refs": [block_id], "ok": True,
                 "text": block.text, "chars": block.chars}
-    return substitute(universe, view, block_id, form, "fetch", 0)
+    return substitute(universe, view, block_id, form, "fetch", 0, keep=keep)
