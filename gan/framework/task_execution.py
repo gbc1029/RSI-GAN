@@ -2264,14 +2264,28 @@ def _sandbox_runtime_preflight(
         )
 
 
+_HARNESS_TIMEOUT_SLACK_S = 900
+
+
 def harness_total_timeout(domain_cfg: Dict[str, Any], num_samples: int) -> int:
     """Total harness wall budget for one task run -- THE single formula.
 
-    Precedence: an explicit domains.yaml ``harness_timeout_s`` (independent
-    harness domains: imo_*/balrog) wins; otherwise the worst-case serial
-    bound -- every question running its full per-question wall budget
-    (``question_timeout_s``, 300s default) plus a fixed 900s slack for model
-    warm-up / first call / report writing.
+    Precedence:
+
+    1. ``harness_timeout_per_sample_s`` -- a SCALED budget, for domains whose
+       harness runs one agent SESSION per sample unit and fans every unit out
+       over a fixed task list (balrog: ``num_samples`` episodes per task x
+       #tasks episodes, each episode = #steps agent sessions). A flat constant
+       cannot fit both ``num_samples=1`` and ``num_samples=10``: balrog_babyai
+       declared 3600s while one generation is ~10 episodes x up to 60 steps,
+       i.e. 600+ LLM calls -- the run was cut mid-episode, the harness exited
+       non-zero, and (for the sandboxed balrog domains) NO report was written
+       at all. The value means "wall seconds per ONE ``--num_samples`` unit"
+       (all tasks' episodes at that episode count), slack added once.
+    2. ``harness_timeout_s`` -- an explicit absolute budget (imo_*).
+    3. the worst-case serial bound -- every question running its full
+       per-question wall budget (``question_timeout_s``, 300s default) plus a
+       fixed 900s slack for model warm-up / first call / report writing.
 
     Shared by BOTH launch sites -- the broker registration (driver, once per
     run) and the outer worker's per-generation harness wait (task_runner) --
@@ -2280,11 +2294,37 @@ def harness_total_timeout(domain_cfg: Dict[str, Any], num_samples: int) -> int:
     coincidence of config: no parent-scored domain declared
     ``harness_timeout_s``).
     """
+    per_sample = domain_cfg.get("harness_timeout_per_sample_s")
+    if per_sample:
+        return int(num_samples) * int(per_sample) + _HARNESS_TIMEOUT_SLACK_S
     declared = domain_cfg.get("harness_timeout_s")
     if declared:
         return int(declared)
     question_timeout_s = int(domain_cfg.get("question_timeout_s") or 300)
-    return int(num_samples) * question_timeout_s + 900
+    return int(num_samples) * question_timeout_s + _HARNESS_TIMEOUT_SLACK_S
+
+
+def task_llm_call_budget(domain_cfg: Dict[str, Any], num_samples: int,
+                         default_calls_per_sample: int) -> int:
+    """Task-proxy LLM call budget for ONE harness launch -- THE single formula.
+
+    ``domains.yaml`` ``task_llm_calls_per_sample`` replaces the per-QUESTION
+    default for domains whose harness spends many calls per ``--num_samples``
+    unit: balrog runs one agent session per EPISODE and every step is a fresh
+    session, so one proxy token covers ``episodes x #tasks x #steps`` calls.
+    Measured shape of the failure it fixes: with the per-question default
+    (64 x num_samples = 128 calls for ``num_samples=2``) the token ran dry a
+    few steps into the first episode, the sandboxed step child raised, the
+    harness died with rc != 0 and -- for balrog_babyai/balrog_babaisai -- the
+    report was skipped entirely, so the generation scored null for a reason
+    that looked like "the model played badly".
+
+    Domains without the declaration keep the historical
+    ``num_samples * task_llm_max_calls_per_question`` budget EXACTLY.
+    """
+    per_sample = domain_cfg.get("task_llm_calls_per_sample")
+    calls = int(per_sample) if per_sample else int(default_calls_per_sample)
+    return max(1, int(num_samples or 1)) * max(1, calls)
 
 
 def effective_token_budget_per_gen(domain_cfg: Dict[str, Any],
@@ -2435,10 +2475,16 @@ def _run_harness_and_report_local(
         from gan.framework.loader import load_gan_loop_config as _load_cfg
         _calls_per_q = int(_load_cfg().get(
             "loop.task_llm_max_calls_per_question", 64))
+        # SAME formula the root-side broker uses (task_llm_call_budget): a
+        # domain that spends many calls per sample unit (balrog) declares
+        # ``task_llm_calls_per_sample``, so this local path cannot starve the
+        # run either -- the two launch sites must never disagree.
+        from gan.framework.loader import load_registry as _load_reg, resolve_domain as _resolve
+        _domain_cfg = _resolve(_load_reg(), domain)
         proxy_token = request_task_token(
             proxy_socket, control_token, str(scope_id), model,
             ttl_s=float(timeout) + 60.0,
-            max_calls=max(1, _calls_per_q) * max(1, int(num_samples or 1)),
+            max_calls=task_llm_call_budget(_domain_cfg, num_samples, _calls_per_q),
             peer_uid=int(_peer_uid))
     needs_sandbox_identity = questions_path is not None or (
         domain in _SANDBOXED_HARNESS_DOMAINS and dataset_root is not None

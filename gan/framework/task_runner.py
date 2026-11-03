@@ -334,7 +334,14 @@ class DomainTaskRunner:
 
         reg = load_registry()
         self.domain_cfg = resolve_domain(reg, domain)
-        self.timeout = int(self.domain_cfg.get("harness_timeout_s") or timeout)
+        # THE shared formula (task_execution.harness_total_timeout) -- the SAME
+        # one the driver registers the root-side broker with. Reading
+        # ``harness_timeout_s`` directly here was a second, hand-copied rule: a
+        # flat constant cannot scale with ``num_samples``, and balrog's 3600s
+        # truncated generations that need ~600 agent sessions (harness rc != 0
+        # -> no report -> null score). The ``timeout`` argument is kept for
+        # API compatibility only; the declared/formula budget wins.
+        self.timeout = tx.harness_total_timeout(self.domain_cfg, self.num_samples)
         self.score_key = self.domain_cfg.get("score_key")
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""

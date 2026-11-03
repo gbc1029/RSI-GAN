@@ -241,15 +241,32 @@ domains:
       gpu: none
       read_only_assets: [domains/imo]
 
+  # Balrog game domains. ONE harness launch is not "one session per question":
+  # it runs (#tasks in domains/balrog/config/config.yaml) episodes per
+  # ``--num-samples`` unit and EVERY STEP is a separate sandboxed agent session
+  # with its own LLM call chain. The per-question wall/call defaults therefore
+  # cannot express the real load, so both budgets are declared PER
+  # ``--num-samples`` UNIT (all tasks' episodes at that episode count):
+  #   * harness_timeout_per_sample_s -> task_execution.harness_total_timeout
+  #   * task_llm_calls_per_sample    -> task_execution.task_llm_call_budget
+  # (the task proxy token is a HARD cap: exhausting it kills the step child,
+  # the harness exits non-zero and -- for the two sandboxed balrog domains -- no
+  # report is written at all, i.e. a null score that looks like bad play).
   balrog_babyai:
-    harness_timeout_s: 3600
+    # 5 tasks x 60 steps; 30s/step -> 9000s per unit; 60 steps x 8 calls ->
+    # 2400 calls per unit.
+    harness_timeout_per_sample_s: 9000
+    task_llm_calls_per_sample: 2400
     task_brief: >-
       Play the BabyAI navigation environment. At each step, inspect the mission
       and observation and respond with exactly one valid environment action.
 
   balrog_babaisai:
     question_timeout_s: 600
-    harness_timeout_s: 7200
+    # 4 tasks x 60 steps; 30s/step -> 7200s per unit; 60 steps x 8 calls ->
+    # 1920 calls per unit.
+    harness_timeout_per_sample_s: 7200
+    task_llm_calls_per_sample: 1920
     task_brief: >-
       Play the Baba Is AI puzzle environment. At each step, inspect the active
       rules and object positions and respond with exactly one valid action.

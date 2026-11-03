@@ -897,10 +897,13 @@ def run_gan_driver(
         "proxy_socket": proxy_socket,
         "proxy_control_token": proxy_control_token,
         "sandbox_etc_dir": sandbox_etc_dir,
-        "task_llm_max_calls": (
-            max(1, int(questions_per_run)) *
-            task_llm_calls_per_question
-        ),
+        # THE shared budget formula (task_execution.task_llm_call_budget):
+        # a domain that spends many calls per sample unit (balrog: one agent
+        # session per episode AND per step) declares
+        # ``task_llm_calls_per_sample``; everything else keeps the historical
+        # num_samples x task_llm_max_calls_per_question exactly.
+        "task_llm_max_calls": task_execution.task_llm_call_budget(
+            domain_cfg, int(questions_per_run), task_llm_calls_per_question),
         "base_env": safe_broker_env,
     }
     try:
@@ -1093,7 +1096,15 @@ def run_gan_driver(
                                 "effective": _effective,
                                 "task_launch_budget": int(task_launch_budget),
                                 "num_samples": num_samples,
-                                "subset": subset})
+                                "subset": subset,
+                                # Both per-launch budgets are records, not
+                                # derivations: a domain-shaped budget (balrog's
+                                # episode x step fan-out) must be checkable
+                                # afterwards without re-deriving the formula.
+                                "harness_timeout_s": int(harness_timeout),
+                                "task_llm_max_calls": task_execution.task_llm_call_budget(
+                                    domain_cfg, int(questions_per_run),
+                                    task_llm_calls_per_question)})
 
         if resume:
             if start > G:

@@ -4,6 +4,8 @@ import logging
 import multiprocessing
 import os
 import random
+import re
+import shutil
 import traceback
 from collections import defaultdict
 from pathlib import Path
@@ -15,8 +17,59 @@ from tqdm import tqdm
 from domains.balrog.dataset import InContextDataset
 from domains.balrog.environments import make_env
 from domains.balrog.utils import get_unique_seed
+from utils.trajectory_log import LLM_CALLS_SIDECAR_SUFFIX
 
 logger = logging.getLogger(__name__)
+
+# The GAN framework archives task evidence from exactly ONE place:
+# ``<run>/outputs/<run_id>/agent_evals/chat_history_<qid>.jsonl``
+# (gan/framework/trajectory.py ``collect``). Balrog writes one transcript per
+# EPISODE under ``<output>/<env>/<task>/<task>_run_NN_chat_history.jsonl``, so
+# without the mirror below every generation died as
+# ``trajectory_archive_failed`` and the evaluator lost its evidence entirely.
+# The episode IS balrog's question, so the qid is ``env__task__ep<NN>``.
+AGENT_EVALS_DIRNAME = "agent_evals"
+
+
+def episode_qid(env_name, task, episode_idx):
+    """Filesystem-safe per-EPISODE id (balrog's analogue of a question id)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(task)).strip("_") or "task"
+    return f"{env_name}__{safe}__ep{int(episode_idx):02d}"
+
+
+def archive_episode_trajectory(output_dir, env_name, task, episode_idx):
+    """Mirror one episode transcript into ``<output>/agent_evals/``.
+
+    A COPY, never a move: the upstream per-task layout (CSV + transcript next to
+    the episode JSON) stays as the domain's own evidence. ``copyfile`` (not
+    ``copy2``) keeps this free of copystat/chmod traps on files the sandboxed
+    uid wrote. Returns the mirrored path, or ``None`` when the episode produced
+    no transcript (then the framework's archive failure is the honest signal).
+    """
+    src = os.path.join(
+        output_dir,
+        env_name,
+        task,
+        f"{task}_run_{int(episode_idx):02d}_chat_history.jsonl",
+    )
+    if not os.path.isfile(src):
+        logging.warning(
+            "no episode transcript to archive (%s/%s ep%d): %s",
+            env_name, task, episode_idx, src,
+        )
+        return None
+    dest_dir = os.path.join(output_dir, AGENT_EVALS_DIRNAME)
+    Path(dest_dir).mkdir(parents=True, exist_ok=True)
+    dest = os.path.join(dest_dir, f"chat_history_{episode_qid(env_name, task, episode_idx)}.jsonl")
+    shutil.copyfile(src, dest)
+    # Per-call LLM audit rows ride a sidecar next to the transcript (agent/llm.py
+    # -> agent/llm_withtools.py). Mirror it when present so the framework's
+    # ``llm_calls`` sidecar fold-in finds it (advisory on absence: sandboxed
+    # step children currently do not hand their sidecar back).
+    src_sidecar = src + LLM_CALLS_SIDECAR_SUFFIX
+    if os.path.isfile(src_sidecar):
+        shutil.copyfile(src_sidecar, dest + LLM_CALLS_SIDECAR_SUFFIX)
+    return dest
 
 def to_jsonable(x):
     if isinstance(x, np.ndarray):
@@ -393,5 +446,16 @@ class Evaluator:
             Path(json_filename).parent.mkdir(exist_ok=True, parents=True)
             with open(json_filename, "w") as f:
                 json.dump(episode_log, f, indent=4)
+
+        # Archive the episode transcript into the framework's evidence contract.
+        # Never fatal: a mirror failure must not lose the episode's score; the
+        # framework then reports the missing archive explicitly.
+        try:
+            archive_episode_trajectory(self.output_dir, self.env_name, task, episode_idx)
+        except Exception as e:  # noqa: BLE001 -- audited, never fatal
+            logging.error(
+                "episode transcript archive failed (%s/%s ep%d): %s",
+                self.env_name, task, episode_idx, e,
+            )
 
         return episode_log
