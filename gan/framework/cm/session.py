@@ -68,8 +68,9 @@ _WARN_RATIO = 0.8      # budget_checkpoint warns at 80% of an active budget
 # strikes rule died with the per-turn policy reload.
 _AGENT_MODULE_STRIKES = 1
 _KIND_FOR_ROLE = {"tool": "tool_output"}
-# view artifacts carry this marker prefix (placeholder/template/excerpt
-# suffix) — history entries showing it are re-bound to their block, never
+# view artifacts carry this marker prefix ("[block <id> " — the match is
+# form-agnostic; legacy excerpt lines from pre-§12.21 histories still
+# re-bind) — history entries showing it are re-bound to their block, never
 # re-registered as new content (the LLM client rebuilds the history list on
 # every call, so object identity does not survive a turn).
 _VIEW_MARKER_PREFIX = "[block "
@@ -1578,10 +1579,11 @@ class CMSession:
     def render(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Materialize the CURRENT persistent view into shallow copies.
 
-        A block's text is only ever replaced by its own excerpt/head_tail cut
-        or the frozen placeholder (or the metadata template) — the view
-        cannot fabricate content (§5.2 不变量 1). Idempotent: an entry whose
-        content already carries the block's baked artifact is left alone."""
+        A block's text is only ever replaced by its own head_tail cut (at
+        the session keep), the frozen placeholder line, or the catalog-card
+        line — the view cannot fabricate content (§5.2 不变量 1). Idempotent:
+        an entry whose content already carries the block's baked artifact is
+        left alone."""
         by_msg: Dict[int, List[Block]] = {}
         for block in self.universe.ordered():
             form = self.view.form_of(block.block_id)

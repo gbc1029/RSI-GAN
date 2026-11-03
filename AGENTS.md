@@ -439,9 +439,13 @@ non-repeatable:
   `docs/10_成本反馈闭环设计.md`, `docs/11_消融实验设计.md` (ablation matrix +
   switch→consumer authority, incl. §3.1 new-sandbox execution-position map)
   (and `docs/cost_tem.md`); `docs/19_CM问题与解决.md` (CM audit ledger +
-  §12 batch records — the authority for CM done/open status; still open
-  there: the `outer=2` real-round acceptance, CM-06/07 residuals, F5
-  anti-tamper user-deferred, T3 process isolation deferred).
+  §12 batch records — the authority for CM done/open status; the `outer=2`
+  real-round acceptance is PASSED (§12.22); still open there: CM-06
+  residuals ⑥ (ctx_view stats aggregation) / ⑧ (reasoning split into the
+  CM meter), CM-08 seat-traj pagination, the make_face_tool fail-closed
+  param hardening + the policy-note semantics ruling (both deferred to a
+  dedicated CM permission-surface batch), F5 anti-tamper user-deferred,
+  T3 process isolation deferred).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

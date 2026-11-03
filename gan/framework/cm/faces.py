@@ -100,7 +100,7 @@ _SPECS: dict = {
         "fn": _ctx_fetch,
     },
     "ctx_budget": {
-        "description": ("Report this session's cost accounting: tokens used (with reasoning split when available), tool calls, and the active budget keys with remaining headroom. Pull-based meter."),
+        "description": ("Report this session's cost accounting: tokens used, tool calls, and the active budget keys with remaining headroom. Pull-based meter."),
         "input_schema": {
             "type": "object",
             "properties": {},
