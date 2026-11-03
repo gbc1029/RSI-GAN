@@ -442,10 +442,12 @@ non-repeatable:
   §12 batch records — the authority for CM done/open status; the `outer=2`
   real-round acceptance is PASSED (§12.22); still open there: CM-06
   residuals ⑥ (ctx_view stats aggregation) / ⑧ (reasoning split into the
-  CM meter), CM-08 seat-traj pagination, the make_face_tool fail-closed
+  CM meter), the make_face_tool fail-closed
   param hardening + the policy-note semantics ruling (both deferred to a
   dedicated CM permission-surface batch), F5 anti-tamper user-deferred,
-  T3 process isolation deferred).
+  T3 process isolation deferred; CM-08 trajectory seat reads CLOSED in
+  §12.24 — segment index/query RPC, offset/fetch/tail/head/grep,
+  per-request 120k cap).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

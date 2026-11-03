@@ -67,6 +67,18 @@ def tool_info():
                                         "(traceback|budget_stop|repeat_break|truncated)."},
                 "offset": {"type": "integer",
                            "description": "Index pagination: skip this many matching segments."},
+                "tail": {"type": "integer",
+                         "description": "Serve the LAST N segments' content as "
+                                        "one page (any mode; the forensic common "
+                                        "case)."},
+                "head": {"type": "integer",
+                         "description": "Serve the FIRST N segments' content as "
+                                        "one page (any mode)."},
+                "grep": {"description": "Regex search over the session files' "
+                                        "segment texts (server-side): returns "
+                                        "matching seg_ids + the first matching "
+                                        "line, so grep -> fetch composes. Bad "
+                                        "regex is a loud error."},
             },
         },
     }
@@ -233,7 +245,8 @@ def _norm_filters(kind, tool, flag, offset):
 
 
 def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
-                  flag=None, offset=0, **kwargs):
+                  flag=None, offset=0, tail=None, head=None, grep=None,
+                  **kwargs):
     actx = get_access_context()
     if actx is None:
         return "Error: no access context"
@@ -268,62 +281,113 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
     if hasattr(broker, "session_trajectory_index"):
         # Sandboxed seat worker: every byte crosses the parent-side RPC
         # (redaction stays parent-side; this seat cannot see other outers'
-        # files). The CM slice index / seg-fetch faces are in-process faces
-        # and do not apply here; filters are noted, never silently ignored.
-        extra = ("# note: kind=/tool=/flag=/offset=/fetch= are in-process "
-                 "slice-mode faces; a sandboxed seat worker reads the full "
-                 "redacted blob\n") if (slice_mode or has_filter) else ""
-        if genid is not None:
-            try:
-                req_outer, req_genid = _parse_genid_ref(genid, outer)
-            except ValueError as e:
-                return f"Error: {e}"
-            try:
+        # files). §12.24 (CM-08): the slice faces cross as a structured
+        # ``query`` — the root-side broker serves index/fetch/tail/head/grep
+        # over the SAME declared files (visibility unchanged; the
+        # materialized payload stays reachable via ctx_index/ctx_fetch).
+        # Old root-side brokers refuse the unknown kwarg with TypeError and
+        # the branch degrades to the legacy blob path LOUDLY, never silently.
+        cap = int(max_chars or 6000)
+        query = None
+        if fetch or tail or head or grep:
+            query = {"fetch": fetch, "tail": tail, "head": head, "grep": grep,
+                     "mode": mode}
+        elif slice_mode:
+            query = {"kind": filt["kind"], "tool": filt["tool"],
+                     "flag": filt["flag"], "offset": filt["offset"],
+                     "mode": mode}
+
+        def _render(req_outer, req_genid, result):
+            where = "" if str(req_outer) == str(outer) else f" (outer_{req_outer})"
+            if isinstance(result, dict):
+                serve = result.get("serve")
+                if serve == "error":
+                    return str(result.get("text") or "Error:")
+                if serve == "segment":
+                    entry = result.get("entry") or {}
+                    meta = (f"# segment {result.get('seg_id')} "
+                            f"kind={entry.get('kind')}"
+                            + (f" tool={entry.get('tool')}" if entry.get("tool") else "")
+                            + f" chars={entry.get('chars')}")
+                    return f"{meta}\n{clip_head(str(entry.get('text') or ''), cap)}"
+                if serve == "page":
+                    return str(result.get("text") or "")
+                if serve == "index":
+                    from gan.framework.cm.traj_index import render_index_text
+                    header = (f"# your session index genid={req_genid}{where} "
+                              f"(mode={mode}, redacted; fetch=<seg_id> for content)")
+                    return header + "\n" + render_index_text(
+                        result.get("index") or {}, max_chars=cap,
+                        kinds=filt["kind"], tools=filt["tool"],
+                        flags=filt["flag"], offset=filt["offset"])
+                return f"Error: unknown serve envelope {serve!r}"
+            blob = str(result or "")
+            if not blob:
+                return ""
+            return f"# your session genid={req_genid}{where}\n{blob}"
+
+        try:
+            if genid is not None:
+                try:
+                    req_outer, req_genid = _parse_genid_ref(genid, outer)
+                except ValueError as e:
+                    return f"Error: {e}"
+                parts = [_render(req_outer, req_genid,
+                                 broker.read_session_trajectory(
+                                     role, actx.node_id, req_outer, req_genid,
+                                     cap, seat=actx.seat, query=query))]
+            else:
+                parts = [_render(o, None,
+                                 broker.read_session_trajectory(
+                                     role, actx.node_id, o, None, cap,
+                                     seat=actx.seat, query=query))
+                         for o in outers]
+        except PermissionError as e:
+            # A refusal is DATA, not an exception the agent has to decode
+            # (docs/19 §12.11: every out-of-set request is refused and the
+            # refusal is reported).
+            return (f"Error: {e}\n"
+                    f"(your session may read outers: {outers})")
+        except TypeError:
+            # Old root-side broker (pre-§12.24): no query face. Retry the
+            # legacy blob path and say so — degradation is never silent.
+            if genid is not None:
+                try:
+                    req_outer, req_genid = _parse_genid_ref(genid, outer)
+                except ValueError as e:
+                    return f"Error: {e}"
                 blob = broker.read_session_trajectory(
                     role, actx.node_id, req_outer, req_genid, cap,
                     seat=actx.seat)
-            except PermissionError as e:
-                # A refusal is DATA, not an exception the agent has to decode
-                # (docs/19 §12.11: every out-of-set request is refused and the
-                # refusal is reported).
-                return (f"Error: {e}\n"
-                        f"(your session may read outers: {outers})")
-            if not blob:
-                return f"No session trajectory for genid {genid}."
-            where = "" if str(req_outer) == str(outer) else f" (outer_{req_outer})"
-            return extra + note + f"# your session genid={req_genid}{where}\n{blob}"
-        pairs = []
-        try:
-            for o in outers:
-                idx = broker.session_trajectory_index(role, actx.node_id, o,
-                                                      seat=actx.seat)
-                for e in (idx or []):
-                    if e.get("quarantined"):
-                        continue
-                    # Two row shapes, because the two seats write differently:
-                    # the self seat's files are OUTER-level (name-addressed),
-                    # plan/evaluate's are per-generation (genid-addressed).
-                    if e.get("name") and e.get("genid") is None:
-                        pairs.append((session_label(outer, o, None, e["name"]),
-                                      o, None))
-                    else:
-                        pairs.append((session_label(outer, o, e["genid"],
-                                                    f"{role}.jsonl"),
-                                      o, e["genid"]))
-        except PermissionError as e:
-            return (f"Error: {e}\n"
-                    f"(your session may read outers: {outers})")
-        if not pairs:
+                parts = [f"# your session genid={req_genid}\n{blob}"]
+            else:
+                pairs = []
+                for o in outers:
+                    idx = broker.session_trajectory_index(role, actx.node_id, o,
+                                                          seat=actx.seat)
+                    for e in (idx or []):
+                        if e.get("quarantined"):
+                            continue
+                        if e.get("name") and e.get("genid") is None:
+                            pairs.append((session_label(outer, o, None, e["name"]),
+                                          o, None))
+                        else:
+                            pairs.append((session_label(outer, o, e["genid"],
+                                                        f"{role}.jsonl"),
+                                          o, e["genid"]))
+                blob = "\n\n".join(
+                    broker.read_session_trajectory(role, actx.node_id, o, g, cap,
+                                                   seat=actx.seat)
+                    for _l, o, g in pairs)
+                parts = [(f"# your sessions (outers={outers}): "
+                          f"{[p[0] for p in pairs]}\n{clip_head(blob, cap)}")]
+            return ("# note: the parent-side broker predates the segment query "
+                    "face (docs/19 §12.24); the full redacted blob is served "
+                    "instead\n" + "\n\n".join(parts))
+        parts = [p for p in parts if p and p.strip()]
+        if not parts:
             return "No session trajectories in your visible outers yet."
-        blob = "\n\n".join(
-            broker.read_session_trajectory(role, actx.node_id, o, g, cap,
-                                           seat=actx.seat) for _l, o, g in pairs
-        )
-        # Counted aggregate clip (docs/17 §17): the header lists every visible
-        # session; the marker makes the cap visible instead of a silent
-        # `blob[:cap]` that read as "short archive".
-        return extra + note + (f"# your sessions (outers={outers}): "
-                               f"{[p[0] for p in pairs]}\n{clip_head(blob, cap)}")
+        return note + "\n\n".join(parts)
 
     if not output_dir:
         return "Error: parent trajectory root is unavailable"

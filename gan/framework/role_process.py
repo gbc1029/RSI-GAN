@@ -936,15 +936,31 @@ class _RemoteBroker:
         return reply["result"]
 
     def read_trajectory(self, role: str, node_id: Any, genid: Any,
-                        max_chars: int, *, seat: str) -> str:
-        return str(self._rpc("read_trajectory",
-                             [role, node_id, genid, int(max_chars)], {"seat": seat}))
+                        max_chars: int, *, seat: str,
+                        query: Optional[Dict[str, Any]] = None) -> Any:
+        # §12.24 (CM-08): ``query`` rides as a KWARG (the protocol already
+        # carries kwargs — "seat" crosses the same way), so the positional
+        # list and broker_info stay untouched. The kwarg is OMITTED when no
+        # query is requested, so a pre-§12.24 root-side broker keeps serving
+        # plain calls; with a query, an old broker refuses it with TypeError
+        # -> the tool's fail-open fallback.
+        call_kwargs: Dict[str, Any] = {"seat": seat}
+        if query is not None:
+            call_kwargs["query"] = query
+        result = self._rpc("read_trajectory",
+                           [role, node_id, genid, int(max_chars)], call_kwargs)
+        return result if isinstance(result, dict) else str(result)
 
     def read_session_trajectory(self, role: str, node_id: Any, outer: Any,
-                                genid: Any, max_chars: int, *, seat: str) -> str:
-        return str(self._rpc("read_session_trajectory",
-                             [role, node_id, outer, genid, int(max_chars)],
-                             {"seat": seat}))
+                                genid: Any, max_chars: int, *, seat: str,
+                                query: Optional[Dict[str, Any]] = None) -> Any:
+        call_kwargs: Dict[str, Any] = {"seat": seat}
+        if query is not None:
+            call_kwargs["query"] = query
+        result = self._rpc("read_session_trajectory",
+                           [role, node_id, outer, genid, int(max_chars)],
+                           call_kwargs)
+        return result if isinstance(result, dict) else str(result)
 
     def session_trajectory_index(self, role: str, node_id: Any, outer: Any,
                                  *, seat: str) -> list[dict[str, Any]]:

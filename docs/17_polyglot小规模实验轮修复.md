@@ -940,6 +940,13 @@ x86_64-linux-gnu-gcc-13），`open(...,"w")` 跟随三层链接把宿主机编�
      生产路径——这是把"一次读 120K"变成"按 segment 精准取"的正解。
   3. （可选）上限进 `loop.yaml`（如 `trajectory.render_max_chars`），免硬编码。
 
+> **§12.24 销项注记（docs/19）**：上述"完整修复"三点——(1) 分页/按段取已落地，
+> 形态为 `query` kwarg 过既有 RPC（比"位置参数追加"更进一步：协议零改动，
+> 旧 broker 向后兼容）；(2) 席位 CM 栈复活由 §12.21/§12.22 完成（B1 真实轮
+> PASS），本批在其上把 payload 路径做成子代直服务；(3) 硬编码上限保留
+> （未进 loop.yaml，YAGNI——分页语义下单请求帽 120k 足够）。
+> **120_000 的语义从"缓解性大窗口"转正为"分页下的每请求上限"。**
+
 ### 15.2 polyglot 评测载荷属主归一（rmtree_failed 根治，§13.2 P3 销项）
 
 - **改动**：`task_execution.py` 新增 `_normalize_eval_payload_ownership(output_path)`
@@ -1216,6 +1223,12 @@ bounds" 对 task child 无效（registry 无 read_file/grep）；⑦
   cost key（roles 走 design context 进程内读、task 走 payload），本轮不需要。
 - **`tool_output_cap_mismatch` advisory**：in-run 可进化内层 cap = 零，无触发者；
   未来组件树出现内层 cap 时再启用（组装期软失败告警，`cm_module_unresolved` 同型）。
+
+> **§12.24 销项注记（docs/19）**：**方案二已落地**——形态从"新增 index/fetch
+> 方法（位置参数）"演进为"`query` kwarg 过既有 RPC 方法"（kwargs 本就跨进程，
+> 协议零改动且旧 broker 向后兼容）；段级 index/fetch/tail/head/grep 均已在
+> seat 可用。**方案三维持拒绝**（重量级重设计；CM seat 栈复活已由 §12.21/22
+> 的描述符通道完成，payload 路径子代直服务，方案三无增量价值）。
 
 ### 17.7 待真实 run 确认
 

@@ -692,14 +692,80 @@ class AccessBroker:
         """
         self._trajectory_scopes[(str(role), str(node_id))] = list(generation_ids or [])
 
+    def _serve_traj_query(self, pairs, query: dict, cap: int) -> Dict[str, Any]:
+        """Segment-level serving shared by both read tools' ``query`` face
+        (docs/19 §12.24, CM-08): the resolved ``(label, path)`` pairs are the
+        CALLER's visibility decision — this helper only classifies and
+        renders, never widens. Returns a JSON-safe envelope: "index" (the
+        raw metadata dict; the child renders it with its filters/offset so
+        there is ONE rendering source), "segment" (a fetch's entry),
+        "page" (tail/head/grep rendered text), or "error" (loud refusal)."""
+        from gan.framework.cm.traj_index import (build_traj_index, grep_page,
+                                                 parse_seg_id, segment_entry,
+                                                 tail_head_page)
+        files = [(p, l) for l, p in pairs if p and os.path.isfile(p)]
+        by_label = {l: p for p, l in files}
+        labels = [l for l, _p in pairs]
+        q = dict(query or {})
+        try:
+            if q.get("fetch"):
+                addr, line_no = parse_seg_id(q["fetch"])
+                label = addr.rsplit(":", 1)[0]
+                if label not in by_label:
+                    if "/" in addr:
+                        raise ValueError(
+                            f"segment '{q['fetch']}' is not in the visible files")
+                    legacy = [l for l in labels
+                              if l.rsplit("/", 1)[-1] == label]
+                    if len(legacy) != 1:
+                        raise ValueError(
+                            f"segment '{q['fetch']}' is ambiguous or unknown "
+                            f"({len(legacy)} candidate files)")
+                    label = legacy[0]
+                entry = segment_entry(by_label[label], line_no)
+                if entry is None:
+                    raise ValueError(f"segment '{q['fetch']}' not found.")
+                return {"serve": "segment", "seg_id": f"{label}:{line_no}",
+                        "entry": entry}
+            if q.get("grep") or q.get("tail") or q.get("head"):
+                index = build_traj_index([p for p, _l in files], labels=labels)
+                segs = index.get("segments") or []
+
+                def _lookup(seg):
+                    p = by_label.get(seg.get("file"))
+                    entry = segment_entry(p, seg.get("line_no")) if p else None
+                    return entry["text"] if entry else None
+
+                if q.get("grep"):
+                    return {"serve": "page",
+                            "text": grep_page(segs, _lookup, q["grep"])}
+                n = q.get("tail") or q.get("head") or 1
+                return {"serve": "page",
+                        "text": tail_head_page(segs, _lookup, n=int(n),
+                                               tail=bool(q.get("tail")),
+                                               max_chars=cap)}
+            index = build_traj_index([p for p, _l in files], labels=labels)
+            return {"serve": "index", "index": index}
+        except ValueError as e:
+            return {"serve": "error", "text": f"Error: {e}"}
+
     def read_trajectory(self, role: str, node_id: Any, genid: Any,
-                        max_chars: int, *, seat: str) -> str:
+                        max_chars: int, *, seat: str,
+                        query: Optional[Dict[str, Any]] = None) -> Any:
         from gan.framework.trajectory import TRAJ_RENDER_MAX_CHARS, read
         allowed = self._trajectory_scopes.get((str(role), str(node_id)), [])
         if str(genid) not in {str(g) for g in allowed}:
             raise PermissionError("generation is not visible to this role session")
-        # Ceiling 120000 = TEMPORARY MITIGATION for the legacy silent 6000
-        # clamp (docs/17 §15); the complete fix is offset/pagination over RPC.
+        # Ceiling 120000 = per-request cap under pagination (docs/17 §15.1's
+        # temporary mitigation promoted by §12.24: pages walk the file, the
+        # ceiling bounds ONE response, never the whole read).
+        if query:
+            from gan.framework import trajectory as traj
+            path = traj._session_file(self.output_dir, genid, "task")
+            label = f"{genid}/{os.path.basename(path or '')}"
+            return self._serve_traj_query([(label, path)], query,
+                                          min(int(max_chars),
+                                              TRAJ_RENDER_MAX_CHARS))
         return read(self.output_dir, genid,
                     max_chars=min(int(max_chars), TRAJ_RENDER_MAX_CHARS),
                     role="task")
@@ -744,9 +810,23 @@ class AccessBroker:
         return node_seat
 
     def read_session_trajectory(self, role: str, node_id: Any, outer: Any,
-                                genid: Any, max_chars: int, *, seat: str) -> str:
-        from gan.framework.trajectory import TRAJ_RENDER_MAX_CHARS, read_session
+                                genid: Any, max_chars: int, *, seat: str,
+                                query: Optional[Dict[str, Any]] = None) -> Any:
+        from gan.framework.trajectory import (TRAJ_RENDER_MAX_CHARS,
+                                              read_session, session_universe)
         node_seat = self._allow_declared_outer(node_id, outer, seat=seat)
+        if query:
+            pairs = session_universe(self.output_dir, role, outer,
+                                     extra_outers=[], seat=node_seat)
+            if genid is not None:
+                want = str(genid)
+                pairs = [(l, p) for l, p in pairs
+                         if l.split("/")[0] == want
+                         or (l.split("/")[0].startswith("outer_")
+                             and l.split("/")[1:2] == [want])]
+            return self._serve_traj_query(pairs, query,
+                                          min(int(max_chars),
+                                              TRAJ_RENDER_MAX_CHARS))
         return read_session(self.output_dir, outer, genid, role,
                             min(int(max_chars), TRAJ_RENDER_MAX_CHARS),
                             seat=node_seat)
