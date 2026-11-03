@@ -118,6 +118,15 @@ def issues_ledger_path(output_dir: str) -> str:
     return os.path.join(issues_dir(output_dir), "ledger.json")
 
 
+def challenges_dir(output_dir: str) -> str:
+    """Framework-owned challenge ledger directory."""
+    return os.path.join(ckpt_dir(output_dir), "challenges")
+
+
+def challenge_ledger_path(output_dir: str) -> str:
+    return os.path.join(challenges_dir(output_dir), "ledger.json")
+
+
 def checkpoint_latest(output_dir: str) -> str:
     return os.path.join(ckpt_dir(output_dir), "checkpoint.json")
 
