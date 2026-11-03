@@ -345,6 +345,11 @@ class GanLoop:
         # the evaluation reuses the main-line runner's sampling).
         self.eval_subset = str(cfg.get("eval.subset", "") or "")
         self.eval_anchor_k = int(cfg.get("eval.anchor_k", 0) or 0)
+        # Challenge protocol is opt-in and IMO-specific. Other domains keep
+        # the legacy evaluator/planner contract until they provide adapters.
+        self.challenge_enabled = bool(cfg.get("challenge.enabled", False)) \
+            and bool(self.domains) and self.domains[0] == "imo_proof"
+        self.challenge_max_k = max(1, int(cfg.get("challenge.max_k", 5) or 5))
         # MAIN-LINE anchor core (``sampling.anchor_k``: ckpt/sample_seed.json
         # ``anchor_ids``). It is the ONLY part of a generation's question sample
         # that is identical across generations, so the inner-stagnation verdict
@@ -1487,6 +1492,53 @@ class GanLoop:
             return [v for v in rec.get("fix_verdicts") or [] if isinstance(v, dict)]
         except Exception:  # noqa: BLE001 -- advisory
             return []
+
+    def _available_parent_challenges(self, parent: Any) -> List[Dict[str, Any]]:
+        """Project unconsumed IMO challenges for the next planner session."""
+        if not getattr(self, "challenge_enabled", False) or parent is None:
+            return []
+        from gan.framework import challenge_ledger
+        rows = challenge_ledger.available_for_parent(
+            challenge_ledger.load(self.output_dir), parent_node=parent.genid)
+        fields = ("challenge_id", "qid", "defect_type", "claim",
+                  "evidence_ref", "repair_criterion")
+        return [{key: row.get(key) for key in fields} for row in rows]
+
+    def _consume_parent_challenges(self, parent: Any, child: Any) -> List[str]:
+        """Bind and consume a parent's challenges on a successful direct child."""
+        if not getattr(self, "challenge_enabled", False) or parent is None:
+            return []
+        from gan.framework import challenge_ledger
+        data = challenge_ledger.load(self.output_dir)
+        rows = challenge_ledger.reserve_for_child(
+            data, parent_node=parent.genid, child_node=child.genid)
+        if not rows:
+            return []
+        challenge_ledger.save(self.output_dir, data, self.ledger_writer)
+        rows = challenge_ledger.consume_for_child(
+            data, parent_node=parent.genid, child_node=child.genid)
+        challenge_ledger.save(self.output_dir, data, self.ledger_writer)
+        return [str(row.get("challenge_id")) for row in rows]
+
+    def _lock_node_challenges(self, child: Any, ctx: Any, outer: int) -> List[str]:
+        """Lock evaluator proposals after the blind/reveal session completes."""
+        if not getattr(self, "challenge_enabled", False):
+            return []
+        from gan.framework import challenge_ledger
+        data = challenge_ledger.load(self.output_dir)
+        ids = challenge_ledger.lock(
+            data,
+            outer=outer,
+            parent_node=child.genid,
+            evaluator_version=(child.meta.get("evaluator_design_hash")
+                                or self._design_hash("evaluator")
+                                or "unknown"),
+            challenges=list(getattr(ctx, "challenges", []) or []),
+            allowed_qids=list(child.meta.get("sampled_ids") or []),
+            max_k=self.challenge_max_k,
+        )
+        challenge_ledger.save(self.output_dir, data, self.ledger_writer)
+        return [str(value) for value in ids]
 
     def _record_supernode(self, outer: int, outer_genids: List[Any]) -> None:
         """Aggregate + persist the per-outer supernode (advisory sink)."""
@@ -3158,6 +3210,7 @@ class GanLoop:
                 self._parent_receipt = parent_receipt
                 self._parent_digest = (
                     None if cross_outer else parent_meta.get("feedback_digest"))
+                parent_challenges = self._available_parent_challenges(parent)
                 parent_predicted_score = parent_meta.get("predicted_score")
                 parent_benchmark_score = parent_meta.get("benchmark_score")
                 evaluator_issues = (parent_feedback or {}).get("issues")
@@ -3259,6 +3312,16 @@ class GanLoop:
                             "inner": inner, "genid": str(genid),
                             "reason": "planner signature lacks require_deep_patch",
                         })
+                plan_challenge_kwargs: Dict[str, Any] = {}
+                if parent_challenges:
+                    if self._accepts_kwarg(self.planner.plan, "parent_challenges"):
+                        plan_challenge_kwargs["parent_challenges"] = parent_challenges
+                    else:
+                        self.log_event({
+                            "type": "challenge_projection_skipped",
+                            "seat": "planner", "genid": str(genid),
+                            "reason": "planner signature lacks parent_challenges",
+                        })
 
                 try:
                     if disable_plan:
@@ -3287,6 +3350,7 @@ class GanLoop:
                             max_tool_calls=plan_ck.get("plan_max_tool_calls", self.plan_max_tool_calls),
                             tool_repeat_limit=self.tool_repeat_limit,
                             carried_over=plan_carried,
+                            **plan_challenge_kwargs,
                             **plan_cost_kwargs,
                         ) or {}
                 except code_repo.RepoIntegrityError:
@@ -3323,6 +3387,15 @@ class GanLoop:
                     self._archive_invalid("task_runner_none", parent, parents, genid, outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
+
+                try:
+                    consumed_challenges = self._consume_parent_challenges(parent, child)
+                except Exception as e:
+                    self._archive_invalid("challenge_ledger_failed", parent, parents,
+                                          genid, str(e), outer=outer, inner=inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
+                child.meta["consumed_challenge_ids"] = consumed_challenges
 
                 # DAG: record all parents used
                 child.parents = [p.genid for p in parents]
@@ -3450,6 +3523,23 @@ class GanLoop:
                     # without the kwarg keeps the pre-C reveal rule — audited).
                     eval_cost_kwargs["reveal_max_tool_calls"] = \
                         eval_ck["evaluate_reveal_max_tool_calls"]
+                challenge_eval_kwargs: Dict[str, Any] = {}
+                if self.challenge_enabled:
+                    challenge_fields = {
+                        "challenge_enabled": self.challenge_enabled,
+                        "challenge_domain": (self.domains[0] if self.domains else None),
+                        "challenge_allowed_qids": list(child.meta.get("sampled_ids") or []),
+                        "challenge_max_k": self.challenge_max_k,
+                    }
+                    if all(self._accepts_kwarg(self.evaluator.evaluate, key)
+                           for key in challenge_fields):
+                        challenge_eval_kwargs.update(challenge_fields)
+                    else:
+                        self.log_event({
+                            "type": "challenge_projection_skipped",
+                            "seat": "evaluator", "genid": str(genid),
+                            "reason": "evaluator signature lacks challenge parameters",
+                        })
                 try:
                     if disable_eval:
                         # A2: skip the evaluator — the planner's only signal
@@ -3486,6 +3576,7 @@ class GanLoop:
                             carried_over=([] if (text_feedback_off
                                                 or (parent_feedback or {}).get("issues"))
                                           else self._carried_over("evaluator")),
+                            **challenge_eval_kwargs,
                             **eval_cost_kwargs,
                         )
                 except code_repo.RepoIntegrityError:
@@ -3538,6 +3629,15 @@ class GanLoop:
                 # use the selected parent's history rather than loop order.
                 child.meta["predicted_score"] = getattr(ctx, "predicted_score", None)
                 child.meta["benchmark_score"] = child.value.score
+                from gan.framework import challenge_ledger
+                try:
+                    child.meta["challenge_ids"] = self._lock_node_challenges(
+                        child, ctx, outer)
+                except challenge_ledger.ChallengeError as e:
+                    self._archive_invalid("challenge_invalid", parent, parents,
+                                          genid, str(e), outer=outer, inner=inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
                 run_dir = paths.runs_dir(self.output_dir, genid)
                 os.makedirs(run_dir, exist_ok=True)
                 packet.save(os.path.join(run_dir, "packet.json"))

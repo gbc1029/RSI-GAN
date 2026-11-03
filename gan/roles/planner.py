@@ -78,6 +78,7 @@ class Planner(Role):
         disable_shallow: bool = False,
         require_deep_patch: bool = False,
         carried_over: Optional[List[Dict[str, Any]]] = None,
+        parent_challenges: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -123,6 +124,15 @@ class Planner(Role):
                 "You MUST call `respond_issue(issue_id, accepted, response_kind, feedback)` with a structured `response_kind` (acted / acted_differently / out_of_scope / disputed / deferred) for EACH issue below."
                 "\n```json\n"
                 f"{json.dumps(evaluator_issues, ensure_ascii=False, indent=2)[:4000]}\n```"
+            )
+        if parent_challenges:
+            parts.append(
+                "\n## Blind proof challenges from the direct parent\n"
+                "Address these qid-bound challenges in the task design. They are "
+                "framework-carried train evidence, not grader scores or validation "
+                "information. Prefer a reusable repair that generalizes beyond the "
+                "listed qids; do not hard-code a qid or copy a reference solution.\n"
+                f"```json\n{json.dumps(parent_challenges, ensure_ascii=False, indent=2)[:4000]}\n```"
             )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
             parts.append(
@@ -179,6 +189,7 @@ class Planner(Role):
         require_deep_patch: bool = False,
         response_contract: Optional[str] = None,
         carried_over: Optional[List[Dict[str, Any]]] = None,
+        parent_challenges: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
@@ -232,7 +243,8 @@ class Planner(Role):
                     disable_shallow=bool(getattr(broker, "disable_shallow", False))
                     if broker is not None else False,
                     require_deep_patch=require_deep_patch,
-                    carried_over=carried_over),
+                    carried_over=carried_over,
+                    parent_challenges=parent_challenges),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
             _absorb_run_flags()

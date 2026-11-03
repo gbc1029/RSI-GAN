@@ -163,6 +163,17 @@ def lock(
     return ids
 
 
+def available_for_parent(data: Dict[str, Any], *, parent_node: Any
+                         ) -> List[Dict[str, Any]]:
+    """Return locked, not-yet-consumed challenges for a parent node."""
+    return [
+        row for row in (data.get("challenges", {}).values() or [])
+        if isinstance(row, dict)
+        and str(row.get("producer_node")) == str(parent_node)
+        and row.get("status") == STATUS_LOCKED
+    ]
+
+
 def reserve_for_child(data: Dict[str, Any], *, parent_node: Any,
                       child_node: Any) -> List[Dict[str, Any]]:
     """Reserve the producer node's challenges for one direct child."""
@@ -201,5 +212,6 @@ def consume_for_child(data: Dict[str, Any], *, parent_node: Any,
 __all__ = [
     "LEDGER_VERSION", "DOMAIN", "STATUS_LOCKED", "STATUS_RESERVED",
     "STATUS_CONSUMED", "ChallengeError", "empty", "load", "save", "lock",
-    "validate_candidate", "reserve_for_child", "consume_for_child",
+    "validate_candidate", "available_for_parent", "reserve_for_child",
+    "consume_for_child",
 ]

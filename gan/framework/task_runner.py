@@ -337,6 +337,7 @@ class DomainTaskRunner:
 
         node_dir = paths.work_dir(self.output_dir, genid)
         os.makedirs(node_dir, exist_ok=True)
+        sample_info: Dict[str, Any] = {}
 
         # Branch-per-node: the selected parent's code state (checked out by the
         # loop BEFORE planning) is the base; the task patch is committed on top
@@ -620,13 +621,35 @@ class DomainTaskRunner:
                     reasoning_effort=self.reasoning_effort,
                 )
             else:
-                sample_info = {}
-                rc, _out = tx.run_harness_and_report(
-                    self.python, run_dir, self.domain, run_id, self.subset,
-                    self.num_samples, model, env, self.timeout,
-                    dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
-                    reasoning_effort=self.reasoning_effort,
-                )
+                if self.domain == "imo_proof":
+                    # Materialize the selected questions in the framework so
+                    # the actual train qids are auditable and can be bound to
+                    # a blind challenge. The selection rule is unchanged:
+                    # seeded runs use the existing per-generation seed and
+                    # anchors; no-seed runs retain the legacy prefix.
+                    per_gen_seed = (
+                        tx.derive_sample_seed(self.sample_seed_base, str(genid))
+                        if self.sample_seed_base is not None else None
+                    )
+                    questions_path, _ground_truth, sample_info = tx.prepare_questions(
+                        self.repo_root, run_dir, self.domain, self.subset,
+                        self.num_samples, sample_seed=per_gen_seed,
+                        anchor_ids=self.anchor_ids,
+                    )
+                    rc, _out = tx.run_harness_and_report(
+                        self.python, run_dir, self.domain, run_id, self.subset,
+                        self.num_samples, model, env, self.timeout,
+                        questions_path=questions_path, scope_id=str(genid),
+                        log_path=self.log_path,
+                        reasoning_effort=self.reasoning_effort,
+                    )
+                else:
+                    rc, _out = tx.run_harness_and_report(
+                        self.python, run_dir, self.domain, self.subset,
+                        self.num_samples, model, env, self.timeout,
+                        dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
+                        reasoning_effort=self.reasoning_effort,
+                    )
             if self.domain == "imo_proof":
                 self._event("task_harness_done", genid=str(genid), rc=rc,
                             question_timeout_s=question_timeout_s,
@@ -795,6 +818,10 @@ class DomainTaskRunner:
                 "toolset_report": toolset_report,
                 "design_stripped": design_stripped or None,
                 "final_output_summary": final_output_summary,
+                "sample_mode": sample_info.get("mode"),
+                "sample_seed": sample_info.get("sample_seed"),
+                "sampled_ids": list(sample_info.get("sampled_ids") or []),
+                "sample_anchor_ids": list(sample_info.get("anchor_ids") or []),
                 # Reserved cost keys of this generation (docs/10 §10): the
                 # effective values that governed the child + the clamp records
                 # (the receipt projects the clamps to the planner).
