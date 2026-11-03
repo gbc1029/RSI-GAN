@@ -1,8 +1,8 @@
 """Blind, one-shot challenge lifecycle for the ``imo_proof`` pilot.
 
-This module deliberately has no role or grader integration yet.  It is the
-framework-owned state carrier used by the later challenge tool and settlement
-steps.  A challenge is locked before score/val evidence is available, can be
+This module deliberately has no role or grader integration. It is the
+framework-owned state carrier used by the challenge tool and settlement steps.
+A challenge is locked before score/val evidence is available, can be
 reserved only for the direct child of its producer node, and is consumed once.
 All writes require the normal run ``WriterToken``.
 """
@@ -22,6 +22,7 @@ DOMAIN = "imo_proof"
 STATUS_LOCKED = "locked"
 STATUS_RESERVED = "reserved"
 STATUS_CONSUMED = "consumed"
+ADJUDICATION_FIELD = "adjudication"
 
 _REQUIRED = ("qid", "defect_type", "claim", "evidence_ref", "repair_criterion")
 _FORBIDDEN = {
@@ -157,6 +158,7 @@ def lock(
             "status": STATUS_LOCKED,
             "reserved_child_node": None,
             "consumed_child_node": None,
+            ADJUDICATION_FIELD: None,
         }
         ids.append(challenge_id)
     locks[key] = {"payload": copy.deepcopy(payload), "challenge_ids": ids}
@@ -209,9 +211,32 @@ def consume_for_child(data: Dict[str, Any], *, parent_node: Any,
     return rows
 
 
+def settle(data: Dict[str, Any], *, challenge_id: Any,
+           adjudication: Mapping[str, Any]) -> Dict[str, Any]:
+    """Attach one immutable adjudication to an already-consumed challenge."""
+    from gan.framework.challenge_adjudication import validate_result
+    records = data.get("challenges", {})
+    row = records.get(str(challenge_id))
+    if not isinstance(row, dict):
+        raise ChallengeError(f"unknown challenge id: {challenge_id}")
+    if row.get("status") != STATUS_CONSUMED:
+        raise ChallengeError("challenge must be consumed before adjudication")
+    try:
+        result = validate_result(adjudication)
+    except ValueError as exc:
+        raise ChallengeError(str(exc)) from exc
+    existing = row.get(ADJUDICATION_FIELD)
+    if existing is not None:
+        if existing != result:
+            raise ChallengeError("challenge adjudication is immutable")
+        return dict(existing)
+    row[ADJUDICATION_FIELD] = copy.deepcopy(result)
+    return dict(result)
+
+
 __all__ = [
     "LEDGER_VERSION", "DOMAIN", "STATUS_LOCKED", "STATUS_RESERVED",
     "STATUS_CONSUMED", "ChallengeError", "empty", "load", "save", "lock",
     "validate_candidate", "available_for_parent", "reserve_for_child",
-    "consume_for_child",
+    "consume_for_child", "settle",
 ]

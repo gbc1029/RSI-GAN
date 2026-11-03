@@ -1549,6 +1549,48 @@ class GanLoop:
         challenge_ledger.save(self.output_dir, data, self.ledger_writer)
         return [str(value) for value in ids]
 
+    def _proof_challenge_evidence(self, node: Any, qid: Any) -> Dict[str, Any]:
+        points = self._read_per_question(node.genid).get(str(qid))
+        return {
+            "qid": str(qid),
+            "points": points,
+            "coverage": node.value.coverage,
+            "score_status": node.value.score_status,
+            "imputed": bool(node.meta.get("imputed")),
+            "report_path": node.meta.get("report_path"),
+        }
+
+    def _settle_parent_challenges(self, parent: Any, child: Any) -> List[Dict[str, Any]]:
+        """Persist conservative parent/child challenge adjudications."""
+        if not getattr(self, "challenge_enabled", False) or parent is None:
+            return []
+        from gan.framework import challenge_adjudication, challenge_ledger
+        data = challenge_ledger.load(self.output_dir)
+        rows = [row for row in data.get("challenges", {}).values()
+                if isinstance(row, dict)
+                and str(row.get("consumed_child_node")) == str(child.genid)]
+        settled: List[Dict[str, Any]] = []
+        for row in rows:
+            qid = str(row.get("qid"))
+            result = challenge_adjudication.adjudicate(
+                row,
+                self._proof_challenge_evidence(parent, qid),
+                self._proof_challenge_evidence(child, qid),
+                evidence_ref=(f"runs/{parent.genid}/report.json -> "
+                              f"runs/{child.genid}/report.json"),
+            )
+            challenge_ledger.settle(
+                data, challenge_id=row.get("challenge_id"), adjudication=result)
+            settled.append({
+                "challenge_id": str(row.get("challenge_id")),
+                "qid": qid,
+                "state": result["state"],
+                "reason": result["reason"],
+            })
+        if rows:
+            challenge_ledger.save(self.output_dir, data, self.ledger_writer)
+        return settled
+
     def _record_supernode(self, outer: int, outer_genids: List[Any]) -> None:
         """Aggregate + persist the per-outer supernode (advisory sink)."""
         try:
@@ -3657,6 +3699,14 @@ class GanLoop:
                         child, ctx, outer)
                 except challenge_ledger.ChallengeError as e:
                     self._archive_invalid("challenge_invalid", parent, parents,
+                                          genid, str(e), outer=outer, inner=inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
+                try:
+                    child.meta["challenge_adjudications"] = (
+                        self._settle_parent_challenges(parent, child))
+                except challenge_ledger.ChallengeError as e:
+                    self._archive_invalid("challenge_adjudication_failed", parent, parents,
                                           genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue

@@ -10,6 +10,7 @@ except ImportError:  # lightweight local test environments may omit pandas
     select_samples = None
 
 from gan.framework import challenge_ledger
+from gan.framework import challenge_adjudication
 from gan.framework.ledger import open_run
 
 
@@ -103,6 +104,51 @@ class ChallengeLedgerTest(unittest.TestCase):
             select_samples(frame, "qid", 3, sample_seed=7,
                             anchor_ids=["q0", "q1", "q2", "q3"],
                             challenge_ids=["q2", "q3", "q4"])
+
+    def test_adjudication_is_conservative_without_fixed_verdict(self):
+        evidence = {"points": 3, "coverage": 1.0,
+                    "score_status": "ok", "imputed": False}
+        result = challenge_adjudication.adjudicate(
+            self.kwargs["challenges"][0], evidence, evidence)
+        self.assertEqual(result["state"], challenge_adjudication.UNDECIDABLE)
+
+    def test_adjudication_maps_four_states_only_with_complete_verdict(self):
+        evidence = {"points": 3, "coverage": 1.0,
+                    "score_status": "ok", "imputed": False}
+        challenge = self.kwargs["challenges"][0]
+        cases = [
+            ((True, False), challenge_adjudication.VERIFIED_REPAIR),
+            ((True, True), challenge_adjudication.VERIFIED_UNRESOLVED),
+            ((False, False), challenge_adjudication.UNSUPPORTED_CHALLENGE),
+            ((False, True), challenge_adjudication.REGRESSION_AFTER_FALSE_CHALLENGE),
+        ]
+        for (parent_present, child_present), expected in cases:
+            with self.subTest(expected=expected):
+                result = challenge_adjudication.adjudicate(
+                    challenge, evidence, evidence,
+                    parent_present=parent_present,
+                    child_present=child_present,
+                    actionable=True)
+                self.assertEqual(result["state"], expected)
+
+    def test_settlement_requires_consumed_and_is_immutable(self):
+        ids = challenge_ledger.lock(self.data, **self.kwargs)
+        result = {"state": challenge_adjudication.UNDECIDABLE,
+                  "reason": "test", "qid": "q1"}
+        with self.assertRaisesRegex(challenge_ledger.ChallengeError, "consumed"):
+            challenge_ledger.settle(self.data, challenge_id=ids[0], adjudication=result)
+        challenge_ledger.consume_for_child(
+            self.data, parent_node="p0", child_node="c1")
+        stored = challenge_ledger.settle(
+            self.data, challenge_id=ids[0], adjudication=result)
+        self.assertEqual(stored, result)
+        self.assertEqual(
+            challenge_ledger.settle(self.data, challenge_id=ids[0], adjudication=result),
+            result)
+        with self.assertRaisesRegex(challenge_ledger.ChallengeError, "immutable"):
+            challenge_ledger.settle(
+                self.data, challenge_id=ids[0],
+                adjudication={**result, "reason": "changed"})
 
 
 if __name__ == "__main__":
