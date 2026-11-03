@@ -45,7 +45,9 @@ KINDS = ("turn_output", "tool_output", "traj_seg", "kb_note", "note",
 HEAD_TAIL_KEEP = 400    # chars kept on each side for head_tail
 EXCERPT_KEEP = 600      # chars kept on each side for excerpt
 MIN_COMPACT_SAVE = 200  # refuse compaction that saves less than this
-PLACEHOLDER_OVERHEAD = 96  # ~ chars a placeholder costs (drop-floor guard)
+PLACEHOLDER_OVERHEAD = 128  # ~ chars a placeholder line costs (declared
+# approximation, drop-floor guard; recalibrated for the enriched line, no
+# runtime consumer — docs/19 §12.20)
 DERIVED_PIECE_KEEP = 300  # per-source head+tail keep inside a merge derived text
 
 
@@ -63,18 +65,27 @@ def cut(text: str, keep: int) -> str:
 
 
 def placeholder(block: "Block", rule: str) -> str:
-    """The frozen placeholder rendering for one block (no content)."""
+    """Eviction EVENT (docs/10 form 语义声明): the block's content is gone
+    from the view and the line says WHY (reason = the op's rule tag) and
+    WHERE the block came from (source, unclipped — address semantics, same
+    as to_meta().source). Recoverable via fetch(block_id, form="full").
+    No content."""
     rule = str(rule)[:60]
     return (f"[block {block.block_id} omitted: {block.chars} chars, "
-            f"kind={block.kind}, reason={rule}]")
+            f"kind={block.kind}, source={block.source}, reason={rule}]")
 
 
 def excerpt_saving(block: "Block") -> int:
     return max(0, block.chars - len(cut(block.text, EXCERPT_KEEP)))
 
 
-def render_form(block: "Block", form: str) -> str:
-    """Render one block in a view form (pure; no new content)."""
+def render_form(block: "Block", form: str, rule: str = "") -> str:
+    """Render one block in a view form (pure; no new content).
+
+    Form semantics (docs/10 form 语义声明): placeholder = eviction event
+    (the reason tag says why); template = catalog card (metadata + the
+    source address instead of content — never claims a loss). Both are
+    sticky and restore via fetch(full)."""
     if form == "full":
         return block.text
     if form == "head_tail":
@@ -82,11 +93,12 @@ def render_form(block: "Block", form: str) -> str:
     if form == "excerpt":
         return cut(block.text, EXCERPT_KEEP)
     if form == "placeholder":
-        return placeholder(block, "view form")
+        return placeholder(block, rule or "view form")
     if form == "template":
         meta = block.to_meta()
         return (f"[block {block.block_id} template: kind={meta['kind']}, "
-                f"chars={meta['chars']}, source={meta['source']}]")
+                f"chars={meta['chars']}, source={meta['source']}, "
+                f"reason={str(rule)[:60] or 'view'}]")
     raise ValueError(f"invalid form {form!r}")
 
 

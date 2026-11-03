@@ -1611,11 +1611,16 @@ class CMSession:
                         new_text = _DEDUP_MARKER + new_content[len(self.system_prefix):]
                     else:
                         continue
-                else:  # template
+                else:  # template — catalog CARD, not an eviction event: the
+                    # line keeps metadata + the source address instead of
+                    # content and never claims a loss; restorable via
+                    # fetch(full) like every non-full form (docs/10 form
+                    # 语义声明, docs/19 §12.20)
                     meta = block.to_meta()
                     new_text = (f"[block {block.block_id} template: "
                                 f"kind={meta['kind']}, chars={meta['chars']}, "
-                                f"source={meta['source']}]")
+                                f"source={meta['source']}, "
+                                f"reason={rule or 'view'}]")
                 if form == "dedup":
                     new_content = new_text  # prefix elision (anchored at head)
                 elif block.text and block.text in new_content:

@@ -90,7 +90,7 @@ _SPECS: dict = {
         "fn": _ctx_index,
     },
     "ctx_fetch": {
-        "description": ("Fetch one context block by id (from ctx_index) into the conversation: form=full restores the whole content; head_tail/excerpt trim it. Fetching costs future tokens — fetch only what you need."),
+        "description": ("Fetch one context block by id (from ctx_index) into the conversation: form=full restores the whole content; head_tail/excerpt trim it. Any [block <id> ...] line already in the conversation (omitted:... or template:...) can be restored the same way with form=full. Fetching costs future tokens — fetch only what you need."),
         "input_schema": {
             "type": "object",
             "properties": {"block_id": {"type": "string"}, "form": {"type": "string", "enum": ["full", "head_tail", "excerpt"], "description": "default full"}},
@@ -130,7 +130,7 @@ _SPECS: dict = {
         "fn": _ctx_note,
     },
     "ctx_view": {
-        "description": ("Show this session's view state: which blocks are full, elided, compacted or placeholder, plus each block's rule tag (your pin annotations and the op reasons — what the framework kept, and why). Forms are sticky across turns."),
+        "description": ("Show this session's view state: each block's form plus its rule tag (your pin annotations and the op reasons — what the framework kept, and why). Form semantics: full = whole content; head_tail/excerpt = trimmed but recognizable; placeholder = evicted (the reason tag says why — window, merge, span-drift, policy); template = catalog card (metadata + the source address kept instead of content). Forms are sticky across turns; every non-full form restores via ctx_fetch(block_id, form=full)."),
         "input_schema": {
             "type": "object",
             "properties": {},
