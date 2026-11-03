@@ -2,6 +2,13 @@ import os
 import tempfile
 import unittest
 
+try:
+    import pandas as pd
+    from gan.framework.task_execution import select_samples
+except ImportError:  # lightweight local test environments may omit pandas
+    pd = None
+    select_samples = None
+
 from gan.framework import challenge_ledger
 from gan.framework.ledger import open_run
 
@@ -73,6 +80,29 @@ class ChallengeLedgerTest(unittest.TestCase):
             challenge_ledger.save(root, self.data, open_run(root))
             loaded = challenge_ledger.load(root)
             self.assertEqual(loaded["challenges"], self.data["challenges"])
+
+    @unittest.skipUnless(pd is not None, "pandas is required for sampling tests")
+    def test_challenge_sampling_is_mandatory_and_separate_from_base_anchors(self):
+        frame = pd.DataFrame({"qid": [f"q{i}" for i in range(8)], "answer": ["x"] * 8})
+        selected, info = select_samples(
+            frame, "qid", 5, sample_seed=7,
+            anchor_ids=["q0", "q1"], challenge_ids=["q5", "q1"])
+        selected_ids = selected["qid"].tolist()
+        self.assertEqual(info["anchor_ids"], ["q0", "q1"])
+        self.assertEqual(info["challenge_ids"], ["q1", "q5"])
+        self.assertEqual(set(info["sampled_ids"]), set(selected_ids))
+        self.assertIn("q5", selected_ids)
+
+    @unittest.skipUnless(pd is not None, "pandas is required for sampling tests")
+    def test_challenge_sampling_rejects_missing_or_overflow(self):
+        frame = pd.DataFrame({"qid": [f"q{i}" for i in range(6)], "answer": ["x"] * 6})
+        with self.assertRaisesRegex(ValueError, "missing from train subset"):
+            select_samples(frame, "qid", 4, sample_seed=7,
+                            challenge_ids=["missing"])
+        with self.assertRaisesRegex(ValueError, "exceed num_samples"):
+            select_samples(frame, "qid", 3, sample_seed=7,
+                            anchor_ids=["q0", "q1", "q2", "q3"],
+                            challenge_ids=["q2", "q3", "q4"])
 
 
 if __name__ == "__main__":

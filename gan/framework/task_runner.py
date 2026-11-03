@@ -327,8 +327,11 @@ class DomainTaskRunner:
 
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,
-                 genid: Any = None, base: Optional[str] = None) -> Node:
+                 genid: Any = None, base: Optional[str] = None,
+                 challenge_ids: Optional[List[Any]] = None) -> Node:
         plan = plan or {}
+        active_challenge_ids = list(dict.fromkeys(
+            str(q) for q in (challenge_ids or [])))
         records = plan.get("records", []) or []
         config = plan.get("config")
         if not isinstance(config, dict):
@@ -548,7 +551,8 @@ class DomainTaskRunner:
                         sample_mode=sample_info.get("mode"),
                         sample_seed=sample_info.get("sample_seed"),
                         sampled_ids=sample_info.get("sampled_ids"),
-                        anchor_ids=sample_info.get("anchor_ids"))
+                        anchor_ids=sample_info.get("anchor_ids"),
+                        challenge_ids=sample_info.get("challenge_ids"))
             report = tx.read_report(report_path) if rc == 0 else None
             if report is not None:
                 self._event("task_eval_done", genid=str(genid),
@@ -583,7 +587,8 @@ class DomainTaskRunner:
                         sample_mode=sample_info.get("mode"),
                         sample_seed=sample_info.get("sample_seed"),
                         sampled_ids=sample_info.get("sampled_ids"),
-                        anchor_ids=sample_info.get("anchor_ids"))
+                        anchor_ids=sample_info.get("anchor_ids"),
+                        challenge_ids=sample_info.get("challenge_ids"))
             predictions_path = os.path.join(output_path, "predictions.csv")
             report = None
             if os.path.exists(predictions_path):
@@ -635,6 +640,7 @@ class DomainTaskRunner:
                         self.repo_root, run_dir, self.domain, self.subset,
                         self.num_samples, sample_seed=per_gen_seed,
                         anchor_ids=self.anchor_ids,
+                        challenge_ids=active_challenge_ids,
                     )
                     rc, _out = tx.run_harness_and_report(
                         self.python, run_dir, self.domain, run_id, self.subset,
@@ -656,7 +662,8 @@ class DomainTaskRunner:
                             harness_timeout_s=self.timeout,
                             sample_mode=sample_info.get("mode"),
                             sampled_ids=sample_info.get("sampled_ids"),
-                            anchor_ids=sample_info.get("anchor_ids"))
+                            anchor_ids=sample_info.get("anchor_ids"),
+                            challenge_ids=sample_info.get("challenge_ids"))
             report = None
             if self.domain == "imo_proof":
                 # Proof grading is completed inside the privileged broker with
@@ -822,6 +829,7 @@ class DomainTaskRunner:
                 "sample_seed": sample_info.get("sample_seed"),
                 "sampled_ids": list(sample_info.get("sampled_ids") or []),
                 "sample_anchor_ids": list(sample_info.get("anchor_ids") or []),
+                "sample_challenge_ids": list(sample_info.get("challenge_ids") or []),
                 # Reserved cost keys of this generation (docs/10 §10): the
                 # effective values that governed the child + the clamp records
                 # (the receipt projects the clamps to the planner).

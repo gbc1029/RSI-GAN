@@ -188,6 +188,15 @@ def build_gan_loop(
     domain = str(domains[0]).strip()
     if not domain:
         raise ValueError(f"domains parses to an empty domain (got {domains!r})")
+    challenge_enabled = bool(cfg.get("challenge.enabled", False)) \
+        and domain == "imo_proof"
+    if challenge_enabled and int(num_samples) > 0:
+        challenge_max_k = max(1, int(cfg.get("challenge.max_k", 5) or 5))
+        base_anchor_k = len(dict.fromkeys(str(q) for q in (anchor_ids or [])))
+        if challenge_max_k > int(num_samples) - base_anchor_k:
+            raise ValueError(
+                "challenge.max_k plus fixed train anchors exceeds num_samples: "
+                f"{challenge_max_k} + {base_anchor_k} > {num_samples}")
     repo_root = os.path.abspath(repo_root)
 
     # Per-domain token budgets (docs/10 §10): domains.yaml token_budget_per_gen

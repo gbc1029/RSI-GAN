@@ -1286,18 +1286,21 @@ def select_seeded_positions(
     num_samples: int,
     sample_seed: int,
     anchor_ids: Optional[List[str]] = None,
+    challenge_ids: Optional[List[str]] = None,
 ) -> Tuple[List[int], Dict[str, Any]]:
     """Position-level seeded draw -- the ONE sampling policy for every domain.
 
-    Anchor rows first (ids present in ``anchor_ids``, pool order,
-    deduplicated; capped at HALF the budget so the anchor core can never
-    consume it), then the remainder drawn WITHOUT replacement from the rest
-    of the pool with ``random.Random(sample_seed)``. Deterministic for a
-    given (seed, pool); returned positions are in pool order. ``select_samples``
-    (CSV domains) and :func:`prepare_polyglot_questions` (metadata domains)
-    both delegate here so the two selection modes can never drift apart.
+    Base anchor rows come first (capped at HALF the budget), followed by every
+    distinct challenge row. The remainder is drawn WITHOUT replacement from
+    the rest of the pool with ``random.Random(sample_seed)``. Challenge rows
+    are never silently truncated; callers must reduce the challenge set or
+    increase ``num_samples`` when the requested set does not fit.
     """
     anchor_req = [str(a) for a in (anchor_ids or [])]
+    challenge_req = [str(q) for q in (challenge_ids or [])]
+    missing_challenges = [q for q in challenge_req if q not in set(ids)]
+    if missing_challenges:
+        raise ValueError(f"challenge qid(s) missing from train subset: {missing_challenges}")
     anchor_set: Dict[str, int] = {}
     for pos, qid in enumerate(ids):
         if qid in anchor_req and qid not in anchor_set:
@@ -1305,16 +1308,27 @@ def select_seeded_positions(
     anchor_positions = sorted(anchor_set.values())
     # Anchor core must never consume the whole budget: cap at half.
     anchor_positions = anchor_positions[: max(0, num_samples // 2)]
-    n_anchor = len(anchor_positions)
-    pool_positions = [p for p in range(len(ids)) if p not in set(anchor_positions)]
-    n_rest = min(num_samples - n_anchor, len(pool_positions))
+    anchor_position_set = set(anchor_positions)
+    challenge_positions = sorted({
+        pos for pos, qid in enumerate(ids)
+        if qid in set(challenge_req) and pos not in anchor_position_set
+    })
+    if len(anchor_positions) + len(challenge_positions) > num_samples:
+        raise ValueError(
+            "base anchors plus challenge anchors exceed num_samples: "
+            f"{len(anchor_positions)} + {len(challenge_positions)} > {num_samples}")
+    selected_anchor_positions = anchor_position_set | set(challenge_positions)
+    pool_positions = [p for p in range(len(ids)) if p not in selected_anchor_positions]
+    n_rest = min(num_samples - len(selected_anchor_positions), len(pool_positions))
     rng = random.Random(int(sample_seed))
     drawn = sorted(rng.sample(pool_positions, n_rest)) if n_rest > 0 else []
-    positions = sorted(anchor_positions + drawn)
+    positions = sorted(anchor_positions + challenge_positions + drawn)
+    challenge_set = set(challenge_req)
     return positions, {
         "mode": "seeded",
         "sample_seed": int(sample_seed),
         "anchor_ids": [ids[p] for p in anchor_positions],
+        "challenge_ids": [ids[p] for p in positions if ids[p] in challenge_set],
         "sampled_ids": [str(ids[p]) for p in positions],
     }
 
@@ -1325,31 +1339,60 @@ def select_samples(
     num_samples: int,
     sample_seed: Optional[int] = None,
     anchor_ids: Optional[List[str]] = None,
+    challenge_ids: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Question selection with two modes (replaces the fixed prefix slice).
 
     - ``sample_seed is None``: legacy behaviour -- the first ``num_samples``
       rows of the file (deterministic prefix; kept as the explicit A/B base).
-    - ``sample_seed is not None``: anchor rows first (``anchor_ids`` present in
-      the pool, dataset order, deduplicated), then the remainder drawn without
+    - ``sample_seed is not None``: base anchor rows first (``anchor_ids``),
+      then required ``challenge_ids``, then the remainder drawn without
       replacement from the rest of the pool with ``random.Random(sample_seed)``.
       Selection is deterministic for a given (seed, pool) and recorded via the
       returned info dict. ``num_samples <= 0`` returns the full dataset.
 
     Returns ``(selected_dataset, info)`` where info carries the audit fields
-    (mode / seed / anchor ids actually present / sampled ids in file order).
+    (mode / seed / base anchor ids / challenge ids / sampled ids in file order).
     """
+    challenge_req = [str(q) for q in (challenge_ids or [])]
     if num_samples is None or num_samples <= 0:
+        ids = [str(v) for v in dataset[question_id_col].tolist()]
+        missing = [q for q in challenge_req if q not in set(ids)]
+        if missing:
+            raise ValueError(f"challenge qid(s) missing from train subset: {missing}")
+        challenge_set = set(challenge_req)
         return dataset, {"mode": "all", "sample_seed": None,
-                         "anchor_ids": [], "sampled_ids": []}
+                         "anchor_ids": [],
+                         "challenge_ids": [q for q in ids if q in challenge_set],
+                         "sampled_ids": (ids if challenge_req else [])}
     if sample_seed is None:
-        selected = dataset.iloc[:num_samples]
+        ids = [str(v) for v in dataset[question_id_col].tolist()]
+        id_set = set(ids)
+        missing = [q for q in challenge_req if q not in id_set]
+        if missing:
+            raise ValueError(f"challenge qid(s) missing from train subset: {missing}")
+        selected_positions = list(range(min(int(num_samples), len(ids))))
+        selected_set = set(selected_positions)
+        challenge_positions = [pos for pos, qid in enumerate(ids)
+                               if qid in set(challenge_req)
+                               and pos not in selected_set]
+        if len(selected_positions) + len(challenge_positions) > int(num_samples):
+            raise ValueError(
+                "legacy prefix plus challenge anchors exceed num_samples: "
+                f"{len(selected_positions)} + {len(challenge_positions)} > {num_samples}")
+        remaining = [pos for pos in range(len(ids))
+                     if pos not in selected_set and pos not in set(challenge_positions)]
+        take = int(num_samples) - len(selected_positions) - len(challenge_positions)
+        selected_positions = sorted(selected_positions + challenge_positions + remaining[:take])
+        selected = dataset.iloc[selected_positions]
+        selected_ids = [ids[pos] for pos in selected_positions]
         return selected, {"mode": "legacy_prefix", "sample_seed": None,
                           "anchor_ids": [],
-                          "sampled_ids": [str(v) for v in selected[question_id_col].tolist()]}
+                          "challenge_ids": [q for q in selected_ids if q in set(challenge_req)],
+                          "sampled_ids": selected_ids}
     ids = [str(v) for v in dataset[question_id_col].tolist()]
     positions, info = select_seeded_positions(
-        ids, int(num_samples), int(sample_seed), anchor_ids)
+        ids, int(num_samples), int(sample_seed), anchor_ids, challenge_ids)
     selected = dataset.iloc[positions]
     return selected, info
 
@@ -1555,6 +1598,7 @@ def prepare_questions(
     num_samples: int,
     sample_seed: Optional[int] = None,
     anchor_ids: Optional[List[str]] = None,
+    challenge_ids: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Write questions-only input and retain ground truth in parent memory.
 
@@ -1566,6 +1610,7 @@ def prepare_questions(
     dataset, sample_info = select_samples(
         dataset, question_id_col, num_samples,
         sample_seed=sample_seed, anchor_ids=anchor_ids,
+        challenge_ids=challenge_ids,
     )
     return _write_questions(dataset, question_id_col, ground_truth_key, run_dir, sample_info)
 

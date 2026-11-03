@@ -1510,6 +1510,15 @@ class GanLoop:
             return []
         from gan.framework import challenge_ledger
         data = challenge_ledger.load(self.output_dir)
+        producer_rows = challenge_ledger.available_for_parent(
+            data, parent_node=parent.genid)
+        expected_qids = {str(row.get("qid")) for row in producer_rows}
+        actual_qids = {str(qid) for qid in (child.meta.get("sample_challenge_ids") or [])}
+        missing_qids = sorted(expected_qids - actual_qids)
+        if missing_qids:
+            raise challenge_ledger.ChallengeError(
+                "child train sample omitted parent challenge qid(s): "
+                + ", ".join(missing_qids))
         rows = challenge_ledger.reserve_for_child(
             data, parent_node=parent.genid, child_node=child.genid)
         if not rows:
@@ -3374,9 +3383,22 @@ class GanLoop:
                     cm_session=_plan_cm)
                 self.planner.cm_session = None  # no stamp leak (§11 D11)
 
+                task_challenge_kwargs: Dict[str, Any] = {}
+                if parent_challenges:
+                    if not self._accepts_kwarg(self.task_runner, "challenge_ids"):
+                        self._archive_invalid(
+                            "challenge_runner_incompatible", parent, parents,
+                            genid,
+                            "task runner signature lacks challenge_ids",
+                            outer=outer, inner=inner)
+                        self._save_checkpoint("inner", outer, inner)
+                        continue
+                    task_challenge_kwargs["challenge_ids"] = [
+                        str(row.get("qid")) for row in parent_challenges]
                 try:
-                    child = self.task_runner(plan=plan_result, parent=parent, genid=genid,
-                                             base=base)
+                    child = self.task_runner(
+                        plan=plan_result, parent=parent, genid=genid,
+                        base=base, **task_challenge_kwargs)
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to task_runner_failed
                 except Exception as e:
