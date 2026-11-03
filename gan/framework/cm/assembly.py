@@ -344,9 +344,11 @@ def load_assembly(path: str) -> Tuple[Callable, Dict[str, Callable], List[str]]:
     raised — a module with an illegal method group still runs as the
     pipeline; the caller speaks the refusal (``cm_methods_refused``)."""
     from .failopen import policy_violations
+    from .ops import clip_diag
     problems = policy_violations(path) + _gan_import_problems(path)
     if problems:
-        raise AssemblyError("assembly refused at load: " + "; ".join(problems)[:200])
+        raise AssemblyError("assembly refused at load: "
+                            + clip_diag("; ".join(problems), 200))
     # sys.modules key UNIQUE PER PATH: parallel in-process sessions (p/e
     # self-improve threads) loading DIFFERENT assemblies must not clobber
     # each other's registration; same path replaces its own entry (the

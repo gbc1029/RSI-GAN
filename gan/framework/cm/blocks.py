@@ -109,10 +109,14 @@ class Block:
     def to_meta(self) -> Dict[str, Any]:
         """Metadata projection (ctx_index / cm_view): sizes + flags, NO text.
         Lineage fields materialize only on derived blocks (conditional audit
-        fields — the canonical block projection stays byte-identical)."""
+        fields — the canonical block projection stays byte-identical).
+        ``source`` is NOT clipped (docs/19 §12.19): for ``traj_seg`` blocks
+        it is the seg_id address shared with the read tools — a clipped
+        address would be a silently broken one; the framework-generated
+        labels are bounded by construction."""
         meta = {"block_id": self.block_id, "kind": self.kind, "turn": self.turn,
                 "chars": self.chars, "token_est": estimate_tokens(self.text),
-                "pinned": self.pinned, "source": self.source[:60]}
+                "pinned": self.pinned, "source": self.source}
         if self.kind == "derived":
             meta["sources"] = list(self.sources)
             meta["depth"] = self.depth
@@ -129,6 +133,9 @@ class View:
         return self.forms.get(block_id, "full")
 
     def set(self, block_id: str, form: str, rule: str) -> None:
+        """Sticky form write. ``rule`` is clipped to 60 (docs/19 §12.19):
+        it is a rule TAG, never content — the cap bounds the surfaces that
+        echo it (the render-suffix line, the cm_view brief at the same 60)."""
         if form not in FORMS:
             raise ValueError(f"invalid form {form!r}")
         self.forms[block_id] = form

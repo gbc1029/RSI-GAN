@@ -173,8 +173,8 @@ def compact(universe: Universe, view: View, block_ids: List[str],
             seg_lines = b.text.splitlines() or [""]
             lines.append(f"- {b.block_id} kind={b.kind} chars={b.chars} "
                          f"token_est={estimate_tokens(b.text)} "
-                         f"head={seg_lines[0][:120]!r} "
-                         f"tail={seg_lines[-1][:120]!r}")
+                         f"head={clip_diag(seg_lines[0], 110)!r} "
+                         f"tail={clip_diag(seg_lines[-1], 110)!r}")
         derived_text = "\n".join(lines)
     saved = sum(b.chars for b in blocks) - len(derived_text)
     if saved < MIN_COMPACT_SAVE:
@@ -234,37 +234,119 @@ def order(universe: Universe, view: View, block_ids: List[str]) -> Dict[str, Any
 
 def pin(universe: Universe, view: View, block_id: str, pin_flag: bool,
         note: str = "") -> Dict[str, Any]:
+    """Pin/unpin with an optional SHORT annotation tag (docs/19 §12.19).
+
+    The note is a ≤``PIN_NOTE_CAP`` tag stored in ``view.rules`` (readable
+    back via ``view_state``); a longer note is a LOUD structured refusal
+    that redirects to ``ctx_note`` — never a silent clip. Unpin clears a
+    stale ``pin:`` tag (never a form rule). Validate first, mutate only on
+    success."""
     block = universe.get(block_id)
     if block is None:
         return {"op": "pin" if pin_flag else "unpin", "refs": [block_id],
                 "ok": False, "error": "unknown block"}
+    note = str(note or "")
+    if pin_flag and len(note) > PIN_NOTE_CAP:
+        return {"op": "pin", "refs": [block_id], "ok": False,
+                "error": (f"pin note exceeds {PIN_NOTE_CAP} chars "
+                          "(short tag only; use ctx_note for longer rationale)")}
     block.pinned = bool(pin_flag)
     rec: Dict[str, Any] = {"op": "pin" if pin_flag else "unpin",
                            "refs": [block_id], "ok": True}
-    if note and rec["op"] == "pin":
-        view.rules[block_id] = "pin:" + str(note)[:40]
+    if pin_flag and note:
+        view.rules[block_id] = "pin:" + note
+        rec["note_stored"] = note
+    elif not pin_flag and str(view.rules.get(block_id, "")).startswith("pin:"):
+        view.rules.pop(block_id, None)
     return rec
 
 
+def clip_diag(text: str, cap: int) -> str:
+    """Diagnostic-field clip with a COUNTED marker (docs/19 §12.19).
+
+    A cut field reads ``...[+N chars]`` (total length stays <= ``cap``), an
+    uncut field is byte-identical — the reader can always tell whether they
+    saw everything. For error/diagnostic strings only; content surfaces use
+    the ``cut``/``clip_head`` idioms."""
+    text = str(text or "")
+    if len(text) <= cap:
+        return text
+    keep = max(0, cap - 20)
+    return text[:keep] + f"...[+{len(text) - keep} chars]"
+
+
 def peek(universe: Universe, block_id: str, cap: int = 16_000) -> Dict[str, Any]:
-    """Policy-side read (decision input; capped like the C2 output cap)."""
+    """Policy-side read (decision input; capped like the C2 output cap).
+
+    Honest cap (docs/19 §12.19): a cut result carries ``truncated`` +
+    ``shown_chars``; an uncut one carries neither (boundary-exact, like
+    ``clip_head``). Full content has its own sanctioned path —
+    ``fetch(form="full")`` — so peek takes NO widening parameter: it is the
+    cheap bounded preview."""
     block = universe.get(block_id)
     if block is None:
         return {"op": "peek", "refs": [block_id], "ok": False, "error": "unknown block"}
+    text = block.text
+    if len(text) <= cap:
+        return {"op": "peek", "refs": [block_id], "ok": True,
+                "text": text, "chars": block.chars}
     return {"op": "peek", "refs": [block_id], "ok": True,
-            "text": block.text[:cap], "chars": block.chars}
+            "text": text[:cap], "chars": block.chars,
+            "truncated": True, "shown_chars": cap}
+
+
+# Index page bounds (docs/19 §12.19): the default is the context-cost guard,
+# the ceiling is what a request may widen to — a clamp is NEVER silent
+# (``cap_clamped``), and a capped page always reports what was not shown.
+INDEX_CAP_DEFAULT = 200
+INDEX_CAP_MAX = 500
+
+# Pin annotation tag budget (docs/19 §12.19): the composed rule
+# ("pin:" + note) stays inside every downstream rule surface
+# (View.set's 60-char tag cap, the cm_view brief's 60).
+PIN_NOTE_CAP = 40
 
 
 def index_blocks(universe: Universe, kinds: Optional[List[str]] = None,
-                 cap: int = 200) -> Dict[str, Any]:
-    """Metadata-only enumeration (mirrors list_dir's entry cap)."""
-    blocks = universe.ordered(kinds)[:cap]
-    return {"op": "index", "ok": True, "blocks": [b.to_meta() for b in blocks]}
+                 cap: int = INDEX_CAP_DEFAULT,
+                 offset: int = 0) -> Dict[str, Any]:
+    """Metadata-only enumeration (mirrors list_dir's entry cap).
+
+    Honest capping + paging (docs/19 §12.19): ``total`` counts the kind-
+    filtered set, ``returned``/``hidden``/``capped`` describe THIS page
+    (``capped`` = the response does not include every match), and
+    ``next_offset`` is None when no further page exists — the loop exit.
+    A past-the-end offset returns a clean empty page, not an error; ``cap``
+    widens up to ``INDEX_CAP_MAX`` (clamped with ``cap_clamped``, never
+    silently); invalid offset/cap are structured refusals, never raises."""
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+        return {"op": "index", "ok": False, "error": f"invalid cap {cap!r}"}
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return {"op": "index", "ok": False, "error": f"invalid offset {offset!r}"}
+    clamped = False
+    if cap > INDEX_CAP_MAX:
+        cap, clamped = INDEX_CAP_MAX, True
+    blocks = universe.ordered(kinds)
+    total = len(blocks)
+    page = blocks[offset:offset + cap]
+    next_offset = offset + len(page) if offset + len(page) < total else None
+    out: Dict[str, Any] = {"op": "index", "ok": True,
+                           "blocks": [b.to_meta() for b in page],
+                           "total": total, "returned": len(page),
+                           "hidden": total - len(page), "capped": len(page) < total,
+                           "offset": offset, "next_offset": next_offset}
+    if clamped:
+        out["cap_clamped"] = True
+    return out
 
 
 def view_state(universe: Universe, view: View) -> Dict[str, Any]:
+    """Forms + rule tags (docs/19 §12.19): the rule tags carry the pin
+    annotations and the op reasons — the agent's read surface for what it
+    pinned and why (the write came from ``ctx_pin``'s note)."""
     forms = {bid: view.form_of(bid) for bid in universe.blocks}
-    return {"op": "view_state", "ok": True, "forms": forms}
+    return {"op": "view_state", "ok": True, "forms": forms,
+            "rules": dict(view.rules)}
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +389,7 @@ def budget_query(reader: Any, tokens_used: Optional[int] = None,
         try:
             snap.update(reader() or {})
         except Exception as e:  # noqa: BLE001 -- advisory read
-            snap = {"error": str(e)[:120]}
+            snap = {"error": clip_diag(str(e), 120)}
     if tokens_used is not None:
         snap["tokens_used"] = int(tokens_used)
     if budget is not None:

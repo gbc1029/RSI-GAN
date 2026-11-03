@@ -27,8 +27,21 @@ _NO_SESSION = "Error: no context-management session is active for this chat"
 # copy of what used to be three byte-identical per-role files per face.
 
 
-def _ctx_index(handle, kind=None):
-    out = handle.index([str(kind)] if kind else None)
+def _as_int(value, default):
+    """Defensive int coercion for face params: None -> default, coercible
+    strings pass, garbage is forwarded so the primitive refuses it with a
+    clean structured record (never a bare TypeError through the tool)."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _ctx_index(handle, kind=None, offset=0, cap=None):
+    out = handle.index([str(kind)] if kind else None,
+                       offset=_as_int(offset, 0), cap=_as_int(cap, None))
     return _json.dumps(out, ensure_ascii=False)
 
 
@@ -67,13 +80,13 @@ def _ctx_view(handle):
 
 _SPECS: dict = {
     "ctx_index": {
-        "description": ("Enumerate the context blocks of this session (history turns, tool outputs, trajectory segments, your notes): id, kind, size, flags — metadata only, no content. Use it to see what can be fetched or pinned."),
+        "description": ("Enumerate the context blocks of this session (history turns, tool outputs, trajectory segments, your notes, derived compaction products): id, kind, size, flags — metadata only, no content. Capped pages say so: total/hidden/capped + next_offset (None = no further page); page with offset, widen with cap (up to 500; a clamp is reported via cap_clamped). Use it to see what can be fetched or pinned."),
         "input_schema": {
             "type": "object",
-            "properties": {"kind": {"type": "string", "description": "optional kind filter (turn_output|tool_output|traj_seg|note — only kinds this protocol materializes; kb_note/boundary/derived are retained vocabulary, never produced)"}},
+            "properties": {"kind": {"type": "string", "description": "optional kind filter (turn_output|tool_output|traj_seg|note|derived — derived blocks are materialized by compact merge/template)"}, "offset": {"type": "integer", "description": "page start (0-based); continue from a previous page's next_offset"}, "cap": {"type": "integer", "description": "max blocks on this page (default 200; widened up to 500)"}},
             "required": [],
         },
-        "params": ("kind=None",),
+        "params": ("kind=None", "offset=0", "cap=None"),
         "fn": _ctx_index,
     },
     "ctx_fetch": {
@@ -97,7 +110,7 @@ _SPECS: dict = {
         "fn": _ctx_budget,
     },
     "ctx_pin": {
-        "description": ("Pin a context block by id so the view assembly must keep it (the framework guarantees respect); unpin to release. Pin sparingly — pinned blocks survive every compaction."),
+        "description": ("Pin a context block by id so the view assembly must keep it (the framework guarantees respect); unpin to release. note is an optional SHORT tag (<= 40 chars, stored with the block and readable back via ctx_view; a longer note is refused — use ctx_note for the rationale). Pin sparingly — pinned blocks survive every compaction."),
         "input_schema": {
             "type": "object",
             "properties": {"block_id": {"type": "string"}, "note": {"type": "string"}, "unpin": {"type": "boolean"}},
@@ -117,7 +130,7 @@ _SPECS: dict = {
         "fn": _ctx_note,
     },
     "ctx_view": {
-        "description": ("Show this session's view state: which blocks are full, elided, compacted or placeholder, and the per-turn assembly stats. Your window into what the framework kept."),
+        "description": ("Show this session's view state: which blocks are full, elided, compacted or placeholder, plus each block's rule tag (your pin annotations and the op reasons — what the framework kept, and why). Forms are sticky across turns."),
         "input_schema": {
             "type": "object",
             "properties": {},

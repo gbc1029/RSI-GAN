@@ -147,10 +147,10 @@ class _ModuleLoad:
         except self.timeout_exc as e:
             self.failed = True
             self.timed_out = True
-            self.error = str(e)[:160]
+            self.error = ops.clip_diag(str(e), 160)
         except Exception as e:  # noqa: BLE001 -- classified by the caller
             self.failed = True
-            self.error = str(e)[:160]
+            self.error = ops.clip_diag(str(e), 160)
         return self.result
 
 
@@ -387,10 +387,13 @@ class ViewHandle:
         return None
 
     # -- read-only ---------------------------------------------------------
-    def index(self, kinds: Optional[List[str]] = None) -> Dict[str, Any]:
+    def index(self, kinds: Optional[List[str]] = None,
+              offset: int = 0, cap: Optional[int] = None) -> Dict[str, Any]:
         if err := self._gate("index"):
             return err
-        return ops.index_blocks(self._s.universe, kinds)
+        return ops.index_blocks(self._s.universe, kinds,
+                                cap=ops.INDEX_CAP_DEFAULT if cap is None else cap,
+                                offset=offset)
 
     def peek(self, block_id: str) -> Dict[str, Any]:
         if err := self._gate("peek"):
@@ -656,7 +659,7 @@ class CMSession:
                     "failures": self.assembly_failures,
                     "violations": self.assembly_violations,
                     "disabled": self.assembly_disabled,
-                    "last_error": str(self._assembly_last_error.get("error") or "")[:160],
+                    "last_error": ops.clip_diag(str(self._assembly_last_error.get("error") or ""), 160),
                     "phase": self._assembly_last_error.get("phase"),
                     "where": str(self._assembly_last_error.get("where") or ""),
                 }
@@ -668,7 +671,7 @@ class CMSession:
                 "stem": os.path.basename(str(self.policy_path)).split(".")[0],
                 "failures": self.policy_failures,
                 "disabled": self.policy_disabled,
-                "last_error": str(self._policy_last_error.get("error") or "")[:160],
+                "last_error": ops.clip_diag(str(self._policy_last_error.get("error") or ""), 160),
                 "phase": self._policy_last_error.get("phase"),
                 "where": str(self._policy_last_error.get("where") or ""),
             }
@@ -797,7 +800,7 @@ class CMSession:
             payload, texts = build_traj_materialization(clean)
         except Exception as e:  # noqa: BLE001 -- degrade, but speak
             self._emit({"type": "cm_traj_materialize_failed",
-                        "error": str(e)[:200]})
+                        "error": ops.clip_diag(str(e), 200)})
             return 0
         registered = 0
         for seg in payload.get("segments", []):
@@ -912,7 +915,7 @@ class CMSession:
                 # it raised: go back to the turn-start state BEFORE the preset
                 # replays (idempotent — the violation path already restored).
                 self._restore_turn(snap, msgs)
-                self._note_assembly_failure(str(e)[:160], phase=phase,
+                self._note_assembly_failure(ops.clip_diag(str(e), 160), phase=phase,
                                             exc=e,
                                             timed_out=isinstance(
                                                 e, assembly.AssemblyTimeout))
@@ -986,7 +989,7 @@ class CMSession:
         try:
             rec = fn(callee, **kwargs)
         except Exception as e:  # noqa: BLE001 -- refusal, never a seam crash
-            return {"op": str(name), "ok": False, "error": str(e)[:160]}
+            return {"op": str(name), "ok": False, "error": ops.clip_diag(str(e), 160)}
         if not isinstance(rec, dict) or "ok" not in rec:
             return {"op": str(name), "ok": False,
                     "error": "method returned a non-record"}
@@ -1389,12 +1392,12 @@ class CMSession:
             # known shared race: the leaked worker still holds the handle
             # (T2 hygiene restart owns the residual; T3 closes it)
             self._restore_turn(snap, msgs)
-            self._note_policy_failure(str(e)[:160], phase="timeout",
+            self._note_policy_failure(ops.clip_diag(str(e), 160), phase="timeout",
                                       timed_out=True, exc=e, restored=True)
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         except Exception as e:  # noqa: BLE001 -- fail-open, never break the session
             self._restore_turn(snap, msgs)
-            self._note_policy_failure(str(e)[:160], phase="run", exc=e,
+            self._note_policy_failure(ops.clip_diag(str(e), 160), phase="run", exc=e,
                                       restored=True)
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         if over_ms:
