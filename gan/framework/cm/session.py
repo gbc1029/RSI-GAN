@@ -117,7 +117,7 @@ class _ModuleLoad:
     strikes on, uniformly for both kinds."""
 
     __slots__ = ("kind", "path", "loader", "timeout_exc",
-                 "result", "failed", "error", "timed_out")
+                 "result", "failed", "error", "timed_out", "exc")
 
     def __init__(self, kind: str, path: Optional[str], loader: Callable,
                  timeout_exc: type) -> None:
@@ -129,6 +129,7 @@ class _ModuleLoad:
         self.failed = False
         self.error = ""
         self.timed_out = False
+        self.exc: Optional[BaseException] = None
 
     @property
     def armed(self) -> bool:
@@ -148,6 +149,7 @@ class _ModuleLoad:
             self.failed = True
             self.timed_out = True
             self.error = ops.clip_diag(str(e), 160)
+            self.exc = e   # carries candidate_thread (docs/19 §12.31)
         except Exception as e:  # noqa: BLE001 -- classified by the caller
             self.failed = True
             self.error = ops.clip_diag(str(e), 160)
@@ -545,6 +547,16 @@ class CMSession:
     # ``summary()`` as CONDITIONAL fields (absence = clean) and drive the
     # seat proxy's post-session hygiene restart (docs/19 CM-03 residual).
     thread_leaks: int = 0
+    # Band-① advisory counters (docs/19 §12.30.3/N1): a run that completed
+    # INSIDE the wait deadline but over the wall budget. Advisory only —
+    # the result is honored, never struck.
+    assembly_overruns: int = 0
+    policy_overruns: int = 0
+    # the workers abandoned at T (candidate threads attached to the raised
+    # timeout exceptions) — ``thread_leaks_live`` measures how many are
+    # STILL alive at summary time (docs/19 §12.31)
+    _timeout_workers: List[Any] = field(default_factory=list, repr=False,
+                                        compare=False)
     _thread_baseline: int = field(default=0, repr=False, compare=False)
     _policy_strikes: int = 0
     _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
@@ -667,6 +679,21 @@ class CMSession:
         delta = _foreign_thread_count() - self._thread_baseline
         if delta > 0:
             out["thread_leak_delta"] = delta
+        if self.assembly_overruns:
+            out["assembly_overruns"] = self.assembly_overruns
+        if self.policy_overruns:
+            out["policy_overruns"] = self.policy_overruns
+        # The MEASURED leak signal (docs/19 §12.31): how many of the
+        # workers abandoned at T are STILL alive. A timed-out worker may
+        # finish normally after the wait was abandoned (band ② — the wait
+        # deadline and the work's completion are different clocks); only
+        # the candidates' liveness distinguishes that from a real hang.
+        # ``thread_leaks`` above stays the historical prediction count and
+        # drives nothing.
+        live = sum(1 for t in self._timeout_workers
+                   if t is not None and t.is_alive())
+        if live:
+            out["thread_leaks_live"] = live
         if self.assembly_path:
             out["assembly_active"] = self.assembly_active
             out["assembly_failures"] = self.assembly_failures
@@ -946,7 +973,7 @@ class CMSession:
                 # session (the published primitive surface + read-only
                 # parameters; ``emit_view``/``count_ops``/state fields are
                 # refused). The parameter name stays ``session``.
-                result = assembly.run_assembly(
+                result, over_ms = assembly.run_assembly(
                     named, self._portal(), msgs, outgoing, tokens_used, budget,
                     self.assembly_exec_ms)
                 if not (isinstance(result, tuple) and len(result) == 2
@@ -957,6 +984,14 @@ class CMSession:
                 problem = _validate_sent_history(result[0])
                 if problem:
                     raise assembly.AssemblyError(problem)
+                if over_ms:
+                    # Band-① advisory, owned by the LIVE session: the emit
+                    # used to fire inside run_assembly through the portal,
+                    # whose _emit raises — a completed-over-budget run died
+                    # as a false contract failure (docs/19 §12.30.3/N1).
+                    self.assembly_overruns += 1
+                    self._emit({"type": "cm_assembly_overrun",
+                                "turn": self.turn, "over_ms": over_ms})
                 violations = self._reconcile_turn(msgs, snap)
                 if violations:
                     self._note_violations(violations)
@@ -1010,7 +1045,7 @@ class CMSession:
         if st.failed and result is None:
             # one strike, one event pair — crash and timeout alike
             self._note_assembly_failure(st.error, phase="load",
-                                        timed_out=st.timed_out)
+                                        timed_out=st.timed_out, exc=st.exc)
             self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
                         "mode": self.mode, "to": self.mode,
                         "reason": st.error})
@@ -1276,6 +1311,9 @@ class CMSession:
         self._turn_degraded = True
         if timed_out:
             self.thread_leaks += 1
+            cand = getattr(exc, "candidate_thread", None)
+            if cand is not None:
+                self._timeout_workers.append(cand)
         where = ""
         if exc is not None and phase == "run":
             try:
@@ -1463,7 +1501,7 @@ class CMSession:
         result = st.ensure(self.policy_exec_ms)
         if st.failed and result is None:
             self._note_policy_failure(st.error, phase="load",
-                                      timed_out=st.timed_out)
+                                      timed_out=st.timed_out, exc=st.exc)
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         apply_fn, methods, method_problems = result
         if first and not self._methods_policy_done:
@@ -1493,6 +1531,7 @@ class CMSession:
                                       restored=True)
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         if over_ms:
+            self.policy_overruns += 1
             self._emit({"type": "cm_policy_overrun", "turn": self.turn,
                         "over_ms": over_ms})
         if not isinstance(records, list):
@@ -1548,6 +1587,9 @@ class CMSession:
         self._turn_degraded = True
         if timed_out:
             self.thread_leaks += 1
+            cand = getattr(exc, "candidate_thread", None)
+            if cand is not None:
+                self._timeout_workers.append(cand)
         where = ""
         if exc is not None and phase == "run":
             try:

@@ -25,6 +25,7 @@ import concurrent.futures
 import importlib.util
 import os
 import sys
+import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Imports a policy module must NEVER make (纯代码: 无 LLM、无网络、无子进程).
@@ -100,6 +101,23 @@ def load_policy(path: str):
     return module, methods, method_problems
 
 
+def _tracked_submit(pool: "concurrent.futures.ThreadPoolExecutor",
+                    fn: Callable, *args: Any
+                    ) -> Tuple["concurrent.futures.Future", List[Any]]:
+    """Submit ``fn`` with a worker-thread tracker. The recorded thread
+    rides the raised timeout as ``candidate_thread`` (docs/19 §12.31): the
+    T2 restart decision consumes the MEASURED liveness of exactly the
+    abandoned workers — never a process-wide census, which would read a
+    just-finished runner of a healthy turn as a leak."""
+    box: List[Any] = []
+
+    def _tracked(*a: Any, **k: Any) -> Any:
+        box.append(threading.current_thread())
+        return fn(*a, **k)
+
+    return pool.submit(_tracked, *args), box
+
+
 def timed_load_policy(path: str, exec_ms: int
                       ) -> Tuple[Callable[..., Any], Dict[str, Any], List[str]]:
     """Load the policy module ONCE under the same budget as its execution
@@ -124,12 +142,14 @@ def timed_load_policy(path: str, exec_ms: int
             raise PolicyMissing("policy module exposes no apply(ctx)")
         return apply_fn, methods, method_problems
 
-    future = pool.submit(_load_and_extract)
+    future, _box = _tracked_submit(pool, _load_and_extract)
     try:
         return future.result(timeout=max(exec_ms, 1) / 1000.0)
     except concurrent.futures.TimeoutError as e:
         future.cancel()
-        raise PolicyTimeout(f"policy load exceeded {exec_ms}ms") from e
+        timeout = PolicyTimeout(f"policy load exceeded {exec_ms}ms")
+        timeout.candidate_thread = _box[0] if _box else None
+        raise timeout from e
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
@@ -144,7 +164,7 @@ def apply_policy(apply_fn: Callable[..., Any], handle: Any, exec_ms: int
     t0 = _time.monotonic()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
                                                  thread_name_prefix="cm_exec")
-    future = pool.submit(apply_fn, handle)
+    future, _box = _tracked_submit(pool, apply_fn, handle)
     try:
         records = future.result(timeout=max(exec_ms, 1) / 1000.0)
     except concurrent.futures.TimeoutError as e:
@@ -152,7 +172,9 @@ def apply_policy(apply_fn: Callable[..., Any], handle: Any, exec_ms: int
         # Same rule as the assembly runner: the budget bounds THIS TURN.
         # ``with`` would block on ``shutdown(wait=True)`` for the hung policy
         # code, so the timeout could not end the turn.
-        raise PolicyTimeout(f"policy exceeded {exec_ms}ms") from e
+        timeout = PolicyTimeout(f"policy exceeded {exec_ms}ms")
+        timeout.candidate_thread = _box[0] if _box else None
+        raise timeout from e
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     over_ms = max(0, int((_time.monotonic() - t0) * 1000) - exec_ms)

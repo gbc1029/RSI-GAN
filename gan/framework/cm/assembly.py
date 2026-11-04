@@ -391,27 +391,34 @@ def timed_load_assembly(path: str, exec_ms: int) -> Tuple[Callable, Dict[str, Ca
     thread leaks exactly like a timed-out ``assemble`` (Python cannot kill
     threads; CM-03 owns that) and is named ``cm_exec`` so the session's
     leak observability can tell it apart from framework pools."""
+    from .failopen import _tracked_submit
     import time as _time
     t0 = _time.monotonic()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
                                                  thread_name_prefix="cm_exec")
-    future = pool.submit(load_assembly, path)
+    future, _box = _tracked_submit(pool, load_assembly, path)
     try:
         return future.result(timeout=max(exec_ms, 1) / 1000.0)
     except concurrent.futures.TimeoutError as e:
         future.cancel()
-        raise AssemblyTimeout(f"assembly load exceeded {exec_ms}ms") from e
+        timeout = AssemblyTimeout(f"assembly load exceeded {exec_ms}ms")
+        timeout.candidate_thread = _box[0] if _box else None
+        raise timeout from e
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
 
 def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
                  outgoing: str, tokens_used: int, budget: Optional[int],
-                 exec_ms: int) -> Tuple[List[Dict[str, Any]], str]:
+                 exec_ms: int) -> Tuple[Tuple[List[Dict[str, Any]], str], int]:
     """Execute one agent assembly under its per-turn execution budget
-    (worker thread; same class as the policy runner). Emits
-    ``cm_assembly_overrun`` when the wall exceeded the budget (the result is
-    still honored if it arrived). Raises on crash/timeout: the session counts
+    (worker thread; same class as the policy runner). Returns
+    ``((history, msg), over_ms)`` — mirrors :func:`failopen.apply_policy`.
+    The ``cm_assembly_overrun`` advisory is owned by the CALLER (the live
+    session): emitting through the assembly-time ``session`` parameter
+    means emitting through the P2 portal, whose ``_emit`` raises — a
+    completed-over-budget run used to die as a false contract failure
+    (docs/19 §12.30.3/N1). Raises on crash/timeout: the session counts
     the failure and re-runs the preset.
 
     THE BUDGET BOUNDS THE TURN: on timeout the pool is shut down WITHOUT
@@ -419,11 +426,13 @@ def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
     ``with`` implies ``shutdown(wait=True)``). The worker itself may keep
     running — termination is CM-03's job, this is only about not dragging the
     session with it."""
+    from .failopen import _tracked_submit
     import time as _time
     t0 = _time.monotonic()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
                                                  thread_name_prefix="cm_exec")
-    future = pool.submit(fn, session, msgs, outgoing, tokens_used, budget)
+    future, _box = _tracked_submit(pool, fn, session, msgs, outgoing,
+                                   tokens_used, budget)
     try:
         result = future.result(timeout=max(exec_ms, 1) / 1000.0)
     except concurrent.futures.TimeoutError as e:
@@ -435,11 +444,10 @@ def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
             # waiting lets the turn proceed; the worker may leak (Python
         # cannot kill threads — CM-03 owns that, this only stops it from
         # dragging the session).
-        raise AssemblyTimeout(f"assembly exceeded {exec_ms}ms") from e
+        timeout = AssemblyTimeout(f"assembly exceeded {exec_ms}ms")
+        timeout.candidate_thread = _box[0] if _box else None
+        raise timeout from e
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     over_ms = max(0, int((_time.monotonic() - t0) * 1000) - exec_ms)
-    if over_ms:
-        session._emit({"type": "cm_assembly_overrun", "turn": session.turn,
-                       "over_ms": over_ms})
-    return result
+    return result, over_ms

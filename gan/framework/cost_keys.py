@@ -135,11 +135,16 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
     },
     "cm_policy_exec_ms": {
         "type": "int", "min": 10, "max": 10_000, "default": 200,
-        "consumer": "cm seam (policy execution budget; overruns count toward the wedge breaker)",
+        "consumer": ("cm seam (policy execution budget per stage — load and "
+                     "run each get one window; a timeout strikes; a "
+                     "completed-over-budget run is honored with a "
+                     "cm_policy_overrun advisory)"),
     },
     "cm_assembly_exec_ms": {
         "type": "int", "min": 10, "max": 10_000, "default": 200,
-        "consumer": "cm seam (agent assembly execution budget per turn; overruns count toward its wedge breaker)",
+        "consumer": ("cm seam (agent assembly execution budget per turn; a "
+                     "timeout strikes; a completed-over-budget run is "
+                     "honored with a cm_assembly_overrun advisory)"),
     },
     "cm_policy": {
         "type": "str", "max_len": 64, "default": None,

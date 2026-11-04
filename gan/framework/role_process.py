@@ -678,7 +678,13 @@ class RoleProcess:
         if not isinstance(summary, dict):
             return
         try:
-            leaked = (int(summary.get("thread_leaks") or 0) > 0
+            # MEASURED, not predicted (docs/19 §12.30.3/N1): the timed-out
+            # worker may still finish normally (band ② — the wait was
+            # abandoned at T, the work completed after it); the live census
+            # is the only signal that separates that from a real hang.
+            # ``thread_leaks`` stays a reported historical fact (the event
+            # fields below) and never triggers a restart by itself.
+            leaked = (int(summary.get("thread_leaks_live") or 0) > 0
                       or int(summary.get("thread_leak_delta") or 0) > 0)
         except (TypeError, ValueError):
             return
