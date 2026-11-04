@@ -479,6 +479,20 @@ def reconcile(output_dir: str) -> Dict[str, Any]:
 
     fine: Dict[str, List[int]] = {}
     unattributed = 0
+
+    def _add(key: str, rec: Optional[Dict[str, Any]]) -> None:
+        # A session with no usage counters is UNATTRIBUTED (reported, never a
+        # mismatch) — and its key must not be created: an empty list would
+        # coerce sum() to 0 and fabricate a trajectory side of zero (the
+        # false-drift mode this function shipped with under the F5 layout).
+        nonlocal unattributed
+        if not rec:
+            return
+        if rec.get("total_tokens") is not None:
+            fine.setdefault(key, []).append(int(rec["total_tokens"]))
+        else:
+            unattributed += 1
+
     traj_root = paths.trajectory_root(output_dir)
     if os.path.isdir(traj_root):
         for outer_name in sorted(os.listdir(traj_root)):
@@ -489,45 +503,40 @@ def reconcile(output_dir: str) -> Dict[str, Any]:
                 outer = int(outer_name[len("outer_"):])
             except ValueError:
                 continue
+            # Role sessions: the F5 seat-keyed trees are the ONLY shape a role
+            # process writes — the genid set is derived from those trees, not
+            # from the legacy numeric genid dirs (a genid whose only session
+            # file is seat-keyed — e.g. an old-format no-usage session — has no
+            # numeric dir and must still be visited; unattributed is a real
+            # state, not an address).
+            genids = set()
+            for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
+                seat_dir = paths.role_traj_dir(output_dir, outer, role, seat)
+                if not os.path.isdir(seat_dir):
+                    continue
+                for f in os.listdir(seat_dir):
+                    stem = f[:-len(".jsonl")] if f.endswith(".jsonl") else ""
+                    if stem.startswith("gen_") and not stem.endswith(".llm_calls"):
+                        genids.add(stem[len("gen_"):])
+            for gid in sorted(genids):
+                # Through the F5 readers (gen_session_costs): re-walking raw
+                # paths here re-created the exact drift those readers fixed.
+                per_gen = gen_session_costs(output_dir, outer, gid)
+                for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
+                    _add(f"role:{role}:{outer_name}", per_gen.get(f"{role}_{seat}"))
+            # The task child stays in the numeric genid dir (task has no seat).
             for name in sorted(os.listdir(outer_dir)):
                 sub = os.path.join(outer_dir, name)
-                if os.path.isdir(sub):
-                    for role in ("planner", "evaluator"):
-                        rec = session_cost_from_file(
-                            os.path.join(sub, f"{role}.jsonl"),
-                            role=role, seat="plan", outer=outer, genid=name)
-                        if rec:
-                            key = f"role:{role}:{outer_name}"
-                            fine.setdefault(key, [])
-                            if rec.get("total_tokens") is not None:
-                                fine[key].append(int(rec["total_tokens"]))
-                            else:
-                                unattributed += 1
+                if os.path.isdir(sub) and name.isdigit():
                     rec = session_cost_from_file(
                         os.path.join(sub, "task.jsonl"),
                         role="task", seat="task", outer=outer, genid=name)
-                    if rec:
-                        key = f"task:gen_{name}"
-                        fine.setdefault(key, [])
-                        if rec.get("total_tokens") is not None:
-                            fine[key].append(int(rec["total_tokens"]))
-                        else:
-                            unattributed += 1
-                elif name.endswith(".jsonl"):
-                    stem = name[: -len(".jsonl")]
-                    role = stem.split("__", 1)[0]
-                    if role not in ("planner", "evaluator"):
-                        continue
-                    rec = session_cost_from_file(
-                        os.path.join(outer_dir, name),
-                        role=role, seat="self_improve", outer=outer)
-                    if rec:
-                        key = f"role:{role}:{outer_name}"
-                        fine.setdefault(key, [])
-                        if rec.get("total_tokens") is not None:
-                            fine[key].append(int(rec["total_tokens"]))
-                        else:
-                            unattributed += 1
+                    _add(f"task:gen_{name}", rec)
+            # Outer-level self-improve sessions (canonical + attempt siblings),
+            # collected by the F5 self reader.
+            for role in ("planner", "evaluator"):
+                for rec in self_session_costs(output_dir, outer, role):
+                    _add(f"role:{role}:{outer_name}", rec)
 
     mismatches: List[Dict[str, Any]] = []
     checked = 0

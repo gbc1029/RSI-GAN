@@ -80,6 +80,26 @@ _EVALUATOR_META_KEYS = (
 )
 
 
+def _report_view_for_evaluator(report_summary):
+    """The BLIND-phase projection of the task's ``report_summary``.
+
+    Exclusion set = the trajectory redaction vocabulary (``trajectory
+    ._SENSITIVE``) — ONE sensitive-key source governing BOTH evaluator-visible
+    channels (rendered trajectory views and this meta projection), so they
+    cannot drift again. The B1 lesson (issue ``harness.infra``, g0/i-2): the
+    old inline strip list named two scalars while ``label_distribution`` rode
+    through with the ground-truth distribution, compromising the blind
+    protocol from the framework side. Process facts (coverage / sample_n /
+    contract_ok / patch counts) survive; the objective outcome family is
+    revealed only through the reveal mechanism, never through this payload.
+    """
+    from gan.framework.trajectory import _SENSITIVE
+    banned = frozenset(_SENSITIVE)
+    if not isinstance(report_summary, dict):
+        return {}
+    return {k: v for k, v in report_summary.items() if k not in banned}
+
+
 def _receipt_for_evaluator(receipt):
     """The evaluator's projection of the plan receipt — outcomes only.
 
@@ -3608,8 +3628,8 @@ class GanLoop:
                 # mirroring the per-role access allowlist.
                 meta_view = {k: child.meta[k] for k in _EVALUATOR_META_KEYS
                              if k in (child.meta or {})}
-                report_view = {k: v for k, v in (child.meta.get("report_summary") or {}).items()
-                               if k not in ("overall_accuracy", "random_guess_accuracy")}
+                report_view = _report_view_for_evaluator(
+                    (child.meta or {}).get("report_summary"))
                 # Cost statement for the evaluate session (B2): THIS round's
                 # task cost as a process fact (no scores — blind discipline).
                 task_cost_pair = ((child.value.cost_tokens, child.value.cost_wallclock_s)
