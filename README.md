@@ -73,9 +73,10 @@ pip install -r requirements.txt
 pip install -r requirements_dev.txt
 ```
 
-> `requirements.txt` contains a few `git+https://github.com/...` deps for the
-> `balrog`/`genesis` domains. If GitHub is not reachable these lines can be
-> dropped for a core install.
+> `requirements.txt` does NOT carry the `balrog`/`genesis` extras: `balrog` has
+> its own installer (see **3d** — the pins it needs cannot be expressed as
+> requirements lines), and the `genesis` deps stay commented out (GPU / WSL CUDA
+> is not configured). A core install needs nothing beyond this file.
 
 ### 3) LLM credentials (create `.env`, NOT committed)
 
@@ -153,6 +154,45 @@ Env vars: `GAN_TASK_SANDBOX_USER` has NO default and must be set explicitly;
 `GAN_PLANNER_SANDBOX_USER` / `GAN_EVALUATOR_SANDBOX_USER` default to
 `rsi_gan_planner` / `rsi_gan_evaluator` — pass all three explicitly to avoid
 deployment ambiguity.
+
+### 3d) balrog domain (optional)
+
+`balrog_babyai` / `balrog_babaisai` need an env stack that a plain
+`pip install -r requirements.txt` cannot produce. Install it with the domain's
+own script (it ends by verifying the stack and is idempotent):
+
+```bash
+bash domains/balrog/scripts/setup_balrog.sh            # babyai only
+bash domains/balrog/scripts/setup_balrog.sh --only all  # + babaisai
+bash domains/balrog/scripts/setup_balrog.sh --check     # verify, install nothing
+bash domains/balrog/scripts/setup_balrog.sh --uninstall # roll back
+```
+
+What it pins, and why (all measured 2026-11-03):
+
+| piece | pin | reason |
+|---|---|---|
+| Minigrid **fork** | `cf73dd148e51276bd675a37e3bfb0bf2b42329b2` (branch `babyai_text`), tarball | PyPI `minigrid==2.3.1` has neither `BabyAI-MixedTrainLocal-v0` nor `info["descriptions"]` — balrog's BabyAI text wrapper needs both |
+| `gymnasium` | `1.2.0` | minigrid's API base |
+| `pygame` | `>=2.5` | minigrid rendering (`get_pov_render`) |
+| `gym` | `0.23.0`, installed with **`--no-deps`** | `domains/balrog/environments` builds its `Strings` space on old gym; its own `pygame==2.1.0` pin has no cp312 wheel |
+| `setuptools` | latest | old gym imports `distutils`, removed from the py3.12 stdlib |
+| `baba-is-ai` (`import baba`) | `40ae1b29dbc67f2ecea06cc161ed5ca51719e5e3`, tarball | babaisai env; git-only project (not on PyPI) |
+
+Known constraints:
+
+- GitHub `git+https` clones stall in restricted networks (`objects.githubusercontent.com`
+  blocked) — the script uses `codeload.github.com/<repo>/tar.gz/<sha>` tarballs and
+  checks their sha256. Point `BALROG_MINGRID_TARBALL` / `BALROG_BABA_TARBALL`
+  at local copies to install fully offline.
+- `pip check` stays clean; numpy/pandas are never touched (numpy 2.x is what the
+  venv already ships and what these pins were verified against).
+- Cost: one `balrog_babaisai` generation is 40 tasks x 100 steps = 4000 agent
+  sessions (the budgets in `gan/framework/domains.yaml` say so out loud). Trim
+  `domains/balrog/config/config.yaml` `babaisai_tasks` for cheap runs.
+- `balrog_minihack` / `balrog_nle` / `crafter` / `textworld` are **not** wired
+  into the GAN path and are not covered by this script (`post_install.py`
+  downloads their data from GitHub/Drive and needs network).
 
 ### 4) Docker (only needed for the original HyperAgents container flow)
 

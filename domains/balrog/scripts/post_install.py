@@ -1,3 +1,15 @@
+"""Balrog DATA post-install (Boxoban levels + TextWorld games).
+
+Only the ``minihack`` and ``textworld`` environments need this: it downloads
+Boxoban levels from GitHub and TextWorld game archives from Google Drive.
+
+NOT required for ``balrog_babyai`` / ``balrog_babaisai`` -- those two are the
+only balrog domains wired into the GAN path, and their Python dependencies are
+installed by ``setup_balrog.sh`` next to this file (see README "3d) balrog
+domain"). Running this script needs external network and belongs to the
+(unwired) minihack/textworld environments.
+"""
+
 import os
 import subprocess
 import zipfile

@@ -252,21 +252,27 @@ domains:
   # (the task proxy token is a HARD cap: exhausting it kills the step child,
   # the harness exits non-zero and -- for the two sandboxed balrog domains -- no
   # report is written at all, i.e. a null score that looks like bad play).
+  # Task counts / episode lengths below are MEASURED (2026-11-03), not guessed:
+  # `len(cfg.tasks.<env>_tasks)` and `EnvWrapper.max_steps` after reset.
   balrog_babyai:
-    # 5 tasks x 60 steps; 30s/step -> 9000s per unit; 60 steps x 8 calls ->
-    # 2400 calls per unit.
-    harness_timeout_per_sample_s: 9000
-    task_llm_calls_per_sample: 2400
+    # 5 tasks; BabyAI-MixedTrainLocal samples a sub-task per episode and its
+    # max_steps is 64 (goto/pickup/open) or 128 (putnext, seq). Worst case:
+    # 5 x 128 steps x 20s = 12800s per unit; 5 x 128 x 4 calls = 2560 calls.
+    harness_timeout_per_sample_s: 12800
+    task_llm_calls_per_sample: 2560
     task_brief: >-
       Play the BabyAI navigation environment. At each step, inspect the mission
       and observation and respond with exactly one valid environment action.
 
   balrog_babaisai:
     question_timeout_s: 600
-    # 4 tasks x 60 steps; 30s/step -> 7200s per unit; 60 steps x 8 calls ->
-    # 1920 calls per unit.
-    harness_timeout_per_sample_s: 7200
-    task_llm_calls_per_sample: 1920
+    # 40 tasks (config.yaml babaisai_tasks) x 100 steps (baba env max_steps).
+    # That is 4000 agent sessions PER unit: 40 x 100 x 10s = 40000s (~11h) and
+    # 40 x 100 x 4 = 16000 calls. This is genuinely expensive -- an operator who
+    # wants a cheaper generation must trim babaisai_tasks or pin
+    # eval.max_steps_per_episode for the run (neither is silently changed here).
+    harness_timeout_per_sample_s: 40000
+    task_llm_calls_per_sample: 16000
     task_brief: >-
       Play the Baba Is AI puzzle environment. At each step, inspect the active
       rules and object positions and respond with exactly one valid action.
