@@ -1752,6 +1752,7 @@ class GanLoop:
 
             payload = {
                 "outer": outer,
+                "code_layout": getattr(self.roots, "layout", "single"),
                 "planner_design_hash": (self._outer_versions.get("planner_design_hash")
                                          or self._design_hash("planner")),
                 "evaluator_design_hash": (self._outer_versions.get("evaluator_design_hash")

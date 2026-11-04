@@ -17,6 +17,58 @@ from gan.framework.archive import MomeArchive
 from gan.framework.supernode import load_supernode
 
 
+def role_code_compatibility(supernode: Optional[Dict[str, Any]],
+                             roles_root: Optional[str]) -> tuple[bool, Dict[str, Any]]:
+    """Check that archived role designs belong to the current role code HEAD."""
+    if not roles_root:
+        return True, {"checked": False, "reason": "no_roles_root"}
+    commits = (supernode or {}).get("code_commits")
+    if not isinstance(commits, dict):
+        return False, {"checked": True, "reason": "missing_code_commits"}
+    expected = {
+        role: str(commits.get(role) or "")
+        for role in ("planner", "evaluator")
+    }
+    if any(not value for value in expected.values()):
+        return False, {"checked": True, "reason": "missing_role_commit",
+                       "expected": expected}
+    try:
+        from gan.framework import code_repo
+        current = str(code_repo.current_commit(roles_root))
+    except Exception as exc:  # noqa: BLE001 -- incompatible is safer than guessing
+        return False, {"checked": True, "reason": "current_role_commit_unavailable",
+                       "error": str(exc)[:300], "expected": expected}
+    mismatches = {role: {"archived": value, "current": current}
+                  for role, value in expected.items() if value != current}
+    if mismatches:
+        # In the legacy single-tree layout task commits and role commits share
+        # one HEAD. A descendant containing only task commits is compatible:
+        # ownership rules guarantee it did not change role source. Any
+        # self-improve commit, or a broken/non-ancestor history, remains
+        # incompatible and is rejected conservatively.
+        if (str((supernode or {}).get("code_layout") or "") == "single"
+                and len(set(expected.values())) == 1):
+            archived = next(iter(expected.values()))
+            try:
+                from gan.framework import code_repo
+                if code_repo.is_ancestor(roles_root, archived, current):
+                    history = code_repo.rev_range_with_subject(
+                        roles_root, archived, current)
+                    if history and all(
+                            not str(subject).startswith("self-improve ")
+                            for _sha, subject in history):
+                        return True, {"checked": True, "current": current,
+                                      "mode": "single_task_descendant",
+                                      "archived": archived}
+            except Exception:  # noqa: BLE001 -- compatibility must fail closed
+                pass
+        return False, {"checked": True, "reason": "role_code_commit_mismatch",
+                       "mismatches": mismatches}
+    return True, {"checked": True, "current": current,
+                  "planner": expected["planner"],
+                  "evaluator": expected["evaluator"]}
+
+
 def select_parent(archive: MomeArchive, rng: random.Random,
                   tournament_k: int = 3,
                   exclude: Optional[set] = None) -> Optional[Dict[str, Any]]:
@@ -116,13 +168,25 @@ def select_and_restore(output_dir: str, archive: MomeArchive,
                     pass
 
     tried: List[Dict[str, Any]] = []
+    attempted_outers = set(exclude or set())
+    attempted_candidates = set()
     for _ in range(int(max_tries)):
-        entry = select_parent(archive, rng, tournament_k, exclude=exclude)
+        entry = select_parent(archive, rng, tournament_k, exclude=attempted_outers)
         if entry is None:
             rollback()
             return None, {"outer": None, "reports": [], "tries": tried,
                           "reason": "no_candidate"}
+        if entry["outer"] in attempted_candidates:
+            break
+        attempted_candidates.add(entry["outer"])
+        attempted_outers.add(entry["outer"])
         sn = load_supernode(output_dir, entry["outer"])
+        compatible, compatibility = role_code_compatibility(sn, roles_root)
+        if not compatible:
+            tried.append({"outer": entry["outer"],
+                          "reason": compatibility.get("reason", "incompatible_code"),
+                          "code_compatibility": compatibility})
+            continue
         designs = (sn or {}).get("designs")
         if not isinstance(designs, dict) or not isinstance(designs.get("planner"), dict):
             tried.append({"outer": entry["outer"], "reason": "no designs"})
@@ -140,9 +204,15 @@ def select_and_restore(output_dir: str, archive: MomeArchive,
                 if rep.get("too_divergent"):
                     ok = False
         if ok:
-            return sn, {"outer": entry["outer"], "reports": reports, "tries": tried}
+            return sn, {"outer": entry["outer"], "reports": reports,
+                        "tries": tried, "code_compatibility": compatibility}
         tried.append({"outer": entry["outer"], "reason": "divergent", "reports": reports})
         rollback()
     rollback()
+    reasons = {str(item.get("reason")) for item in tried}
+    reason = ("all_incompatible_code" if tried and reasons <= {
+        "missing_code_commits", "missing_role_commit",
+        "current_role_commit_unavailable", "role_code_commit_mismatch"
+    } else "all_divergent")
     return None, {"outer": None, "reports": [], "tries": tried,
-                  "reason": "all_divergent"}
+                  "reason": reason}
