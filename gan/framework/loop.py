@@ -1600,6 +1600,38 @@ class GanLoop:
             challenge_ledger.save(self.output_dir, data, self.ledger_writer)
         return settled
 
+    def _challenge_metrics_for_outer(self, outer: int,
+                                     outer_genids: List[Any]) -> Dict[str, Any]:
+        """Compute pilot challenge metrics for challenges consumed this outer."""
+        if not self.challenge_enabled:
+            return {}
+        from gan.framework import challenge_adjudication, challenge_ledger, challenge_metrics
+        data = challenge_ledger.load(self.output_dir)
+        genids = {str(g) for g in outer_genids}
+        rows: List[Dict[str, Any]] = []
+        gains: Dict[str, float] = {}
+        for row in (data.get("challenges", {}).values() or []):
+            if not isinstance(row, dict) or row.get("status") != challenge_ledger.STATUS_CONSUMED:
+                continue
+            child_id = str(row.get("consumed_child_node") or "")
+            child = self.task_tree.get(child_id)
+            child_outer = str((child.meta or {}).get("outer_id")) if child else ""
+            if child_id not in genids and child_outer != str(outer):
+                continue
+            rows.append(row)
+            result = row.get("adjudication") or {}
+            if result.get("state") in {
+                    challenge_adjudication.VERIFIED_REPAIR,
+                    challenge_adjudication.VERIFIED_UNRESOLVED}:
+                parent = self.task_tree.get(str(row.get("producer_node")))
+                if parent is not None and child is not None:
+                    parent_points = self._read_per_question(parent.genid).get(str(row.get("qid")))
+                    child_points = self._read_per_question(child.genid).get(str(row.get("qid")))
+                    if parent_points is not None and child_points is not None:
+                        gains[str(row.get("challenge_id"))] = (
+                            float(child_points) - float(parent_points)) / 7.0
+        return challenge_metrics.compute(rows, gains)
+
     def _record_supernode(self, outer: int, outer_genids: List[Any]) -> None:
         """Aggregate + persist the per-outer supernode (advisory sink)."""
         try:
@@ -1690,6 +1722,7 @@ class GanLoop:
             except Exception:  # noqa: BLE001 -- advisory
                 tr = {"verified": 0, "hits": 0, "unsupported": 0, "judged": 0}
                 verdict_stability = None
+            challenge_stats = self._challenge_metrics_for_outer(outer, outer_genids)
 
             payload = {
                 "outer": outer,
@@ -1741,7 +1774,18 @@ class GanLoop:
                     "task_val_candidate_genid": None,
                     "task_val_parent_genid": None,
                 },
-                "planner_stats": {"op_dist": op_dist, "response_kind": response_kind},
+                "planner_stats": {
+                    "op_dist": op_dist,
+                    "response_kind": response_kind,
+                    "challenge": {
+                        key: challenge_stats.get(key)
+                        for key in ("state_counts", "supported_challenges",
+                                    "undecidable_challenges", "repair_rate_raw",
+                                    "repair_rate_smoothed",
+                                    "planner_adversarial_score",
+                                    "mean_anchor_point_gain", "point_gain_count")
+                    } if challenge_stats else {},
+                },
                 "evaluator_stats": {
                     "issues_per_task": (len(issues) / len(outer_genids)) if outer_genids else None,
                     "severity": severity,
@@ -1759,6 +1803,15 @@ class GanLoop:
                     "verdict_verified": tr["verified"],
                     "verdict_hits": tr["hits"],
                     "verdict_unsupported": tr["unsupported"],
+                    "challenge": {
+                        key: challenge_stats.get(key)
+                        for key in ("state_counts", "supported_challenges",
+                                    "undecidable_challenges",
+                                    "challenge_precision_raw",
+                                    "challenge_precision_smoothed",
+                                    "evaluator_adversarial_score",
+                                    "point_gain_count")
+                    } if challenge_stats else {},
                 },
             }
             record_supernode(self.output_dir, outer, payload, writer=self.ledger_writer)
