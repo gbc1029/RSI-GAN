@@ -1371,10 +1371,16 @@ if __name__ == "__main__":
         agent_factory = None
         if domain in _SANDBOXED_BALROG_MODULES and args.dataset_root is not None:
             _require_sandboxed_balrog_runtime(domain)
+            # ``proxy_token`` (resolved above), NOT ``args.proxy_token``: in the
+            # secure broker path the credential arrives as a sealed memfd and is
+            # only visible through ``--proxy_token_file``, so ``args.proxy_token``
+            # is None there. Passing the raw arg made every driver-mode balrog
+            # launch die with "requires a scoped task proxy" (measured
+            # 2026-11-04, first real round).
             agent_factory = _SandboxedBalrogAgentFactory(
                 args.model,
                 args.proxy_socket,
-                args.proxy_token,
+                proxy_token,
                 args.reasoning_effort,
             )
         from domains.balrog.eval import harness_balrog
