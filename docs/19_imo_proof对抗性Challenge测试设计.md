@@ -451,38 +451,27 @@ task config/patch 做机械审计：禁止出现 challenge qid 的显式分支�
 
 ---
 
-## 3. 当前实现缺口
+## 3. 当前实现状态
 
-以下均是相对当前 `local_test` 的缺口；本文只定义方案，不声称已经实现。
+`local_test` 已实现本文首版范围。下表是最终核对结果；“完成”指相应契约已有代码路径和针对性
+测试，不表示真实模型实验已经达到足够统计功效。
 
-1. **Challenge 契约缺失**：`EvalContext`、role process 返回契约、evaluator 工具和 feedback schema
-   目前只有普通 issue / fix verdict，没有 blind-lock 的 challenge。
-2. **外部根因裁判缺失**：proof grader 只产生 0..7 分和普通 grading trajectory，没有固定的
-   parent/child challenge adjudication 调用与三态结构化输出。
-3. **正常 grader 证据未完整封存**：task runner 目前主要保留 report、predictions 和 failure logs；
-   正常 proof-grading 的公开判定需在临时 workdir 删除前归档到 framework-owned evidence。
-4. **动态 challenge anchors 缺失**：现有 sampler 只有固定 `anchor_ids` 和随机补题；尚无独立的
-   `challenge_ids`、一次性预留、去重和 `random_min` 启动检查。
-5. **Challenge ledger 缺失**：当前 issue ledger 不能表达 qid、生产/消费版本、延迟结算和四状态，
-   也不能保证分支上的一次性消费与 resume 幂等。
-6. **Proof challenge 真值检查缺失**：现有 `issue_checks.py` 只覆盖可由节点聚合事实机械判定的
-   closed issue keys，不能判断数学证明中的某个具体根因。
-7. **Task 成对 val 缺失**：现有 `benchmark.val_mean` 是 fixed-root planner evaluation；还没有在
-   val 读取前锁定 task candidate，并对 candidate / direct parent 产生 `task_val_delta`。
-8. **Broker 预算不足**：新增 task parent/candidate val 和 challenge adjudication 后，task launch / LLM
-   budget 必须显式增加，否则会再次触发 `task launch budget exhausted` 或 role-seat 重启耗尽。
-9. **Fitness 尚无对抗项**：现有 `F_p` 是 held-out benchmark，`F_e` 是 calibration + verdict
-   stability；没有版本级 challenge precision、repair 或 adversarial score。
-10. **版本记录顺序错配**：当前 self-improve 先于 supernode 记录和 fixed-root eval；新设计可能继承
-    旧设计完成 inner 所产生的指标。必须按 §2.10 调整归因顺序。
-11. **跨 role code commit 的恢复缺失**：outer-select 当前只恢复 design，不恢复 planner/evaluator
-    源码。首版必须拒绝 commit 不兼容的归档版本，完整恢复另行实现。
-12. **防单题硬编码规则缺失**：现有 reward-hacking/rule-violation 检查没有 challenge qid 和题面
-    片段的专用审计。
-13. **分析输出缺失**：需要直接打印每 outer 的 challenge 状态计数、planner/evaluator 对抗指标、
-    `planner_root_val_mean`、`task_val_mean`、`task_parent_val_mean` 和 `task_val_delta`。
-14. **Pilot 基线缺失**：尚无 no-op parent/child val 重复数据，不能估计当前 proof 生成与 grader 的
-    空效应噪声；首轮阈值只能使用 §2.3 的临时值。
+| 项 | 状态 | 实现摘要 |
+|---|---|---|
+| 1 Challenge 契约 | 完成 | blind-only `submit_challenge`、context、IPC 和 feedback 均为加法兼容 |
+| 2 外部根因裁判 | 完成 | framework 通过 task broker 调固定父子联合裁判；模型看私有参考证据，角色不可修改其 prompt |
+| 3 grader 证据封存 | 完成 | report、predictions、失败日志及 `challenge_adjudication.json` 在 workdir 清理前归档 |
+| 4 动态 anchors | 完成 | base/challenge/random 分离，强制 challenge 入样并执行 `random_min` 启动检查 |
+| 5 Challenge ledger | 完成 | WriterToken、blind lock、直接边预留、一次消费、幂等 settlement |
+| 6 Proof 真值检查 | 完成 | 固定裁判输出父/子 present 三态及 actionable；缺失或冲突统一 `UNDECIDABLE` |
+| 7 Task 成对 val | 完成 | outer 边界锁定 candidate/direct parent，同一 hidden val 计算 `task_val_delta` |
+| 8 Broker 预算 | 完成 | 预算覆盖 inner、fixed-root eval、paired val、no-op 及每 inner 至多一批裁判调用 |
+| 9 对抗 fitness | 完成 | 严格按 §2.12 两阶段 gate、权重、planner 正项钳制和 evaluator 延迟动态归因 |
+| 10 版本顺序 | 完成 | outer 入口冻结版本，完成 inner/val/归档后才 self-improve |
+| 11 代码版本恢复 | 首版完成 | version ID 同时含 design hash 与 role commit；不兼容 commit 拒绝恢复。完整跨 commit 源码恢复不属于首版 |
+| 12 防硬编码 | 完成 | 只审计新增 patch/config，拒绝 qid、参考答案及 grading guideline 泄漏 |
+| 13 分析输出 | 完成 | `analysis/imo_challenge_report.py` 直接打印 challenge、两类 val、delta 与 fitness gate |
+| 14 Pilot 基线 | 完成 | 可配置 no-op repeats，记录 delta 分布并以 `Q75(abs(delta))` 抬高 val gate |
     
 ## 4.跨领域兼容边界
 

@@ -773,6 +773,14 @@ class GanLoop:
                         **self._outer_versions})
         return dict(self._outer_versions)
 
+    def _frozen_role_version(self, role: str) -> str:
+        """Version identity required by challenge credit attribution (§2.10)."""
+        design = self._outer_versions.get(f"{role}_design_hash")
+        commit = self._outer_versions.get(f"{role}_commit")
+        if design and commit:
+            return f"{design}@{commit}"
+        return str(design or commit or "unknown")
+
     def _impute_score(self, parent: Optional[Node]) -> Optional[float]:
         """Impute a missing benchmark score: siblings' median, else parent score."""
         if parent is None:
@@ -1541,6 +1549,30 @@ class GanLoop:
                   "evidence_ref", "repair_criterion")
         return [{key: row.get(key) for key in fields} for row in rows]
 
+    def _public_challenge_results(self, genids: Iterable[Any]) -> List[Dict[str, Any]]:
+        """Sanitized settled results; never projects private grader evidence."""
+        if not getattr(self, "challenge_enabled", False):
+            return []
+        from gan.framework import challenge_ledger
+        wanted = {str(genid) for genid in genids}
+        fields = ("challenge_id", "qid", "defect_type", "claim")
+        results = []
+        for row in (challenge_ledger.load(self.output_dir)
+                    .get("challenges", {}).values()):
+            if (not isinstance(row, dict)
+                    or str(row.get("consumed_child_node")) not in wanted):
+                continue
+            adjudication = row.get("adjudication")
+            if not isinstance(adjudication, dict):
+                continue
+            results.append({
+                **{key: row.get(key) for key in fields},
+                "state": adjudication.get("state"),
+                "reason": adjudication.get("reason"),
+                "actionable": adjudication.get("actionable"),
+            })
+        return results
+
     def _consume_parent_challenges(self, parent: Any, child: Any) -> List[str]:
         """Bind and consume a parent's challenges on a successful direct child."""
         if not getattr(self, "challenge_enabled", False) or parent is None:
@@ -1563,7 +1595,7 @@ class GanLoop:
         challenge_ledger.save(self.output_dir, data, self.ledger_writer)
         rows = challenge_ledger.consume_for_child(
             data, parent_node=parent.genid, child_node=child.genid,
-            planner_version=self._outer_versions.get("planner_design_hash"))
+            planner_version=self._frozen_role_version("planner"))
         challenge_ledger.save(self.output_dir, data, self.ledger_writer)
         return [str(row.get("challenge_id")) for row in rows]
 
@@ -1577,10 +1609,7 @@ class GanLoop:
             data,
             outer=outer,
             parent_node=child.genid,
-            evaluator_version=(child.meta.get("evaluator_design_hash")
-                                or self._outer_versions.get("evaluator_design_hash")
-                                or self._design_hash("evaluator")
-                                or "unknown"),
+            evaluator_version=self._frozen_role_version("evaluator"),
             challenges=list(getattr(ctx, "challenges", []) or []),
             allowed_qids=list(child.meta.get("sampled_ids") or []),
             max_k=self.challenge_max_k,
@@ -1612,11 +1641,27 @@ class GanLoop:
         rows = [row for row in data.get("challenges", {}).values()
                 if isinstance(row, dict)
                 and str(row.get("consumed_child_node")) == str(child.genid)]
+        verdicts: Dict[str, Dict[str, Any]] = {}
+        if rows and self.domain == "imo_proof":
+            try:
+                verdicts = self.task_runner.adjudicate_proof_challenges(
+                    parent, child, rows, outer=int((child.meta or {}).get("outer_id")))
+            except Exception as exc:  # noqa: BLE001 -- becomes UNDECIDABLE
+                soft_fail(
+                    f"fixed challenge adjudicator failed for child {child.genid}: {exc}",
+                    event_path=paths.events_path(self.output_dir),
+                    event_type="challenge_adjudicator_failed",
+                    genid=str(child.genid),
+                )
         settled: List[Dict[str, Any]] = []
         for row in rows:
             qid = str(row.get("qid"))
             parent_evidence = self._proof_challenge_evidence(parent, qid)
             child_evidence = self._proof_challenge_evidence(child, qid)
+            verdict = verdicts.get(str(row.get("challenge_id")))
+            if verdict is not None:
+                parent_evidence["challenge_verdict"] = verdict
+                child_evidence["challenge_verdict"] = verdict
             if self.domain == "imo_proof":
                 from domains.imo import challenge_adjudication as domain_adjudication
                 result = domain_adjudication.adjudicate(
@@ -1770,6 +1815,8 @@ class GanLoop:
                                          or self._design_hash("planner")),
                 "evaluator_design_hash": (self._outer_versions.get("evaluator_design_hash")
                                            or self._design_hash("evaluator")),
+                "planner_version_id": self._frozen_role_version("planner"),
+                "evaluator_version_id": self._frozen_role_version("evaluator"),
                 "designs": {
                     "planner": self._design_snapshot("planner"),
                     "evaluator": self._design_snapshot("evaluator"),
@@ -1908,7 +1955,8 @@ class GanLoop:
                     min_determinate_rate=self.challenge_fitness_min_determinate_rate)
                 if activation.get("active"):
                     def version_metrics(sn: Dict[str, Any]) -> Dict[str, Any]:
-                        version = str(sn.get("evaluator_design_hash") or "")
+                        version = str(sn.get("evaluator_version_id")
+                                      or sn.get("evaluator_design_hash") or "")
                         return challenge_metrics.compute([
                             row for row in rows if isinstance(row, dict)
                             and str(row.get("producer_evaluator_version") or "") == version
@@ -2032,10 +2080,36 @@ class GanLoop:
                              challenge_active=challenge_active,
                              lambda_adv=self.challenge_lambda_p,
                              generalized_repair=generalized_repair)
-            # Evaluator challenge credit is delayed and belongs to the
-            # producer version. Keep the archived base immutable; outer-select
-            # recomputes its adversarial terms from the live ledger.
+            # Evaluator credit belongs to the producer version. Use a current
+            # ledger snapshot for Pareto insertion so F_e_adv can affect
+            # archive survival, while retaining fitness_e_base unchanged;
+            # outer-select recomputes the same terms from the live ledger after
+            # later challenges settle.
             fe = fe_base
+            if challenge_active and isinstance(fe_base, (int, float)):
+                def version_metrics(node: Dict[str, Any]) -> Dict[str, Any]:
+                    version = str(node.get("evaluator_version_id")
+                                  or node.get("evaluator_design_hash") or "")
+                    return challenge_metrics.compute([
+                        row for row in all_challenges if isinstance(row, dict)
+                        and str(row.get("producer_evaluator_version") or "") == version
+                    ])
+
+                candidate_metrics = version_metrics(sn)
+                reference_metrics = [version_metrics(ref) for ref in refs]
+                ref_adv = [float(value) for metrics in reference_metrics
+                           if isinstance((value := metrics.get(
+                               "evaluator_adversarial_score")), (int, float))]
+                ref_precision = [float(value) for metrics in reference_metrics
+                                 if isinstance((value := metrics.get(
+                                     "challenge_precision_smoothed")), (int, float))]
+                adv = candidate_metrics.get("evaluator_adversarial_score")
+                precision = candidate_metrics.get("challenge_precision_smoothed")
+                if isinstance(adv, (int, float)):
+                    fe += self.challenge_lambda_e * F.z_ref(float(adv), ref_adv)
+                if isinstance(precision, (int, float)):
+                    fe += self.challenge_lambda_precision * F.z_ref(
+                        float(precision), ref_precision)
             # An entry with no benchmark at all has NO comparable F_p: it would
             # never be pruned (_dominates returns False on None), would occupy a
             # per-cell capacity slot, and could win a tournament draw when its
@@ -3604,6 +3678,8 @@ class GanLoop:
                 self._parent_digest = (
                     None if cross_outer else parent_meta.get("feedback_digest"))
                 parent_challenges = self._available_parent_challenges(parent)
+                parent_challenge_results = self._public_challenge_results(
+                    [parent.genid])
                 parent_predicted_score = parent_meta.get("predicted_score")
                 parent_benchmark_score = parent_meta.get("benchmark_score")
                 evaluator_issues = (parent_feedback or {}).get("issues")
@@ -3714,6 +3790,16 @@ class GanLoop:
                             "type": "challenge_projection_skipped",
                             "seat": "planner", "genid": str(genid),
                             "reason": "planner signature lacks parent_challenges",
+                        })
+                if parent_challenge_results:
+                    if self._accepts_kwarg(self.planner.plan, "challenge_results"):
+                        plan_challenge_kwargs["challenge_results"] = (
+                            parent_challenge_results)
+                    else:
+                        self.log_event({
+                            "type": "challenge_projection_skipped",
+                            "genid": str(genid),
+                            "reason": "planner signature lacks challenge_results",
                         })
 
                 try:
@@ -4193,10 +4279,13 @@ class GanLoop:
             # decision point (kept/adjusted eval_points / planner prompt).
             # The digests list is the experience stream; ``last_feedback`` is not
             # part of this payload.
+            public_challenge_results = self._public_challenge_results(outer_genids)
             recent_eval = {"digests": self._digests[-I_max:],
+                           "challenge_results": public_challenge_results,
                            "toolset_report": getattr(self.evaluator, "assembly_report", None)}
             recent_plan = {"advantages": self._advantages[-I_max:],
                            "task_tree_size": len(self.task_tree),
+                           "challenge_results": public_challenge_results,
                            "toolset_report": getattr(self.planner, "assembly_report", None)}
             # Self-improve cost statements (B2): each role's OWN sessions this
             # outer (cost × quality alignment material) + the role's compact

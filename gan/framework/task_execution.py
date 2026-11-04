@@ -65,7 +65,7 @@ _PARENT_SCORED_DOMAINS = {
 }
 _SANDBOXED_BALROG_DOMAINS = {"balrog_babyai", "balrog_babaisai"}
 _SANDBOXED_HARNESS_DOMAINS = _SANDBOXED_BALROG_DOMAINS | {
-    "imo_proof", "imo_proof_grading",
+    "imo_proof", "imo_proof_grading", "imo_challenge_adjudication",
 }
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
 _SANDBOX_PROFILE_KEYS = {
@@ -2740,12 +2740,53 @@ def _write_proofgrader_shim(
     return "./.gan_runtime/proofgrader_task_agent.py"
 
 
-def _require_sandboxable_proofgrader() -> None:
-    """Require proofgrader to live inside the trusted Python prefix."""
+def _write_challenge_adjudicator_shim(
+    run_dir: str,
+    expected_owner_uid: Optional[int] = None,
+    expected_owner_gid: Optional[int] = None,
+) -> str:
+    """Create the fixed adjudicator entry point with the grader's ownership rules."""
+    grader_shim = _write_proofgrader_shim(
+        run_dir, expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid)
+    shim_path = os.path.join(run_dir, ".gan_runtime", "challenge_agent.py")
+    if expected_owner_uid is None:
+        with open(shim_path, "w", encoding="utf-8") as stream:
+            stream.write("from proofgrader.challenge_agent import TaskAgent\n")
+        os.chmod(shim_path, 0o644)
+    else:
+        # The proofgrader helper already validated and created the private
+        # runtime directory. Replace a framework-created sibling using the same
+        # owner/mode contract; task-controlled links are rejected.
+        if os.path.lexists(shim_path):
+            raise RuntimeError("challenge adjudicator shim path already exists")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(shim_path, flags, 0o600)
+        try:
+            os.fchown(fd, int(expected_owner_uid), int(expected_owner_gid))
+            payload = b"from proofgrader.challenge_agent import TaskAgent\n"
+            if os.write(fd, payload) != len(payload):
+                raise OSError("short write while creating challenge adjudicator shim")
+            os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+    # The ordinary grader shim is unused in this scope. Removing it avoids
+    # exposing a second entry point while preserving the validated directory.
     try:
-        spec = importlib.util.find_spec("proofgrader.task_agent")
+        os.remove(os.path.join(run_dir, grader_shim.removeprefix("./")))
+    except OSError:
+        pass
+    return "./.gan_runtime/challenge_agent.py"
+
+
+def _require_sandboxable_proofgrader(
+    module: str = "proofgrader.task_agent",
+) -> None:
+    """Require a proofgrader entry point to live inside the trusted prefix."""
+    try:
+        spec = importlib.util.find_spec(module)
     except (ImportError, ModuleNotFoundError, ValueError) as exc:
-        raise RuntimeError("proofgrader.task_agent is not importable") from exc
+        raise RuntimeError(f"{module} is not importable") from exc
     origin = os.path.realpath(str(spec.origin or "")) if spec else ""
     prefix = os.path.realpath(sys.prefix)
     if not origin or not (
@@ -2754,7 +2795,7 @@ def _require_sandboxable_proofgrader() -> None:
         or origin.startswith(os.path.realpath("/usr") + os.sep)
     ):
         raise RuntimeError(
-            "proofgrader.task_agent must be installed inside the trusted Python "
+            f"{module} must be installed inside the trusted Python "
             "environment; editable source outside the sandbox is refused"
         )
 

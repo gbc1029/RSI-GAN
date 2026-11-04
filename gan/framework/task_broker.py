@@ -30,6 +30,7 @@ _SCOPE_RE = re.compile(
     r"(?:0|[1-9][0-9]{0,11}"
     r"|eval_outer(?:0|[1-9][0-9]{0,11})_s(?:0|[1-9][0-9]{0,11})"
     r"|taskval_outer(?:0|[1-9][0-9]{0,11})_(?:candidate|parent|noop[1-9][0-9]{0,11})"
+    r"|challenge_outer(?:0|[1-9][0-9]{0,11})_gen(?:0|[1-9][0-9]{0,11})"
     r")\Z")
 _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
@@ -246,7 +247,9 @@ class _TaskBrokerState:
         from gan.framework import llm_proxy
         from gan.framework import task_execution as tx
 
-        domain = str(self.config["domain"])
+        challenge_adjudication = scope_id.startswith("challenge_outer")
+        domain = ("imo_challenge_adjudication" if challenge_adjudication
+                  else str(self.config["domain"]))
         model = str(self.config["model"])
 
         parent_scored = bool(self.config["parent_scored"])
@@ -255,7 +258,7 @@ class _TaskBrokerState:
         # for input selection, including independent domains such as imo_proof.
         fixed_eval = scope_id.startswith(("eval_outer", "taskval_outer"))
         questions_path = os.path.join(run_dir, "input", "questions.csv")
-        if (parent_scored or fixed_eval) and not os.path.isfile(questions_path):
+        if (parent_scored or fixed_eval or challenge_adjudication) and not os.path.isfile(questions_path):
             raise RuntimeError(f"task questions file is missing: {questions_path}")
 
         launch_num_samples = int(self.config["num_samples"])
@@ -276,6 +279,11 @@ class _TaskBrokerState:
             grading_subset = str(
                 seed_info.get("eval_subset") or self.config["subset"]
             )
+        elif challenge_adjudication:
+            import pandas as pd
+            launch_num_samples = len(pd.read_csv(questions_path, dtype=str))
+            if launch_num_samples < 1:
+                raise RuntimeError("challenge adjudication has no input rows")
 
         total_timeout = int(self.config["timeout"])
         stage_timeout = max(1, total_timeout // 2) if domain == "imo_proof" else total_timeout
@@ -369,6 +377,15 @@ class _TaskBrokerState:
                     anchor_ids = list(seed_info.get("anchor_ids") or [])
                 except (OSError, ValueError, KeyError):
                     sample_seed = None  # fall back to the legacy prefix slice
+            agent_path = "./task_agent.py"
+            if challenge_adjudication:
+                tx._require_sandboxable_proofgrader(
+                    "proofgrader.challenge_agent")
+                agent_path = tx._write_challenge_adjudicator_shim(
+                    run_dir,
+                    expected_owner_uid=int(self.config["owner_uid"]),
+                    expected_owner_gid=int(self.config["owner_gid"]),
+                )
             rc, output = tx._run_harness_and_report_local(
                 str(self.config["python"]),
                 run_dir,
@@ -379,8 +396,12 @@ class _TaskBrokerState:
                 model,
                 env,
                 stage_timeout,
-                questions_path=questions_path if (parent_scored or fixed_eval) else None,
-                dataset_root=None if (parent_scored or fixed_eval) else str(self.config["repo_root"]),
+                questions_path=(questions_path if
+                                (parent_scored or fixed_eval or challenge_adjudication)
+                                else None),
+                dataset_root=(None if
+                              (parent_scored or fixed_eval or challenge_adjudication)
+                              else str(self.config["repo_root"])),
                 proxy_socket=str(self.config["proxy_socket"]),
                 proxy_token_fd=proxy_token_fd,
                 expected_owner_uid=int(self.config["owner_uid"]),
@@ -397,8 +418,20 @@ class _TaskBrokerState:
                 python_prefix=str(self.config["python_prefix"]),
                 sandbox_etc_dir=str(self.config["sandbox_etc_dir"]),
                 sandbox_profile=dict(self.config["sandbox_profile"]),
+                agent_path=agent_path,
             )
-            if domain == "imo_proof" and rc == 0:
+            if challenge_adjudication and rc == 0:
+                output_path = os.path.join(
+                    run_dir, "outputs", f"gan_{scope_id}")
+                from domains.imo.challenge_eval import report_challenge_adjudication
+                _report, challenge_report_path = report_challenge_adjudication(
+                    output_path, questions_path=questions_path)
+                os.chown(
+                    challenge_report_path,
+                    int(self.config["owner_uid"]), int(self.config["owner_gid"]),
+                    follow_symlinks=False,
+                )
+            elif domain == "imo_proof" and rc == 0:
                 grading_rc, grading_output = tx.run_imo_proof_grading(
                     str(self.config["python"]),
                     run_dir,

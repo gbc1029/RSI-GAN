@@ -940,6 +940,7 @@ if __name__ == "__main__":
             "imo_grading",
             "imo_proof",
             "imo_proof_grading",  # To grade generated proofs with an agent
+            "imo_challenge_adjudication",
         ],
         required=True,
         help="Domain to evaluate",
@@ -1038,7 +1039,8 @@ if __name__ == "__main__":
         parser.error("--proofs_dname is required when domain is 'imo_proof_grading'")
 
     # Human preferences domains
-    if domain in ["search_arena", "paper_review", "imo_grading", "imo_proof", "imo_proof_grading"]:
+    if domain in ["search_arena", "paper_review", "imo_grading", "imo_proof",
+                  "imo_proof_grading", "imo_challenge_adjudication"]:
         output_folder = harness(
             agent_path=args.agent_path,
             output_dir=args.output_dir,

@@ -79,6 +79,7 @@ class Planner(Role):
         require_deep_patch: bool = False,
         carried_over: Optional[List[Dict[str, Any]]] = None,
         parent_challenges: Optional[List[Dict[str, Any]]] = None,
+        challenge_results: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -133,6 +134,14 @@ class Planner(Role):
                 "information. Prefer a reusable repair that generalizes beyond the "
                 "listed qids; do not hard-code a qid or copy a reference solution.\n"
                 f"```json\n{json.dumps(parent_challenges, ensure_ascii=False, indent=2)[:4000]}\n```"
+            )
+        if challenge_results:
+            parts.append(
+                "\n## Settled challenge results on this selected parent\n"
+                "These are framework-adjudicated public states from earlier fixes. "
+                "Use them to avoid repeating failed local repairs. They contain no "
+                "grader score, reference solution, grading guideline, or val data.\n"
+                f"```json\n{json.dumps(challenge_results, ensure_ascii=False, indent=2)[:4000]}\n```"
             )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
             parts.append(
@@ -190,6 +199,7 @@ class Planner(Role):
         response_contract: Optional[str] = None,
         carried_over: Optional[List[Dict[str, Any]]] = None,
         parent_challenges: Optional[List[Dict[str, Any]]] = None,
+        challenge_results: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
@@ -244,7 +254,8 @@ class Planner(Role):
                     if broker is not None else False,
                     require_deep_patch=require_deep_patch,
                     carried_over=carried_over,
-                    parent_challenges=parent_challenges),
+                    parent_challenges=parent_challenges,
+                    challenge_results=challenge_results),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
             _absorb_run_flags()

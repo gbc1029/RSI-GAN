@@ -596,7 +596,8 @@ def _materialize_run_roots(repo_root: str, output_dir: str, layout: str):
 
 
 def _launch_budget(cfg: Any, inner: Optional[int], *, paired_val: bool = False,
-                   noop_repeats: int = 0) -> tuple[int, int, int]:
+                   noop_repeats: int = 0,
+                   challenge_adjudication: bool = False) -> tuple[int, int, int]:
     """Per-outer TASK LAUNCH budget: ``(inner_generations, eval_rounds, total)``.
 
     The privileged broker refills a launch counter per outer (``register_outer``)
@@ -624,8 +625,12 @@ def _launch_budget(cfg: Any, inner: Optional[int], *, paired_val: bool = False,
     # their own explicit reservation.
     paired_val_rounds = (2 + max(0, int(noop_repeats))
                          if paired_val else 0)
-    return inner_generations, eval_rounds + paired_val_rounds, \
-        inner_generations + eval_rounds + paired_val_rounds
+    # At most one fixed adjudicator batch is launched after each inner task.
+    # The first generation normally has no parent challenge, but reserving the
+    # full inner count keeps resume/branch selection within a simple hard cap.
+    adjudication_rounds = inner_generations if challenge_adjudication else 0
+    extra_rounds = eval_rounds + paired_val_rounds + adjudication_rounds
+    return inner_generations, extra_rounds, inner_generations + extra_rounds
 
 
 def _resolve_eval_subset(raw: str, domain_config: Any) -> tuple[str, str]:
@@ -1057,7 +1062,11 @@ def run_gan_driver(
                         if paired_val else 0)
         I_max, eval_rounds, task_launch_budget = _launch_budget(
             cfg, inner, paired_val=paired_val,
-            noop_repeats=noop_repeats)
+            noop_repeats=noop_repeats,
+            challenge_adjudication=(
+                domain == "imo_proof"
+                and bool((cfg.get("challenge") or {}).get("enabled", False))),
+        )
 
         start = (int(newest["index"]) + 1) if (resume and newest) else 1
         _driver_t0 = time.time()

@@ -295,6 +295,7 @@ class Evaluator(Role):
         from gan.framework.trajectory import outer_session_index
         digests = (recent or {}).get("digests") or []
         digest_text = "\n\n".join(str(d)[:2000] for d in digests[-3:]) or "(no digests yet)"
+        challenge_results = list((recent or {}).get("challenge_results") or [])
         sessions = outer_session_index(self.output_dir, self.outer, "evaluator")
         sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
         rr = render_receipt((recent or {}).get("receipt"))
@@ -322,6 +323,11 @@ class Evaluator(Role):
             + ((f"\n{cost_stmt}\n") if cost_stmt else "")
             + ((f"\n## Recent costs (per-session, framework-measured; your own sessions)\n"
                 f"{costs_json}\n") if costs_json else "")
+            + (("\n## Framework-adjudicated challenge outcomes\n"
+                "Use these public states to improve challenge precision and difficulty; "
+                "they contain no private reference or val evidence.\n"
+                f"{json.dumps(challenge_results, ensure_ascii=False)[:4000]}\n")
+               if challenge_results else "")
             + f"\n## Feedback digests\n{digest_text}"
         )
         # Scaffold (design context, self-seat access, session run, patch retry

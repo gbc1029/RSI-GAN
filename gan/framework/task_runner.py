@@ -325,6 +325,104 @@ class DomainTaskRunner:
                         reason="sidecar present but no seam events (child "
                                "ran without a cm session)")
 
+    def adjudicate_proof_challenges(
+        self, parent: Node, child: Node, challenges: List[Dict[str, Any]],
+        *, outer: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Run the fixed parent/child adjudicator through the task broker."""
+        if self.domain != "imo_proof" or not challenges:
+            return {}
+        scope_id = f"challenge_outer{int(outer)}_gen{int(child.genid)}"
+        node_dir = paths.work_dir(self.output_dir, scope_id)
+        source_root = self.code_root or self.repo_root
+        run_dir, _ = tx.prepare_run_dir(
+            source_root, node_dir, "", domain="imo_proof")
+        os.makedirs(os.path.join(run_dir, ".gan_runtime"), exist_ok=True)
+        run_id = f"gan_{scope_id}"
+        output_dir = os.path.join(run_dir, "outputs", run_id)
+        os.makedirs(output_dir, exist_ok=True)
+
+        def proof_rows(node: Node) -> Dict[str, str]:
+            path = os.path.join(
+                paths.runs_dir(self.output_dir, node.genid), "predictions.csv")
+            frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+            if "Problem ID" not in frame.columns or "prediction" not in frame.columns:
+                raise RuntimeError("archived proof predictions lack id or prediction")
+            if frame["Problem ID"].astype(str).duplicated().any():
+                raise RuntimeError("archived proof predictions contain duplicate ids")
+            return dict(zip(frame["Problem ID"].astype(str),
+                            frame["prediction"].astype(str)))
+
+        parent_proofs = proof_rows(parent)
+        child_proofs = proof_rows(child)
+        dataset, question_id_col, ground_truth_key = tx.load_dataset_frame(
+            self.repo_root, "imo_proof", self.subset)
+        trusted = dataset.copy()
+        trusted[question_id_col] = trusted[question_id_col].astype(str)
+        trusted = trusted.set_index(question_id_col, drop=False)
+        rows = []
+        for challenge in challenges:
+            qid = str(challenge.get("qid") or "")
+            if (qid not in trusted.index or qid not in parent_proofs
+                    or qid not in child_proofs):
+                continue
+            reference = trusted.loc[qid]
+            rows.append({
+                "Challenge ID": str(challenge.get("challenge_id") or ""),
+                "Problem ID": qid,
+                "Problem": str(reference["Problem"]),
+                "Solution": str(reference[ground_truth_key]),
+                "Grading guidelines": str(reference["Grading guidelines"]),
+                "Parent Response": parent_proofs[qid],
+                "Child Response": child_proofs[qid],
+                "Defect Type": str(challenge.get("defect_type") or ""),
+                "Claim": str(challenge.get("claim") or ""),
+                "Evidence Ref": str(challenge.get("evidence_ref") or ""),
+                "Repair Criterion": str(challenge.get("repair_criterion") or ""),
+            })
+        if len(rows) != len(challenges):
+            raise RuntimeError(
+                "challenge adjudication could not resolve every parent/child proof")
+        input_dir = os.path.join(run_dir, "input")
+        os.makedirs(input_dir, exist_ok=True)
+        questions_path = os.path.join(input_dir, "questions.csv")
+        pd.DataFrame(rows).to_csv(questions_path, index=False)
+
+        env = {
+            key: value for key, value in os.environ.items()
+            if key.startswith("GAN_TASK_BROKER_")
+        }
+        rc, output = tx.run_harness_and_report(
+            self.python, run_dir, "imo_challenge_adjudication", run_id,
+            self.subset, len(rows), self.default_model, env, self.timeout,
+            questions_path=questions_path, scope_id=scope_id,
+            log_path=self.log_path, reasoning_effort=self.reasoning_effort,
+        )
+        if rc != 0:
+            raise RuntimeError(
+                "fixed challenge adjudicator failed: " + str(output)[-1000:])
+        report_path = os.path.join(output_dir, "report.json")
+        with open(report_path, "r", encoding="utf-8") as stream:
+            report = json.load(stream)
+        verdicts = report.get("challenge_adjudications")
+        if not isinstance(verdicts, dict):
+            raise RuntimeError("fixed challenge adjudicator report is malformed")
+        evidence_dir = paths.runs_dir(self.output_dir, child.genid)
+        os.makedirs(evidence_dir, exist_ok=True)
+        shutil.copy2(
+            report_path, os.path.join(evidence_dir, "challenge_adjudication.json"))
+        determinate = sum(
+            1 for verdict in verdicts.values()
+            if isinstance(verdict, dict)
+            and isinstance(verdict.get("parent_present"), bool)
+            and isinstance(verdict.get("child_present"), bool)
+            and verdict.get("actionable") is True)
+        self._event(
+            "challenge_adjudicator_done", genid=str(child.genid),
+            requested=len(rows), parsed=len(verdicts), determinate=determinate)
+        return {str(key): dict(value) for key, value in verdicts.items()
+                if isinstance(value, dict)}
+
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,
                  genid: Any = None, base: Optional[str] = None,

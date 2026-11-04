@@ -144,7 +144,7 @@ def _packageize_proofgrader_repo(dst_dir: str, package_name: str = "proofgrader"
     _ensure_init_py(pkg)
 
     # Move common top-level modules/folders into the package namespace if they exist
-    move_candidates = ["task_agent.py", "domains", "utils", "agent"]
+    move_candidates = ["task_agent.py", "challenge_agent.py", "domains", "utils", "agent"]
     for name in move_candidates:
         src = dst / name
         if not src.exists():
@@ -258,6 +258,12 @@ def setup_default(dst_dir, proofautograder=False):
         shutil.copyfile(src_file, dst_file)
         print(f"Copied {src_file} → {dst_file}")
 
+    challenge_src = os.path.join(
+        src, "baselines/imo_grading/challenge_adjudicator.py")
+    challenge_dst = os.path.join(dst_dir, "challenge_agent.py")
+    shutil.copyfile(challenge_src, challenge_dst)
+    print(f"Copied {challenge_src} → {challenge_dst}")
+
     # Package-ize the copied repo so it can be installed/imported cleanly
     _packageize_proofgrader_repo(dst_dir, package_name="proofgrader")
 
@@ -301,6 +307,10 @@ def setup_from_run(dst_dir, generate_dir):
         with open(patch_file, "r") as f:
             patch_str = f.read()
         apply_patch(dst_dir, patch_str)
+
+    challenge_src = os.path.join(
+        ".", "baselines/imo_grading/challenge_adjudicator.py")
+    shutil.copyfile(challenge_src, os.path.join(dst_dir, "challenge_agent.py"))
 
     # Commit it just in case
     _ = commit_repo(dst_dir)
