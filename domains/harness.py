@@ -16,6 +16,8 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from utils.telemetry import TelemetryServer
+from gan.framework.traj_chain import TrajChain
 import pandas as pd
 from hydra import compose, initialize_config_dir
 from utils.common import summarize_error
@@ -344,8 +346,8 @@ def _add_empty_parents(command, path, created):
         created.add(item)
 
 
-def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None,
-                     cm_events_path=None):
+def _sandbox_command(run_root, agent_path, proxy_socket=None,
+                     telemetry_socket=None):
     """Create a fail-closed Bubblewrap command for one TaskAgent question."""
     bwrap = shutil.which("bwrap")
     if not bwrap:
@@ -457,12 +459,17 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None,
     # created /workspace/cm_events.jsonl inside the tmpfs — every append
     # "succeeded" and the ingested sidecar stayed empty. Staging the file and
     # copying it back is the same contract the trajectory already uses.
-    if cm_events_path:
-        command.extend(["--bind", cm_events_path, "/workspace/cm_events.jsonl"])
+    # F5 P1 (docs/19 §12.28): NO trajectory/sidecar bind — the child holds
+    # NO write authority over its audit streams; rows arrive over the
+    # telemetry socket and the harness writes them (hash-chained). The
+    # socket is ro-bound like the LLM proxy socket (connect needs file-perm,
+    # not a writable mount).
+    if telemetry_socket:
+        command.extend([
+            "--ro-bind", telemetry_socket, "/workspace/.telemetry.sock",
+            "--setenv", "GAN_TELEMETRY_UNIX", "/workspace/.telemetry.sock",
+        ])
     command.extend([
-        # Expose only this question's trajectory file, never outputs/ or other
-        # questions' trajectories, which may themselves contain benchmark data.
-        "--bind", trajectory_path, "/workspace/trajectory.jsonl",
         "--tmpfs", "/workspace/scratch",
         "--chdir", "/workspace/scratch",
         "--setenv", "HOME", "/tmp",
@@ -549,6 +556,10 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
     run_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     run_root = f"/proc/self/fd/{run_fd}"
     stage_root = tempfile.mkdtemp(prefix="rsi-gan-task-", dir="/tmp")
+    # F5 P1: initialized before the try so an early-staging failure cannot
+    # make the finally block NameError on the teardown path.
+    _telemetry = None
+    cm_received: list = []
     try:
         run_real = os.path.realpath(run_root)
         trajectory_real = os.path.realpath(trajectory_path)
@@ -585,21 +596,47 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
             shutil.copytree(runtime_source,
                             os.path.join(stage_root, ".gan_runtime"),
                             symlinks=False)
-        staged_trajectory = os.path.join(stage_root, "trajectory.jsonl")
-        shutil.copy2(trajectory_source, staged_trajectory)
-        # CM seam sidecar: stage an EMPTY file (owned by the sandbox uid, in
-        # this process's /tmp), bind it, and copy the child's lines back to
-        # the run dir afterwards. The name is fixed (paths.CM_EVENTS_NAME).
-        staged_cm_events = os.path.join(stage_root, "cm_events.jsonl")
-        with open(staged_cm_events, "w", encoding="utf-8"):
-            pass
+        # F5 P1 (docs/19 §12.28): the telemetry channel REPLACES the staged
+        # trajectory/sidecar copy-back contract. The harness (trusted) owns
+        # both streams now: trajectory rows are hash-chained INTO the real
+        # host file; cm events append straight to the host sidecar that
+        # task_runner ingests. Pre-create the sidecar so a zero-event run
+        # reads as "present but empty", not "missing".
+        if cm_events_target:
+            host_cm_events = os.path.abspath(cm_events_target)
+            os.makedirs(os.path.dirname(host_cm_events), exist_ok=True)
+            with open(host_cm_events, "a", encoding="utf-8"):
+                pass
+        chain = TrajChain()
+        cm_received: list = []
+        telemetry_socket = os.path.join(stage_root, "telemetry.sock")
+
+        def _on_telemetry(msg):
+            mtype = msg.get("type")
+            if mtype == "traj_row" and isinstance(msg.get("record"), dict):
+                from utils import trajectory_log as _tlog
+                _tlog.append(trajectory_source,
+                             chain.stamp(trajectory_source, msg["record"]))
+            elif mtype == "traj_reset":
+                from utils import trajectory_log as _tlog
+                _tlog.reset(trajectory_source)
+            elif mtype == "cm_event" and isinstance(msg.get("event"), dict):
+                cm_received.append(msg["event"])
+                if cm_events_target:
+                    with open(os.path.abspath(cm_events_target), "a",
+                              encoding="utf-8") as handle:
+                        handle.write(json.dumps(
+                            msg["event"], ensure_ascii=False, default=str) + "\n")
+
+        _telemetry = TelemetryServer(telemetry_socket, _on_telemetry)
+        _telemetry.start()
 
         with tempfile.TemporaryFile(mode="w+b") as result_file:
             result_fd = result_file.fileno()
             payload["result_fd"] = result_fd
             proc = subprocess.run(
-                _sandbox_command(stage_root, "./task_agent.py", staged_trajectory,
-                                 proxy_socket, cm_events_path=staged_cm_events),
+                _sandbox_command(stage_root, "./task_agent.py",
+                                 proxy_socket, telemetry_socket=telemetry_socket),
                 input=json.dumps(payload, ensure_ascii=False, default=str),
                 text=True,
                 stdout=subprocess.PIPE,
@@ -608,34 +645,14 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
                 timeout=QUESTION_TIMEOUT,
                 pass_fds=(result_fd,),
             )
-            # Fold the child's seam events into the OUTPUT tree BEFORE any
-            # returncode judgement: a failed question's seam activity is
-            # evidence too. This is the only sandbox-writable host tree, and
-            # the parent ingests exactly this path afterwards; a write
-            # failure is reported and never fatal.
-            staged_lines = ""
-            try:
-                if not cm_events_target:
-                    raise OSError("no cm_events_target configured")
-                with open(staged_cm_events, "r", encoding="utf-8") as handle:
-                    staged_lines = handle.read()
-                if staged_lines.strip():
-                    # APPEND, never overwrite: one harness process answers
-                    # several questions and every question's sidecar is staged
-                    # separately, so a copyfile would keep only the last one.
-                    host_cm_events = os.path.abspath(cm_events_target)
-                    with open(host_cm_events, "a", encoding="utf-8") as handle:
-                        handle.write(staged_lines)
-                        if not staged_lines.endswith("\n"):
-                            handle.write("\n")
-            except OSError as exc:
-                print(f"[cm] sidecar copy-back failed ({exc}); this question's "
-                      "seam events are not ingested", flush=True)
-            # CM-03 generation latch feed: a named-assembly failure in ANY
-            # question of this generation latches the assembly for every
-            # LATER question of the same harness process (read the staged
-            # lines even when the copy-back failed — the evidence exists).
-            if _cm_latch_scan(staged_lines) and not _CM_ASSEMBLY_LATCH:
+            # F5 P1: no copy-back — the sink appended received cm events to
+            # the host sidecar LIVE (the writer is the trusted harness now).
+            # The CM-03 generation latch feed reads the RECEIVED events
+            # (joined back to lines — the scan's contract is text).
+            _latch_text = "".join(
+                json.dumps(e, ensure_ascii=False, default=str) + "\n"
+                for e in cm_received)
+            if _cm_latch_scan(_latch_text) and not _CM_ASSEMBLY_LATCH:
                 _CM_ASSEMBLY_LATCH = True
                 print("[cm] assembly latched for the rest of this "
                       "generation (cm_assembly_failed seen)", flush=True)
@@ -645,8 +662,16 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
 
             result_file.seek(0)
             raw_result = result_file.read()
-            shutil.copyfile(staged_trajectory, trajectory_source)
+            # F5 P1: no trajectory copy-back — the telemetry sink wrote the
+            # real host file live (hash-chained).
     finally:
+        if _telemetry is not None:
+            _telemetry.stop()
+        from gan.framework.traj_chain import stream_fingerprint
+        fseq, fhead, freason = stream_fingerprint(trajectory_source)
+        if fseq > 0 or freason:
+            print(f"[f5] traj rows chained={fseq} head={fhead} "
+                  f"reason={freason} cm_events={len(cm_received)}", flush=True)
         shutil.rmtree(stage_root, ignore_errors=True)
         os.close(run_fd)
 

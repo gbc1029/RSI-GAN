@@ -328,6 +328,15 @@ class RoleProcess:
         self._call_id = 0
         self._lock = threading.Lock()
         self._closed = False
+        # F5 P1/P2 (docs/19 §12.28): the seat's trajectory write authority is
+        # GONE (role_broker no longer grants the dir); rows arrive as
+        # ``traj_row`` protocol messages and land HERE, stamped with a
+        # parent-owned hash chain. ``_traj_seat`` pins the one seat identity
+        # this child may name (first row wins; the child knows its own seat
+        # at bootstrap, the host learns it before the first call).
+        from gan.framework.traj_chain import TrajChain
+        self._traj_chain: "TrajChain" = TrajChain()
+        self._traj_seat: "Optional[str]" = None
         self._process: Optional[subprocess.Popen[str]] = None
         self._socket: Optional[socket.socket] = None
         self._reader: Optional[TextIO] = None
@@ -411,6 +420,9 @@ class RoleProcess:
             reply = _read_message(self._reader)
             if reply.get("type") == "event":
                 self._handle_event(reply)
+                continue
+            if reply.get("type") in ("traj_row", "traj_reset"):
+                self._handle_traj_row(reply)
                 continue
             if reply.get("type") == "error":
                 _exact_keys(reply, {"v", "type", "error"}, "init error")
@@ -608,6 +620,9 @@ class RoleProcess:
                     if reply.get("type") == "event":
                         self._handle_event(reply)
                         continue
+                    if reply.get("type") in ("traj_row", "traj_reset"):
+                        self._handle_traj_row(reply)
+                        continue
                     if reply.get("type") == "broker_call":
                         self._handle_broker_call(reply, call_id, method, broker)
                         continue
@@ -636,6 +651,7 @@ class RoleProcess:
                     result = _validated_result(method, reply["result"])
                     call_succeeded = True
                     self._maybe_hygiene_restart(seat, method)
+                    self._emit_traj_fingerprint()
                     return result
             finally:
                 if watchdog is not None:
@@ -680,6 +696,70 @@ class RoleProcess:
             self._log_worker_event("role_worker_restart_denied", seat=seat,
                                    reason="cm_thread_leak",
                                    detail=str(exc)[:300])
+
+    def _handle_traj_row(self, request: Dict[str, Any]) -> None:
+        """Parent-side sink for the seat's trajectory rows (F5 P1/P2,
+        docs/19 §12.28). The child forwards every trajectory-root append
+        (main stream + llm_calls sidecar) and every reset; THIS process is
+        the only writer. Structural validation: rel must be a relative,
+        non-escaping path under ``trajectory/outer_*/roles/<role>/<seat>/``
+        with THIS host's role, a pinned seat, and no ``..``."""
+        from utils import trajectory_log
+        from gan.framework.traj_chain import TrajChain
+        want = {"traj_row": {"v", "type", "rel", "traj_record"},
+                "traj_reset": {"v", "type", "rel"}}.get(request.get("type"))
+        if want is None:
+            self._log_worker_event("traj_row_refused", reason="unknown type")
+            return
+        try:
+            _exact_keys(request, want, "traj message")
+        except Exception:
+            self._log_worker_event("traj_row_refused", reason="bad shape")
+            return
+        rel = request.get("rel")
+        parts = rel.split(os.sep) if isinstance(rel, str) else []
+        seat = parts[4] if len(parts) > 4 else None
+        if (request.get("v") != _PROTOCOL_VERSION or len(parts) < 6 or not parts
+                or os.path.isabs(rel) or ".." in parts
+                or parts[0] != "trajectory" or not parts[1].startswith("outer_")
+                or parts[2] != "roles" or parts[3] != self.role
+                or not seat or seat.startswith("outer_")):
+            self._log_worker_event("traj_row_refused", rel=str(rel)[:120],
+                                   reason="structurally invalid")
+            return
+        if self._traj_seat is None:
+            self._traj_seat = seat
+        elif seat != self._traj_seat:
+            self._log_worker_event("traj_row_refused", rel=rel[:120],
+                                   reason="seat pin mismatch")
+            return
+        if self._seat is not None and self._seat != seat:
+            self._log_worker_event("traj_row_refused", rel=rel[:120],
+                                   reason="call seat mismatch")
+            return
+        base = os.path.join(self.output_dir, rel)
+        if request["type"] == "traj_reset":
+            trajectory_log.reset(base)
+            self._traj_chain = TrajChain()
+            return
+        record = request.get("traj_record")
+        if not isinstance(record, dict):
+            self._log_worker_event("traj_row_refused", rel=rel[:120],
+                                   reason="record must be an object")
+            return
+        trajectory_log.append(base, self._traj_chain.stamp(base, record))
+
+    def _emit_traj_fingerprint(self) -> None:
+        """One chain-head checkpoint event per call (the last one of a
+        launch is the session fingerprint; auditable + replayable without
+        touching the frozen role result contracts)."""
+        for base, (seq, head) in sorted(self._traj_chain.state().items()):
+            if seq <= 0:
+                continue
+            self._log_worker_event(
+                "traj_chain_fingerprint", file=os.path.relpath(
+                    base, self.output_dir), seq=seq, head=head,
+                seat=self._traj_seat)
 
     def _log_worker_event(self, event_type: str, **fields: Any) -> None:
         try:
@@ -1110,7 +1190,22 @@ def _worker_main() -> None:
         from gan.framework import paths as role_paths
         from utils import trajectory_log as role_trajectory_log
         original_append = role_trajectory_log.append
+        original_reset = role_trajectory_log.reset
         event_path = os.path.realpath(role_paths.events_path(init["output_dir"]))
+        # F5 P1 (docs/19 §12.28): the trajectory write authority moves to the
+        # parent — EVERY append under the output trajectory tree (main
+        # stream + llm_calls sidecar) and every reset is FORWARDED; the
+        # child keeps local write only for paths outside both sinks (there
+        # are none under the granted roots once role_broker drops the
+        # trajectory grant).
+        traj_root = os.path.realpath(os.path.join(init["output_dir"], "trajectory"))
+        output_root = os.path.realpath(init["output_dir"])
+
+        def _traj_rel(path: str) -> Optional[str]:
+            rp = os.path.realpath(path)
+            if not rp.startswith(traj_root + os.sep):
+                return None
+            return os.path.relpath(rp, output_root)
 
         def append_with_parent_event(path: str, record: Dict[str, Any],
                                      max_bytes: Optional[int] =
@@ -1120,9 +1215,26 @@ def _worker_main() -> None:
                     "v": _PROTOCOL_VERSION, "type": "event", "event": record,
                 })
                 return
+            rel = _traj_rel(path)
+            if rel is not None:
+                _write_message(protocol_writer, {
+                    "v": _PROTOCOL_VERSION, "type": "traj_row",
+                    "rel": rel, "traj_record": record,
+                })
+                return
             original_append(path, record, max_bytes=max_bytes)
 
+        def reset_with_parent_event(path: str) -> None:
+            rel = _traj_rel(path)
+            if rel is not None:
+                _write_message(protocol_writer, {
+                    "v": _PROTOCOL_VERSION, "type": "traj_reset", "rel": rel,
+                })
+                return
+            original_reset(path)
+
         role_trajectory_log.append = append_with_parent_event
+        role_trajectory_log.reset = reset_with_parent_event
         with contextlib.redirect_stdout(sys.stderr):
             if role_name == "planner":
                 from gan.roles.planner import Planner as RoleClass

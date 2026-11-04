@@ -502,6 +502,52 @@ def _cm_failure_record(target, exc, fallback_landed):
             "sibling_landed": bool(fallback_landed)}
 
 
+# F5 P1 (docs/19 §12.28): the task child holds NO write authority over its
+# audit streams — trajectory rows and cm events are FORWARDED to the trusted
+# harness over the run-scoped telemetry socket. Local file writes are the
+# FALLBACK (channel lost mid-run: best-effort tmpfs, lost with the
+# namespace — never a session failure, never silent: stderr keeps speaking).
+_TELEMETRY: "TelemetryClient | None" = None
+
+
+def _init_telemetry() -> None:
+    global _TELEMETRY
+    tp = os.environ.get("GAN_TELEMETRY_UNIX") or ""
+    if not tp:
+        return  # local/manual run: local files, DGM-H base behavior
+    try:
+        from utils.telemetry import TelemetryClient
+    except ImportError:
+        print("[f5] telemetry client unavailable (utils.telemetry missing)",
+              flush=True)
+        return
+    client = TelemetryClient(tp)
+    if not client.active:
+        print(f"[f5] telemetry channel not established ({client.connect_error}); "
+              "audit rows fall back to local best-effort", flush=True)
+        return
+    _TELEMETRY = client
+    from utils import trajectory_log as _tlog
+    _orig_append, _orig_reset = _tlog.append, _tlog.reset
+
+    def _fwd_append(path, record, max_bytes=None):
+        if _TELEMETRY is not None and _TELEMETRY.send(
+                {"v": 1, "type": "traj_row", "record": record}):
+            return
+        _orig_append(path, record, max_bytes=max_bytes)
+
+    def _fwd_reset(path):
+        if _TELEMETRY is not None and _TELEMETRY.send(
+                {"v": 1, "type": "traj_reset"}):
+            return
+        _orig_reset(path)
+
+    _tlog.append = _fwd_append
+    _tlog.reset = _fwd_reset
+    print("[f5] telemetry channel up; audit rows forwarded to the harness",
+          flush=True)
+
+
 def _cm_emit(event):
     """Audit sink for the child's seam events (cm_view/cm_violation/...):
     appended to the sidecar and folded into events.jsonl by task_runner.
@@ -510,6 +556,11 @@ def _cm_emit(event):
     diagnostic row lands on the TASK TRAJECTORY (durable on the host), and
     the failure is echoed to stderr."""
     line = json.dumps(dict(event), ensure_ascii=False, default=str)
+    if _TELEMETRY is not None:
+        if _TELEMETRY.send({"v": 1, "type": "cm_event", "event": dict(event)}):
+            return
+        print("[cm] telemetry send failed; falling back to the local sidecar",
+              flush=True)
     target = _cm_events_path()
     try:
         with open(target, "a", encoding="utf-8") as f:
@@ -679,6 +730,7 @@ def _build_cm_session():
 def _run_agent_child(result_fd: int) -> None:
     if "GAN_DATASET_ROOT" in os.environ:
         raise RuntimeError("GAN_DATASET_ROOT must not enter the TaskAgent sandbox")
+    _init_telemetry()
 
     payload = json.load(sys.stdin)
     TaskAgent = _load_task_agent(payload["agent_path"])

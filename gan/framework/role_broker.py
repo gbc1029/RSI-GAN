@@ -409,8 +409,12 @@ def _seat_mounts(role: str, seat: str, instance: Any, outer: Any) -> Tuple[List[
     writable = [
         os.path.join("toolsets", role, instance, seat),
         os.path.join("logs", "roles", role, instance, seat),
-        os.path.join("trajectory", f"outer_{_traj_label(instance, outer)}",
-                     "roles", role, seat),
+        # F5 P1 (docs/19 §12.28): the seat's trajectory dir is NO LONGER
+        # writable — trajectory rows arrive over the role protocol and the
+        # PARENT writes them (hash-chained, gan/framework/traj_chain.py).
+        # The audited party must not hold write authority over its own audit
+        # stream. Reads were already broker RPC (read_trajectory /
+        # read_session_trajectory / session_trajectory_index).
     ]
     if seat != "evaluate":
         writable.insert(0, os.path.join("workspaces", role, f"{instance}__{seat}"))

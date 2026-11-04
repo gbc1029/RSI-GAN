@@ -243,22 +243,25 @@ class DomainTaskRunner:
             print(f"[WARN] {event_type} event write failed: {e}")
 
     def _ingest_cm_events(self, run_dir: str, run_id: str, genid: Any) -> None:
-        """Fold the child's CM seam-event sidecar into events.jsonl (docs/10
-        §11.5): each line is re-emitted with role=task attribution so the
-        per-generation cost record and the offline reconcilers see the seam
-        activity in the ONE audit stream. Advisory end to end: never a run
-        failure -- but NEVER silent (no-silent-fail rule, AGENTS.md): a
-        MISSING or EMPTY sidecar is itself a finding (the runner pre-creates
-        the file, so absence/emptiness means the child had no seam at all)
-        and gets its own event. The sidecar dies with the pruned work dir
-        either way."""
-        # The sidecar is written by the harness into the OUTPUT tree (the
-        # only path that is read-write inside the sandbox namespace).
+        """Fold the CM seam-event sidecar into events.jsonl (docs/10 §11.5,
+        transport reworked by F5 P1 / docs/19 §12.28): each line is
+        re-emitted with role=task attribution so the per-generation cost
+        record and the offline reconcilers see the seam activity in the ONE
+        audit stream. Advisory end to end: never a run failure -- but NEVER
+        silent (no-silent-fail rule, AGENTS.md): a MISSING or EMPTY sidecar
+        is itself a finding and gets its own event. The sidecar dies with
+        the pruned work dir either way.
+
+        F5 WRITER CHANGE: the sidecar is no longer child-written. The
+        trusted harness receives the child's seam events over the run-scoped
+        telemetry socket and appends them here (pre-created, so a
+        zero-event run reads as present-but-empty); the child holds no
+        write path to this file at all."""
         sidecar = paths.task_cm_events_path(run_dir, run_id)
         if not os.path.isfile(sidecar):
             self._event("cm_events_ingest_empty", genid=str(genid),
-                        reason="sidecar file missing (child never created "
-                               "or never bound it)")
+                        reason="sidecar file missing (harness failed before "
+                               "staging the telemetry run)")
             return
         try:
             with open(sidecar, "r", encoding="utf-8") as f:

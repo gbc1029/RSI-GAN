@@ -452,7 +452,11 @@ non-repeatable:
   guarded-cm import gate, POLICY_FACES narrowed to read+shrink (D8 ruled
   direction (b) thorough: no pin/unpin/note on the policy face; protection
   = agent ctx_pin/presets, creation = ctx_note; policy-turn pinned delta
-  caught by the reconcile's fourth question).
+  caught by the reconcile's fourth question); F5 audit-stream write
+  authority moved to the parent (§12.28 — seat trajectory rows arrive as
+  protocol messages, task child forwards over the telemetry socket,
+  role_broker no longer grants the trajectory dir, parent-side hash chain
+  in gan/framework/traj_chain.py, offline verifier verify_stream).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license
