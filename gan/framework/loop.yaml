@@ -192,6 +192,11 @@ issues:
                                 # （判据 = 决策规则反转[acc_C <= 少数类占比 - acc_tol]
                                 #  且 acc_C < acc_P - acc_tol；见 issue_checks.py）
 
+challenge:
+  enabled: false
+  max_k: 5
+  random_min: 10             # minimum fresh train questions after worst-case anchors
+
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
   eval_samples: 1               # 每个 supernode 入档评估次数（docs/14 允许 2–3；

@@ -595,7 +595,7 @@ def _materialize_run_roots(repo_root: str, output_dir: str, layout: str):
     return code_root, roots
 
 
-def _launch_budget(cfg: Any, inner: Optional[int]) -> tuple[int, int, int]:
+def _launch_budget(cfg: Any, inner: Optional[int], *, paired_val: bool = False) -> tuple[int, int, int]:
     """Per-outer TASK LAUNCH budget: ``(inner_generations, eval_rounds, total)``.
 
     The privileged broker refills a launch counter per outer (``register_outer``)
@@ -617,7 +617,13 @@ def _launch_budget(cfg: Any, inner: Optional[int]) -> tuple[int, int, int]:
                          else int(cfg.get("loop.inner_max", 3)))
     eval_rounds = (max(0, int(cfg.get("eval.eval_samples", 3)))
                    if bool(cfg.get("outer_select.enabled", False)) else 0)
-    return inner_generations, eval_rounds, inner_generations + eval_rounds
+    # The IMO challenge protocol performs one candidate and one direct-parent
+    # fixed-val run at the outer boundary.  They are ordinary task-broker
+    # launches, but are not part of ``eval.eval_samples`` and therefore need
+    # their own explicit reservation.
+    paired_val_rounds = 2 if paired_val else 0
+    return inner_generations, eval_rounds + paired_val_rounds, \
+        inner_generations + eval_rounds + paired_val_rounds
 
 
 def _resolve_eval_subset(raw: str, domain_config: Any) -> tuple[str, str]:
@@ -1033,6 +1039,19 @@ def run_gan_driver(
         else:
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": sampling_mode})
+
+        # Paired task validation is enabled only when the IMO challenge
+        # protocol has a dedicated fixed-id evaluation runner.  Recompute the
+        # broker reservation after the run-persistent eval ids are known; this
+        # keeps legacy domains/arms unchanged while preventing mid-outer
+        # ``task launch budget exhausted`` failures in the challenge arm.
+        paired_val = bool(
+            domain == "imo_proof"
+            and bool((cfg.get("challenge") or {}).get("enabled", False))
+            and eval_anchor_ids
+        )
+        I_max, eval_rounds, task_launch_budget = _launch_budget(
+            cfg, inner, paired_val=paired_val)
 
         start = (int(newest["index"]) + 1) if (resume and newest) else 1
         _driver_t0 = time.time()

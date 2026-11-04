@@ -201,13 +201,18 @@ def reserve_for_child(data: Dict[str, Any], *, parent_node: Any,
 
 
 def consume_for_child(data: Dict[str, Any], *, parent_node: Any,
-                      child_node: Any) -> List[Dict[str, Any]]:
+                      child_node: Any, planner_version: Any = None) -> List[Dict[str, Any]]:
     """Consume a reservation exactly once; repeated resume is idempotent."""
     rows = reserve_for_child(data, parent_node=parent_node, child_node=child_node)
     for row in rows:
         if row.get("status") == STATUS_RESERVED:
             row["status"] = STATUS_CONSUMED
             row["consumed_child_node"] = str(child_node)
+            if planner_version is not None:
+                row["consumer_planner_version"] = str(planner_version)
+        elif (planner_version is not None
+              and row.get("consumer_planner_version") is None):
+            row["consumer_planner_version"] = str(planner_version)
     return rows
 
 

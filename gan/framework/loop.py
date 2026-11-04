@@ -303,6 +303,10 @@ class GanLoop:
         self._attempt = uuid.uuid4().hex[:8]
         # role self-edit commits made by this run (audit)
         self._role_commits: Dict[str, str] = {}
+        # Frozen after role restoration at outer entry. Inner/challenge records
+        # must remain attributed to the design that actually ran them, even
+        # though self-improve mutates the live design before supernode write.
+        self._outer_versions: Dict[str, Optional[str]] = {}
         # -- outer-level selection (docs/14) ---------------------------------
         self.outer_select_enabled = bool(cfg.get("outer_select.enabled", False))
         self.tournament_k = int(cfg.get("outer_select.tournament_k", 3))
@@ -735,6 +739,26 @@ class GanLoop:
             return hashlib.sha256(data.encode("utf-8")).hexdigest()
         except Exception:  # noqa: BLE001 -- advisory stamp
             return None
+
+    def _capture_outer_versions(self, outer: int) -> Dict[str, Optional[str]]:
+        """Freeze active role design/code versions for one outer."""
+        from gan.framework import code_repo
+        roles_commit = None
+        roles_root = self._roles_root()
+        if roles_root:
+            try:
+                roles_commit = code_repo.current_commit(roles_root)
+            except Exception:  # noqa: BLE001 -- advisory metadata
+                roles_commit = None
+        self._outer_versions = {
+            "planner_design_hash": self._design_hash("planner"),
+            "evaluator_design_hash": self._design_hash("evaluator"),
+            "planner_commit": roles_commit,
+            "evaluator_commit": roles_commit,
+        }
+        self.log_event({"type": "outer_versions_frozen", "outer": outer,
+                        **self._outer_versions})
+        return dict(self._outer_versions)
 
     def _impute_score(self, parent: Optional[Node]) -> Optional[float]:
         """Impute a missing benchmark score: siblings' median, else parent score."""
@@ -1525,7 +1549,8 @@ class GanLoop:
             return []
         challenge_ledger.save(self.output_dir, data, self.ledger_writer)
         rows = challenge_ledger.consume_for_child(
-            data, parent_node=parent.genid, child_node=child.genid)
+            data, parent_node=parent.genid, child_node=child.genid,
+            planner_version=self._outer_versions.get("planner_design_hash"))
         challenge_ledger.save(self.output_dir, data, self.ledger_writer)
         return [str(row.get("challenge_id")) for row in rows]
 
@@ -1540,6 +1565,7 @@ class GanLoop:
             outer=outer,
             parent_node=child.genid,
             evaluator_version=(child.meta.get("evaluator_design_hash")
+                                or self._outer_versions.get("evaluator_design_hash")
                                 or self._design_hash("evaluator")
                                 or "unknown"),
             challenges=list(getattr(ctx, "challenges", []) or []),
@@ -1726,16 +1752,20 @@ class GanLoop:
 
             payload = {
                 "outer": outer,
-                "planner_design_hash": self._design_hash("planner"),
-                "evaluator_design_hash": self._design_hash("evaluator"),
+                "planner_design_hash": (self._outer_versions.get("planner_design_hash")
+                                         or self._design_hash("planner")),
+                "evaluator_design_hash": (self._outer_versions.get("evaluator_design_hash")
+                                           or self._design_hash("evaluator")),
                 "designs": {
                     "planner": self._design_snapshot("planner"),
                     "evaluator": self._design_snapshot("evaluator"),
                 },
                 "code_commits": {
                     "task": task_commit,
-                    "planner": self._role_commits.get("planner") or roles_head,
-                    "evaluator": self._role_commits.get("evaluator") or roles_head,
+                    "planner": (self._outer_versions.get("planner_commit")
+                                 or roles_head),
+                    "evaluator": (self._outer_versions.get("evaluator_commit")
+                                   or roles_head),
                 },
                 "root_genid": str(outer_genids[0]) if outer_genids else None,
                 "subtree": [str(g) for g in outer_genids],
@@ -3346,6 +3376,7 @@ class GanLoop:
             # fresh role instances (design + tools + chat + workspace) for this outer
             self._select_outer_parent(outer)
             self._refresh_roles(outer)
+            self._capture_outer_versions(outer)
             # pin the outer's entry HEAD as the base for parent=initial children
             # (HEAD drifts to task-branch tips during the outer)
             self._pin_outer_base(outer)
@@ -3641,11 +3672,15 @@ class GanLoop:
                 # Design stamp (docs/13 §2.2): outer + design hashes + three commits
                 # + which candidate pool supplied the parent (blood-lineage audit).
                 child.meta["outer_id"] = outer
-                child.meta["planner_design_hash"] = self._design_hash("planner")
-                child.meta["evaluator_design_hash"] = self._design_hash("evaluator")
+                child.meta["planner_design_hash"] = (
+                    self._outer_versions.get("planner_design_hash")
+                    or self._design_hash("planner"))
+                child.meta["evaluator_design_hash"] = (
+                    self._outer_versions.get("evaluator_design_hash")
+                    or self._design_hash("evaluator"))
                 child.meta["task_commit"] = child.meta.get("code_commit")
-                child.meta["planner_commit"] = self._role_commits.get("planner")
-                child.meta["evaluator_commit"] = self._role_commits.get("evaluator")
+                child.meta["planner_commit"] = self._outer_versions.get("planner_commit")
+                child.meta["evaluator_commit"] = self._outer_versions.get("evaluator_commit")
                 child.meta["source_pool"] = "global" if use_global else "subtree"
                 child.meta["deep_probe_required"] = require_deep_probe
                 child.meta["deep_probe_patch_proposed"] = bool(
@@ -4000,6 +4035,19 @@ class GanLoop:
                                     "anchor_parent_points": anc_parent})
                     break
 
+            # Active-version boundary: record, evaluate, and archive the
+            # version that actually completed this outer's inner work before
+            # self-improvement produces the next candidate.
+            self._update_issue_ledger(outer, outer_genids)
+            self._record_supernode(outer, outer_genids)
+            self._evaluate_supernode(outer)
+            self._evaluate_task_pair_val(
+                outer, outer_genids,
+                branch_limit=bl, depth_limit=dl, method=method,
+                ucb_c=ucb_c, depth_penalty=depth_penalty,
+                cost_penalty=cost_penalty, lcb_delta=lcb_delta, lcb_z=lcb_z)
+            self._archive_supernode(outer)
+
             # ---------------- outer self-improvement ----------------
             # Each role's own instance assembly rides its self-improve
             # payload — the CURRENT outer's assembly state is visible at the
@@ -4230,18 +4278,4 @@ class GanLoop:
                             "self_cost_tokens": self_own_costs,
                             "duration_s": round(time.time() - _outer_t0, 1)})
             self._save_checkpoint("outer", outer, I_max)
-            # Issue continuity: accumulate this outer's raises/verdicts/stances
-            # (and their mechanical truth) under the closed issue_key vocabulary.
-            # MUST run BEFORE _record_supernode: verdict_stability is read back
-            # from the ledger this call just wrote.
-            self._update_issue_ledger(outer, outer_genids)
-            self._record_supernode(outer, outer_genids)
-            self._evaluate_supernode(outer)
-            self._evaluate_task_pair_val(
-                outer, outer_genids,
-                branch_limit=bl, depth_limit=dl, method=method,
-                ucb_c=ucb_c, depth_penalty=depth_penalty,
-                cost_penalty=cost_penalty, lcb_delta=lcb_delta, lcb_z=lcb_z)
-            self._archive_supernode(outer)
-
         return self.task_tree
