@@ -24,6 +24,8 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
+
 from gan.framework import task_execution as tx
 from gan.framework import paths, scores, code_repo
 from gan.framework.loader import load_registry, resolve_domain

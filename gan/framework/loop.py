@@ -1642,7 +1642,8 @@ class GanLoop:
                 if isinstance(row, dict)
                 and str(row.get("consumed_child_node")) == str(child.genid)]
         verdicts: Dict[str, Dict[str, Any]] = {}
-        if rows and self.domain == "imo_proof":
+        is_imo_proof = bool(self.domains) and self.domains[0] == "imo_proof"
+        if rows and is_imo_proof:
             try:
                 verdicts = self.task_runner.adjudicate_proof_challenges(
                     parent, child, rows, outer=int((child.meta or {}).get("outer_id")))
@@ -1662,7 +1663,7 @@ class GanLoop:
             if verdict is not None:
                 parent_evidence["challenge_verdict"] = verdict
                 child_evidence["challenge_verdict"] = verdict
-            if self.domain == "imo_proof":
+            if is_imo_proof:
                 from domains.imo import challenge_adjudication as domain_adjudication
                 result = domain_adjudication.adjudicate(
                     row, parent_evidence, child_evidence)
