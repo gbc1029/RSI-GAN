@@ -1550,6 +1550,10 @@ class GanLoop:
         return [str(value) for value in ids]
 
     def _proof_challenge_evidence(self, node: Any, qid: Any) -> Dict[str, Any]:
+        archived_report = os.path.join(
+            paths.runs_dir(self.output_dir, node.genid), "report.json")
+        report_path = (archived_report if os.path.isfile(archived_report)
+                       else node.meta.get("report_path"))
         points = self._read_per_question(node.genid).get(str(qid))
         return {
             "qid": str(qid),
@@ -1557,7 +1561,7 @@ class GanLoop:
             "coverage": node.value.coverage,
             "score_status": node.value.score_status,
             "imputed": bool(node.meta.get("imputed")),
-            "report_path": node.meta.get("report_path"),
+            "report_path": report_path,
         }
 
     def _settle_parent_challenges(self, parent: Any, child: Any) -> List[Dict[str, Any]]:
@@ -1572,13 +1576,18 @@ class GanLoop:
         settled: List[Dict[str, Any]] = []
         for row in rows:
             qid = str(row.get("qid"))
-            result = challenge_adjudication.adjudicate(
-                row,
-                self._proof_challenge_evidence(parent, qid),
-                self._proof_challenge_evidence(child, qid),
-                evidence_ref=(f"runs/{parent.genid}/report.json -> "
-                              f"runs/{child.genid}/report.json"),
-            )
+            parent_evidence = self._proof_challenge_evidence(parent, qid)
+            child_evidence = self._proof_challenge_evidence(child, qid)
+            if self.domain == "imo_proof":
+                from domains.imo import challenge_adjudication as domain_adjudication
+                result = domain_adjudication.adjudicate(
+                    row, parent_evidence, child_evidence)
+            else:
+                result = challenge_adjudication.adjudicate(
+                    row, parent_evidence, child_evidence,
+                    evidence_ref=(f"runs/{parent.genid}/report.json -> "
+                                  f"runs/{child.genid}/report.json"),
+                )
             challenge_ledger.settle(
                 data, challenge_id=row.get("challenge_id"), adjudication=result)
             settled.append({
