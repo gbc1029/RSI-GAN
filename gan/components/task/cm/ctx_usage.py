@@ -1,4 +1,4 @@
-"""ctx_budget — canonical face adapter (framework-synced stub).
+"""ctx_usage — canonical face adapter (framework-synced stub).
 
 Do NOT specialize this file: the face contract lives in the frozen core
 (``gan/framework/cm/faces.py``, snapshot-delivered as ``cm.faces``). To
@@ -17,7 +17,7 @@ def _core():
     return _cm
 
 
-_INFO, _FN = _core().make_face_tool("ctx_budget")
+_INFO, _FN = _core().make_face_tool("ctx_usage")
 
 
 def tool_info():

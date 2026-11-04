@@ -18,8 +18,8 @@
       "kind": "cm"
     },
     {
-      "name": "ctx_budget",
-      "module": "planner/cm/ctx_budget.py",
+      "name": "ctx_usage",
+      "module": "planner/cm/ctx_usage.py",
       "description": "Session cost meter: tokens used, tool calls, active budgets, headroom.",
       "params_schema": {},
       "kind": "cm"

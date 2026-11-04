@@ -407,11 +407,11 @@ class ViewHandle:
         return ops.view_state(self._s.universe, self._s.view,
                               head_tail_keep=self._s.head_tail_keep)
 
-    def budget_query(self, tokens_used: Optional[int] = None,
+    def usage_query(self, tokens_used: Optional[int] = None,
                      budget: Optional[int] = None) -> Dict[str, Any]:
-        if err := self._gate("budget_query"):
+        if err := self._gate("usage_query"):
             return err
-        return self._s.budget_snapshot(tokens_used, budget)
+        return self._s.usage_snapshot(tokens_used, budget)
 
     # -- mutations (ops validate first; view mutates only on success) ---------
     def fetch(self, block_id: str, form: str = "full") -> Dict[str, Any]:
@@ -506,7 +506,7 @@ class CMSession:
     policy_exec_ms: int = 200
     note_cap_chars: int = 8_000
     emit: Optional[Callable[[Dict[str, Any]], None]] = None
-    budget_reader: Optional[Callable[[], Dict[str, Any]]] = None
+    usage_reader: Optional[Callable[[], Dict[str, Any]]] = None
     policy_path: Optional[str] = None  # custom mode: agent policy module path
     assembly_path: Optional[str] = None  # named agent-owned assembly module
     assembly_exec_ms: int = 200          # per-turn budget for that assembly
@@ -1274,8 +1274,8 @@ class CMSession:
         """Advisory warning at >=80% of an active token budget (the C8 soft
         stop stays the enforcement point; this only informs)."""
         used = tokens_used
-        if not used and self.budget_reader is not None:
-            used = self.budget_snapshot().get("tokens_used") or 0
+        if not used and self.usage_reader is not None:
+            used = self.usage_snapshot().get("tokens_used") or 0
         if not isinstance(budget, int) or budget <= 0 \
                 or not isinstance(used, int) or used <= 0:
             return None
@@ -1343,9 +1343,9 @@ class CMSession:
                                    keep=self.head_tail_keep))
         return out
 
-    def budget_snapshot(self, tokens_used: Optional[int] = None,
-                        budget: Optional[int] = None) -> Dict[str, Any]:
-        return ops.budget_query(self.budget_reader, tokens_used, budget)
+    def usage_snapshot(self, tokens_used: Optional[int] = None,
+                       budget: Optional[int] = None) -> Dict[str, Any]:
+        return ops.usage_query(self.usage_reader, tokens_used, budget)
 
     # -- policy segment -----------------------------------------------------------
     def run_policy(self, msgs: Optional[List[Dict[str, Any]]] = None
@@ -1707,7 +1707,7 @@ class CMSession:
 
 
 def build_session(keys: Dict[str, Any], *, emit: Optional[Callable] = None,
-                  budget_reader: Optional[Callable] = None,
+                  usage_reader: Optional[Callable] = None,
                   policy_path: Optional[str] = None,
                   assembly_path: Optional[str] = None) -> CMSession:
     """Factory: already-clamped effective keys -> a ready session. Unknown or
@@ -1715,7 +1715,7 @@ def build_session(keys: Dict[str, Any], *, emit: Optional[Callable] = None,
     parent-side); the safe defaults are the passthrough posture. The named
     assembly path is FRAMEWORK-RESOLVED (the snapshot/component tree), never
     a design value: keys carry only the name."""
-    session = CMSession(emit=emit, budget_reader=budget_reader,
+    session = CMSession(emit=emit, usage_reader=usage_reader,
                         policy_path=policy_path, assembly_path=assembly_path)
     session.apply_keys(keys or {})
     return session

@@ -109,8 +109,8 @@ live under `scripts/dgmh/`.
   `task/` (tools + the curated `task/knowledge/*.md` base), `evaluator/`,
   `planner/` (self-authored knowledge/tools); each tree may carry a `cm/`
   pool of THIN context-management wrappers (``ctx_index``/`ctx_fetch`/
-  `ctx_budget`/`ctx_pin`/`ctx_note`/`ctx_view` — task selects only
-  `ctx_budget`/`ctx_note`; its trajectory access rides the
+  `ctx_usage`/`ctx_pin`/`ctx_note`/`ctx_view` — task selects only
+  `ctx_usage`/`ctx_note`; its trajectory access rides the
   `read_trajectory` slice front-end instead).
 - `gan/registries/` — per-role tool catalog: **one single-writer `json` per role**
   (`task.json` / `planner.json` / `evaluator.json`; no shared file) + `loader.py`.
@@ -440,14 +440,15 @@ non-repeatable:
   switch→consumer authority, incl. §3.1 new-sandbox execution-position map)
   (and `docs/cost_tem.md`); `docs/19_CM问题与解决.md` (CM audit ledger +
   §12 batch records — the authority for CM done/open status; the `outer=2`
-  real-round acceptance is PASSED (§12.22); still open there: CM-06
-  residuals ⑥ (ctx_view stats aggregation) / ⑧ (reasoning split into the
-  CM meter), the make_face_tool fail-closed
-  param hardening + the policy-note semantics ruling (both deferred to a
-  dedicated CM permission-surface batch), F5 anti-tamper user-deferred,
-  T3 process isolation deferred; CM-08 trajectory seat reads CLOSED in
-  §12.24 — segment index/query RPC, offset/fetch/tail/head/grep,
-  per-request 120k cap).
+  real-round acceptance is PASSED (§12.22); still open there:
+  the make_face_tool fail-closed param hardening + the policy-note semantics
+  ruling (both deferred to a dedicated CM permission-surface batch), F5
+  anti-tamper user-deferred, T3 process isolation deferred; CM-08
+  trajectory seat reads CLOSED in §12.24 (segment index/query RPC,
+  offset/fetch/tail/head/grep, per-request 120k cap); CM-06 CLOSED in
+  §12.25 — usage face renamed ctx_budget→ctx_usage (budget = runtime cap,
+  usage = meter) + tokens split input/output/reasoning (absent when
+  unreported), ⑥ ctx_view stats ruled won't-fix).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

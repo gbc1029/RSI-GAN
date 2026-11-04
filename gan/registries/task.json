@@ -27,8 +27,8 @@
       "params_schema": {}
     },
     {
-      "name": "ctx_budget",
-      "module": "task/cm/ctx_budget.py",
+      "name": "ctx_usage",
+      "module": "task/cm/ctx_usage.py",
       "description": "Session cost meter: tokens used, tool calls, active budgets, headroom.",
       "params_schema": {},
       "kind": "cm"

@@ -5,7 +5,7 @@ success (拒绝即不动 — a policy failure must never leave a half-applied op
 The seam never re-checks: these functions ARE the enforcement for their own
 op, and the post-segment only counts + emits.
 
-FACES (双形态暴露): the agent face exposes index/fetch/budget_query/pin/
+FACES (双形态暴露): the agent face exposes index/fetch/usage_query/pin/
 unpin/note/view_state (``ctx_view`` is the agent's 知情权 tool, docs/10
 §5.2.3); the policy face may additionally drop/compact/substitute/order/peek.
 ``call`` is on BOTH faces: the entry to the
@@ -24,10 +24,10 @@ from .blocks import (Block, Universe, View, bake, cut, form_saving,
                        PLACEHOLDER_OVERHEAD, MIN_COMPACT_SAVE,
                        DERIVED_PIECE_KEEP, estimate_tokens)
 
-AGENT_FACES = ("index", "fetch", "budget_query", "pin", "unpin", "note",
+AGENT_FACES = ("index", "fetch", "usage_query", "pin", "unpin", "note",
                "view_state", "call")
 POLICY_FACES = ("index", "fetch", "peek", "pin", "unpin", "drop", "compact",
-                "substitute", "order", "budget_query", "view_state", "note",
+                "substitute", "order", "usage_query", "view_state", "note",
                 "call")
 
 _SHRINK_OPS = ("drop", "compact", "substitute")
@@ -415,15 +415,19 @@ def note_list(notes: Dict[str, str]) -> Dict[str, Any]:
             "notes": [{"id": k, "chars": len(v)} for k, v in sorted(notes.items())]}
 
 
-def budget_query(reader: Any, tokens_used: Optional[int] = None,
-                 budget: Optional[int] = None) -> Dict[str, Any]:
+def usage_query(reader: Any, tokens_used: Optional[int] = None,
+                budget: Optional[int] = None) -> Dict[str, Any]:
     """Live usage snapshot (meter 与它同一实现, §5.2 分二).
 
     ``reader`` is the loop-attached ledger of THIS chat run (attached by
     ``chat_with_agent``; docs/10 §11.5): the contract keys are
-    ``tokens_used`` / ``budget`` / ``tool_calls`` / ``wallclock_s`` (all
-    optional, 实付口径). Explicit arguments OVERRIDE the reader's same-named
-    keys; ``None`` arguments never shadow reader data."""
+    ``tokens_used`` / ``budget`` / ``tool_calls`` / ``wallclock_s`` plus the
+    OPTIONAL ``input_tokens`` / ``output_tokens`` / ``reasoning_tokens``
+    split (a counter the provider never reported stays ABSENT, never 0;
+    all 实付口径). Explicit arguments OVERRIDE the reader's same-named
+    keys; ``None`` arguments never shadow reader data. READ-ONLY: the cap
+    semantics live on the runtime side (``budget``/``budget_armed`` report
+    the soft stop, they do not enforce it)."""
     snap: Dict[str, Any] = {}
     if reader is not None:
         try:
@@ -434,7 +438,7 @@ def budget_query(reader: Any, tokens_used: Optional[int] = None,
         snap["tokens_used"] = int(tokens_used)
     if budget is not None:
         snap["budget"] = budget
-    return {"op": "budget_query", "ok": True, **snap}
+    return {"op": "usage_query", "ok": True, **snap}
 
 
 def fetch(universe: Universe, view: View, block_id: str,

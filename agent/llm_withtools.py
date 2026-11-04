@@ -657,12 +657,19 @@ def chat_with_agent(
     # mechanism, no GAN semantics: None (default) keeps today's behaviour.
     tokens_used = 0
     token_budget_exhausted = False
+    # Usage split (docs/19 §12.25): per-provider-reported counters summed
+    # alongside the total. None-initialized — a counter the provider never
+    # reports stays ABSENT from the reader output (never 0), the same rule
+    # the per-row `_output_fields` follow.
+    _usage_parts = {"input_tokens": None, "output_tokens": None,
+                    "reasoning_tokens": None}
 
     # Live meter source for the CM session (docs/10 §11.5): the chat loop owns
     # the authoritative running totals, so it hands the session a reader
     # closure over them instead of letting the meter keep a second counter.
     # Reader contract (gan/framework/cm/session.py): keys tokens_used / budget
-    # / tool_calls / wallclock_s, all optional, 实付口径 (proxy usage sums).
+    # / tool_calls / wallclock_s plus the optional input/output/reasoning
+    # split, all optional, 实付口径 (proxy usage sums).
     cm_started = time.time()
     cm_token = None
 
@@ -670,10 +677,15 @@ def chat_with_agent(
         out = {"tokens_used": tokens_used,
                "tool_calls": num_tool_calls,
                "wallclock_s": round(time.time() - cm_started, 1)}
+        for field, part in _usage_parts.items():
+            if part is not None:
+                out[field] = part
         # budget_armed must be EXPLICIT in both states (no-silent-fail rule):
         # a missing "budget" key alone reads as "a budget exists somewhere
         # else" — it does not; unset means NO token soft stop for this run
-        # (only tool-call caps and the time walls constrain it).
+        # (only tool-call caps and the time walls constrain it). The cap is
+        # runtime-enforced; this meter only reports it (§12.25: the usage
+        # face plans nothing, it shows the dial).
         out["budget_armed"] = isinstance(max_total_tokens, int) and max_total_tokens > 0
         if out["budget_armed"]:
             out["budget"] = max_total_tokens
@@ -707,6 +719,12 @@ def chat_with_agent(
         total = usage.get("total_tokens")
         if isinstance(total, (int, float)):
             tokens_used += int(total)
+        for field, key in (("input_tokens", "prompt_tokens"),
+                           ("output_tokens", "completion_tokens"),
+                           ("reasoning_tokens", "reasoning_tokens")):
+            v = usage.get(key)
+            if isinstance(v, (int, float)):
+                _usage_parts[field] = (_usage_parts[field] or 0) + int(v)
         if cm is not None and n_viewed and isinstance(hist, list):
             # keep the CANONICAL (raw) history: the seam's copies were only
             # for sending; the user turn is rebuilt RAW, the assistant reply
@@ -740,12 +758,12 @@ def chat_with_agent(
             # The seam learns the per-turn header (dedup target) and binds
             # itself for ctx_* tools (contextvar; process_tool_call copies it
             # into the dispatch threads). The live meter reader rides the same
-            # wiring: ctx_budget reads THIS chat run's authoritative totals
+            # wiring: ctx_usage reads THIS chat run's authoritative totals
             # instead of an empty snapshot (docs/10 §11.5).
             try:
                 cm.set_system_prefix(system_msg)
-                if hasattr(cm, "budget_reader"):
-                    cm.budget_reader = _cm_usage_reader
+                if hasattr(cm, "usage_reader"):
+                    cm.usage_reader = _cm_usage_reader
                 cm_token = cm.activate()
             except Exception as e:  # noqa: BLE001 -- advisory wiring
                 logging(f"[cm] session wiring degraded: {e}")

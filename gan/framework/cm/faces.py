@@ -52,8 +52,8 @@ def _ctx_fetch(handle, block_id, form='full'):
     return str(out.get("text") or "")
 
 
-def _ctx_budget(handle):
-    return _json.dumps(handle.budget_query(), ensure_ascii=False)
+def _ctx_usage(handle):
+    return _json.dumps(handle.usage_query(), ensure_ascii=False)
 
 
 def _ctx_pin(handle, block_id, note='', unpin=False):
@@ -99,15 +99,15 @@ _SPECS: dict = {
         "params": ("block_id", "form='full'"),
         "fn": _ctx_fetch,
     },
-    "ctx_budget": {
-        "description": ("Report this session's cost accounting: tokens used, tool calls, and the active budget keys with remaining headroom. Pull-based meter."),
+    "ctx_usage": {
+        "description": ("Report this session's usage accounting — a pull-based, READ-ONLY meter: tokens_used (billed total), an input/output/reasoning split when the provider reports the counters (a counter never reported stays ABSENT, never 0), tool calls, wallclock, and the runtime token soft-stop state (budget_armed/budget). It enforces nothing: limits live in the runtime, cost-shaping levers live in design keys (cm_mode, cm_head_tail_keep, reasoning_effort)."),
         "input_schema": {
             "type": "object",
             "properties": {},
             "required": [],
         },
         "params": (),
-        "fn": _ctx_budget,
+        "fn": _ctx_usage,
     },
     "ctx_pin": {
         "description": ("Pin a context block by id so the view assembly must keep it (the framework guarantees respect); unpin to release. note is an optional SHORT tag (<= 40 chars, stored with the block and readable back via ctx_view; a longer note is refused — use ctx_note for the rationale). Pin sparingly — pinned blocks survive every compaction."),
