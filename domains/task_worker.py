@@ -31,10 +31,10 @@ _TASK_ENV_NAMES = {
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
                       "GAN_CM_EVENTS",
     # CM-03 generation latch (docs/19 §12.16): HARNESS-ORIGINATED (an earlier
-    # question of this generation failed its named assembly; the snapshot is
-    # fixed per generation) — honored in _build_cm_session, never supplied
-    # by the parent.
-    "GAN_CM_ASSEMBLY_DISABLED",
+    # question of this generation failed its named assembly or policy; the
+    # snapshot is fixed per generation) — honored in _build_cm_session,
+    # never supplied by the parent.
+    "GAN_CM_ASSEMBLY_DISABLED", "GAN_CM_POLICY_DISABLED",
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -688,13 +688,19 @@ def _build_cm_session():
                          f"deliverable (env={env_policy!r}, snapshot has no "
                          f"cm_policy.py"
                          + (f", design names {named!r}" if named else "")
-                         + "); running PASSTHROUGH instead")
-                # The degrade CLAIMS passthrough — the keys must say it too,
-                # or apply_keys would still build a custom session whose
-                # every turn fails on the missing policy.
-                mode = "passthrough"
+                         + "); running SLICE instead")
+                # The degrade CLAIMS slice — the keys must say it too, or
+                # apply_keys would still build a custom session whose every
+                # turn fails on the missing policy. Slice, not passthrough:
+                # the unified build-time degrade target for an undeliverable
+                # component claim, same as both role-side paths
+                # (cm_wiring.build_from_descriptor, loop._build_cm_session) —
+                # and a build-time absence must not govern LESS than a
+                # runtime policy failure does, since that fail-open keeps
+                # the slice-structured pre-segment (docs/19 §12.30 rule 2).
+                mode = "slice"
                 keys = dict(keys)
-                keys["cm_mode"] = "passthrough"
+                keys["cm_mode"] = "slice"
     assembly_path = None
     env_asm = os.environ.get("GAN_CM_ASSEMBLY") or ""
     if env_asm and os.path.isfile(env_asm):
@@ -724,6 +730,18 @@ def _build_cm_session():
                   "reason": "harness generation latch: an earlier question "
                             "of this generation produced "
                             "cm_assembly_failed"})
+    # Same latch contract for the custom-mode policy (docs/19 §12.30 rule 3
+    # — the persistence layer is kind-symmetric): an earlier question's
+    # ``cm_policy_failed`` latches the policy for the rest of the
+    # generation. Re-attempting per question cannot change the outcome —
+    # the snapshot's module bytes are fixed — it would only re-burn the
+    # exec budget and leak another worker thread per question.
+    if os.environ.get("GAN_CM_POLICY_DISABLED") == "1":
+        session.policy_disabled = True
+        _cm_emit({"type": "cm_policy_latched",
+                  "reason": "harness generation latch: an earlier question "
+                            "of this generation produced "
+                            "cm_policy_failed"})
     return session
 
 

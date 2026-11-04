@@ -904,8 +904,10 @@ class CMSession:
         identity posture: a named assembly is never executed under it (the
         kill switch must stay absolute; the mismatch is spoken once). ANY
         assembly failure re-runs the baseline preset on the current state
-        for that turn (sticky forms make the replay safe) and leaves a
-        durable trace: ``cm_assembly_failed`` per failing turn,
+        for that turn (sticky forms make the replay safe) — the preset is
+        the SESSION'S OWN mode preset: the fail-open removes exactly the
+        failed module and keeps the rest (docs/19 §12.30 rule 1) — and
+        leaves a durable trace: ``cm_assembly_failed`` per failing turn,
         ``degraded`` on that turn's ``cm_view``, ``assembly_disabled`` in
         every subsequent ``cm_view`` — a fallback is never silent."""
         self.turn += 1
@@ -981,7 +983,6 @@ class CMSession:
                                             exc=e,
                                             timed_out=isinstance(
                                                 e, assembly.AssemblyTimeout))
-                self._turn_degraded = True
                 # fall through: the preset re-runs on the CLEAN state (sticky
                 # forms make the replay safe); this turn's cm_view carries
                 # degraded=true
@@ -1269,6 +1270,10 @@ class CMSession:
         (CM-03)."""
         self.assembly_failures += 1
         self._assembly_strikes += 1
+        # A strike turn IS a degraded turn — its governance came from the
+        # fail-open preset (docs/19 §12.30 rule 1; this also covers the
+        # load-failure turn, which has no other degraded marker).
+        self._turn_degraded = True
         if timed_out:
             self.thread_leaks += 1
         where = ""
@@ -1537,6 +1542,10 @@ class CMSession:
         ``policy_report`` for the next self-improve session."""
         self.policy_failures += 1
         self._policy_strikes += 1
+        # A strike turn IS a degraded turn (docs/19 §12.30 rule 1 — same
+        # rule as the assembly side): the failing turn's governance came
+        # from the pre-segment fail-open.
+        self._turn_degraded = True
         if timed_out:
             self.thread_leaks += 1
         where = ""

@@ -163,7 +163,15 @@ def resolve(mode: str) -> Tuple[AssembleFn, Optional[str]]:
     ``mode`` selects a shipped baseline preset; ``load_assembly`` resolves
     a NAMED agent-owned assembly module through the same contract, budgeted
     and wedge-broken by the session — the baseline presets remain the
-    fail-open target."""
+    fail-open target. THE FAIL-OPEN RULE (docs/19 §12.30 rule 1): the
+    target is the SESSION'S OWN mode preset, and a failed named module is
+    absent from it by construction — no preset ever contained the named
+    assembly, so falling back removes exactly the failed module and keeps
+    the rest (a healthy custom-mode policy keeps running in the fallback
+    turns). ``slice`` is the endpoint only for an UNKNOWN mode here, and
+    for the unified BUILD-TIME degrade of an undeliverable component claim
+    (``cm_wiring.build_from_descriptor`` / ``task_worker`` — docs/19
+    §12.30 rule 2)."""
     fn = BASELINE_ASSEMBLY.get(mode)
     if fn is None:
         return BASELINE_ASSEMBLY["slice"], "slice"

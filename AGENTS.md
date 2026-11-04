@@ -90,9 +90,10 @@ live under `scripts/dgmh/`.
   and is deliberately NOT a CM latch signal) plus a post-session hygiene
   restart when the session summary reports leaked worker threads
   (``thread_leaks``/``thread_leak_delta`` — conditional fields, absence =
-  clean); the task seat latches a failed named assembly for the REST of the
-  generation (harness-injected ``GAN_CM_ASSEMBLY_DISABLED`` — the agent
-  child is per-question); STDLIB-ONLY import contract because it is
+  clean); the task seat latches a failed named assembly OR POLICY for the
+  REST of the generation (harness-injected ``GAN_CM_ASSEMBLY_DISABLED`` /
+  ``GAN_CM_POLICY_DISABLED`` — the agent child is per-question);
+  STDLIB-ONLY import contract because it is
   snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,

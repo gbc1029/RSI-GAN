@@ -52,11 +52,12 @@ _TASK_ENV_NAMES = {
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
                       "GAN_CM_EVENTS",
     # CM-03 generation latch (docs/19 §12.16): HARNESS-ORIGINATED, never
-    # parent-supplied — this process sets it after a question's seam events
-    # showed a named-assembly failure (the snapshot is fixed for the whole
-    # generation, so re-attempting per question cannot change the outcome).
-    # Listed so the hop-1 audit face shows everything that crosses it.
-    "GAN_CM_ASSEMBLY_DISABLED",
+    # parent-supplied — this process sets them after a question's seam
+    # events showed a named-assembly or named-policy failure (the snapshot
+    # is fixed for the whole generation, so re-attempting per question
+    # cannot change the outcome). Listed so the hop-1 audit face shows
+    # everything that crosses it.
+    "GAN_CM_ASSEMBLY_DISABLED", "GAN_CM_POLICY_DISABLED",
     # timeout plumbing (consumers: QUESTION_TIMEOUT above, agent/llm.py
     # per-call client budget). The thinking-intensity knob does NOT ride the
     # env: it is threaded explicitly (CLI --reasoning_effort -> payload).
@@ -494,6 +495,7 @@ def _sandbox_command(run_root, agent_path, proxy_socket=None,
 # child as ``GAN_CM_ASSEMBLY_DISABLED=1``; the child honors it at session
 # build (``task_worker._build_cm_session``).
 _CM_ASSEMBLY_LATCH = False
+_CM_POLICY_LATCH = False
 
 
 def _cm_latch_scan(staged_lines: str) -> bool:
@@ -504,6 +506,16 @@ def _cm_latch_scan(staged_lines: str) -> bool:
     ``cm_assembly_fallback`` and is CHEAP to retry (no budget burn, no
     leaked thread), so it deliberately does not latch here."""
     return '"cm_assembly_failed"' in (staged_lines or "")
+
+
+def _cm_policy_latch_scan(staged_lines: str) -> bool:
+    """True when staged seam-event lines show a named-policy failure.
+
+    Mirror of ``_cm_latch_scan`` (docs/19 §12.30 rule 3 — the persistence
+    layer is kind-symmetric): every ``cm_policy_failed`` is strike-counted
+    (``_note_policy_failure``), so the presence of the event alone is the
+    trigger — same one-event-per-strike contract as the assembly scan."""
+    return '"cm_policy_failed"' in (staged_lines or "")
 
 
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
@@ -549,6 +561,8 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
     # reads assembly_disabled=true, so the latch is loud, not silent).
     if _CM_ASSEMBLY_LATCH:
         child_env["GAN_CM_ASSEMBLY_DISABLED"] = "1"
+    if _CM_POLICY_LATCH:
+        child_env["GAN_CM_POLICY_DISABLED"] = "1"
 
     # The result channel is an anonymous temporary file. Only the trusted
     # task_worker receives its fd; the TaskAgent child is spawned later with
@@ -656,6 +670,10 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
                 _CM_ASSEMBLY_LATCH = True
                 print("[cm] assembly latched for the rest of this "
                       "generation (cm_assembly_failed seen)", flush=True)
+            if _cm_policy_latch_scan(_latch_text) and not _CM_POLICY_LATCH:
+                _CM_POLICY_LATCH = True
+                print("[cm] policy latched for the rest of this "
+                      "generation (cm_policy_failed seen)", flush=True)
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
                 raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
