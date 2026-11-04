@@ -1732,6 +1732,14 @@ class GanLoop:
                     "val_anchor_ids": [],
                     "eval_baseline": None,   # filled by evaluate_on_root (B4)
                     "reevaluated": False,    # -> true after evaluate_on_root (B4)
+                    # IMO challenge protocol: paired task validation is filled
+                    # at the outer boundary after the candidate is selected.
+                    "task_val_mean": None,
+                    "task_parent_val_mean": None,
+                    "task_val_delta": None,
+                    "task_val_n_valid": 0,
+                    "task_val_candidate_genid": None,
+                    "task_val_parent_genid": None,
                 },
                 "planner_stats": {"op_dist": op_dist, "response_kind": response_kind},
                 "evaluator_stats": {
@@ -2288,8 +2296,110 @@ class GanLoop:
                 close = getattr(eval_planner, "close", None)
                 if close is not None and eval_planner is not self.planner:
                     close()
-            except Exception:  # noqa: BLE001 -- advisory
+            except Exception:  # noqa: BLE001 -- advisory cleanup
                 pass
+
+    def _evaluate_task_pair_val(self, outer: int, outer_genids: List[Any], *,
+                                branch_limit: int, depth_limit: int,
+                                method: str, ucb_c: float,
+                                depth_penalty: float, cost_penalty: float,
+                                lcb_delta: float, lcb_z: float) -> None:
+        """Evaluate the selected task candidate and its direct parent together.
+
+        This is a framework-only diagnostic gate for ``imo_proof``. It reuses
+        the fixed-id evaluation runner, but supplies each node's persisted task
+        config and code commit with an empty plan, so no planner is involved and
+        no evaluation round becomes a task-tree node.
+        """
+        if not self.challenge_enabled or self.eval_runner is None:
+            return
+        fixed_ids = list(getattr(self.eval_runner, "fixed_question_ids", None) or [])
+        if not fixed_ids or self.eval_runner is self.task_runner:
+            return
+        try:
+            from gan.framework import code_repo
+            from gan.framework.supernode import load_supernode, update_supernode
+
+            report: Dict[str, Any] = {}
+            candidates = self.task_tree.select_parents(
+                k=1, branch_limit=branch_limit, depth_limit=depth_limit,
+                method=method, ucb_c=ucb_c, depth_penalty=depth_penalty,
+                cost_penalty=cost_penalty, outer_id=outer,
+                exclude={"initial"},
+                lcb_delta=lcb_delta, lcb_z=lcb_z, report=report)
+            candidate = candidates[0] if candidates else None
+            if candidate is None:
+                self.log_event({"type": "task_pair_val_skipped", "outer": outer,
+                                "reason": "no_candidate", "selection": report})
+                return
+            parent = (self.task_tree.get(candidate.parent_genid)
+                      if candidate.parent_genid is not None else
+                      self.task_tree.get("initial"))
+            if parent is None:
+                self.log_event({"type": "task_pair_val_skipped", "outer": outer,
+                                "reason": "no_direct_parent",
+                                "candidate": str(candidate.genid)})
+                return
+
+            task_root = self._task_root()
+            main_head = None
+            if task_root:
+                main_head = code_repo.current_commit(task_root)
+
+            def run_node(node: Any, label: str) -> Optional[Dict[str, Any]]:
+                config = self._parent_config(node)
+                base = ((node.meta or {}).get("task_code_commit")
+                        or (node.meta or {}).get("code_commit")
+                        or self.eval_base_ref)
+                genid = f"taskval_outer{outer}_{label}"
+                plan = {"records": [], "responses": [], "config": config,
+                        "patch": "", "patch_proposed": ""}
+                evaluated = self.eval_runner(
+                    plan=plan, parent=node, genid=genid, base=base)
+                if evaluated is None or evaluated.value.score is None:
+                    return None
+                if evaluated.value.score_status not in _MEASURED:
+                    return None
+                return {
+                    "mean": float(evaluated.value.score),
+                    "coverage": evaluated.value.coverage,
+                    "score_status": evaluated.value.score_status,
+                    "genid": str(node.genid),
+                }
+
+            try:
+                candidate_val = run_node(candidate, "candidate")
+                parent_val = run_node(parent, "parent")
+            finally:
+                if task_root and main_head:
+                    code_repo.checkout(task_root, main_head)
+                    self._rebuild_composed_view()
+            sn = load_supernode(self.output_dir, outer)
+            if not sn:
+                return
+            benchmark = sn.setdefault("benchmark", {})
+            benchmark["task_val_mean"] = (candidate_val or {}).get("mean")
+            benchmark["task_parent_val_mean"] = (parent_val or {}).get("mean")
+            benchmark["task_val_delta"] = (
+                candidate_val["mean"] - parent_val["mean"]
+                if candidate_val is not None and parent_val is not None else None)
+            benchmark["task_val_n_valid"] = int(candidate_val is not None) + int(parent_val is not None)
+            benchmark["task_val_candidate_genid"] = str(candidate.genid)
+            benchmark["task_val_parent_genid"] = str(parent.genid)
+            update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
+            self.log_event({
+                "type": "task_pair_val_recorded", "outer": outer,
+                "candidate_genid": str(candidate.genid),
+                "parent_genid": str(parent.genid),
+                "task_val_mean": benchmark["task_val_mean"],
+                "task_parent_val_mean": benchmark["task_parent_val_mean"],
+                "task_val_delta": benchmark["task_val_delta"],
+                "n_valid": benchmark["task_val_n_valid"],
+            })
+        except Exception as e:  # noqa: BLE001 -- diagnostic val is advisory
+            soft_fail(f"task pair val failed (outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="task_pair_val_failed", outer=outer)
 
     def _refresh_roles(self, outer: int) -> None:
         """Rebuild planner/evaluator for a new outer generation (instance refresh).
@@ -4074,6 +4184,11 @@ class GanLoop:
             self._update_issue_ledger(outer, outer_genids)
             self._record_supernode(outer, outer_genids)
             self._evaluate_supernode(outer)
+            self._evaluate_task_pair_val(
+                outer, outer_genids,
+                branch_limit=bl, depth_limit=dl, method=method,
+                ucb_c=ucb_c, depth_penalty=depth_penalty,
+                cost_penalty=cost_penalty, lcb_delta=lcb_delta, lcb_z=lcb_z)
             self._archive_supernode(outer)
 
         return self.task_tree
