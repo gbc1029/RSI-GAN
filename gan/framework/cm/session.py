@@ -18,7 +18,7 @@ live in the PRIMITIVES below, each of which validates before it mutates
         (validate via the ``cm.ops`` vocabulary; pre-check pinned / floor /
         sticky so a stage's predictable refusal never becomes violation noise)
     run_policy                             the custom policy hook (fail-open,
-        execution budget, 2-strike wedge breaker)
+        execution budget, one-strike wedge breaker — docs/19 §12.17)
     finalize_turn                          the post segment: count_ops +
         emit_view (audit completeness) + render (no-fabrication) + the
         outgoing dedup contract
@@ -417,6 +417,18 @@ class ViewHandle:
     def fetch(self, block_id: str, form: str = "full") -> Dict[str, Any]:
         if err := self._gate("fetch"):
             return err
+        # Agent-face fetch verb contract (ops.AGENT_FETCH_FORMS — the same
+        # constant the ctx_fetch schema enum is built from): materialize
+        # (full) or trim (head_tail). The eviction forms are the
+        # assembly/policy layer's, and the agent tool face has NO turn-end
+        # reconcile — an out-of-contract form is refused HERE rather than
+        # left to a backstop. The policy face's fetch(non-full) shrink verb
+        # is deliberately untouched.
+        if self.face == "agent" and form not in ops.AGENT_FETCH_FORMS:
+            return self._audit({
+                "op": "fetch", "refs": [block_id], "ok": False,
+                "error": (f"invalid form {form!r} on the agent face "
+                          f"(allowed: {', '.join(ops.AGENT_FETCH_FORMS)})")})
         return self._audit(ops.fetch(self._s.universe, self._s.view, block_id,
                                      form, keep=self._s.head_tail_keep))
 
@@ -721,8 +733,23 @@ class CMSession:
                 continue  # tool-call carriers etc. — no text to manage
             bid = _parse_view_marker(content)
             if bid is not None and bid in self.universe.blocks:
-                self.universe.get(bid).msg_index = i  # re-bind, not re-register
-                continue
+                block = self.universe.get(bid)
+                # Re-bind only a GENUINE rendered copy: an entry whose whole
+                # text is the block's current baked form (render replaces the
+                # block's span with the bake output; when that span WAS the
+                # whole entry, the copy is byte-identical — the case this
+                # branch exists for: the rendered copy must not grow a second
+                # block). A marker QUOTED inside agent/tool text — discussing
+                # one's own context, or a fetch trim's returned line riding
+                # inside the tool-result json wrapper — must NOT steal the
+                # binding: that silently un-applied the block's form on its
+                # real entry (the eviction/trim shipped raw again) and left
+                # the quoting entry unmanaged (docs/19 batch record).
+                # Non-matching entries fall through to the fingerprint path
+                # and register as the fresh content they are.
+                if content.strip() == self._baked_entry_text(block).strip():
+                    block.msg_index = i  # re-bind, not re-register
+                    continue
             fp = _fingerprint(content)
             known = self._by_fp.get(fp)
             if known is not None and known in self.universe.blocks:
@@ -740,6 +767,30 @@ class CMSession:
                 self._seen_user = True
             block.msg_index = i
             self._by_fp[fp] = block.block_id
+
+    def _baked_entry_text(self, block: Block) -> str:
+        """What a WHOLE-ENTRY rendered copy of this block looks like right
+        now — the marker re-bind guard's expectation. Mirrors render's bake
+        switch (span replacement makes an echoed copy byte-identical only
+        when the baked span WAS the whole entry); ``full``/``dedup`` have no
+        baked whole-entry form to match (identical text re-binds via the
+        fingerprint path anyway; the dedup rewrite carries no ``[block``
+        marker)."""
+        form = self.view.form_of(block.block_id)
+        rule = str(self.view.rules.get(block.block_id) or "")
+        if form == "head_tail":
+            return bake(block, "head_tail", rule, keep=self.head_tail_keep)
+        if form == "placeholder":
+            return bake(block, "placeholder", rule)
+        if form == "template":
+            return bake(block, "template", rule)
+        if form == "derived_host":
+            dblock = (self.universe.get(rule[len("derived="):])
+                      if rule.startswith("derived=") else None)
+            if dblock is None:
+                return ""  # unreachable (universe add-only): nothing to match
+            return bake(block, "derived_host", rule, host_text=dblock.text)
+        return ""
 
     def register_note(self, text: str) -> Tuple[Optional[str], str]:
         """Scratchpad note write: the note block is auto-pinned (never dropped)."""
@@ -848,7 +899,8 @@ class CMSession:
         When the design names an assembly (``assembly_path``), it
         REPLACES the preset composition for every non-passthrough turn —
         loaded once per session, executed under ``cm_assembly_exec_ms``,
-        wedge-broken after 2 failures. ``passthrough`` is the ABSOLUTE
+        wedge-broken after ONE failure (docs/19 §12.17: load-once makes
+        byte-identical retries deterministic waste). ``passthrough`` is the ABSOLUTE
         identity posture: a named assembly is never executed under it (the
         kill switch must stay absolute; the mismatch is spoken once). ANY
         assembly failure re-runs the baseline preset on the current state

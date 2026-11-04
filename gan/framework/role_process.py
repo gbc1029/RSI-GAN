@@ -671,8 +671,8 @@ class RoleProcess:
         retro-affects the delivered call — the worker state resets and the
         NEXT invoke re-runs the restart through the seat-switch path (and
         fails the seat only if the relaunch itself fails:
-        role_worker_restart_denied). Latch-bounded upstream (assembly first
-        failure latches the session; policy wedges after 2), so this fires
+        role_worker_restart_denied). Latch-bounded upstream (assembly and
+        policy each latch on FIRST failure — docs/19 §12.17), so this fires
         at most a couple of times per seat segment."""
         summary = self.last_cm_summary
         if not isinstance(summary, dict):

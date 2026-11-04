@@ -13,8 +13,12 @@ session's registered custom methods — it runs at the CALLER's privilege
 (the method receives the caller's own handle, so no capability is added),
 only the same-level extension surface.
 Agent-side ``drop`` is deliberately NOT a
-tool — eviction can only happen at the view layer (an agent "drop" call's
-output would itself enter the history).
+tool: the agent's only view-shaping verbs are restore (``fetch`` form=full)
+and trim (``fetch`` form=head_tail — ``AGENT_FETCH_FORMS``, declared in the
+ctx_fetch schema and enforced at the agent-face handle). The EVICTION
+vocabulary (placeholder/template) belongs to the assembly/policy layer,
+which has the per-turn accounting and turn-end reconcile the agent tool
+face lacks.
 """
 from __future__ import annotations
 
@@ -37,6 +41,17 @@ AGENT_FACES = ("index", "fetch", "usage_query", "pin", "unpin", "note",
 POLICY_FACES = ("index", "fetch", "peek", "drop", "compact",
                 "substitute", "order", "usage_query", "view_state",
                 "call")
+
+# The agent face's fetch verb (the ctx_fetch schema enum's single source):
+# materialize the whole content (full) or trim it in place (head_tail). The
+# EVICTION forms (placeholder/template) are the assembly/policy layer's —
+# agent-side drop is deliberately not a tool (module docstring) — so
+# ``faces.py`` builds the declared enum from THIS constant and
+# ``ViewHandle.fetch`` enforces it for the agent face only (the policy
+# face's fetch(non-full) shrink verb is untouched). A general spec-driven
+# value gate in ``make_face_tool`` is the recorded evolution path once a
+# second consumer exists.
+AGENT_FETCH_FORMS = ("full", "head_tail")
 
 _SHRINK_OPS = ("drop", "compact", "substitute")
 
@@ -85,7 +100,17 @@ def substitute(universe: Universe, view: View, block_id: str, form: str,
                keep: Optional[int] = None) -> Dict[str, Any]:
     """``keep`` = the session's head_tail notch (``cm_head_tail_keep``),
     threaded explicitly by the caller — primitives stay session-free
-    (docs/19 §12.21)."""
+    (docs/19 §12.21).
+
+    Pin/note protection is UNIFORM across the mutating primitives: a PINNED
+    block only ever takes ``full`` here (``dedup`` is the one sanctioned
+    non-full pinned form and ``dedup_prefix`` writes it directly, never
+    through this primitive), and a NOTE is never elided in any form — the
+    same sentences drop/compact enforce. The guard covers EVERY form, not
+    only ``placeholder``: the agent ``ctx_fetch`` face has NO turn-end
+    reconcile, so a hole here is a SILENT pin break rather than a reconciled
+    one (the P1 ``pinned_form`` question stays as the escape-tier backstop,
+    never the primary guard)."""
     block = universe.get(block_id)
     if block is None:
         return {"op": "substitute", "refs": [block_id], "ok": False,
@@ -93,11 +118,13 @@ def substitute(universe: Universe, view: View, block_id: str, form: str,
     if form not in ("full", "head_tail", "placeholder", "template"):
         return {"op": "substitute", "refs": [block_id], "ok": False,
                 "error": f"invalid form {form!r}"}
-    if form == "placeholder" and block.pinned:
+    if block.pinned and form != "full":
         return {"op": "substitute", "refs": [block_id], "ok": False,
                 "error": "pinned block"}
-    if form in ("placeholder", "head_tail", "template") \
-            and block.chars < floor_chars:
+    if block.kind == "note" and form != "full":
+        return {"op": "substitute", "refs": [block_id], "ok": False,
+                "error": "note blocks are never dropped"}
+    if form != "full" and block.chars < floor_chars:
         return {"op": "substitute", "refs": [block_id], "ok": False,
                 "error": f"below drop floor ({floor_chars})"}
     if form == "full":
@@ -452,7 +479,12 @@ def usage_query(reader: Any, tokens_used: Optional[int] = None,
 def fetch(universe: Universe, view: View, block_id: str,
           form: str = "full", keep: Optional[int] = None) -> Dict[str, Any]:
     """Materialize a block into the view (None≠0: restoring costs future
-    tokens but never fabricates) — fetch-forms other than full substitute."""
+    tokens but never fabricates) — fetch-forms other than full substitute.
+    Pinned/note blocks refuse non-full forms through that substitute guard
+    (same matrix as drop/compact); the ``full`` restore is always allowed.
+    A non-full fetch RETURNS the block's baked form as ``text`` — the trim
+    is self-verifiable (an empty success used to be unconfirmable from the
+    tool's return)."""
     block = universe.get(block_id)
     if block is None:
         return {"op": "fetch", "refs": [block_id], "ok": False,
@@ -461,4 +493,13 @@ def fetch(universe: Universe, view: View, block_id: str,
         view.set(block_id, "full", "fetch")
         return {"op": "fetch", "refs": [block_id], "ok": True,
                 "text": block.text, "chars": block.chars}
-    return substitute(universe, view, block_id, form, "fetch", 0, keep=keep)
+    rec = substitute(universe, view, block_id, form, "fetch", 0, keep=keep)
+    if rec.get("ok"):
+        # The trim's own delivery: the record used to carry no text, so a
+        # successful trim was indistinguishable from a silent no-op in the
+        # agent's hands. The text is the block's baked form — exactly what
+        # this block renders from now on.
+        rec["text"] = bake(block, form, str(rec.get("rule") or "fetch"),
+                           keep=keep)
+        rec["chars"] = len(rec["text"])
+    return rec

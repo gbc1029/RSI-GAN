@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json as _json
 
+from .ops import AGENT_FETCH_FORMS
+
 _NO_SESSION = "Error: no context-management session is active for this chat"
 
 # name -> (tool_info dict WITHOUT the name key duplicated, adapter fn).
@@ -90,10 +92,10 @@ _SPECS: dict = {
         "fn": _ctx_index,
     },
     "ctx_fetch": {
-        "description": ("Fetch one context block by id (from ctx_index) into the conversation: form=full restores the whole content; head_tail trims it to the session's configured keep. Any [block <id> ...] line already in the conversation (omitted:... or template:...) can be restored the same way with form=full. Fetching costs future tokens — fetch only what you need."),
+        "description": ("Fetch one context block by id (from ctx_index) into the conversation: form=full restores the whole content; head_tail trims it to the session's configured keep. Any [block <id> ...] line already in the conversation (omitted:... or template:...) can be restored the same way with form=full. Only full and head_tail are accepted here — the eviction forms belong to the context-management assembly/policy layer; a trim returns the block's baked line so you can see exactly what is kept. Pinned and note blocks refuse non-full forms — unpin first (ctx_pin unpin=true) if you truly want to trim. Fetching costs future tokens — fetch only what you need."),
         "input_schema": {
             "type": "object",
-            "properties": {"block_id": {"type": "string"}, "form": {"type": "string", "enum": ["full", "head_tail"], "description": "default full"}},
+            "properties": {"block_id": {"type": "string"}, "form": {"type": "string", "enum": list(AGENT_FETCH_FORMS), "description": "default full"}},
             "required": [],
         },
         "params": ("block_id", "form='full'"),
