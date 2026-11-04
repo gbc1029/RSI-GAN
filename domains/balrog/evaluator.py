@@ -17,6 +17,7 @@ from tqdm import tqdm
 from domains.balrog.dataset import InContextDataset
 from domains.balrog.environments import make_env
 from domains.balrog.utils import get_unique_seed
+from utils.episode_seed import anchor_seeds_by_task, plan_episodes
 from utils.trajectory_log import LLM_CALLS_SIDECAR_SUFFIX
 
 logger = logging.getLogger(__name__)
@@ -89,26 +90,52 @@ class EvaluatorManager:
     of evaluation tasks either sequentially or in parallel using multiple workers.
     """
 
-    def __init__(self, config, original_cwd="", output_dir="."):
+    def __init__(self, config, original_cwd="", output_dir="", sample_seed=None, anchor_ids=None):
         """Initialize the EvaluatorManager.
 
         Args:
             config (omegaconf.DictConfig): Configuration object containing evaluation settings.
             original_cwd (str, optional): Original current working directory. Defaults to "".
             output_dir (str, optional): Directory to save evaluation outputs. Defaults to ".".
+            sample_seed (int, optional): This generation's rotating-episode seed
+                (framework ``derive_sample_seed(base_seed, genid)``). ``None``
+                keeps the legacy random-per-episode behaviour.
+            anchor_ids (list, optional): Run-frozen ``<task>#<seed>`` episode ids
+                (``ckpt/sample_seed.json``); the first slots of every task.
         """
         self.config = config
         self.original_cwd = original_cwd
-        self.output_dir = output_dir
+        self.output_dir = output_dir or "."
+        self.sample_seed = sample_seed
+        # Malformed ids are REFUSED (utils.episode_seed.split_episode_id raises):
+        # silently dropping one would shrink the anchor core while the run still
+        # looked healthy.
+        self.anchor_seeds = anchor_seeds_by_task(anchor_ids or [])
 
         self.env_names = config.envs.names.split("-")
         self.env_evaluators = {}
-        self.tasks = []
+        self.episodes = []
         for env_name in self.env_names:
             evaluator = Evaluator(env_name, config, original_cwd=original_cwd, output_dir=self.output_dir)
             self.env_evaluators[env_name] = evaluator
+            known_tasks = {str(t) for t in evaluator.tasks}
+            # Fail closed: a plan naming a task the harness does not know means
+            # domains.yaml ``episode_tasks`` and config.yaml drifted apart.
+            unknown = [t for t in self.anchor_seeds if t not in known_tasks]
+            if unknown:
+                raise RuntimeError(
+                    f"episode plan names task(s) absent from config.tasks.{env_name}_tasks: "
+                    f"{unknown} -- domains.yaml episode_tasks and "
+                    f"domains/balrog/config/config.yaml disagree"
+                )
             for task in evaluator.tasks:
-                for episode_idx in range(evaluator.num_episodes):
+                task = str(task)
+                slots = plan_episodes(
+                    task, evaluator.num_episodes,
+                    self.anchor_seeds.get(task, []), self.sample_seed,
+                )
+                for slot in slots:
+                    episode_idx = slot["episode_idx"]
                     # Check if task has been completed
                     json_filename = os.path.join(
                         self.output_dir,
@@ -119,8 +146,22 @@ class EvaluatorManager:
                     if os.path.exists(json_filename):
                         logging.info(f"Skipping completed task: {env_name}, {task}, episode {episode_idx}")
                     else:
-                        self.tasks.append((env_name, task, episode_idx))
+                        self.episodes.append({**slot, "env": env_name, "task": task})
         self.num_workers = config.eval.num_workers
+
+    def write_plan(self, output_dir):
+        """Persist this generation's episode plan (audit; read back by task_runner)."""
+        path = os.path.join(output_dir, "episode_plan.json")
+        payload = {
+            "sample_seed": self.sample_seed,
+            "anchor_seeds": {k: list(v) for k, v in self.anchor_seeds.items()},
+            "episodes": self.episodes,
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)
+        return path
 
     def run(self, agent_factory):
         """Run the evaluation using the specified agent factory.
@@ -147,9 +188,10 @@ class EvaluatorManager:
             dict: Results of the evaluation aggregated by environment name.
         """
         results = defaultdict(list)
-        total_episodes = len(self.tasks)
+        total_episodes = len(self.episodes)
         with tqdm(total=total_episodes, desc="Evaluating Episodes", position=0, disable=True) as pbar:
-            for env_name, task, episode_idx in self.tasks:
+            for ep in self.episodes:
+                env_name, task, episode_idx = ep["env"], ep["task"], ep["episode_idx"]
                 evaluator = self.env_evaluators[env_name]
 
                 # Create agent
@@ -157,7 +199,10 @@ class EvaluatorManager:
                 Path(chat_history_file).parent.mkdir(exist_ok=True, parents=True)
                 agent = agent_factory.create_agent(chat_history_file=chat_history_file)
 
-                episode_log = evaluator.run_episode(task, agent, position=1, episode_idx=episode_idx)
+                episode_log = evaluator.run_episode(
+                    task, agent, position=1, episode_idx=episode_idx,
+                    episode_seed=ep["seed"], episode_id=ep["id"], is_anchor=ep["anchor"],
+                )
                 results[env_name].append(episode_log)
                 pbar.update(1)
         return results
@@ -177,11 +222,11 @@ class EvaluatorManager:
         ctx = multiprocessing.get_context("fork")
 
         # Initially fill the task queue with tasks up to the number of workers
-        for item in self.tasks[: self.num_workers]:
+        for item in self.episodes[: self.num_workers]:
             task_queue.put(item)
 
         # Create a master progress bar
-        pbar = tqdm(total=len(self.tasks), position=0, leave=True, disable=True)
+        pbar = tqdm(total=len(self.episodes), position=0, leave=True, disable=True)
 
         # Assign unique positions for progress bars
         positions = list(range(self.num_workers))
@@ -200,7 +245,7 @@ class EvaluatorManager:
         tasks_completed = 0
         tasks_queued = self.num_workers
 
-        total_tasks = len(self.tasks)
+        total_tasks = len(self.episodes)
 
         while tasks_completed < total_tasks:
             result = results_queue.get()
@@ -217,7 +262,7 @@ class EvaluatorManager:
 
             # Queue another task if there are any left
             if tasks_queued < total_tasks:
-                task_queue.put(self.tasks[tasks_queued])
+                task_queue.put(self.episodes[tasks_queued])
                 tasks_queued += 1
 
         # Signal workers to stop
@@ -252,7 +297,7 @@ class EvaluatorManager:
             if item is None:
                 break
             try:
-                env_name, task, episode_idx = item
+                env_name, task, episode_idx = item["env"], item["task"], item["episode_idx"]
                 evaluator = self.env_evaluators[env_name]
 
                 # Create a fresh agent per episode so files don't collide across parallel runs
@@ -266,6 +311,9 @@ class EvaluatorManager:
                     process_num=process_num,
                     position=position + 1,
                     episode_idx=episode_idx,
+                    episode_seed=item["seed"],
+                    episode_id=item["id"],
+                    is_anchor=item["anchor"],
                 )
                 result["process_num"] = process_num  # Include process number in result
                 result["env_name"] = env_name
@@ -311,7 +359,8 @@ class Evaluator:
 
         self.dataset = InContextDataset(self.config, self.env_name, original_cwd=original_cwd)
 
-    def run_episode(self, task, agent, process_num=None, position=0, episode_idx=0):
+    def run_episode(self, task, agent, process_num=None, position=0, episode_idx=0,
+                    episode_seed=None, episode_id=None, is_anchor=False):
         """Run a single evaluation episode.
 
         Args:
@@ -320,20 +369,35 @@ class Evaluator:
             process_num (str, optional): Identifier of the process running the episode. Defaults to None.
             position (int, optional): Position index for the progress bar. Defaults to 0.
             episode_idx (int, optional): Index of the episode. Defaults to 0.
+            episode_seed (int, optional): Seed from the EPISODE PLAN (see
+                utils/episode_seed). It replaces the historical
+                ``get_unique_seed(time_ns)`` draw, which made every generation a
+                different episode set (unpaired comparison). ``None`` keeps the
+                legacy behaviour for direct runs without a plan.
+            episode_id (str, optional): ``<task>#<seed>``; only for the log.
+            is_anchor (bool): Whether this slot is a run-frozen anchor episode.
 
         Returns:
             dict: Log of the episode containing statistics and results.
         """
         env = make_env(self.env_name, task, self.config)
 
-        seed = self.config.envs.env_kwargs.seed
+        seed = episode_seed
+        if seed is None:
+            seed = self.config.envs.env_kwargs.seed
         if seed is None:
             seed = get_unique_seed(process_num=process_num, episode_idx=episode_idx)
+        seed = int(seed)
         random.seed(seed)
         np.random.seed(seed)
         obs, info = env.reset(seed=seed)
         episode_log = {
             "task": task,
+            # Episode identity: the key report.json's question_points uses and
+            # the framework's frozen anchor core matches against.
+            "episode_id": episode_id or f"{task}#{seed}",
+            "seed": seed,
+            "anchor": bool(is_anchor),
             "action_frequency": defaultdict(int),
             # "input_tokens": 0,
             # "output_tokens": 0,
@@ -434,7 +498,6 @@ class Evaluator:
             episode_log["failed_candidates"] = env.failed_candidates
             episode_log.update(env.get_stats())
             episode_log["process_num"] = process_num
-            episode_log["seed"] = seed
 
             # Save the episode_log to a JSON file
             json_filename = os.path.join(

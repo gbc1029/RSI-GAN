@@ -37,6 +37,12 @@ from gan.design.store import DesignStore
 from gan.framework.sandbox_etc import SANDBOX_HOSTNAME, validate_sandbox_etc
 from gan.patch import apply_patch
 from gan.tools.assembly import assemble_tools_dir_reported
+from utils.episode_seed import (
+    ANCHOR_KIND,
+    EPISODE_RULE,
+    derive_episode_seed,
+    episode_id,
+)
 
 _PY_IGNORE = shutil.ignore_patterns(".env", "__pycache__", "*.pyc")
 # Benchmark labels / heavy assets must NOT be present in a task run (leakage
@@ -1432,6 +1438,25 @@ def _stratified_sample(
     return sorted(picked), alloc
 
 
+def episode_anchor_budget(domain_cfg: Dict[str, Any], num_samples: int) -> int:
+    """Anchors PER TASK for an episode domain (``0`` = no episode plan).
+
+    ``domains.yaml anchor_episodes_per_task``: ``auto`` (the default) is
+    ``min(n, max(1, n // 2))`` -- the paper_review rule (half the budget stays
+    paired) with a FLOOR of one, because ``num_samples=1`` would otherwise give
+    ``1 // 2 == 0`` and silently disable the anchor core (and with it the LCB
+    parent selector). An explicit integer is clamped to ``[0, n]``.
+    """
+    tasks = domain_cfg.get("episode_tasks") or []
+    n = int(num_samples or 0)
+    if not tasks or n <= 0:
+        return 0
+    declared = domain_cfg.get("anchor_episodes_per_task", "auto")
+    if declared is None or str(declared).strip().lower() in ("", "auto"):
+        return min(n, max(1, n // 2))
+    return max(0, min(int(declared), n))
+
+
 def ensure_sampling_seed(
     output_dir: str,
     domain: str,
@@ -1473,17 +1498,45 @@ def ensure_sampling_seed(
         base_seed = int.from_bytes(os.urandom(8), "big")
     anchor_ids: List[str] = []
     anchor_alloc: Dict[str, int] = {}
+    domain_cfg: Dict[str, Any] = {}
     try:
+        from gan.framework.loader import load_registry, resolve_domain
+        domain_cfg = resolve_domain(load_registry(), domain) or {}
+    except Exception as exc:  # noqa: BLE001 -- registry trouble must not kill sampling
+        _log_soft_sample_note(f"domain registry unavailable ({exc}); no episode plan")
+    episode_tasks = [str(t) for t in (domain_cfg.get("episode_tasks") or [])]
+    episode_anchor_per_task = 0
+    if episode_tasks:
+        # EPISODE domain (balrog): one "question" is one EPISODE, identified by
+        # ``<task>#<seed>`` (utils/episode_seed, measured reproducible through
+        # env.reset(seed=...)). The anchor core is therefore a frozen list of
+        # (task, seed) pairs -- the paired half of the main line, and the
+        # evidence the LCB parent selector reads back through report.json.
+        # ``sampling.anchor_k`` (a QUESTION count, default 10) deliberately does
+        # NOT apply here: it would stack 10 fixed episodes onto every task.
+        episode_anchor_per_task = episode_anchor_budget(domain_cfg, num_samples)
+        for task in episode_tasks:
+            for i in range(episode_anchor_per_task):
+                seed = derive_episode_seed(int(base_seed), ANCHOR_KIND, task, i)
+                anchor_ids.append(episode_id(task, seed))
+            anchor_alloc[task] = episode_anchor_per_task
+        if episode_anchor_per_task <= 0:
+            _log_soft_sample_note(
+                "episode domain with num_samples<=0: no anchor episodes drawn "
+                "(the run keeps its historical random seeds)")
+    try:
+        # Episode domains never consult a "question pool": their anchor core was
+        # already built above from ``episode_tasks`` (one seed per task slot).
         # polyglot: anchors come from the FULL metadata pool (a pinned
         # eval_task_list filters only the eval side, so anchors simply find
-        # no row when a pinned pool excludes them); balrog has no pool;
-        # CSV domains read their dataset. One resolver for all of them.
+        # no row when a pinned pool excludes them); CSV domains read their
+        # dataset. One resolver for all of them.
         # Draw is PROPORTIONAL across polyglot languages (largest remainder):
         # the anchor core is frozen for the whole run, so a small uniform id
         # draw bakes its language skew into every generation (k=9 uniform
         # anchors left cpp unanchored in ~32% of simulated runs). CSV domains
         # have no category column and keep the uniform draw.
-        pool = load_pool_ids(domain, dataset_root, subset)
+        pool = [] if episode_tasks else load_pool_ids(domain, dataset_root, subset)
         k = max(0, min(int(anchor_k), int(num_samples) // 2 if num_samples > 0 else 0))
         if pool and k > 0:
             rng = random.Random(f"{int(base_seed)}:anchor")
@@ -1545,7 +1598,14 @@ def ensure_sampling_seed(
             "eval_anchor_ids": eval_ids,
             "eval_anchor_alloc": eval_alloc,
             "eval_subset": eval_subset_used,
-            "eval_anchor_k": eval_k_used}
+            "eval_anchor_k": eval_k_used,
+            # Episode plan (balrog; empty for question domains). The seed file is
+            # the ONE place a run's episode identity is frozen: anchors here,
+            # rotating seeds re-derived per generation from base_seed+genid, and
+            # the recipe string so a future rule change is detectable.
+            "episode_tasks": episode_tasks,
+            "anchor_episodes_per_task": episode_anchor_per_task,
+            "episode_rule": EPISODE_RULE if episode_tasks else ""}
     os.makedirs(os.path.dirname(seed_path), exist_ok=True)
     tmp = seed_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

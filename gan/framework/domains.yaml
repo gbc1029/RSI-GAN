@@ -260,6 +260,22 @@ domains:
     # 5 x 128 steps x 20s = 12800s per unit; 5 x 128 x 4 calls = 2560 calls.
     harness_timeout_per_sample_s: 12800
     task_llm_calls_per_sample: 2560
+    # EPISODE PLAN (the balrog analogue of paper_review's question sampling):
+    # a balrog "question" is one EPISODE, so the anchor core is a frozen list of
+    # (task, episode seed) pairs -- `<task>#<seed>` in ckpt/sample_seed.json --
+    # drawn by task_execution.ensure_sampling_seed from THIS list. The balrog
+    # harness refuses a plan whose task is absent from
+    # domains/balrog/config/config.yaml (fail-closed: the two lists must not
+    # drift silently). ``anchor_episodes_per_task: auto`` = min(n, max(1, n//2))
+    # -- the paper_review "half the budget stays paired" rule with a floor of
+    # one; 0 disables the plan and restores the historical random seeds.
+    episode_tasks:
+      - "BabyAI-MixedTrainLocal-v0/goto"
+      - "BabyAI-MixedTrainLocal-v0/pickup"
+      - "BabyAI-MixedTrainLocal-v0/open"
+      - "BabyAI-MixedTrainLocal-v0/putnext"
+      - "BabyAI-MixedTrainLocal-v0/pick_up_seq_go_to"
+    anchor_episodes_per_task: auto
     task_brief: >-
       Play the BabyAI navigation environment. At each step, inspect the mission
       and observation and respond with exactly one valid environment action.
@@ -273,6 +289,51 @@ domains:
     # eval.max_steps_per_episode for the run (neither is silently changed here).
     harness_timeout_per_sample_s: 40000
     task_llm_calls_per_sample: 16000
+    # Episode plan -- see balrog_babyai above. 40 tasks (config.yaml
+    # babaisai_tasks), so at num_samples=2 this freezes 40 anchor episodes and
+    # rotates 40 per generation.
+    episode_tasks:
+      - "env/make_win-distr_obj_rule"
+      - "env/goto_win-distr_obj_rule"
+      - "env/goto_win"
+      - "env/goto_win-distr_obj"
+      - "env/goto_win-distr_rule"
+      - "env/goto_win-distr_obj-irrelevant_rule"
+      - "env/make_win-distr_obj"
+      - "env/make_win-distr_rule"
+      - "env/make_win"
+      - "env/make_win-distr_obj-irrelevant_rule"
+      - "env/two_room-goto_win"
+      - "env/two_room-goto_win-distr_obj_rule"
+      - "env/two_room-goto_win-distr_rule"
+      - "env/two_room-goto_win-distr_obj"
+      - "env/two_room-goto_win-distr_obj-irrelevant_rule"
+      - "env/two_room-goto_win-distr_win_rule"
+      - "env/two_room-break_stop-goto_win-distr_obj_rule"
+      - "env/two_room-break_stop-goto_win-distr_obj"
+      - "env/two_room-break_stop-goto_win-distr_rule"
+      - "env/two_room-break_stop-goto_win-distr_obj-irrelevant_rule"
+      - "env/two_room-break_stop-goto_win"
+      - "env/two_room-maybe_break_stop-goto_win-distr_obj_rule"
+      - "env/two_room-maybe_break_stop-goto_win"
+      - "env/two_room-maybe_break_stop-goto_win-distr_obj"
+      - "env/two_room-maybe_break_stop-goto_win-distr_rule"
+      - "env/two_room-maybe_break_stop-goto_win-distr_obj-irrelevant_rule"
+      - "env/two_room-make_win-distr_obj_rule"
+      - "env/two_room-make_win-distr_rule"
+      - "env/two_room-make_win"
+      - "env/two_room-make_win-distr_obj-irrelevant_rule"
+      - "env/two_room-make_win-distr_obj"
+      - "env/two_room-make_win-distr_win_rule"
+      - "env/two_room-break_stop-make_win-distr_obj_rule"
+      - "env/two_room-break_stop-make_win-distr_rule"
+      - "env/two_room-break_stop-make_win"
+      - "env/two_room-break_stop-make_win-distr_obj-irrelevant_rule"
+      - "env/two_room-break_stop-make_win-distr_obj"
+      - "env/two_room-make_you"
+      - "env/two_room-make_you-make_win"
+      - "env/two_room-make_wall_win"
+    anchor_episodes_per_task: auto
     task_brief: >-
       Play the Baba Is AI puzzle environment. At each step, inspect the active
       rules and object positions and respond with exactly one valid action.

@@ -767,6 +767,29 @@ class DomainTaskRunner:
                     soft_fail(f"existing-domain report failed for genid {genid}: {e}",
                               event_path=paths.events_path(self.output_dir),
                               event_type="existing_domain_report_failed", genid=str(genid))
+        # Episode plan audit (episode domains only: balrog). The harness writes
+        # what it actually ran to <output>/episode_plan.json BEFORE the first
+        # episode; folding it into events makes "did the frozen anchor core
+        # apply this generation" answerable without opening report.json. Only
+        # counts are recorded -- the seed VALUES stay in ckpt/sample_seed.json
+        # and the (unprojected) plan file, so no seed leaks into an agent face.
+        plan_path = os.path.join(output_path, "episode_plan.json")
+        if os.path.isfile(plan_path):
+            try:
+                with open(plan_path, "r", encoding="utf-8") as f:
+                    _plan = json.load(f)
+                _eps = [e for e in (_plan.get("episodes") or []) if isinstance(e, dict)]
+                self._event(
+                    "episode_plan_ready", genid=str(genid),
+                    sample_seed_present=_plan.get("sample_seed") is not None,
+                    episodes=len(_eps),
+                    anchors=sum(1 for e in _eps if e.get("anchor")),
+                    anchor_tasks={k: len(v) for k, v in
+                                  (_plan.get("anchor_seeds") or {}).items()},
+                )
+            except Exception as e:  # noqa: BLE001 -- audit only, never fatal
+                self._event("episode_plan_unreadable", genid=str(genid),
+                            error=str(e)[:200])
         # Context-management audit exit (docs/10 §11.5): fold the child's
         # seam events into events.jsonl on EVERY post-harness path (the child
         # may have run a seam session even when scoring later failed).
@@ -878,7 +901,7 @@ class DomainTaskRunner:
         try:
             evid = paths.runs_dir(self.output_dir, genid)
             os.makedirs(evid, exist_ok=True)
-            for name in ("report.json", "predictions.csv"):
+            for name in ("report.json", "predictions.csv", "episode_plan.json"):
                 src = os.path.join(os.path.dirname(report_path), name)
                 if os.path.isfile(src):
                     shutil.copy2(src, os.path.join(evid, name))

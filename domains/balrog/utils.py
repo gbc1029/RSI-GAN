@@ -212,10 +212,64 @@ def collect_and_summarize_results(output_dir):
         # "agent": agent_config,
     }
 
+    # --- per-EPISODE truth (the balrog analogue of per-question points) -------
+    # The GAN framework reads exactly these three keys back from
+    # runs/<genid>/report.json (gan/framework/loop.py:_read_per_question) to
+    # compute anchor_correct / anchor_n and to feed the LCB parent selector.
+    # Keys are episode ids ``<task>#<seed>`` -- the same ids frozen in
+    # ckpt/sample_seed.json -- so an anchor episode can be paired across
+    # generations. Episodes that never produced a log are simply absent here;
+    # the framework scores a missing anchor as a miss.
+    question_points = {}
+    episodes = []
+    _idx = 0
+    for env_name, episode_logs in results_summaries.items():
+        for episode_log in episode_logs:
+            eid = episode_result_id(episode_log, _idx)
+            _idx += 1
+            while eid in question_points:  # defensive: never silently overwrite
+                eid = f"{eid}+"
+            points = max(0.0, min(1.0, float(episode_log.get("progression") or 0.0)))
+            question_points[eid] = points
+            episodes.append({
+                "id": eid,
+                "env": env_name,
+                "task": episode_log.get("task"),
+                "seed": episode_log.get("seed"),
+                "anchor": bool(episode_log.get("anchor")),
+                "progression": points,
+                "steps": episode_log.get("num_steps"),
+                "invalid_actions": len(episode_log.get("failed_candidates") or []),
+            })
+    summary["question_points"] = question_points
+    summary["question_ids_passed"] = sorted(
+        k for k, v in question_points.items() if v >= 1.0 - 1e-9)
+    summary["question_ids_failed"] = sorted(
+        k for k, v in question_points.items() if v < 1.0 - 1e-9)
+    summary["episodes"] = episodes
+
     summary_filename = os.path.join(output_dir, "report.json")
     with open(summary_filename, "w") as f:
         json.dump(summary, f, indent=4)
     return summary
+
+
+def episode_result_id(episode_log, fallback_index):
+    """Episode id for a report row; legacy logs (pre-plan) get a stable fallback.
+
+    New runs carry ``episode_id`` (``<task>#<seed>``). Old logs carry only the
+    seed, so the same shape is reconstructed; logs predating seeds at all fall
+    back to ``<task>#legacy<idx>`` -- unique, but never matching an anchor id,
+    which is the honest outcome for an unpaired run.
+    """
+    eid = episode_log.get("episode_id")
+    if eid:
+        return str(eid)
+    task = str(episode_log.get("task") or "task")
+    seed = episode_log.get("seed")
+    if isinstance(seed, int):
+        return f"{task}#{seed}"
+    return f"{task}#legacy{fallback_index}"
 
 
 def print_summary_table(summary):

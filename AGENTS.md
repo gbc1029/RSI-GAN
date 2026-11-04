@@ -401,6 +401,41 @@ with a GAN-native data layer.
 - The two role self-improve sessions inside one outer run in **parallel threads**; their write surfaces are seat-disjoint by `frozen.SEAT_WRITE`. Only the fast patch apply+commit serializes on `code_repo._TREE_LOCK`, staging exactly the patch's own files (attribution-clean).
 - Credentials travel as an explicit `api_key` argument and the toolset load-report sink as an explicit parameter — never process-global `os.environ` swaps; `AccessBroker.last_result` is thread-local.
 
+### Episode sampling (episode-based domains: balrog)
+
+- A balrog "question" is an **episode**, identified by `<task>#<seed>`.
+  `utils/episode_seed.py` is the ONE definition (stdlib-only — `utils/` is copied
+  into every sandboxed harness run, so the parent and the domain harness derive
+  identical seeds). Measured 2026-11-04: `env.reset(seed=...)` alone reproduces
+  an episode through `EnvWrapper -> domain wrapper -> gym/gymnasium` for BOTH
+  wired balrog domains; seeding the global RNGs does nothing (the constructor's
+  random draw only picks the BabyAI sub-task, which the harness's goal filter
+  already pins).
+- Three layers, mirroring the question-sampling design:
+  **anchor** (frozen per run in `ckpt/sample_seed.json.anchor_ids` — paired
+  child-vs-parent comparison, and the evidence the LCB parent selector reads),
+  **rotate** (per generation, from `derive_sample_seed(base_seed, genid)`),
+  **eval** (frozen, reserved for the fixed-root evaluation; NOT wired yet —
+  that round would need an episode-plan file instead of `questions.json`).
+- `domains.yaml episode_tasks` + `anchor_episodes_per_task` (`auto` =
+  `min(n, max(1, n//2))`, the paper_review rule with a floor of one) are drawn
+  by `task_execution.ensure_sampling_seed`. `sampling.anchor_k` deliberately does
+  NOT apply to episode domains (it is a QUESTION count, default 10). The balrog
+  harness refuses a plan whose task is absent from
+  `domains/balrog/config/config.yaml` (fail-closed drift check).
+- The plan travels on the EXISTING transport — `--sample_seed` / `--anchor_ids`,
+  already forwarded by the task broker for non-parent-scored domains — and the
+  harness writes `<output>/episode_plan.json` BEFORE the first episode
+  (`task_runner` folds counts into an `episode_plan_ready` event and archives
+  the file into `runs/<genid>/`).
+- `report.json` gains `question_points` / `question_ids_passed|failed` /
+  `episodes[]` keyed by episode id, so the FROZEN `loop._read_per_question` ->
+  `_anchor_stats` -> `_select_parents_lcb` work unchanged (the selector stops
+  reporting `fallback_no_anchor`; a missing anchor episode is a miss, matching
+  the per-question convention).
+- Seeds/ids never reach an agent face: the archived transcript qid stays
+  `env__task__epNN` and `report_summary` carries no episode ids.
+
 ### Output layout — `gan/framework/paths.py` is the single source
 
 | path | contents |

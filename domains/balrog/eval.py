@@ -23,7 +23,15 @@ def redirect_to_file(filepath):
         finally:
             sys.stdout = original
 
-def harness_balrog(config, agent_factory=None):
+def harness_balrog(config, agent_factory=None, sample_seed=None, anchor_ids=None):
+    """Run the balrog evaluation for one generation.
+
+    ``sample_seed`` / ``anchor_ids`` are the EPISODE PLAN handed down by the GAN
+    framework (``task_broker`` -> ``--sample_seed`` / ``--anchor_ids``):
+    ``anchor_ids`` are run-frozen ``<task>#<seed>`` episode ids, and
+    ``sample_seed`` derives the rotating (per-generation) half. ``None`` keeps
+    the historical behaviour (random episode seeds) for direct/legacy runs.
+    """
     # original_cwd = get_original_cwd()
     original_cwd = ""
 
@@ -49,7 +57,13 @@ def harness_balrog(config, agent_factory=None):
     )
 
     # Create an EvaluatorManager and run evaluation
-    evaluator_manager = EvaluatorManager(config, original_cwd=original_cwd, output_dir=output_dir)
+    evaluator_manager = EvaluatorManager(
+        config, original_cwd=original_cwd, output_dir=output_dir,
+        sample_seed=sample_seed, anchor_ids=anchor_ids,
+    )
+    # Audit the plan BEFORE any episode runs: a crashed generation must still
+    # say which episodes it intended (task_runner folds this into an event).
+    evaluator_manager.write_plan(output_dir)
     if agent_factory is None:
         from domains.balrog.agents import AgentFactory
         agent_factory = AgentFactory(config)

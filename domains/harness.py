@@ -1378,6 +1378,14 @@ if __name__ == "__main__":
                 args.reasoning_effort,
             )
         from domains.balrog.eval import harness_balrog
+        # Episode plan (the balrog analogue of question sampling). The framework
+        # ALREADY forwards both values for non-parent-scored domains
+        # (task_broker.launch -> --sample_seed/--anchor_ids), but this branch
+        # used to drop them, so every generation ran a fresh random episode set:
+        # child-vs-parent was unpaired and the LCB parent selector had no anchor
+        # evidence at all. ``anchor_ids`` are '<task>#<seed>' episode ids frozen
+        # in ckpt/sample_seed.json; ``sample_seed`` derives the rotating half.
+        episode_anchor_ids = [a for a in (args.anchor_ids or "").split(",") if a.strip()]
 
         config_dir = os.path.join(os.getcwd(), "./domains/balrog/config")
         with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
@@ -1401,7 +1409,12 @@ if __name__ == "__main__":
                     else []
                 ),
             )
-            output_folder = harness_balrog(cfg, agent_factory=agent_factory)
+            output_folder = harness_balrog(
+                cfg,
+                agent_factory=agent_factory,
+                sample_seed=args.sample_seed,
+                anchor_ids=episode_anchor_ids,
+            )
             # Save cfg in output folder
             from omegaconf import OmegaConf
             OmegaConf.save(config=cfg, f=os.path.join(output_folder, "config.yaml"))
