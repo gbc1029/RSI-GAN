@@ -26,8 +26,16 @@ from .blocks import (Block, Universe, View, bake, cut, form_saving,
 
 AGENT_FACES = ("index", "fetch", "usage_query", "pin", "unpin", "note",
                "view_state", "call")
-POLICY_FACES = ("index", "fetch", "peek", "pin", "unpin", "drop", "compact",
-                "substitute", "order", "usage_query", "view_state", "note",
+# D8 ruled direction (b) thorough (docs/19 §12.27): the policy is the
+# ADJUSTER — read + raw shrink primitives only. pin/unpin/note are the
+# protect/create family: pin is the strongest survival lever (a pin-all
+# policy silently neutralizes its own compaction), note-write is the
+# create+auto-protect COMPOSITE of the two agent-owned faces' exclusive
+# powers (the one union hole in the permission surface). Protection belongs
+# to the agent tool face (ctx_pin, persistent intent) and the framework
+# presets (structural pins); creation belongs to ctx_note.
+POLICY_FACES = ("index", "fetch", "peek", "drop", "compact",
+                "substitute", "order", "usage_query", "view_state",
                 "call")
 
 _SHRINK_OPS = ("drop", "compact", "substitute")

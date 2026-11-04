@@ -441,14 +441,18 @@ non-repeatable:
   (and `docs/cost_tem.md`); `docs/19_CM问题与解决.md` (CM audit ledger +
   §12 batch records — the authority for CM done/open status; the `outer=2`
   real-round acceptance is PASSED (§12.22); still open there:
-  the make_face_tool fail-closed param hardening + the policy-note semantics
-  ruling (both deferred to a dedicated CM permission-surface batch), F5
-  anti-tamper user-deferred, T3 process isolation deferred; CM-08
-  trajectory seat reads CLOSED in §12.24 (segment index/query RPC,
+  F5 anti-tamper user-deferred, T3 process isolation deferred;
+  CM-08 trajectory seat reads CLOSED in §12.24 (segment index/query RPC,
   offset/fetch/tail/head/grep, per-request 120k cap); CM-06 CLOSED in
   §12.25 — usage face renamed ctx_budget→ctx_usage (budget = runtime cap,
   usage = meter) + tokens split input/output/reasoning (absent when
-  unreported), ⑥ ctx_view stats ruled won't-fix).
+  unreported), ⑥ ctx_view stats ruled won't-fix); the CM permission-surface
+  batch CLOSED in §12.27 — make_face_tool param boundary (spec params
+  enforced, keyword-only, no internal-name leaks), load_policy runs the
+  guarded-cm import gate, POLICY_FACES narrowed to read+shrink (D8 ruled
+  direction (b) thorough: no pin/unpin/note on the policy face; protection
+  = agent ctx_pin/presets, creation = ctx_note; policy-turn pinned delta
+  caught by the reconcile's fourth question).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

@@ -1131,12 +1131,18 @@ class CMSession:
                         snap: Optional[Dict[str, Any]],
                         check_closure: bool = True
                         ) -> List[Tuple[str, List[str]]]:
-        """The three seam-contract questions (docs/19 §12.14).
+        """The four seam-contract questions (docs/19 §12.14, §12.27).
 
         1. every non-full form must be explained by a recorded op;
         2. a pinned block may only be ``full`` (or ``dedup``: the prefix-elision
            form, which loses only the repeated header);
-        3. the canonical history must be untouched.
+        3. the canonical history must be untouched;
+        4. the pinned set of PRE-EXISTING blocks is policy-immutable (D8
+           direction (b): the policy face has no pin/unpin — a pinned delta
+           on a block that existed at snapshot time is a ``_s``-escape:
+           detected here, restored by the caller, strike-counted). Blocks the
+           attempt REGISTERED keep their add-only auto-pin (the universe is
+           never rolled back).
 
         ``check_closure=False`` (the POLICY path) skips the turn-closure
         question: a policy's ops are closed by ``assemble_custom``'s
@@ -1167,6 +1173,16 @@ class CMSession:
             and self.view.form_of(block.block_id) not in ("full", "dedup"))
         if pinned_broken:
             out.append(("pinned_form", pinned_broken))
+        # 4. pinned delta on pre-existing blocks (docs/19 §12.27): BOTH
+        # directions — an escape pin (protection the policy must not grant)
+        # and an escape unpin (protection the policy must not remove).
+        pinned_before = (snap or {}).get("pinned_state") or {}
+        pinned_delta = sorted(
+            bid for bid, block in self.universe.blocks.items()
+            if bid in pinned_before
+            and bool(pinned_before[bid]) != bool(block.pinned))
+        if pinned_delta:
+            out.append(("unrecorded_pin", pinned_delta))
         snap_texts = (snap or {}).get("texts")
         if snap_texts is not None:
             before = [t[0] for t in snap_texts]

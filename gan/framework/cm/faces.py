@@ -158,12 +158,37 @@ def make_face_tool(name: str):
             f"make_face_tool: unknown face {name!r} (known: {sorted(_SPECS)})")
 
     fn = spec["fn"]
+    # The spec's ``params`` declaration becomes ENFORCED here (docs/19
+    # §12.27): declared names, keyword-only. A typo'd or hallucinated
+    # parameter used to die one frame deeper as a raw TypeError — the
+    # frozen core's internal function name leaking into the agent surface,
+    # with no allowed vocabulary to self-correct from; a silently-ignored
+    # parameter would be worse (an ignored parameter reads as taken
+    # effect — the B1 lesson's sibling). Refusals are DATA: same "Error:"
+    # envelope as the faces' business refusals, tool name only.
+    declared = tuple(p.split("=", 1)[0] for p in spec.get("params", ()))
+    declared_set = frozenset(declared)
+    # entries WITHOUT a default are required
+    required = frozenset(p.split("=", 1)[0] for p in spec.get("params", ())
+                         if "=" not in p)
 
     def tool_function(*args, **kwargs):
+        if args:
+            return (f"Error: {name} takes keyword parameters only "
+                    f"({', '.join(declared) if declared else 'none'}).")
+        unknown = sorted(k for k in kwargs if k not in declared_set)
+        if unknown:
+            return (f"Error: {name} got unexpected parameter(s) "
+                    f"{', '.join(unknown)}; allowed: "
+                    f"{', '.join(declared) if declared else 'none'}.")
+        missing = [k for k in required if k not in kwargs]
+        if missing:
+            return (f"Error: {name} is missing required parameter(s) "
+                    f"{', '.join(missing)}.")
         handle = current_handle("agent")
         if handle is None:
             return _NO_SESSION
-        return fn(handle, *args, **kwargs)
+        return fn(handle, **kwargs)
 
     tool_info_dict = {
         "name": name,

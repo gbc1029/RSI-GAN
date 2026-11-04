@@ -68,7 +68,12 @@ def policy_violations(path: str) -> List[str]:
 def load_policy(path: str):
     """Import the policy module from an explicit file path (snapshot).
     Returns ``(module, methods, method_problems)``. The AST gate runs first
-    (fail-closed); the ``METHODS`` harvest is ADDITIVE
+    (fail-closed): banned modules/calls (no LLM, no network, no subprocess,
+    no dynamic exec) AND the dual-posture import rule (stdlib + guarded
+    ``cm`` imports only — the SAME gate ``load_assembly`` runs; without it a
+    policy module could import any other ``gan.*`` in-process, a capability
+    docs10 never declared: L2-06's guarded-only-cm clause, docs/19 §12.27).
+    The ``METHODS`` harvest is ADDITIVE
     — its problems are returned, never raised.
 
     The sys.modules registration key is UNIQUE PER PATH (hash suffix): the
@@ -77,7 +82,8 @@ def load_policy(path: str):
     other's registration. Same path replaces its own entry (no unbounded
     growth: the per-turn reload reuses one key)."""
     import hashlib
-    problems = policy_violations(path)
+    from .assembly import _gan_import_problems
+    problems = policy_violations(path) + _gan_import_problems(path)
     if problems:
         raise ImportError("policy refused by AST gate: " + "; ".join(problems))
     name = ("cm_policy_user_"
