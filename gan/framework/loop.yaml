@@ -196,6 +196,15 @@ challenge:
   enabled: false
   max_k: 5
   random_min: 10             # minimum fresh train questions after worst-case anchors
+  val_min_delta: null        # null = 2 / (7 * fixed-val question count)
+  pilot_noop_repeats: 0      # optional no-op val repeats; 0 keeps pilot overhead off
+  fitness:
+    enabled: false           # explicit second-stage opt-in
+    min_supported: 30
+    min_determinate_rate: 0.8
+    lambda_p: 0.10
+    lambda_e: 0.05
+    lambda_precision: 0.05
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）

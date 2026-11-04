@@ -595,7 +595,8 @@ def _materialize_run_roots(repo_root: str, output_dir: str, layout: str):
     return code_root, roots
 
 
-def _launch_budget(cfg: Any, inner: Optional[int], *, paired_val: bool = False) -> tuple[int, int, int]:
+def _launch_budget(cfg: Any, inner: Optional[int], *, paired_val: bool = False,
+                   noop_repeats: int = 0) -> tuple[int, int, int]:
     """Per-outer TASK LAUNCH budget: ``(inner_generations, eval_rounds, total)``.
 
     The privileged broker refills a launch counter per outer (``register_outer``)
@@ -621,7 +622,8 @@ def _launch_budget(cfg: Any, inner: Optional[int], *, paired_val: bool = False) 
     # fixed-val run at the outer boundary.  They are ordinary task-broker
     # launches, but are not part of ``eval.eval_samples`` and therefore need
     # their own explicit reservation.
-    paired_val_rounds = 2 if paired_val else 0
+    paired_val_rounds = (2 + max(0, int(noop_repeats))
+                         if paired_val else 0)
     return inner_generations, eval_rounds + paired_val_rounds, \
         inner_generations + eval_rounds + paired_val_rounds
 
@@ -1050,8 +1052,12 @@ def run_gan_driver(
             and bool((cfg.get("challenge") or {}).get("enabled", False))
             and eval_anchor_ids
         )
+        noop_repeats = (int((cfg.get("challenge") or {})
+                            .get("pilot_noop_repeats", 0) or 0)
+                        if paired_val else 0)
         I_max, eval_rounds, task_launch_budget = _launch_budget(
-            cfg, inner, paired_val=paired_val)
+            cfg, inner, paired_val=paired_val,
+            noop_repeats=noop_repeats)
 
         start = (int(newest["index"]) + 1) if (resume and newest) else 1
         _driver_t0 = time.time()
@@ -1086,6 +1092,15 @@ def run_gan_driver(
             # two runs' inner-loop stopping behaviour incomparable -- the regime
             # guard must see it.
             "sampling.anchor_k": int((cfg.get("sampling") or {}).get("anchor_k", 0) or 0),
+            "challenge.enabled": bool(cfg.get("challenge.enabled", False)),
+            "challenge.pilot_noop_repeats": int(
+                cfg.get("challenge.pilot_noop_repeats", 0) or 0),
+            "challenge.fitness.enabled": bool(
+                cfg.get("challenge.fitness.enabled", False)),
+            "challenge.fitness.min_supported": int(
+                cfg.get("challenge.fitness.min_supported", 30)),
+            "challenge.fitness.min_determinate_rate": float(
+                cfg.get("challenge.fitness.min_determinate_rate", 0.8)),
             # Parent-selection policy. ``lcb`` (confidence set) and ``ucb``
             # (legacy additive bonus) explore different lineages from the same
             # tree, so two runs that differ here are NOT comparable -- the

@@ -377,6 +377,19 @@ class GanLoop:
         self.lambda_novelty = float(cfg.get("fitness.lambda_novelty", 0.2))
         self.w1_calibration = float(cfg.get("fitness.w1_calibration", 0.6))
         self.w2_verdict_stability = float(cfg.get("fitness.w2_verdict_stability", 0.4))
+        self.challenge_fitness_enabled = bool(
+            cfg.get("challenge.fitness.enabled", False))
+        self.challenge_fitness_min_supported = int(
+            cfg.get("challenge.fitness.min_supported", 30))
+        self.challenge_fitness_min_determinate_rate = float(
+            cfg.get("challenge.fitness.min_determinate_rate", 0.8))
+        self.challenge_lambda_p = float(cfg.get("challenge.fitness.lambda_p", 0.10))
+        self.challenge_lambda_e = float(cfg.get("challenge.fitness.lambda_e", 0.05))
+        self.challenge_lambda_precision = float(
+            cfg.get("challenge.fitness.lambda_precision", 0.05))
+        self.challenge_val_min_delta = cfg.get("challenge.val_min_delta")
+        self.challenge_noop_repeats = max(0, int(
+            cfg.get("challenge.pilot_noop_repeats", 0) or 0))
         self._archive: Any = None
         self._outer_select_rng = random.Random()
         self.cooldown_window = int(cfg.get("outer_select.cooldown_window", 3))
@@ -1803,8 +1816,11 @@ class GanLoop:
                     "task_parent_val_mean": None,
                     "task_val_delta": None,
                     "task_val_n_valid": 0,
+                    "task_val_question_n": 0,
                     "task_val_candidate_genid": None,
                     "task_val_parent_genid": None,
+                    "task_val_noop_deltas": [],
+                    "task_val_noop_abs_q75": None,
                 },
                 "planner_stats": {
                     "op_dist": op_dist,
@@ -1880,12 +1896,61 @@ class GanLoop:
                    if last >= outer - self.cooldown_window}
         try:
             from gan.framework.outer_select import select_and_restore
+            evaluator_fitness: Dict[int, float] = {}
+            if self.challenge_fitness_enabled:
+                from gan.framework import challenge_ledger, challenge_metrics
+                from gan.framework import fitness as F
+                from gan.framework.supernode import load_supernode
+                rows = list((challenge_ledger.load(self.output_dir)
+                             .get("challenges", {}).values()) or [])
+                activation = challenge_metrics.activation_status(
+                    rows, min_supported=self.challenge_fitness_min_supported,
+                    min_determinate_rate=self.challenge_fitness_min_determinate_rate)
+                if activation.get("active"):
+                    def version_metrics(sn: Dict[str, Any]) -> Dict[str, Any]:
+                        version = str(sn.get("evaluator_design_hash") or "")
+                        return challenge_metrics.compute([
+                            row for row in rows if isinstance(row, dict)
+                            and str(row.get("producer_evaluator_version") or "") == version
+                        ])
+
+                    ref_metrics = [version_metrics(ref) for oid in arch.reference
+                                   if (ref := load_supernode(self.output_dir, oid))]
+                    ref_adv = [float(value) for metrics in ref_metrics
+                               if isinstance((value := metrics.get(
+                                   "evaluator_adversarial_score")), (int, float))]
+                    ref_precision = [float(value) for metrics in ref_metrics
+                                     if isinstance((value := metrics.get(
+                                         "challenge_precision_smoothed")), (int, float))]
+                    for entry in arch.elite_entries():
+                        oid = int(entry["outer"])
+                        candidate = load_supernode(self.output_dir, oid)
+                        if not candidate:
+                            continue
+                        metrics = version_metrics(candidate)
+                        adv = metrics.get("evaluator_adversarial_score")
+                        precision = metrics.get("challenge_precision_smoothed")
+                        base = entry.get("fitness_e_base")
+                        if not isinstance(base, (int, float)):
+                            base = entry.get("fitness_e")
+                        if not isinstance(base, (int, float)):
+                            continue
+                        evaluator_fitness[oid] = float(base)
+                        if isinstance(adv, (int, float)):
+                            evaluator_fitness[oid] += self.challenge_lambda_e * F.z_ref(
+                                float(adv), ref_adv)
+                        if isinstance(precision, (int, float)):
+                            evaluator_fitness[oid] += self.challenge_lambda_precision * F.z_ref(
+                                float(precision), ref_precision)
+                self.log_event({"type": "challenge_fitness_selection", "outer": outer,
+                                "activation": activation,
+                                "dynamic_evaluator_candidates": len(evaluator_fitness)})
             sn, report = select_and_restore(
                 self.output_dir, arch, self._roles_root(), self.ledger_writer,
                 self._outer_select_rng, tournament_k=self.tournament_k,
                 max_tries=self.restore_max_tries,
                 tool_overlap_threshold=self.heal_tool_overlap,
-                exclude=exclude)
+                exclude=exclude, evaluator_fitness=evaluator_fitness)
             if sn is None:
                 self.log_event({"type": "outer_parent_none", "outer": outer,
                                 "reason": report.get("reason")})
@@ -1905,8 +1970,9 @@ class GanLoop:
         if not self.outer_select_enabled:
             return
         try:
-            from gan.framework.supernode import load_supernode
+            from gan.framework.supernode import load_supernode, update_supernode
             from gan.framework import fitness as F
+            from gan.framework import challenge_ledger, challenge_metrics
             sn = load_supernode(self.output_dir, outer)
             if not sn:
                 return
@@ -1919,13 +1985,57 @@ class GanLoop:
                 return
             refs = [r for o in arch.reference
                     if (r := load_supernode(self.output_dir, o)) is not None]
+            all_challenges = list((challenge_ledger.load(self.output_dir)
+                                   .get("challenges", {}).values()) or [])
+            activation = challenge_metrics.activation_status(
+                all_challenges,
+                min_supported=self.challenge_fitness_min_supported,
+                min_determinate_rate=self.challenge_fitness_min_determinate_rate)
+            outer_challenge = ((sn.get("planner_stats") or {}).get("challenge") or {})
+            gate = challenge_metrics.challenge_gate(outer_challenge)
+            benchmark = sn.get("benchmark") or {}
+            val_n = len(benchmark.get("val_anchor_ids") or [])
+            default_delta = (2.0 / (7.0 * val_n)) if val_n > 0 else None
+            configured_delta = (float(self.challenge_val_min_delta)
+                                if isinstance(self.challenge_val_min_delta, (int, float))
+                                else default_delta)
+            noop_q75 = benchmark.get("task_val_noop_abs_q75")
+            if isinstance(noop_q75, (int, float)) and configured_delta is not None:
+                configured_delta = max(configured_delta, float(noop_q75))
+            generalized_repair = bool(
+                gate.get("passed")
+                and configured_delta is not None
+                and isinstance(benchmark.get("task_val_delta"), (int, float))
+                and float(benchmark["task_val_delta"]) >= configured_delta)
+            challenge_active = bool(
+                self.challenge_fitness_enabled and activation.get("active"))
+            sn["challenge_fitness"] = {
+                "enabled": self.challenge_fitness_enabled,
+                "active": challenge_active,
+                "activation": activation,
+                "outer_gate": gate,
+                "generalized_repair": generalized_repair,
+                "val_min_delta": configured_delta,
+                "noop_abs_q75": noop_q75,
+            }
+            update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
+            fp_base = F.fitness_p(sn, refs, beta=self.beta_variance,
+                                  lambda_=self.lambda_novelty,
+                                  novelty_k=self.novelty_k, x_ops=self.buckets[0])
+            fe_base = F.fitness_e(sn, refs, w1=self.w1_calibration,
+                                  w2=self.w2_verdict_stability,
+                                  lambda_=self.lambda_novelty,
+                                  novelty_k=self.novelty_k, x_ops=self.buckets[0])
             fp = F.fitness_p(sn, refs, beta=self.beta_variance,
                              lambda_=self.lambda_novelty,
-                             novelty_k=self.novelty_k, x_ops=self.buckets[0])
-            fe = F.fitness_e(sn, refs, w1=self.w1_calibration,
-                             w2=self.w2_verdict_stability,
-                             lambda_=self.lambda_novelty,
-                             novelty_k=self.novelty_k, x_ops=self.buckets[0])
+                             novelty_k=self.novelty_k, x_ops=self.buckets[0],
+                             challenge_active=challenge_active,
+                             lambda_adv=self.challenge_lambda_p,
+                             generalized_repair=generalized_repair)
+            # Evaluator challenge credit is delayed and belongs to the
+            # producer version. Keep the archived base immutable; outer-select
+            # recomputes its adversarial terms from the live ledger.
+            fe = fe_base
             # An entry with no benchmark at all has NO comparable F_p: it would
             # never be pruned (_dominates returns False on None), would occupy a
             # per-cell capacity slot, and could win a tournament draw when its
@@ -1945,6 +2055,8 @@ class GanLoop:
                 "outer": outer,
                 "fitness_p": fp,
                 "fitness_e": fe,
+                "fitness_p_base": fp_base,
+                "fitness_e_base": fe_base,
                 "design_hash": sn.get("planner_design_hash"),
                 "op_dist": (sn.get("planner_stats") or {}).get("op_dist"),
                 "issues_per_task": (sn.get("evaluator_stats") or {}).get("issues_per_task"),
@@ -1953,6 +2065,13 @@ class GanLoop:
             arch.save()
             self.log_event({"type": "supernode_archived", "outer": outer,
                             "fitness_p": fp, "fitness_e": fe, "cell": key})
+            self.log_event({"type": "challenge_fitness_status", "outer": outer,
+                            "enabled": self.challenge_fitness_enabled,
+                            "active": challenge_active,
+                            "activation": activation,
+                            "outer_gate": gate,
+                            "generalized_repair": generalized_repair,
+                            "val_min_delta": configured_delta})
         except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
             soft_fail(f"archive upsert failed (outer {outer}): {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -2456,6 +2575,14 @@ class GanLoop:
             try:
                 candidate_val = run_node(candidate, "candidate")
                 parent_val = run_node(parent, "parent")
+                noop_deltas: List[float] = []
+                noop_repeats = int(getattr(self, "challenge_noop_repeats", 0) or 0)
+                if candidate_val is not None and noop_repeats:
+                    for index in range(1, noop_repeats + 1):
+                        repeat = run_node(candidate, f"noop{index}")
+                        if repeat is not None:
+                            noop_deltas.append(float(repeat["mean"])
+                                                - float(candidate_val["mean"]))
             finally:
                 if task_root and main_head:
                     code_repo.checkout(task_root, main_head)
@@ -2470,8 +2597,17 @@ class GanLoop:
                 candidate_val["mean"] - parent_val["mean"]
                 if candidate_val is not None and parent_val is not None else None)
             benchmark["task_val_n_valid"] = int(candidate_val is not None) + int(parent_val is not None)
+            benchmark["task_val_question_n"] = len(fixed_ids)
             benchmark["task_val_candidate_genid"] = str(candidate.genid)
             benchmark["task_val_parent_genid"] = str(parent.genid)
+            benchmark["task_val_noop_deltas"] = noop_deltas
+            if noop_deltas:
+                absolute = sorted(abs(value) for value in noop_deltas)
+                index = max(0, min(len(absolute) - 1,
+                                   int(0.75 * len(absolute) + 0.999999) - 1))
+                benchmark["task_val_noop_abs_q75"] = absolute[index]
+            else:
+                benchmark["task_val_noop_abs_q75"] = None
             update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
             self.log_event({
                 "type": "task_pair_val_recorded", "outer": outer,

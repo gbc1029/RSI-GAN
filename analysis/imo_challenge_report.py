@@ -36,6 +36,7 @@ def _row(sn: Dict[str, Any]) -> Dict[str, Any]:
     benchmark = sn.get("benchmark") or {}
     planner = (sn.get("planner_stats") or {}).get("challenge") or {}
     evaluator = (sn.get("evaluator_stats") or {}).get("challenge") or {}
+    challenge_fitness = sn.get("challenge_fitness") or {}
     return {
         "outer": sn.get("outer"),
         "state_counts": evaluator.get("state_counts", planner.get("state_counts", {})),
@@ -52,6 +53,9 @@ def _row(sn: Dict[str, Any]) -> Dict[str, Any]:
         "task_val_mean": benchmark.get("task_val_mean"),
         "task_parent_val_mean": benchmark.get("task_parent_val_mean"),
         "task_val_delta": benchmark.get("task_val_delta"),
+        "task_val_noop_abs_q75": benchmark.get("task_val_noop_abs_q75"),
+        "challenge_fitness_active": challenge_fitness.get("active", False),
+        "generalized_repair": challenge_fitness.get("generalized_repair", False),
     }
 
 
@@ -67,13 +71,15 @@ def main(argv=None) -> int:
             print(json.dumps(row, ensure_ascii=False, sort_keys=True))
         return 0
     print("outer\tsupported\tundecidable\tevaluator_adv\tplanner_adv\t"
-          "planner_root_val\ttask_val\ttask_parent_val\ttask_delta\tstate_counts")
+          "planner_root_val\ttask_val\ttask_parent_val\ttask_delta\t"
+          "noop_q75\tfitness_active\tgeneralized_repair\tstate_counts")
     for row in rows:
         print("\t".join(str(row[key]) for key in (
             "outer", "supported_challenges", "undecidable_challenges",
             "evaluator_adversarial_score", "planner_adversarial_score",
             "planner_root_val_mean", "task_val_mean", "task_parent_val_mean",
-            "task_val_delta", "state_counts")))
+            "task_val_delta", "task_val_noop_abs_q75",
+            "challenge_fitness_active", "generalized_repair", "state_counts")))
     return 0
 
 

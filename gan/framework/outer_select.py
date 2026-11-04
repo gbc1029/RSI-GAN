@@ -71,7 +71,9 @@ def role_code_compatibility(supernode: Optional[Dict[str, Any]],
 
 def select_parent(archive: MomeArchive, rng: random.Random,
                   tournament_k: int = 3,
-                  exclude: Optional[set] = None) -> Optional[Dict[str, Any]]:
+                  exclude: Optional[set] = None,
+                  evaluator_fitness: Optional[Dict[int, float]] = None
+                  ) -> Optional[Dict[str, Any]]:
     """Two-level sampling tournament (docs/14 §5.2).
 
     Level 1 draws a uniformly-random non-empty cell; level 2 draws a random
@@ -98,9 +100,13 @@ def select_parent(archive: MomeArchive, rng: random.Random,
     for _ in range(int(tournament_k)):
         ck, elite = rng.choice(candidates)
         picked.append({**rng.choice(elite), "cell": ck})
+    evaluator_fitness = evaluator_fitness or {}
+    def evaluator_score(entry: Dict[str, Any]) -> float:
+        value = evaluator_fitness.get(int(entry.get("outer")), entry.get("fitness_e"))
+        return float(value) if isinstance(value, (int, float)) else float("-inf")
     return max(picked, key=lambda e: (
         e.get("fitness_p") if e.get("fitness_p") is not None else float("-inf"),
-        e.get("fitness_e") if e.get("fitness_e") is not None else float("-inf"),
+        evaluator_score(e) if e.get("outer") is not None else float("-inf"),
     ))
 
 
@@ -141,7 +147,8 @@ def select_and_restore(output_dir: str, archive: MomeArchive,
                        roles_root: Optional[str], writer: Any,
                        rng: random.Random, tournament_k: int = 3,
                        max_tries: int = 3, tool_overlap_threshold: float = 0.5,
-                       exclude: Optional[set] = None) -> tuple:
+                       exclude: Optional[set] = None,
+                       evaluator_fitness: Optional[Dict[int, float]] = None) -> tuple:
     """Pick a parent and restore its designs; returns (supernode, report).
 
     ``report`` = {"outer", "reports", "tries"}; the returned supernode is None
@@ -171,7 +178,9 @@ def select_and_restore(output_dir: str, archive: MomeArchive,
     attempted_outers = set(exclude or set())
     attempted_candidates = set()
     for _ in range(int(max_tries)):
-        entry = select_parent(archive, rng, tournament_k, exclude=attempted_outers)
+        entry = select_parent(
+            archive, rng, tournament_k, exclude=attempted_outers,
+            evaluator_fitness=evaluator_fitness)
         if entry is None:
             rollback()
             return None, {"outer": None, "reports": [], "tries": tried,

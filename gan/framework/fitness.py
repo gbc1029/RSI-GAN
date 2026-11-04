@@ -208,7 +208,9 @@ def _ref_scalars(refs: List[Dict[str, Any]], path: Tuple[str, ...],
 
 def fitness_p(sn: Dict[str, Any], refs: List[Dict[str, Any]],
               beta: float = 0.1, lambda_: float = 0.2, novelty_k: int = 5,
-              x_ops: Optional[Tuple[str, ...]] = None) -> Optional[float]:
+              x_ops: Optional[Tuple[str, ...]] = None,
+              challenge_active: bool = False, lambda_adv: float = 0.10,
+              generalized_repair: bool = False) -> Optional[float]:
     """Planner fitness: benchmark mean minus variance, plus novelty (docs/14 §4.3).
 
     Reads the LEVEL from ``benchmark.val_mean`` when the fixed-root evaluation
@@ -232,14 +234,27 @@ def fitness_p(sn: Dict[str, Any], refs: List[Dict[str, Any]],
     refs_std = _ref_scalars(refs, ("benchmark",), std_key)
     z_mean = z_ref(float(mean), refs_mean)
     z_std = z_ref(float(std) if isinstance(std, (int, float)) else 0.0, refs_std)
-    return z_mean - beta * z_std + lambda_ * novelty(sn, refs, novelty_k, x_ops,
+    base = z_mean - beta * z_std + lambda_ * novelty(sn, refs, novelty_k, x_ops,
                                                      level_key=level_key)
+    if not challenge_active:
+        return base
+    ch = (sn.get("planner_stats") or {}).get("challenge") or {}
+    score = ch.get("planner_adversarial_score")
+    ref_scores = _ref_scalars(refs, ("planner_stats", "challenge"),
+                              "planner_adversarial_score")
+    adv = (float(lambda_adv) * z_ref(float(score), ref_scores)
+           if _is_num(score) else 0.0)
+    if not generalized_repair:
+        adv = min(adv, 0.0)
+    return base + adv
 
 
 def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
               w1: float = 0.6, w2: float = 0.4, lambda_: float = 0.2,
               novelty_k: int = 5,
-              x_ops: Optional[Tuple[str, ...]] = None) -> float:
+              x_ops: Optional[Tuple[str, ...]] = None,
+              challenge_active: bool = False, lambda_adv: float = 0.05,
+              lambda_precision: float = 0.05) -> float:
     """Evaluator fitness: negated calibration error + verdict stability + novelty.
 
     Never touches benchmark level (docs/14 §3). Both scalars are z-scored
@@ -287,6 +302,18 @@ def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
     # vector, so its benchmark columns must still come from ONE field -- pin them
     # to this candidate's level (every supernode has ``mean``, so the column is
     # always well defined).
-    return (-w1 * z_ce + w2 * z_vs
+    base = (-w1 * z_ce + w2 * z_vs
             + lambda_ * novelty(sn, refs, novelty_k, x_ops,
                                 level_key=_level_key(sn.get("benchmark") or {})))
+    if not challenge_active:
+        return base
+    ch = ev.get("challenge") or {}
+    adv = ch.get("evaluator_adversarial_score")
+    precision = ch.get("challenge_precision_smoothed")
+    z_adv = (z_ref(float(adv), _ref_scalars(
+        refs, ("evaluator_stats", "challenge"),
+        "evaluator_adversarial_score")) if _is_num(adv) else 0.0)
+    z_precision = (z_ref(float(precision), _ref_scalars(
+        refs, ("evaluator_stats", "challenge"),
+        "challenge_precision_smoothed")) if _is_num(precision) else 0.0)
+    return base + float(lambda_adv) * z_adv + float(lambda_precision) * z_precision

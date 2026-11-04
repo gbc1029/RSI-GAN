@@ -1,9 +1,4 @@
-"""Pilot-only metrics for settled IMO proof challenges.
-
-These values are diagnostic in the current phase. They are deliberately
-computed from framework-settled adjudication states and never alter fitness or
-parent selection.
-"""
+"""Metrics and two-stage activation gates for settled IMO proof challenges."""
 from __future__ import annotations
 
 from collections import Counter
@@ -70,4 +65,40 @@ def compute(rows: Iterable[Mapping[str, Any]],
     }
 
 
-__all__ = ["compute"]
+def challenge_gate(metrics: Mapping[str, Any], *, min_supported: int = 2,
+                   min_repair_rate: float = 0.5,
+                   min_anchor_gain: float = 0.0) -> Dict[str, Any]:
+    """Apply the §2.3 per-outer challenge gate without scoring it."""
+    supported = int(metrics.get("supported_challenges") or 0)
+    if supported < int(min_supported):
+        return {"status": "insufficient_evidence", "passed": False}
+    counts = metrics.get("state_counts") or {}
+    regression = int(counts.get(adjudication.REGRESSION_AFTER_FALSE_CHALLENGE, 0) or 0)
+    gain = metrics.get("mean_anchor_point_gain")
+    passed = bool(
+        float(metrics.get("repair_rate_smoothed") or 0.0) > float(min_repair_rate)
+        and isinstance(gain, (int, float))
+        and float(gain) >= float(min_anchor_gain)
+        and regression == 0)
+    return {"status": "passed" if passed else "failed", "passed": passed,
+            "false_challenge_regression": regression}
+
+
+def activation_status(rows: Iterable[Mapping[str, Any]], *,
+                      min_supported: int = 30,
+                      min_determinate_rate: float = 0.8) -> Dict[str, Any]:
+    """Return the cumulative gate for enabling adversarial fitness terms."""
+    metrics = compute(rows)
+    supported = int(metrics.get("supported_challenges") or 0)
+    undecidable = int(metrics.get("undecidable_challenges") or 0)
+    total = supported + undecidable
+    rate = float(supported / total) if total else 0.0
+    active = supported >= int(min_supported) and rate >= float(min_determinate_rate)
+    return {"active": active, "supported_challenges": supported,
+            "undecidable_challenges": undecidable,
+            "determinate_rate": rate,
+            "min_supported": int(min_supported),
+            "min_determinate_rate": float(min_determinate_rate)}
+
+
+__all__ = ["compute", "challenge_gate", "activation_status"]

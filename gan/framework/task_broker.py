@@ -29,6 +29,7 @@ from typing import Any, Dict, Tuple
 _SCOPE_RE = re.compile(
     r"(?:0|[1-9][0-9]{0,11}"
     r"|eval_outer(?:0|[1-9][0-9]{0,11})_s(?:0|[1-9][0-9]{0,11})"
+    r"|taskval_outer(?:0|[1-9][0-9]{0,11})_(?:candidate|parent|noop[1-9][0-9]{0,11})"
     r")\Z")
 _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
@@ -252,7 +253,7 @@ class _TaskBrokerState:
         # Fixed-root eval runners materialize their explicit question list
         # before asking the broker. Treat that scope like a parent-scored run
         # for input selection, including independent domains such as imo_proof.
-        fixed_eval = scope_id.startswith("eval_outer")
+        fixed_eval = scope_id.startswith(("eval_outer", "taskval_outer"))
         questions_path = os.path.join(run_dir, "input", "questions.csv")
         if (parent_scored or fixed_eval) and not os.path.isfile(questions_path):
             raise RuntimeError(f"task questions file is missing: {questions_path}")
