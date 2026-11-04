@@ -5,12 +5,14 @@ import os
 import shutil
 import fnmatch
 import re
+import sys
 from pathlib import Path
 
-from utils.constants import REPO_NAME
-from utils.git_utils import apply_patch, commit_repo
-from utils.gl_utils import get_patch_files, get_saved_score, load_archive_data
-
+# Direct execution sets sys.path[0] to domains/imo rather than the repository
+# root. Resolve the root from this file before importing project modules.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 def get_mae_score(domain, output_dir, genid, split="train"):
     # Get score from eval file
@@ -273,6 +275,10 @@ def setup_from_run(dst_dir, generate_dir):
     Create ./proofgrader_repo by copying best node from an optimization run,
     applying patches, committing, then package-ize into 'proofgrader'.
     """
+    from utils.constants import REPO_NAME
+    from utils.git_utils import apply_patch, commit_repo
+    from utils.gl_utils import get_patch_files, get_saved_score, load_archive_data
+
     N = 3
     domain = "imo_grading"
     archive = load_archive_data(os.path.join(generate_dir, "archive.jsonl"), last_only=True)["archive"]
