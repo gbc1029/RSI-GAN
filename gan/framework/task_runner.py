@@ -337,6 +337,15 @@ class DomainTaskRunner:
         if not isinstance(config, dict):
             config = {}
         patch_str = plan.get("patch", "") or ""
+        challenge_audit: Dict[str, Any] = {"triggered": False, "reason": None}
+        if active_challenge_ids:
+            from gan.framework import challenge_ledger
+            challenge_audit = challenge_ledger.audit_single_question_hardcoding(
+                active_challenge_ids, patch_str, config)
+            if challenge_audit.get("triggered"):
+                # Refuse before code_repo.apply_task_patch: the suspicious
+                # response must never enter the task lineage.
+                patch_str = ""
 
         node_dir = paths.work_dir(self.output_dir, genid)
         os.makedirs(node_dir, exist_ok=True)
@@ -356,6 +365,8 @@ class DomainTaskRunner:
         task_patch_files = []
         patch_applied = False
         task_patch_rejected = None
+        if challenge_audit.get("triggered"):
+            task_patch_rejected = "challenge response failed framework audit"
         if self.code_root and base:
             res = code_repo.apply_task_patch(
                 apply_target, "planner", patch_str, genid,
@@ -370,7 +381,10 @@ class DomainTaskRunner:
                 task_patch_files = code_repo.changed_files(patch_str)
             # Only a PROPOSED patch with no new commit is a rejection --
             # "no patch proposed" must not masquerade as one.
-            task_patch_rejected = task_patch_rejection(patch_str, task_code_commit, base_commit)
+            task_patch_rejected = (
+                "challenge response failed framework audit"
+                if challenge_audit.get("triggered") else
+                task_patch_rejection(patch_str, task_code_commit, base_commit))
         elif (patch_str or "").strip() and apply_target:
             # legacy path (no base resolved): pre-branch time-line HEAD behaviour
             try:
@@ -818,6 +832,7 @@ class DomainTaskRunner:
                 "code_ref_mode": code_ref_mode,
                 "task_patch_files": task_patch_files,
                 "task_patch_rejected": task_patch_rejected,
+                "challenge_audit": challenge_audit,
                 "records": records,
                 "report_summary": report_summary,
                 "score_status": score_status,

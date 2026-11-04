@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 from gan.framework import paths
@@ -34,6 +35,43 @@ _FORBIDDEN = {
 
 class ChallengeError(ValueError):
     """Invalid challenge data or an invalid lifecycle transition."""
+
+
+_PROTECTED_RESPONSE_KEYS = re.compile(
+    r"(?:reference[_ -]?solution|grading[_ -]?guidelines|answer[_ -]?key|"
+    r"ground[_ -]?truth|grader[_ -]?output)", re.IGNORECASE)
+
+
+def audit_single_question_hardcoding(
+    challenge_qids: Iterable[Any], patch: Any = "", config: Any = None,
+) -> Dict[str, Any]:
+    """Reject challenge-specific qid/answer leakage in a task response.
+
+    The planner may use general proof methods. This audit only covers explicit
+    challenge identifiers and protected answer/grader fields in the submitted
+    patch or task config; it never reads held-out val data.
+    """
+    qids = [str(q).strip() for q in (challenge_qids or []) if str(q).strip()]
+    try:
+        blob = json.dumps(config, ensure_ascii=False, sort_keys=True,
+                          default=str) if config is not None else ""
+    except (TypeError, ValueError):
+        blob = str(config or "")
+    raw_patch = str(patch or "")
+    added_patch = "\n".join(
+        line[1:] for line in raw_patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++"))
+    text = f"{added_patch}\n{blob}"
+    for qid in qids:
+        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(qid)
+                     + r"(?![A-Za-z0-9_])", text):
+            return {"triggered": True, "reason": "challenge_qid_embedded",
+                    "qid": qid}
+    match = _PROTECTED_RESPONSE_KEYS.search(text)
+    if match:
+        return {"triggered": True, "reason": "protected_answer_or_grader_field",
+                "token": match.group(0)}
+    return {"triggered": False, "reason": None}
 
 
 def empty() -> Dict[str, Any]:

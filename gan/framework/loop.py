@@ -1784,6 +1784,7 @@ class GanLoop:
                     # evaluation set, identical for every supernode -> that is
                     # what ``fitness_p`` compares and what the selection orders by.
                     "val_mean": None,
+                    "planner_root_val_mean": None,
                     "val_std": None,
                     "val_n_valid": 0,
                     # Honest FACT, not configuration intent: only a dedicated
@@ -2347,6 +2348,7 @@ class GanLoop:
                 # an in-run measurement with an out-of-run one (and made the
                 # pre/post-evaluation numbers incomparable).
                 sn["benchmark"]["val_mean"] = result["mean"]
+                sn["benchmark"]["planner_root_val_mean"] = result["mean"]
                 sn["benchmark"]["val_std"] = result["std"]
                 sn["benchmark"]["val_n_valid"] = result["n_valid"]
                 sn["benchmark"]["val_subset"] = (
