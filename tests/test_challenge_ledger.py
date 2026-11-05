@@ -71,6 +71,19 @@ class ChallengeLedgerTest(unittest.TestCase):
             challenge_ledger.available_for_parent(self.data, parent_node="p0"),
             [])
 
+    def test_empty_challenge_filter_does_not_scan_history(self):
+        challenge_ledger.lock(self.data, **self.kwargs)
+        challenge_ledger.consume_for_child(
+            self.data, parent_node="p0", child_node="c1")
+        self.assertEqual(
+            challenge_ledger.reserve_for_child(
+                self.data, parent_node="p0", child_node="c2",
+                challenge_ids=[]),
+            [])
+        with self.assertRaisesRegex(challenge_ledger.ChallengeError, "another child"):
+            challenge_ledger.reserve_for_child(
+                self.data, parent_node="p0", child_node="c2")
+
     @unittest.skipUnless(os.name == "posix", "POSIX filesystem permissions required")
     def test_save_requires_framework_writer_and_load_round_trip(self):
         temp_parent = os.environ.get("GAN_TEST_TMPDIR") or os.getcwd()

@@ -1581,6 +1581,8 @@ class GanLoop:
         data = challenge_ledger.load(self.output_dir)
         producer_rows = challenge_ledger.available_for_parent(
             data, parent_node=parent.genid)
+        if not producer_rows:
+            return []
         expected_qids = {str(row.get("qid")) for row in producer_rows}
         actual_qids = {str(qid) for qid in (child.meta.get("sample_challenge_ids") or [])}
         missing_qids = sorted(expected_qids - actual_qids)
@@ -1589,13 +1591,15 @@ class GanLoop:
                 "child train sample omitted parent challenge qid(s): "
                 + ", ".join(missing_qids))
         rows = challenge_ledger.reserve_for_child(
-            data, parent_node=parent.genid, child_node=child.genid)
+            data, parent_node=parent.genid, child_node=child.genid,
+            challenge_ids=[row.get("challenge_id") for row in producer_rows])
         if not rows:
             return []
         challenge_ledger.save(self.output_dir, data, self.ledger_writer)
         rows = challenge_ledger.consume_for_child(
             data, parent_node=parent.genid, child_node=child.genid,
-            planner_version=self._frozen_role_version("planner"))
+            planner_version=self._frozen_role_version("planner"),
+            challenge_ids=[row.get("challenge_id") for row in producer_rows])
         challenge_ledger.save(self.output_dir, data, self.ledger_writer)
         return [str(row.get("challenge_id")) for row in rows]
 

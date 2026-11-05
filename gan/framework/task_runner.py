@@ -363,10 +363,24 @@ class DomainTaskRunner:
         trusted[question_id_col] = trusted[question_id_col].astype(str)
         trusted = trusted.set_index(question_id_col, drop=False)
         rows = []
+        unresolved: List[Dict[str, Any]] = []
         for challenge in challenges:
             qid = str(challenge.get("qid") or "")
-            if (qid not in trusted.index or qid not in parent_proofs
-                    or qid not in child_proofs):
+            if qid not in trusted.index:
+                unresolved.append({"challenge_id": challenge.get("challenge_id"),
+                                   "qid": qid, "reason": "missing_trusted_qid"})
+                continue
+            missing_sides = []
+            if qid not in parent_proofs:
+                missing_sides.append("parent")
+            if qid not in child_proofs:
+                missing_sides.append("child")
+            if missing_sides:
+                unresolved.append({
+                    "challenge_id": challenge.get("challenge_id"),
+                    "qid": qid,
+                    "reason": "missing_" + "_and_".join(missing_sides) + "_proof",
+                })
                 continue
             reference = trusted.loc[qid]
             rows.append({
@@ -382,9 +396,14 @@ class DomainTaskRunner:
                 "Evidence Ref": str(challenge.get("evidence_ref") or ""),
                 "Repair Criterion": str(challenge.get("repair_criterion") or ""),
             })
-        if len(rows) != len(challenges):
-            raise RuntimeError(
-                "challenge adjudication could not resolve every parent/child proof")
+        if unresolved:
+            self._event(
+                "challenge_adjudicator_unresolved",
+                genid=str(child.genid), requested=len(challenges),
+                resolved=len(rows), unresolved=unresolved,
+            )
+        if not rows:
+            return {}
         input_dir = os.path.join(run_dir, "input")
         os.makedirs(input_dir, exist_ok=True)
         questions_path = os.path.join(input_dir, "questions.csv")

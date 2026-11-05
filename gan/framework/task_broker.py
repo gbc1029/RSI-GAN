@@ -253,12 +253,16 @@ class _TaskBrokerState:
         model = str(self.config["model"])
 
         parent_scored = bool(self.config["parent_scored"])
+        # IMO proof train runs materialize the exact train batch in
+        # ``input/questions.csv`` so challenge anchors cannot be lost to a
+        # second sandbox-side sample. Proof grading still happens afterwards.
+        imo_proof_task = str(self.config.get("domain") or "") == "imo_proof"
         # Fixed-root eval runners materialize their explicit question list
         # before asking the broker. Treat that scope like a parent-scored run
         # for input selection, including independent domains such as imo_proof.
         fixed_eval = scope_id.startswith(("eval_outer", "taskval_outer"))
         questions_path = os.path.join(run_dir, "input", "questions.csv")
-        if (parent_scored or fixed_eval or challenge_adjudication) and not os.path.isfile(questions_path):
+        if (parent_scored or fixed_eval or challenge_adjudication or imo_proof_task) and not os.path.isfile(questions_path):
             raise RuntimeError(f"task questions file is missing: {questions_path}")
 
         launch_num_samples = int(self.config["num_samples"])
@@ -279,11 +283,11 @@ class _TaskBrokerState:
             grading_subset = str(
                 seed_info.get("eval_subset") or self.config["subset"]
             )
-        elif challenge_adjudication:
+        elif challenge_adjudication or imo_proof_task:
             import pandas as pd
             launch_num_samples = len(pd.read_csv(questions_path, dtype=str))
             if launch_num_samples < 1:
-                raise RuntimeError("challenge adjudication has no input rows")
+                raise RuntimeError("IMO proof/challenge adjudication has no input rows")
 
         total_timeout = int(self.config["timeout"])
         stage_timeout = max(1, total_timeout // 2) if domain == "imo_proof" else total_timeout
@@ -365,7 +369,7 @@ class _TaskBrokerState:
             # from the run-persistent seed file written by the driver.
             sample_seed = None
             anchor_ids = None
-            if (not parent_scored and not fixed_eval
+            if (not parent_scored and not fixed_eval and not imo_proof_task
                     and str(self.config.get("sampling_mode", "")) == "seeded"):
                 seed_path = os.path.join(str(self.config["output_dir"]),
                                          "ckpt", "sample_seed.json")
@@ -397,10 +401,10 @@ class _TaskBrokerState:
                 env,
                 stage_timeout,
                 questions_path=(questions_path if
-                                (parent_scored or fixed_eval or challenge_adjudication)
+                                (parent_scored or fixed_eval or challenge_adjudication or imo_proof_task)
                                 else None),
                 dataset_root=(None if
-                              (parent_scored or fixed_eval or challenge_adjudication)
+                              (parent_scored or fixed_eval or challenge_adjudication or imo_proof_task)
                               else str(self.config["repo_root"])),
                 proxy_socket=str(self.config["proxy_socket"]),
                 proxy_token_fd=proxy_token_fd,

@@ -12,7 +12,7 @@ import copy
 import json
 import os
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from gan.framework import paths
 from gan.framework.ledger import guard_writer
@@ -215,10 +215,15 @@ def available_for_parent(data: Dict[str, Any], *, parent_node: Any
 
 
 def reserve_for_child(data: Dict[str, Any], *, parent_node: Any,
-                      child_node: Any) -> List[Dict[str, Any]]:
+                      child_node: Any,
+                      challenge_ids: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
     """Reserve the producer node's challenges for one direct child."""
+    wanted = (None if challenge_ids is None
+              else {str(value) for value in challenge_ids})
     rows = [row for row in data.get("challenges", {}).values()
-            if isinstance(row, dict) and str(row.get("producer_node")) == str(parent_node)]
+            if isinstance(row, dict)
+            and str(row.get("producer_node")) == str(parent_node)
+            and (wanted is None or str(row.get("challenge_id")) in wanted)]
     reserved: List[Dict[str, Any]] = []
     for row in rows:
         status = row.get("status")
@@ -239,9 +244,11 @@ def reserve_for_child(data: Dict[str, Any], *, parent_node: Any,
 
 
 def consume_for_child(data: Dict[str, Any], *, parent_node: Any,
-                      child_node: Any, planner_version: Any = None) -> List[Dict[str, Any]]:
+                      child_node: Any, planner_version: Any = None,
+                      challenge_ids: Optional[Iterable[Any]] = None) -> List[Dict[str, Any]]:
     """Consume a reservation exactly once; repeated resume is idempotent."""
-    rows = reserve_for_child(data, parent_node=parent_node, child_node=child_node)
+    rows = reserve_for_child(data, parent_node=parent_node, child_node=child_node,
+                             challenge_ids=challenge_ids)
     for row in rows:
         if row.get("status") == STATUS_RESERVED:
             row["status"] = STATUS_CONSUMED
