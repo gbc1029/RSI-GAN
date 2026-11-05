@@ -764,6 +764,18 @@ def run_gan_driver(
     eval_anchor_k = max(0, int(eval_section.get("anchor_k") or 0))
     eval_subset, eval_subset_source = _resolve_eval_subset(
         str(eval_section.get("subset") or ""), domain_config)
+    # Episode domains size their fixed-root evaluation DIFFERENTLY: there is no
+    # question dataset to hold out, so the evaluation set is a frozen list of
+    # (task, episode seed) pairs -- ``eval_episodes_per_task`` episodes for every
+    # declared task. ``eval.episodes_per_task`` is three-state like
+    # ``eval.subset``: null/absent = inherit ``domains.yaml
+    # eval_episodes_per_task``, 0 = explicitly off, >0 = explicit override.
+    _raw_eval_episodes = eval_section.get("episodes_per_task", None)
+    eval_episodes_per_task = task_execution.episode_eval_budget(
+        domain_config,
+        None if _raw_eval_episodes in (None, "", "auto")
+        else int(_raw_eval_episodes),
+    )
     # NOTE: the eval_subset_resolved EVENT is logged POST-drop, right after the
     # output_dir ownership check below. Every write into output_dir must belong
     # to the post-drop caller uid: logging it HERE (still root) created
@@ -772,7 +784,12 @@ def run_gan_driver(
     # 2026-10-29). The values stay in locals; the anchor_k refusal below stays
     # pre-drop so a bad pair never reaches the sandbox layer.
     eval_questions = eval_anchor_k if (eval_subset and eval_anchor_k) else 0
-    if eval_questions > int(num_samples):
+    # The evaluation launch must fit the SAME per-outer budgets as the main line;
+    # for an episode domain the evaluation's per-task episode count is its
+    # "question count" (see episode_eval_budget -- NOT capped by num_samples
+    # because nothing re-slices the list).
+    eval_questions = max(eval_questions, int(eval_episodes_per_task or 0))
+    if eval_questions > int(num_samples) and eval_subset and eval_anchor_k:
         raise ValueError(
             f"eval.anchor_k ({eval_questions}) exceeds --num_samples "
             f"({int(num_samples)}): the root-side task broker pins num_samples for "
@@ -1020,7 +1037,8 @@ def run_gan_driver(
         _log_event(output_dir, {"type": "eval_subset_resolved", "domain": domain,
                                 "source": eval_subset_source,
                                 "subset": eval_subset or None,
-                                "anchor_k": eval_anchor_k or None})
+                                "anchor_k": eval_anchor_k or None,
+                                "episodes_per_task": eval_episodes_per_task or None})
 
         # Re-entry policy. Follow the newest completed attempt.
         newest = ckpt_mod.newest_outer_snapshot(output_dir)
@@ -1041,6 +1059,7 @@ def run_gan_driver(
         sample_seed_base: Optional[int] = None
         anchor_ids: list = []
         eval_anchor_ids: list = []
+        eval_episode_ids: list = []
         if sampling_mode == "seeded":
             # A FIXED base seed makes every ARM of an ablation matrix sample the
             # SAME questions (pairing / fairness); 0/absent keeps the old
@@ -1056,10 +1075,14 @@ def run_gan_driver(
                 # fixed, never mixed with a fresh draw).
                 eval_subset=eval_subset or None,
                 eval_anchor_k=eval_anchor_k,
+                # Episode domains: freeze the fixed-root evaluation's episode set
+                # (EVAL_KIND) alongside the main-line anchors. 0 = disabled.
+                eval_episodes_per_task=int(eval_episodes_per_task or 0),
             )
             sample_seed_base = int(seed_info["base_seed"])
             anchor_ids = list(seed_info.get("anchor_ids") or [])
             eval_anchor_ids = list(seed_info.get("eval_anchor_ids") or [])
+            eval_episode_ids = list(seed_info.get("eval_episode_ids") or [])
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": "seeded",
                                     "base_seed": sample_seed_base,
@@ -1069,7 +1092,10 @@ def run_gan_driver(
                                     "eval_subset": seed_info.get("eval_subset"),
                                     "eval_anchor_k": seed_info.get("eval_anchor_k"),
                                     "eval_anchor_ids": eval_anchor_ids,
-                                    "eval_anchor_alloc": seed_info.get("eval_anchor_alloc") or {}})
+                                    "eval_anchor_alloc": seed_info.get("eval_anchor_alloc") or {},
+                                    "eval_episodes_per_task": seed_info.get(
+                                        "eval_episodes_per_task") or 0,
+                                    "eval_episode_ids": eval_episode_ids})
         else:
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": sampling_mode})
@@ -1102,6 +1128,7 @@ def run_gan_driver(
             # scores measured on a different exam incomparable.
             "eval.subset": eval_subset,
             "eval.anchor_k": eval_anchor_k,
+            "eval.episodes_per_task": int(eval_episodes_per_task or 0),
             # Main-line anchor core size. It decides the resolution of the R4
             # stagnation metric (anchor correct-count), so a change here makes
             # two runs' inner-loop stopping behaviour incomparable -- the regime
@@ -1231,6 +1258,10 @@ def run_gan_driver(
                         cmd.extend(["--anchor-ids", ",".join(anchor_ids)])
                     if eval_anchor_ids:
                         cmd.extend(["--eval-anchor-ids", ",".join(eval_anchor_ids)])
+                    if eval_episode_ids:
+                        cmd.extend(["--eval-episode-ids", ",".join(eval_episode_ids)])
+                        cmd.extend(["--eval-episodes-per-task",
+                                    str(int(eval_episodes_per_task))])
                 # Overrides must reach the per-outer worker: it rebuilds its own
                 # loop config from loop.yaml + these overrides. Forwarding ONLY
                 # `ablation` silently reverted every other section (outer_select.*,
@@ -1258,6 +1289,12 @@ def run_gan_driver(
                 # the evaluation is off -- so loop.py and the seed file always
                 # agree (docs/15 §12.5, event eval_subset_resolved).
                 worker_overrides.setdefault("eval", {})["subset"] = eval_subset
+                # Same reasoning for the episode evaluation size: the worker
+                # re-loads loop.yaml, so pin the driver's RESOLVED per-task count
+                # (0 = off) to keep loop.py, the seed file and the broker in
+                # agreement.
+                worker_overrides.setdefault("eval", {})["episodes_per_task"] = \
+                    int(eval_episodes_per_task or 0)
                 if worker_overrides:
                     cmd.extend(["--cfg-overrides", json.dumps(worker_overrides)])
                 if inner is not None:

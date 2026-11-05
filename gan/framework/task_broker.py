@@ -244,6 +244,7 @@ class _TaskBrokerState:
         _node_dir, run_dir = self._run_dir(scope_id)
         from gan.framework import llm_proxy
         from gan.framework import task_execution as tx
+        from gan.framework.loader import load_registry, resolve_domain
 
         domain = str(self.config["domain"])
         model = str(self.config["model"])
@@ -254,27 +255,35 @@ class _TaskBrokerState:
         # for input selection, including independent domains such as imo_proof.
         fixed_eval = scope_id.startswith("eval_outer")
         questions_path = os.path.join(run_dir, "input", "questions.csv")
-        if (parent_scored or fixed_eval) and not os.path.isfile(questions_path):
-            raise RuntimeError(f"task questions file is missing: {questions_path}")
-
         launch_num_samples = int(self.config["num_samples"])
         grading_subset = str(self.config["subset"])
+        # The fixed-root evaluation's input shape (pinned question ids vs a
+        # frozen EPISODE plan) is decided in ONE place from the run seed file.
+        # Episode domains (balrog) have no questions.csv at all: their frozen
+        # ``<task>#<seed>`` list IS the episode set, and ``num_samples`` means
+        # "episodes per task" (the harness runs every declared task).
+        fixed_plan: Dict[str, Any] = {}
         if fixed_eval:
             seed_path = os.path.join(str(self.config["output_dir"]),
                                      "ckpt", "sample_seed.json")
             try:
                 with open(seed_path, "r", encoding="utf-8") as f:
                     seed_info = json.load(f)
-                eval_ids = list(seed_info.get("eval_anchor_ids") or [])
             except (OSError, TypeError, ValueError) as exc:
                 raise RuntimeError(
                     f"fixed-root eval seed is unavailable: {seed_path}") from exc
-            if not eval_ids:
-                raise RuntimeError("fixed-root eval has no eval_anchor_ids")
-            launch_num_samples = len(eval_ids)
-            grading_subset = str(
-                seed_info.get("eval_subset") or self.config["subset"]
-            )
+            try:
+                fixed_plan = tx.fixed_eval_launch_plan(
+                    seed_info, resolve_domain(load_registry(), domain),
+                    default_subset=str(self.config["subset"]))
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
+            launch_num_samples = int(fixed_plan["num_samples"])
+            grading_subset = str(fixed_plan["subset"])
+        # A questions.csv launch and an episode launch are mutually exclusive.
+        question_input = parent_scored or bool(fixed_plan.get("questions_required"))
+        if question_input and not os.path.isfile(questions_path):
+            raise RuntimeError(f"task questions file is missing: {questions_path}")
 
         total_timeout = int(self.config["timeout"])
         stage_timeout = max(1, total_timeout // 2) if domain == "imo_proof" else total_timeout
@@ -358,7 +367,13 @@ class _TaskBrokerState:
             # from the run-persistent seed file written by the driver.
             sample_seed = None
             anchor_ids = None
-            if (not parent_scored and not fixed_eval
+            if fixed_plan.get("mode") == "episodes":
+                # Fixed-root evaluation on an episode domain: the frozen
+                # evaluation list fills EVERY episode slot of every task
+                # (``plan_episodes`` takes anchors first), so there is no
+                # rotating half and ``sample_seed`` must stay None.
+                anchor_ids = list(fixed_plan["anchor_ids"])
+            elif (not parent_scored and not fixed_eval
                     and str(self.config.get("sampling_mode", "")) == "seeded"):
                 seed_path = os.path.join(str(self.config["output_dir"]),
                                          "ckpt", "sample_seed.json")
@@ -370,6 +385,10 @@ class _TaskBrokerState:
                     anchor_ids = list(seed_info.get("anchor_ids") or [])
                 except (OSError, ValueError, KeyError):
                     sample_seed = None  # fall back to the legacy prefix slice
+            # The balrog harness needs ``dataset_root`` (it is also the signal
+            # that makes the harness build the SANDBOXED agent factory) and no
+            # questions file; the question domains need the file and must NOT
+            # see the label root.
             rc, output = tx._run_harness_and_report_local(
                 str(self.config["python"]),
                 run_dir,
@@ -380,8 +399,8 @@ class _TaskBrokerState:
                 model,
                 env,
                 stage_timeout,
-                questions_path=questions_path if (parent_scored or fixed_eval) else None,
-                dataset_root=None if (parent_scored or fixed_eval) else str(self.config["repo_root"]),
+                questions_path=questions_path if question_input else None,
+                dataset_root=None if question_input else str(self.config["repo_root"]),
                 proxy_socket=str(self.config["proxy_socket"]),
                 proxy_token_fd=proxy_token_fd,
                 expected_owner_uid=int(self.config["owner_uid"]),

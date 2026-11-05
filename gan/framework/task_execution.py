@@ -40,8 +40,10 @@ from gan.tools.assembly import assemble_tools_dir_reported
 from utils.episode_seed import (
     ANCHOR_KIND,
     EPISODE_RULE,
+    EVAL_KIND,
     derive_episode_seed,
     episode_id,
+    split_episode_id,
 )
 
 _PY_IGNORE = shutil.ignore_patterns(".env", "__pycache__", "*.pyc")
@@ -1457,6 +1459,122 @@ def episode_anchor_budget(domain_cfg: Dict[str, Any], num_samples: int) -> int:
     return max(0, min(int(declared), n))
 
 
+def episode_eval_budget(domain_cfg: Dict[str, Any],
+                        override: Optional[int] = None) -> int:
+    """EVALUATION episodes PER TASK for an episode domain (``0`` = disabled).
+
+    The episode domain's analogue of ``eval.anchor_k``: the fixed-root
+    evaluation must run an episode set that no sampling rule can move, so the
+    run freezes ``eval_episodes_per_task`` episodes per task and every
+    evaluation round replays exactly those.
+
+    ``loop.yaml eval.episodes_per_task`` (``override``) is THREE-STATE, mirroring
+    ``eval.subset``: ``None`` = inherit the domain's declaration
+    (``domains.yaml eval_episodes_per_task``), ``0`` = explicitly OFF, ``>0`` =
+    an explicit per-task count.
+
+    Deliberately NOT capped by ``num_samples`` (unlike a question set): the
+    harness is told ``eval.num_episodes.<env> = N`` for the evaluation launch and
+    the frozen list carries exactly ``N`` ids per task, so there is no re-slice
+    that could silently truncate it. A count larger than the main line's simply
+    buys a tighter evaluation at proportionally higher cost.
+    """
+    tasks = domain_cfg.get("episode_tasks") or []
+    if not tasks:
+        return 0
+    if override is not None:
+        return max(0, int(override))
+    declared = domain_cfg.get("eval_episodes_per_task")
+    if declared is None or str(declared).strip() in ("", "auto"):
+        return 0
+    return max(0, int(declared))
+
+
+def episode_eval_launch(seed_info: Dict[str, Any],
+                        domain_cfg: Optional[Dict[str, Any]] = None
+                        ) -> Optional[Dict[str, Any]]:
+    """The fixed-root evaluation's EPISODE plan from the run seed file, or None.
+
+    A question-domain run has no ``eval_episode_ids``, so this returns ``None``
+    and the caller keeps the questions.csv path untouched. An episode run with a
+    frozen evaluation plan returns the ids plus the PER-TASK count, which is what
+    the harness needs (``eval.num_episodes.<env>``), NOT the id count: a balrog
+    launch runs every declared task, ``N`` episodes each.
+
+    Malformed ids RAISE (``ValueError`` from ``split_episode_id``) instead of
+    being skipped -- silently shrinking the evaluation set would corrupt exactly
+    the comparison it exists to enable.
+    """
+    ids = [str(x) for x in ((seed_info or {}).get("eval_episode_ids") or [])]
+    if not ids:
+        return None
+    per_task = int((seed_info or {}).get("eval_episodes_per_task") or 0)
+    if per_task <= 0:
+        raise ValueError(
+            "episode evaluation plan has ids but no eval_episodes_per_task; "
+            "the harness launch count cannot be derived")
+    tasks = [str(t) for t in ((domain_cfg or {}).get("episode_tasks") or [])]
+    for raw in ids:
+        split_episode_id(raw)  # refuses a malformed id instead of dropping it
+    if tasks and len(ids) != len(tasks) * per_task:
+        raise ValueError(
+            f"episode evaluation plan is inconsistent: {len(ids)} ids for "
+            f"{len(tasks)} tasks x {per_task} episodes")
+    return {"episode_ids": ids, "per_task": per_task, "tasks": tasks}
+
+
+def fixed_eval_launch_plan(seed_info: Dict[str, Any],
+                           domain_cfg: Optional[Dict[str, Any]],
+                           *, default_subset: str
+                           ) -> Dict[str, Any]:
+    """What a FIXED-ROOT EVALUATION launch feeds the harness (ONE decision point).
+
+    Two mutually exclusive shapes, both derived from the run seed file so the
+    evaluation set is identical in every outer:
+
+    ``episodes`` (episode domains, balrog)
+        ``eval_episode_ids`` -- a frozen ``<task>#<seed>`` list -- becomes the
+        harness ANCHOR list (``plan_episodes`` fills every slot from it, so the
+        round has no rotating half and ``sample_seed`` stays ``None``), and the
+        harness launch count is the PER-TASK count, not ``len(ids)`` (which is
+        tasks x N). No ``questions.csv`` exists for this shape.
+    ``questions`` (CSV / polyglot / imo domains)
+        ``eval_anchor_ids`` -- the pinned question ids -- was already materialized
+        into ``input/questions.csv`` by the eval runner, so the launch count is
+        exactly ``len(ids)`` and the file is REQUIRED.
+
+    Returned keys: ``mode``, ``num_samples``, ``anchor_ids``, ``sample_seed``,
+    ``questions_required``, ``subset``, ``episode_ids``, ``per_task``.
+    """
+    episode = episode_eval_launch(seed_info, domain_cfg)
+    if episode:
+        return {
+            "mode": "episodes",
+            "num_samples": int(episode["per_task"]),
+            "anchor_ids": list(episode["episode_ids"]),
+            "sample_seed": None,
+            "questions_required": False,
+            "subset": str(default_subset),
+            "episode_ids": list(episode["episode_ids"]),
+            "per_task": int(episode["per_task"]),
+        }
+    ids = [str(x) for x in ((seed_info or {}).get("eval_anchor_ids") or [])]
+    if not ids:
+        raise ValueError(
+            "fixed-root eval has no eval_anchor_ids (question set) and no "
+            "eval_episode_ids (episode plan); nothing can be pinned")
+    return {
+        "mode": "questions",
+        "num_samples": len(ids),
+        "anchor_ids": [],
+        "sample_seed": None,
+        "questions_required": True,
+        "subset": str((seed_info or {}).get("eval_subset") or default_subset),
+        "episode_ids": [],
+        "per_task": 0,
+    }
+
+
 def ensure_sampling_seed(
     output_dir: str,
     domain: str,
@@ -1467,6 +1585,7 @@ def ensure_sampling_seed(
     base_seed: Optional[int] = None,
     eval_subset: Optional[str] = None,
     eval_anchor_k: int = 0,
+    eval_episodes_per_task: int = 0,
 ) -> Dict[str, Any]:
     """Create (or reload) the run-persistent sampling seed + anchor core.
 
@@ -1479,6 +1598,11 @@ def ensure_sampling_seed(
     used only by the fixed-root evaluation. Because the loader is
     skip-if-exists, both fields only materialize for a NEW run dir -- an old
     dir keeps its historical sampling and its historical (no-val) supernodes.
+
+    ``eval_episodes_per_task`` is the EPISODE domain's version of the same idea
+    (there is no question dataset to hold out): it freezes
+    ``eval_episode_ids`` from ``episode_tasks`` with ``EVAL_KIND``, used by every
+    fixed-root evaluation round of the run.
 
     BOTH cores draw PROPORTIONALLY across polyglot languages (largest
     remainder, ``proportional_allocate`` / ``_stratified_sample``): the frozen
@@ -1559,7 +1683,28 @@ def ensure_sampling_seed(
     eval_alloc: Dict[str, int] = {}
     eval_subset_used = str(eval_subset or "")
     eval_k_used = max(0, int(eval_anchor_k or 0))
-    if eval_subset_used and eval_k_used > 0:
+    # EPISODE domains (balrog): the evaluation set is a frozen list of
+    # (task, episode seed) pairs drawn with EVAL_KIND, so it can never collide
+    # with the main-line anchor core or with a generation's rotating half. It is
+    # independent of ``eval.subset`` (there is no question dataset to hold out):
+    # ``domains.yaml eval_episodes_per_task`` declares it, ``loop.yaml
+    # eval.episodes_per_task`` overrides it. Wired into the fixed-root evaluation
+    # by ``fixed_eval_launch_plan`` (broker) + ``DomainTaskRunner.fixed_episode_ids``.
+    #
+    # Kept in its OWN list: ``eval_anchor_ids`` means "pinned QUESTION ids" and a
+    # non-empty value there would let the question-shaped eval runner claim an
+    # episode plan (``prepare_questions_by_ids`` against a dataset that has no
+    # such ids). The two shapes stay distinguishable in the seed file.
+    episode_eval_ids: List[str] = []
+    episode_eval_per_task = 0
+    if episode_tasks and int(eval_episodes_per_task or 0) > 0:
+        episode_eval_per_task = int(eval_episodes_per_task)
+        for task in episode_tasks:
+            for i in range(episode_eval_per_task):
+                seed = derive_episode_seed(int(base_seed), EVAL_KIND, task, i)
+                episode_eval_ids.append(episode_id(task, seed))
+            eval_alloc[task] = episode_eval_per_task
+    if not episode_eval_ids and eval_subset_used and eval_k_used > 0:
         try:
             if domain == "polyglot":
                 # eval.subset names a polyglot subset file (subsets/<name>.json
@@ -1601,8 +1746,11 @@ def ensure_sampling_seed(
             "eval_anchor_k": eval_k_used,
             # Episode plan (balrog; empty for question domains). The seed file is
             # the ONE place a run's episode identity is frozen: anchors here,
-            # rotating seeds re-derived per generation from base_seed+genid, and
+            # rotating seeds re-derived per generation from base_seed+genid, the
+            # evaluation set (EVAL_KIND) used by every fixed-root evaluation, and
             # the recipe string so a future rule change is detectable.
+            "eval_episode_ids": episode_eval_ids,
+            "eval_episodes_per_task": episode_eval_per_task,
             "episode_tasks": episode_tasks,
             "anchor_episodes_per_task": episode_anchor_per_task,
             "episode_rule": EPISODE_RULE if episode_tasks else ""}
@@ -2569,8 +2717,16 @@ def _run_harness_and_report_local(
         harness_args.extend(["--dataset_root", child_path(dataset_root)])
         if sample_seed is not None:
             harness_args.extend(["--sample_seed", str(int(sample_seed))])
-            if anchor_ids:
-                harness_args.extend(["--anchor_ids", ",".join(str(a) for a in anchor_ids)])
+        # ANCHORS ARE INDEPENDENT OF THE ROTATING SEED. The fixed-root
+        # evaluation sends a frozen (task, seed) list with NO rotating half
+        # (``sample_seed`` None) and must still reach the harness. Nesting this
+        # inside the ``sample_seed is not None`` branch silently dropped EVERY
+        # evaluation episode: measured 2026-11-05 (balrog_feval_1105) the plan
+        # came out ``episodes=5 anchors=0`` with ``id: null``, i.e. five
+        # time-seeded random episodes -- an INCOMPARABLE evaluation round that
+        # still looked healthy (rc=0, report written, val_mean stamped).
+        if anchor_ids:
+            harness_args.extend(["--anchor_ids", ",".join(str(a) for a in anchor_ids)])
     if proofs_dname:
         harness_args.extend(["--proofs_dname", child_path(proofs_dname)])
     if proxy_token_fd is not None:

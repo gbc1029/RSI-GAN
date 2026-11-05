@@ -2710,18 +2710,27 @@ class GanLoop:
             # unpaired measurement the val evaluation replaced: refuse to stamp
             # a score for it instead of publishing an incomparable number that
             # ``fitness_p`` would then PREFER over the honest main-line mean.
+            #
+            # EPISODE domains (balrog) freeze the equivalent fact as
+            # ``fixed_episode_ids``: one "question" is one episode, so a frozen
+            # (task, seed) list is the same guarantee in a different shape.
             fixed_ids = list(getattr(self.eval_runner, "fixed_question_ids", None) or [])
-            if self.eval_runner is self.task_runner or not fixed_ids:
+            fixed_episode_ids = list(
+                getattr(self.eval_runner, "fixed_episode_ids", None) or [])
+            if self.eval_runner is self.task_runner or not (fixed_ids or fixed_episode_ids):
                 self.log_event({
                     "type": "eval_question_set_missing", "outer": outer,
                     "eval_runner_is_main": self.eval_runner is self.task_runner,
                     "fixed_ids": len(fixed_ids),
+                    "fixed_episode_ids": len(fixed_episode_ids),
                     "eval_subset": self.eval_subset or None,
                     "eval_anchor_k": self.eval_anchor_k,
+                    "eval_episodes_per_task": int(
+                        getattr(self.eval_runner, "fixed_episodes_per_task", 0) or 0),
                     "skipped_note": "no benchmark.val_mean written for this outer",
-                    "hint": ("ckpt/sample_seed.json has no eval_anchor_ids "
-                             "(the loader is skip-if-exists, so a NEW run dir is "
-                             "required for the val evaluation)"),
+                    "hint": ("ckpt/sample_seed.json has no eval_anchor_ids / "
+                             "eval_episode_ids (the loader is skip-if-exists, so a "
+                             "NEW run dir is required for the val evaluation)"),
                 })
                 return
             eval_base = self._resolve_eval_base()
@@ -2905,8 +2914,16 @@ class GanLoop:
                 sn["benchmark"]["val_subset"] = (
                     getattr(self.eval_runner, "subset", None)
                     or self.eval_subset or None)
-                sn["benchmark"]["val_anchor_ids"] = list(
-                    getattr(self.eval_runner, "fixed_question_ids", None) or [])
+                sn["benchmark"]["val_anchor_ids"] = (
+                    list(getattr(self.eval_runner, "fixed_question_ids", None) or [])
+                    or list(getattr(self.eval_runner, "fixed_episode_ids", None) or []))
+                # Episode domains: the per-task episode count the evaluation ran
+                # (a question set has no analogue; the id list already carries
+                # the count there).
+                _val_per_task = int(
+                    getattr(self.eval_runner, "fixed_episodes_per_task", 0) or 0)
+                if _val_per_task:
+                    sn["benchmark"]["val_episodes_per_task"] = _val_per_task
                 sn["benchmark"]["eval_baseline"] = self.eval_base_ref
                 sn["benchmark"]["reevaluated"] = True
             else:

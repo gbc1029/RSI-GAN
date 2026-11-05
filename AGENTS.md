@@ -425,8 +425,8 @@ with a GAN-native data layer.
   **anchor** (frozen per run in `ckpt/sample_seed.json.anchor_ids` — paired
   child-vs-parent comparison, and the evidence the LCB parent selector reads),
   **rotate** (per generation, from `derive_sample_seed(base_seed, genid)`),
-  **eval** (frozen, reserved for the fixed-root evaluation; NOT wired yet —
-  that round would need an episode-plan file instead of `questions.json`).
+  **eval** (frozen, `EVAL_KIND`, for the fixed-root evaluation — see the
+  fixed-root evaluation bullet below).
 - `domains.yaml episode_tasks` + `anchor_episodes_per_task` (`auto` =
   `min(n, max(1, n//2))`, the paper_review rule with a floor of one) are drawn
   by `task_execution.ensure_sampling_seed`. `sampling.anchor_k` deliberately does
@@ -444,7 +444,36 @@ with a GAN-native data layer.
   reporting `fallback_no_anchor`; a missing anchor episode is a miss, matching
   the per-question convention).
 - Seeds/ids never reach an agent face: the archived transcript qid stays
-  `env__task__epNN` and `report_summary` carries no episode ids.- **Episode-level failure isolation** (`domains/balrog/evaluator.py`): one broken
+  `env__task__epNN` and `report_summary` carries no episode ids.
+- **Fixed-root evaluation (the eval layer, wired 2026-11-05)**: an episode domain
+  has no question dataset to hold out, so its evaluation set is a frozen
+  `<task>#<seed>` list instead. `domains.yaml eval_episodes_per_task` (per-task
+  count, `loop.yaml eval.episodes_per_task` three-state override: `null` =
+  inherit / `0` = off / `>0` = override) is drawn by
+  `task_execution.ensure_sampling_seed` with `EVAL_KIND` into
+  `ckpt/sample_seed.json.eval_episode_ids` + `eval_episodes_per_task`, disjoint
+  from both the anchor core and every generation's rotating half.
+  `build.py` builds a second `DomainTaskRunner` with
+  `fixed_episode_ids` + `fixed_episodes_per_task`, and the launch shape is
+  decided in ONE place — `task_execution.fixed_eval_launch_plan` — which the
+  root-side broker calls for `eval_outer*` scopes: episode mode feeds the frozen
+  list as the harness **anchor** list (so `plan_episodes` fills EVERY slot and
+  `sample_seed` stays `None`), passes the PER-TASK count as `num_samples`
+  (NOT `len(ids)`, which is tasks × N), and requires NO `questions.csv`;
+  question mode keeps `questions.csv` + `len(ids)` exactly as before. The loop's
+  comparability guard accepts either shape (`fixed_question_ids` OR
+  `fixed_episode_ids`) and records `val_anchor_ids` / `val_episodes_per_task`
+  with the `val_mean` batch. **`--anchor_ids` is INDEPENDENT of `--sample_seed`**
+  in `_run_harness_and_report_local`: it used to be emitted only inside the
+  seeded branch, so the evaluation plan came out `episodes=5 anchors=0 id:null`
+  — five time-seeded random episodes that still produced rc=0, a report and a
+  `val_mean` (measured 2026-11-05, `balrog_feval_1105`). `DomainTaskRunner` now
+  also refuses such a round: `fixed_eval_plan_mismatch` + a raise, so
+  `run_eval_rounds` drops it (`n_valid=0` → `supernode_eval_degraded`, previous
+  `val_mean` preserved) instead of stamping a different exam's score.
+  Guards: `scripts/local/verify_fixed_eval_episodes.py` (51 checks) and
+  `scripts/local/check_fixed_eval_run.py` (audits a finished run dir).
+- **Episode-level failure isolation** (`domains/balrog/evaluator.py`): one broken
   episode (upstream 502, malformed step response, crashed step child) must not
   void the generation. Both execution paths (`_run_sequential`, `_worker`)
   catch per episode and `_record_aborted` persists a row with the SAME shape a

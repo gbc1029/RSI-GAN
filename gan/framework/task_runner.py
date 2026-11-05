@@ -286,6 +286,8 @@ class DomainTaskRunner:
         sample_seed_base: Optional[int] = None,
         anchor_ids: Optional[list] = None,
         fixed_question_ids: Optional[list] = None,
+        fixed_episode_ids: Optional[list] = None,
+        fixed_episodes_per_task: int = 0,
         token_budget_per_gen: Optional[int] = None,
         ledger_writer: Optional[Any] = None,
         task_repo: Optional[str] = None,
@@ -320,6 +322,21 @@ class DomainTaskRunner:
             # denominator and the broker call budget: it must match the set
             # actually run, and the fixed set is the authority.
             self.num_samples = len(self.fixed_question_ids)
+        # EPISODE domains (balrog): their fixed-root evaluation freezes a list of
+        # ``<task>#<seed>`` ids and replays it, but ``num_samples`` is the PER
+        # TASK episode count the harness runs for EVERY declared task -- so the
+        # authority is ``fixed_episodes_per_task``, never ``len(ids)`` (which is
+        # tasks x N). Keeping this distinct from the question-shaped branch is
+        # what stops the harness from being told "run len(ids) episodes of each
+        # task" (= a silently 5x/40x more expensive evaluation).
+        self.fixed_episode_ids = [str(q) for q in (fixed_episode_ids or [])]
+        self.fixed_episodes_per_task = int(fixed_episodes_per_task or 0)
+        if self.fixed_episode_ids:
+            if self.fixed_episodes_per_task <= 0:
+                raise ValueError(
+                    "fixed_episode_ids requires fixed_episodes_per_task > 0 "
+                    f"(got {self.fixed_episodes_per_task})")
+            self.num_samples = self.fixed_episodes_per_task
         # Thinking-intensity knob for the task child's every LLM call; rides
         # the stdin payload (explicit transport, never an env — same chain as
         # the budget fields; the CLI --reasoning_effort argument feeds it).
@@ -722,7 +739,29 @@ class DomainTaskRunner:
                               event_type="parent_scoring_failed", genid=str(genid))
         else:
             # Preserve independent harness/evaluator domains.
-            if self.fixed_question_ids:
+            _t_harness = time.time()
+            if self.fixed_episode_ids:
+                # Fixed-root evaluation on an EPISODE domain (balrog): the frozen
+                # ``<task>#<seed>`` list is the whole episode set, so there is no
+                # questions.csv and no per-genid draw -- the root-side broker
+                # reads ``eval_episode_ids`` from the run seed file for this
+                # ``eval_outer*`` scope and hands it to the harness as the anchor
+                # list (plan_episodes fills every slot from it). ``num_samples``
+                # is the PER-TASK count (see __init__).
+                sample_info = {
+                    "mode": "fixed_episodes",
+                    "episode_ids": list(self.fixed_episode_ids),
+                    "anchor_ids": list(self.fixed_episode_ids),
+                    "episodes_per_task": self.fixed_episodes_per_task,
+                }
+                rc, _out = tx.run_harness_and_report(
+                    self.python, run_dir, self.domain, run_id, self.subset,
+                    self.num_samples, model, env, self.timeout,
+                    dataset_root=self.repo_root, scope_id=str(genid),
+                    log_path=self.log_path,
+                    reasoning_effort=self.reasoning_effort,
+                )
+            elif self.fixed_question_ids:
                 # Fixed-root evaluation must use the same explicit question
                 # ids on every outer.  The broker receives this file through
                 # the eval scope and must not resample the training subset.
@@ -747,10 +786,21 @@ class DomainTaskRunner:
                 )
             if self.domain == "imo_proof":
                 self._event("task_harness_done", genid=str(genid), rc=rc,
+                            duration_s=round(time.time() - _t_harness, 1),
                             question_timeout_s=question_timeout_s,
                             harness_timeout_s=self.timeout,
                             sample_mode=sample_info.get("mode"),
                             sampled_ids=sample_info.get("sampled_ids"),
+                            anchor_ids=sample_info.get("anchor_ids"))
+            elif self.fixed_episode_ids:
+                # Same audit shape as the question domains: rc, wall clock and
+                # the episode set this evaluation round actually asked for.
+                self._event("task_harness_done", genid=str(genid), rc=rc,
+                            duration_s=round(time.time() - _t_harness, 1),
+                            question_timeout_s=question_timeout_s,
+                            harness_timeout_s=self.timeout,
+                            sample_mode=sample_info.get("mode"),
+                            episodes_per_task=sample_info.get("episodes_per_task"),
                             anchor_ids=sample_info.get("anchor_ids"))
             report = None
             if self.domain == "imo_proof":
@@ -774,6 +824,14 @@ class DomainTaskRunner:
         # counts are recorded -- the seed VALUES stay in ckpt/sample_seed.json
         # and the (unprojected) plan file, so no seed leaks into an agent face.
         plan_path = os.path.join(output_path, "episode_plan.json")
+        # Tripwire for the fixed-root evaluation: the plan the harness actually
+        # ran MUST be the frozen list. Measured 2026-11-05 (balrog_feval_1105):
+        # ``--anchor_ids`` was emitted only inside the seeded branch, so the
+        # evaluation plan came out ``episodes=5 anchors=0 id:null`` -- five
+        # time-seeded RANDOM episodes that still produced rc=0, a report and a
+        # val_mean. A fixed evaluation on a different exam is worse than no
+        # evaluation, so this refuses the round (see below).
+        fixed_eval_plan_ok = None
         if os.path.isfile(plan_path):
             try:
                 with open(plan_path, "r", encoding="utf-8") as f:
@@ -787,6 +845,21 @@ class DomainTaskRunner:
                     anchor_tasks={k: len(v) for k, v in
                                   (_plan.get("anchor_seeds") or {}).items()},
                 )
+                if self.fixed_episode_ids:
+                    plan_ids = sorted(str(e.get("id")) for e in _eps)
+                    expected = sorted(self.fixed_episode_ids)
+                    fixed_eval_plan_ok = (
+                        plan_ids == expected
+                        and all(e.get("anchor") for e in _eps)
+                    )
+                    if not fixed_eval_plan_ok:
+                        self._event(
+                            "fixed_eval_plan_mismatch", genid=str(genid),
+                            expected=len(expected), got=len(plan_ids),
+                            anchors=sum(1 for e in _eps if e.get("anchor")),
+                            missing=len(set(expected) - set(plan_ids)),
+                            unexpected=sorted(set(plan_ids) - set(expected))[:10],
+                        )
             except Exception as e:  # noqa: BLE001 -- audit only, never fatal
                 self._event("episode_plan_unreadable", genid=str(genid),
                             error=str(e)[:200])
@@ -924,6 +997,19 @@ class DomainTaskRunner:
 
         parent_score = parent.value.score if parent is not None else None
         delta = (score - parent_score) if (score is not None and parent_score is not None) else None
+
+        if self.fixed_episode_ids and not fixed_eval_plan_ok:
+            # FAIL CLOSED: a fixed-root evaluation that did NOT run the frozen
+            # episode set is incomparable with every other supernode's. Raising
+            # here (after the evidence copy above, so the artifacts survive)
+            # makes `run_eval_rounds` drop this round: n_valid falls to 0, the
+            # batch reports `supernode_eval_degraded`, and the PREVIOUS val_mean
+            # is preserved instead of being replaced by a different exam's score.
+            raise RuntimeError(
+                f"fixed-root evaluation plan mismatch for genid {genid}: the harness "
+                f"did not run the frozen episode set "
+                f"({len(self.fixed_episode_ids)} ids, "
+                f"{self.fixed_episodes_per_task}/task)")
 
         return Node(
             genid=genid,

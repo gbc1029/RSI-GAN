@@ -180,6 +180,8 @@ def build_gan_loop(
     sample_seed_base: Optional[int] = None,
     anchor_ids: Optional[list] = None,
     eval_anchor_ids: Optional[list] = None,
+    eval_episode_ids: Optional[list] = None,
+    eval_episodes_per_task: int = 0,
 ) -> GanLoop:
     cfg = load_gan_loop_config(cfg_overrides)
     # Domain shape checks: `domains` is required input with NO default (the only
@@ -350,8 +352,40 @@ def build_gan_loop(
     # question draw changes per eval genid (i.e. per outer, incomparable).
     eval_runner = None
     eval_ids = [str(q) for q in (eval_anchor_ids or [])]
+    # EPISODE domains carry a second, mutually exclusive shape: a frozen list of
+    # ``<task>#<seed>`` ids plus the PER-TASK episode count the harness must run
+    # for every task. ``len(eval_episode_ids)`` is tasks x N, so it can NOT feed
+    # ``num_samples`` the way a question list does (that would tell every
+    # evaluation round to run N x tasks episodes per task).
+    eval_ep_ids = [str(q) for q in (eval_episode_ids or [])]
+    eval_per_task = int(eval_episodes_per_task or 0)
     eval_subset = str(cfg.get("eval.subset") or "") or subset
-    if eval_ids:
+    if eval_ep_ids:
+        if eval_per_task <= 0:
+            raise ValueError(
+                f"episode evaluation plan ({len(eval_ep_ids)} ids) needs "
+                f"eval.episodes_per_task > 0 (got {eval_per_task})")
+        eval_runner = DomainTaskRunner(
+            repo_root=repo_root,
+            output_dir=output_dir,
+            domain=domain,
+            subset=eval_subset,
+            num_samples=eval_per_task,
+            default_model=t_model,
+            reasoning_effort=t_effort,
+            code_root=code_root,
+            task_repo=roots.task if (roots is not None and layout == "split") else None,
+            rebuild_view=_rebuild_view,
+            # No per-genid seed and no main-line anchors: the frozen episode plan
+            # IS the selection rule (the broker replays it for eval_outer* scopes).
+            sample_seed_base=None,
+            anchor_ids=[],
+            fixed_episode_ids=eval_ep_ids,
+            fixed_episodes_per_task=eval_per_task,
+            token_budget_per_gen=cfg.get("cost.token_budget_per_gen"),
+            ledger_writer=ledger_writer,
+        )
+    elif eval_ids:
         if len(eval_ids) > int(num_samples):
             # The root-side task broker pins ``num_samples`` for every harness
             # launch and the harness re-slices a provided questions.csv by it,

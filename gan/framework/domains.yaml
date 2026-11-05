@@ -276,6 +276,16 @@ domains:
       - "BabyAI-MixedTrainLocal-v0/putnext"
       - "BabyAI-MixedTrainLocal-v0/pick_up_seq_go_to"
     anchor_episodes_per_task: auto
+    # FIXED-ROOT EVALUATION (第三层：docs/14 §5.5 的 episode 版). 一个 question =
+    # 一个 episode，所以"固定评估题集"= 一份冻结的 (task, seed) 列表：
+    # `eval_episodes_per_task` 个 episode / task，用 `EVAL_KIND` 从 run base seed
+    # 派生，跨 outer / 跨 supernode 完全相同 ⇒ sibling 可比。落地在
+    # ckpt/sample_seed.json 的 `eval_episode_ids`，由 root 侧 broker 在
+    # `eval_outer*` scope 里当作 anchor 列表下发（plan_episodes 先填 anchor，
+    # 所以整轮没有轮换槽）；结果写 benchmark.val_mean（不覆盖主线 mean）。
+    # 代价：每轮评估 = 5 task x N episode x (≤128 step)。N=1 已经是一个完整
+    # 生成的数量级 ⇒ 默认 1，要更细就抬 loop.yaml eval.episodes_per_task 或这里。
+    eval_episodes_per_task: 1
     task_brief: >-
       Play the BabyAI navigation environment. At each step, inspect the mission
       and observation and respond with exactly one valid environment action.
@@ -334,6 +344,11 @@ domains:
       - "env/two_room-make_you-make_win"
       - "env/two_room-make_wall_win"
     anchor_episodes_per_task: auto
+    # 固定根评估：见 balrog_babyai 上方。40 tasks x N episodes x 100 steps，N=1 已
+    # = 4000 步 / 轮（比 babyai 贵一个量级），所以默认 1 且只在
+    # outer_select.enabled 时才会跑；运营者要更大评估集请显式抬这里或
+    # loop.yaml eval.episodes_per_task。
+    eval_episodes_per_task: 1
     task_brief: >-
       Play the Baba Is AI puzzle environment. At each step, inspect the active
       rules and object positions and respond with exactly one valid action.

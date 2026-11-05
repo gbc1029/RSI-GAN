@@ -229,6 +229,14 @@ eval:
   anchor_k: 30                  # 0 = 不做固定锚点评估；建议 >= 20 才有区分度；
                                 # 必须 <= --num_samples（driver 启动 fail-fast，
                                 # 否则 broker 钉值会静默截断评估集）
+  # episode 域（balrog）的固定根评估尺寸：每个 task 固定跑 N 个 episode（第三层
+  # 采样，EVAL_KIND，冻结在 ckpt/sample_seed.json 的 eval_episode_ids）。
+  # 三态（同 eval.subset 的写法）：
+  #   null（默认）= 继承 domains.yaml 各域的 eval_episodes_per_task；
+  #   0           = 显式关闭 episode 固定评估（即使域声明了）；
+  #   >0          = 显式覆盖（不受 --num_samples 约束：episode 列表不会被重切，
+  #                 但 driver 会把评估开销计入每 outer 的 harness 预算）。
+  episodes_per_task: null
   eval_timeout_s: 1800          # 评估批次墙钟预算（轮次之间检查；0 = 不限）
 
 # ---------------------------------------------------------------------------

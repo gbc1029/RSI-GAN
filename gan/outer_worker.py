@@ -36,6 +36,14 @@ def main() -> None:
                    help="Comma-separated FIXED evaluation question ids (held-out "
                         "val subset) used by every fixed-root evaluation of this "
                         "run; empty = fall back to the main-line sampling.")
+    p.add_argument("--eval-episode-ids", dest="eval_episode_ids", default="",
+                   help="Comma-separated FIXED evaluation EPISODE ids "
+                        "('<task>#<seed>', episode domains only) used by every "
+                        "fixed-root evaluation round; empty = same fallback.")
+    p.add_argument("--eval-episodes-per-task", dest="eval_episodes_per_task",
+                   type=int, default=0,
+                   help="Evaluation EPISODES PER TASK for an episode domain "
+                        "(driver-owned; 0 = no fixed episode evaluation).")
     p.add_argument("--cfg-overrides", dest="cfg_overrides", default="",
                    help="JSON-encoded loop.yaml overrides (ablation.* + "
                         "source_access.deny_deep) passed from the driver; "
@@ -74,6 +82,8 @@ def main() -> None:
         sample_seed_base=args.sample_seed_base,
         anchor_ids=[a for a in (args.anchor_ids or "").split(",") if a.strip()],
         eval_anchor_ids=[a for a in (args.eval_anchor_ids or "").split(",") if a.strip()],
+        eval_episode_ids=[a for a in (args.eval_episode_ids or "").split(",") if a.strip()],
+        eval_episodes_per_task=int(args.eval_episodes_per_task or 0),
     )
     loop.resume = True  # load trees/state produced by previous outers
     loop.resume_boundary = args.resume_boundary
