@@ -215,6 +215,28 @@ def extract_run(run_dir):
         )
         sha_prev["prev"] = sha
         per_gen[g] = rec
+        # EPISODE domains (balrog): no predictions.csv and no dataset CSV exist.
+        # The harness report itself carries per-EPISODE truth (question_points),
+        # so a row IS an episode and its score is its PROGRESSION in [0, 1] --
+        # exactly the quantity the online scorer averages (score_key
+        # average_progress / 100). Binary accuracy is meaningless here, which is
+        # why the episode report has its own writer.
+        qpoints = rep.get("question_points") or {}
+        if not preds and qpoints:
+            ep_meta = {e.get("id"): e for e in (rep.get("episodes") or [])}
+            for eid, pts in sorted(qpoints.items()):
+                m = ep_meta.get(str(eid)) or {}
+                rows.append(dict(
+                    run=name, genid=g, question_id=str(eid),
+                    raw_head=f"episode {eid}", score=None,
+                    method="episode_progression",
+                    progression=float(pts or 0.0),
+                    anchor=bool(m.get("anchor")),
+                    task=m.get("task"), seed=m.get("seed"),
+                    steps=m.get("steps"),
+                    aborted=bool(m.get("aborted")), error=m.get("error"),
+                ))
+            continue
         for qid, raw in sorted(preds.items()):
             rows.append(dict(run=name, genid=g, question_id=qid, raw_head=re.sub(r"\s+", " ", (raw or ""))[:120],
                              score=None, method=None))
@@ -232,6 +254,7 @@ def extract_run(run_dir):
                 llm_calls=llm_calls, self_receipts=self_receipts,
                 sessions=cost_ledger.read_session_costs(run_dir),
                 domain=domain, score_mode=score_mode,
+                is_episode=any(r.get("method") == "episode_progression" for r in rows),
                 events=events)
 
 
@@ -260,6 +283,59 @@ def attach_truth(run, truth):
             candidate = (raw or "").strip().lower()
             r["method"] = "label_exact" if candidate else "empty"
             r["score"] = int(bool(candidate and tlab and candidate == tlab))
+
+
+def attach_episode_truth(run):
+    """Balrog: the EPISODE is the question, PROGRESSION is the score.
+
+    There is no winner/outcome dataset and no text prediction to re-parse, so
+    the run's own report.json is the truth: every episode contributes its
+    progression in [0, 1] (the online scorer averages exactly this for
+    ``score_key: average_progress``). An ABORTED episode (infrastructure killed
+    it) is scored 0.0 like a lost episode -- the framework's consensus is that a
+    crashed episode is a played-and-lost episode -- but it carries ``aborted``
+    so a run-level drop is not misread as a regression in play quality.
+    Returns (n_episode_rows, n_aborted).
+    """
+    n = n_ab = 0
+    for r in run["rows"]:
+        prog = float(r.get("progression") or 0.0)
+        r["truth"] = "progression_target=1.0"
+        r["score"] = max(0.0, min(1.0, prog))
+        r["passed"] = bool(r["score"] >= 1.0 - 1e-9)
+        if r.get("aborted"):
+            r["method"] = "aborted"
+            n_ab += 1
+        else:
+            r["method"] = "episode_progression"
+        n += 1
+    return n, n_ab
+
+
+def episode_crosscheck(run):
+    """offline mean progression per generation vs the ONLINE score.
+
+    The balrog report has no ``total_correct``/``total`` (the score is a mean),
+    so the offline==online probe compares the recomputed MEAN with the number
+    the loop actually recorded in ``scores.jsonl``. A mismatch means the report
+    rows and the online aggregation disagree -- drift, not convention.
+    """
+    mism = []
+    for g in run["gens"]:
+        vals = [float(r["score"] or 0.0) for r in run["rows"] if r["genid"] == g]
+        if not vals:
+            continue
+        mine = float(np.mean(vals))
+        theirs = (run["per_gen"].get(g) or {}).get("score")
+        if theirs is None:
+            continue
+        try:
+            theirs_f = float(theirs)
+        except (TypeError, ValueError):
+            continue
+        if abs(mine - theirs_f) > 1e-3:
+            mism.append((g, round(mine, 6), theirs_f))
+    return mism
 
 
 def attach_polyglot_truth(run):
@@ -319,11 +395,178 @@ def fmt_ci(ci):
 # ---------------------------------------------------------------- outputs
 def write_extract_csv(run, outdir):
     path = os.path.join(outdir, "scores_extract.csv")
-    cols = ["run", "genid", "question_id", "truth", "score", "method", "raw_head"]
+    cols = ["run", "genid", "question_id", "truth", "score", "method",
+            "task", "seed", "anchor", "aborted", "raw_head"]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(run["rows"])
+    return path
+
+
+def write_episode_report(run, outdir):
+    """Episode-domain report (balrog): progression means, not binary accuracy.
+
+    Binary "correct/wrong" is the wrong lens here -- an episode is a graded
+    rollout (progression in [0,1]) and the online score is its MEAN. The
+    per-episode table is what localizes a systematic failure (one task family
+    stuck at 0.0 across every generation), and the aborted list keeps an
+    infrastructure outage distinguishable from bad play.
+    """
+    gens = run["gens"]
+    L = [f"# 成绩分析：`{run['name']}`\n"]
+    cfg = (run["model_cfg"] or {})
+    body = {k: v for k, v in cfg.items() if k not in ("type", "ts", "time")}
+    if body:
+        L.append(f"- 模型配置：`{json.dumps(body, ensure_ascii=False)}`")
+    outer_done = [e for e in run["events"] if e.get("type") == "outer_done"]
+    L.append(f"- 规模：{len(gens)} generations（outer_done ×{len(outer_done)}），"
+             f"domain=`{run['domain']}`")
+    L.append("- 口径：episode 域。一个 question = 一个 EPISODE，分数 = 该 episode 的 "
+             "`progression` ∈ [0,1]；在线分数 = 每代所有 episode 的 MEAN"
+             "（`score_key: average_progress` / 100）。没有 dataset 标签，"
+             "truth 不是二元对错。")
+    if run["brief_missing"]:
+        L.append(f"- ⚠ `task_brief_missing` ×{run['brief_missing']}")
+    if run["stagnation"]:
+        L.append(f"- `stagnation_break`：{run['stagnation']}")
+    L.append("")
+
+    L.append("## 每 generation 一览\n")
+    L.append("| gen | 在线 score | 离线 mean progression | episodes | anchors | aborted | "
+             "harness_s | inner_s | cost_tokens | plan_tok | eval_tok |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    for g in gens:
+        r = run["per_gen"][g]
+        rs = [x for x in run["rows"] if x["genid"] == g]
+        mean = float(np.mean([float(x["score"] or 0.0) for x in rs])) if rs else None
+        n_anchor = sum(1 for x in rs if x.get("anchor"))
+        n_ab = sum(1 for x in rs if x.get("aborted"))
+        online = "—" if r["score"] is None else str(r["score"])
+        L.append(f"| {g} | {online} | "
+                 f"{'—' if mean is None else f'{mean:.4f}'} | {len(rs)} | {n_anchor} | {n_ab} "
+                 f"| {r['harness_s']} | {r['inner_s']} | {r['cost_tokens']} "
+                 f"| {r['plan_tokens']} | {r['eval_tokens']} |")
+    L.append("")
+
+    L.append("## 逐 episode（系统性失败定位）\n")
+    L.append("| episode_id | task | seed | anchor | 各 gen progression | 均值 | 备注 |")
+    L.append("|---|---|---|---|---|---|---|")
+    for eid in sorted({r["question_id"] for r in run["rows"]}):
+        rs = [r for r in run["rows"] if r["question_id"] == eid]
+        seq = "/".join(f"{float(r['score'] or 0.0):.2f}" for r in rs)
+        mean = float(np.mean([float(r["score"] or 0.0) for r in rs]))
+        note = []
+        if rs[0].get("anchor"):
+            note.append("anchor")
+        if any(r.get("aborted") for r in rs):
+            note.append("ABORTED")
+        steps = [r.get("steps") for r in rs if r.get("steps")]
+        if steps:
+            note.append(f"steps≤{max(steps)}")
+        L.append(f"| {eid} | {rs[0].get('task')} | {rs[0].get('seed')} "
+                 f"| {'Y' if rs[0].get('anchor') else ''} | {seq} | {mean:.3f} "
+                 f"| {' '.join(note)} |")
+    L.append("")
+
+    aborted = [r for r in run["rows"] if r.get("aborted")]
+    if aborted:
+        L.append("## 中断的 episode（基础设施，非对局质量）\n")
+        for r in aborted:
+            L.append(f"- `{r['question_id']}` gen {r['genid']}: {r.get('error')}")
+        L.append("")
+
+    # per-task aggregation (the balrog analogue of a per-topic breakdown)
+    tasks = {}
+    for r in run["rows"]:
+        tasks.setdefault(str(r.get("task")), []).append(float(r["score"] or 0.0))
+    if tasks:
+        L.append("## 逐 task 均值\n")
+        L.append("| task | episodes | mean progression | 全 0 的比例 |")
+        L.append("|---|---|---|---|")
+        for t in sorted(tasks):
+            v = tasks[t]
+            zeros = sum(1 for x in v if x <= 1e-9)
+            L.append(f"| {t} | {len(v)} | {float(np.mean(v)):.3f} | {zeros}/{len(v)} |")
+        L.append("")
+
+    L.append("## 结论（自动摘要）\n")
+    score = run_scores(run)
+    if len(score):
+        L.append(f"- episode 级 mean progression = {float(np.mean(score)):.4f}"
+                 f"（n={len(score)} 个 episode × gen）")
+    gen_means = np.array([
+        float(np.mean([float(x["score"] or 0.0) for x in run["rows"] if x["genid"] == g]))
+        for g in gens if any(x["genid"] == g for x in run["rows"])
+    ], dtype=float)
+    if len(gen_means) >= 2:
+        L.append(f"- 每代 mean 的 median/CI = {fmt_ci(compute_bootstrap_ci(gen_means))}")
+    flat = [t for t, v in tasks.items() if v and all(x <= 1e-9 for x in v)]
+    if flat:
+        L.append(f"- 全 0 的 task（结构性失败，值得优先看）：{sorted(flat)}")
+    if aborted:
+        L.append(f"- ⚠ {len(aborted)} 个 episode 因基础设施中断记 0 分，"
+                 "这些不是对局质量的证据。")
+    noop = [g for g in gens if run["per_gen"][g]["same_report_as_prev"]]
+    if noop:
+        L.append(f"- 无效子代（与前代同 report_sha）：gen {noop}。")
+    L.append("- 产物：scores_extract.csv / significance.txt / progress.png（本目录）。")
+    L.append("")
+
+    path = os.path.join(outdir, "REPORT.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L) + "\n")
+    return path
+
+
+def write_episode_plot(run, outdir):
+    """Per-generation mean progression + per-episode progression heat strip."""
+    gens = run["gens"]
+    x = np.arange(1, len(gens) + 1)
+    means = [float(np.mean([float(r["score"] or 0.0) for r in run["rows"]
+                            if r["genid"] == g]))
+             if any(r["genid"] == g for r in run["rows"]) else np.nan for g in gens]
+    pred = [run["per_gen"][g]["predicted_score"]
+            if run["per_gen"][g].get("predicted_score") is not None else np.nan
+            for g in gens]
+    vals = [0.0 if v is None or (isinstance(v, float) and np.isnan(v)) else float(v)
+            for v in means]
+    best = np.maximum.accumulate([0.0] + vals)[1:]
+
+    eids = sorted({r["question_id"] for r in run["rows"]})
+    grid = np.full((len(eids), len(gens)), np.nan)
+    for i, eid in enumerate(eids):
+        for j, g in enumerate(gens):
+            hit = [float(r["score"] or 0.0) for r in run["rows"]
+                   if r["question_id"] == eid and r["genid"] == g]
+            if hit:
+                grid[i, j] = hit[0]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4),
+                                   gridspec_kw={"width_ratios": [1, 1.1]})
+    ax1.plot(x, means, "o-", ms=5, label="mean progression", zorder=3)
+    ax1.plot(x, pred, "^--", label="evaluator predicted")
+    ax1.plot(x, best, ":", color="gray", label="best-so-far")
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([str(g) for g in gens], fontsize=8)
+    ax1.set_xlabel("generation")
+    ax1.set_title(f"{run['name']} episode progression")
+    ax1.legend(fontsize=7)
+    ax1.grid(alpha=0.3)
+
+    im = ax2.imshow(grid, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+    ax2.set_yticks(range(len(eids)))
+    ax2.set_yticklabels(eids, fontsize=6)
+    ax2.set_xticks(range(len(gens)))
+    ax2.set_xticklabels([str(g) for g in gens], fontsize=8)
+    ax2.set_xlabel("generation")
+    ax2.set_title("per-episode progression")
+    fig.colorbar(im, ax=ax2, fraction=0.046, pad=0.02)
+    fig.tight_layout()
+    path = os.path.join(outdir, "progress.png")
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
     return path
 
 
@@ -650,6 +893,21 @@ def main():
 
     runs = [extract_run(d) for d in args.run_dirs]
     for run in runs:
+        if run.get("is_episode"):
+            # balrog & friends: no dataset CSV, no predictions.csv. Ground truth
+            # is the report's own per-episode progression (see
+            # attach_episode_truth); the crosscheck replaces "total_correct"
+            # with the recorded mean score, because the online value IS a mean.
+            n_rows, n_ab = attach_episode_truth(run)
+            run["truth_path"] = None
+            run["score_mode"] = "episode_progression"
+            mism = episode_crosscheck(run)
+            if mism:
+                print(f"[WARN] {run['name']} episode score cross-check mismatch "
+                      f"(offline != online, investigate): {mism}")
+            print(f"[NOTE] {run['name']}: episode domain — {n_rows} episode rows "
+                  f"from report.json, {n_ab} aborted (scored 0.0, flagged)")
+            continue
         qids = {r["question_id"] for r in run["rows"]}
         tp, truth = detect_dataset(run["dir"], run["domain"] or "search_arena", qids)
         if run["domain"] == "imo_proof":
@@ -714,6 +972,9 @@ def main():
         if run.get("score_mode") == "proof_points":
             rep_path = write_proof_report(run, run["truth_path"], outdir)
             plot_path = None if args.skip_plots else write_proof_plot(run, outdir)
+        elif run.get("score_mode") == "episode_progression":
+            rep_path = write_episode_report(run, outdir)
+            plot_path = None if args.skip_plots else write_episode_plot(run, outdir)
         else:
             rep_path = write_report(run, run["truth_path"], outdir, cross=cross if run is runs[0] else None)
             plot_path = None if args.skip_plots else write_plot(run, outdir)
@@ -721,6 +982,9 @@ def main():
         if run.get("score_mode") == "proof_points":
             print(f"[OK] {run['name']}: proof score mean "
                   f"{(float(s.mean()) if len(s) else float('nan')):.3f} ({len(s)} scored generations)")
+        elif run.get("score_mode") == "episode_progression":
+            print(f"[OK] {run['name']}: episode mean progression "
+                  f"{(float(s.mean()) if len(s) else float('nan')):.4f} ({len(s)} episode rows)")
         else:
             print(f"[OK] {run['name']}: score {int(s.sum())}/{len(s)} "
                   f"({s.mean():.1%})" if len(s) else f"[OK] {run['name']}: score —/0")

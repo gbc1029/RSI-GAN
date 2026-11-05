@@ -270,7 +270,17 @@ with a GAN-native data layer.
   rule change (regex extraction, paper-style) is DEFERRED — the draft cascade
   and landing steps are archived in `docs/17_polyglot小规模实验轮修复.md` §10.5;
   the offline tool needs NO change when it lands (score_mode dispatch follows
-  the runtime self-description).
+  the runtime self-description). **Episode domains (balrog) have their own
+  branch**: there is no `predictions.csv` and no `dataset*.csv`, so
+  `extract_run` builds one row per EPISODE straight from `report.json`'s
+  `question_points` (the truth the harness already computed), `attach_episode_truth`
+  scores it by PROGRESSION in [0,1] (binary accuracy is meaningless here), and
+  `episode_crosscheck` replaces `report_crosscheck`'s `total_correct` comparison
+  with "recomputed mean vs the mean the loop recorded in `scores.jsonl`". Output
+  is `write_episode_report` / `write_episode_plot`: per-generation means, a
+  per-episode progression grid (systematic-failure localization), a per-TASK
+  breakdown and an explicit list of aborted episodes — an infrastructure drop is
+  never reported as a play-quality regression.
 - **`gan_lineage_graph.py` — genealogy graphs + offline lineage audit** (per
   run: `lineage_inner_{lenient,strict}.png`, `lineage_outer_{lenient,strict}.png`,
   `lineage_audit.md`). Imports `analysis/visualize_archive.py:visualize_graph`
@@ -434,8 +444,19 @@ with a GAN-native data layer.
   reporting `fallback_no_anchor`; a missing anchor episode is a miss, matching
   the per-question convention).
 - Seeds/ids never reach an agent face: the archived transcript qid stays
-  `env__task__epNN` and `report_summary` carries no episode ids.
-
+  `env__task__epNN` and `report_summary` carries no episode ids.- **Episode-level failure isolation** (`domains/balrog/evaluator.py`): one broken
+  episode (upstream 502, malformed step response, crashed step child) must not
+  void the generation. Both execution paths (`_run_sequential`, `_worker`)
+  catch per episode and `_record_aborted` persists a row with the SAME shape a
+  finished episode writes (`episode_id`/`seed`/`anchor`/`progression: 0.0`,
+  `num_steps: 0`) plus `aborted: true` + `error`, so the report counts it as a
+  played-and-lost episode (the denominator never shrinks) and the anchor
+  pairing reads "this anchor missed" — true — instead of the anchor vanishing.
+  `report.json` adds `episodes_aborted[]` and flags those `episodes[]` rows.
+  The one asymmetry is deliberate: if EVERY planned episode aborted, `run()`
+  raises ("infrastructure failure rather than a zero score") so the framework
+  marks the generation invalid instead of writing a fabricated 0.0 into the
+  lineage.
 ### Output layout — `gan/framework/paths.py` is the single source
 
 | path | contents |
@@ -486,6 +507,23 @@ with a GAN-native data layer.
 
 Lessons from the first driver-mode rounds run end-to-end against a real
 OpenAI-compatible gateway — each was invisible to the offline smokes:
+
+- **A venv on a host-shared filesystem taxes every sandboxed child.** Each
+  child re-imports site-packages from scratch and the prefix is bound read-only
+  into every sandbox, so its read latency is multiplied by the child count —
+  and `balrog` spawns one child per ENVIRONMENT STEP. Measured 2026-11-04 with
+  a byte-identical venv (`cp -a`): `import agent.llm` = **3.0 s** on ext4 vs
+  **67.5 s** under `/mnt/d` (WSL 9p/drvfs); through a repo symlink it is still
+  20 s, because `sys.prefix` follows the symlink path and Python keeps
+  resolving site-packages over 9p. This matched the live symptom exactly:
+  alternating ~50 s / ~5 s `llm_call` gaps in a 10-episode round (51.9, 57.3,
+  4.8, 5.0, 56.3, …) with `task_trajectory.wallclock_s = 537.7` for 10 calls.
+  A per-call staging copy was measured at 0.47 s — the hypothesis "staging is
+  the bottleneck" was WRONG, so measure before optimizing. `gan/driver.py`
+  prints a `WARNING` and records `python_prefix_slow_fs` in `driver_start`
+  whenever `sys.prefix` sits under `/mnt|/media|/net`; the fix is deployment
+  (create the venv at a native path and invoke it by ABSOLUTE path), see README
+  "2) Python environment".
 
 - **Latency-dependent transport bugs need slow fakes.** `LocalLLMRelay` held a
   10s socket timeout across its whole pump lifetime: every response slower than

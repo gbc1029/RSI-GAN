@@ -222,6 +222,7 @@ def collect_and_summarize_results(output_dir):
     # the framework scores a missing anchor as a miss.
     question_points = {}
     episodes = []
+    aborted_episodes = []
     _idx = 0
     for env_name, episode_logs in results_summaries.items():
         for episode_log in episode_logs:
@@ -231,7 +232,7 @@ def collect_and_summarize_results(output_dir):
                 eid = f"{eid}+"
             points = max(0.0, min(1.0, float(episode_log.get("progression") or 0.0)))
             question_points[eid] = points
-            episodes.append({
+            row = {
                 "id": eid,
                 "env": env_name,
                 "task": episode_log.get("task"),
@@ -240,13 +241,24 @@ def collect_and_summarize_results(output_dir):
                 "progression": points,
                 "steps": episode_log.get("num_steps"),
                 "invalid_actions": len(episode_log.get("failed_candidates") or []),
-            })
+            }
+            # An ABORTED episode is scored 0.0 (it was played and lost) but it is
+            # flagged, so "the agent fails this task" and "the infrastructure
+            # killed this episode" stay distinguishable offline.
+            if episode_log.get("aborted"):
+                row["aborted"] = True
+                row["error"] = episode_log.get("error")
+                aborted_episodes.append({"id": eid, "env": env_name,
+                                         "task": episode_log.get("task"),
+                                         "error": episode_log.get("error")})
+            episodes.append(row)
     summary["question_points"] = question_points
     summary["question_ids_passed"] = sorted(
         k for k, v in question_points.items() if v >= 1.0 - 1e-9)
     summary["question_ids_failed"] = sorted(
         k for k, v in question_points.items() if v < 1.0 - 1e-9)
     summary["episodes"] = episodes
+    summary["episodes_aborted"] = aborted_episodes
 
     summary_filename = os.path.join(output_dir, "report.json")
     with open(summary_filename, "w") as f:

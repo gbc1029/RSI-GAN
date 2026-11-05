@@ -73,6 +73,36 @@ pip install -r requirements.txt
 pip install -r requirements_dev.txt
 ```
 
+> **Put the venv on a Linux-native filesystem when the repo is on a Windows
+> drive (WSL).** Every sandboxed child process (`domains/harness.py` spawns one
+> per task question — and one per ENVIRONMENT STEP for `balrog`) re-imports the
+> interpreter's site-packages from scratch, so the prefix's read latency is
+> multiplied by the number of children. Measured 2026-11-04 on this repo with a
+> byte-identical venv (`cp -a`):
+>
+> | `import agent.llm` | prefix | wall |
+> |---|---|---|
+> | native (ext4) | `~/venv_nat` | **3.0 s** |
+> | repo on `/mnt/d` (9p/drvfs) | `/mnt/d/.../venv_nat` | **67.5 s** |
+>
+> `python3 -m venv venv_nat` inside a repo that lives under `/mnt/...` therefore
+> adds ~60 s of pure I/O to EVERY step (a 10-episode × 128-step balrog
+> generation then spends hours before the model is called). Recommended:
+>
+> ```bash
+> python3.12 -m venv ~/venv_nat                 # native path
+> ~/venv_nat/bin/pip install -r requirements.txt -r requirements_dev.txt
+> ~/venv_nat/bin/python scripts/run_gan.py ...   # use the ABSOLUTE native path
+> ```
+>
+> A symlink `<repo>/venv_nat -> ~/venv_nat` keeps repo-relative tooling working,
+> but `sys.prefix` then reports the `/mnt/...` path and Python keeps resolving
+> site-packages through 9p (measured 20 s instead of 3 s): for long runs invoke
+> the interpreter by its native absolute path. The driver emits a loud
+> `WARNING` (and records `python_prefix_slow_fs` in the `driver_start` event)
+> whenever `sys.prefix` sits under `/mnt|/media|/net`, so a slow run is
+> diagnosable after the fact.
+
 > `requirements.txt` does NOT carry the `balrog`/`genesis` extras: `balrog` has
 > its own installer (see **3d** — the pins it needs cannot be expressed as
 > requirements lines), and the `genesis` deps stay commented out (GPU / WSL CUDA

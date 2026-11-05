@@ -176,7 +176,79 @@ class EvaluatorManager:
             results = self._run_parallel(agent_factory)
         else:
             results = self._run_sequential(agent_factory)
+
+        # Episode-level failure isolation. ONE broken episode (a gateway 502, a
+        # malformed env response, a crashed step child) must not void the whole
+        # generation: it is recorded as an aborted row scored 0.0, exactly like
+        # an episode the agent lost. But when EVERY episode aborted the honest
+        # reading is "infrastructure", not "the agent plays terribly", so fail
+        # loudly and let the framework mark the generation invalid instead of
+        # feeding a 0.0 into the lineage (that would be a fabricated datapoint).
+        planned = len(self.episodes)
+        aborted = [log for logs in results.values() for log in logs if log.get("aborted")]
+        if planned and len(aborted) >= planned:
+            first = aborted[0].get("error") if aborted else "unknown"
+            raise RuntimeError(
+                f"all {planned} balrog episode(s) aborted -- treating this generation as an "
+                f"infrastructure failure rather than a zero score (first error: {first})"
+            )
+        if aborted:
+            logging.warning(
+                "balrog: %d/%d episode(s) aborted and scored 0.0 (first error: %s)",
+                len(aborted), planned, aborted[0].get("error"),
+            )
         return results
+
+    def _record_aborted(self, ep, error, tb=None):
+        """Persist an ABORTED episode row and return its log.
+
+        The row has the SAME shape a finished episode writes (``progression``,
+        ``num_steps``, ``episode_id``, ``seed``, ``anchor``) so
+        ``collect_and_summarize_results`` counts it as a played episode that
+        scored 0.0 -- the anchor pairing then reads "this anchor missed", which
+        is true, instead of the anchor silently disappearing from the report.
+        """
+        env_name, task, episode_idx = ep.get("env"), ep.get("task"), ep.get("episode_idx")
+        log = {
+            "task": task,
+            "episode_id": ep.get("id") or f"{task}#{ep.get('seed')}",
+            "seed": ep.get("seed"),
+            "anchor": bool(ep.get("anchor")),
+            "progression": 0.0,
+            "num_steps": 0,
+            "episode_return": 0.0,
+            "failed_candidates": [],
+            "action_frequency": {},
+            "aborted": True,
+            "error": f"{type(error).__name__}: {error}"[:300],
+        }
+        if tb:
+            tail = [ln for ln in tb.strip().splitlines() if ln.strip()]
+            if tail:
+                log["error_traceback_tail"] = tail[-1][:300]
+        if env_name is None or task is None:
+            # Nothing to key the row on -- still never raise: the caller is an
+            # except branch and a second exception would wedge the worker pool.
+            return log
+        path = os.path.join(
+            self.output_dir, env_name, task, f"{task}_run_{int(episode_idx or 0):02d}.json"
+        )
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(log, f, indent=4)
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001 -- the row is nice-to-have, the score is not
+            logging.error("cannot persist aborted episode row %s: %s", path, e)
+        # Mirror whatever transcript the episode produced before dying, so the
+        # framework's evidence archive still sees this episode.
+        try:
+            archive_episode_trajectory(self.output_dir, env_name, task, episode_idx)
+        except Exception as e:  # noqa: BLE001 -- audited, never fatal
+            logging.error("aborted-episode archive failed (%s/%s ep%d): %s",
+                          env_name, task, episode_idx, e)
+        return log
 
     def _run_sequential(self, agent_factory):
         """Run the evaluation sequentially.
@@ -197,12 +269,16 @@ class EvaluatorManager:
                 # Create agent
                 chat_history_file = os.path.join(self.output_dir, env_name, task, f"{task}_run_{episode_idx:02d}_chat_history.jsonl")
                 Path(chat_history_file).parent.mkdir(exist_ok=True, parents=True)
-                agent = agent_factory.create_agent(chat_history_file=chat_history_file)
-
-                episode_log = evaluator.run_episode(
-                    task, agent, position=1, episode_idx=episode_idx,
-                    episode_seed=ep["seed"], episode_id=ep["id"], is_anchor=ep["anchor"],
-                )
+                try:
+                    agent = agent_factory.create_agent(chat_history_file=chat_history_file)
+                    episode_log = evaluator.run_episode(
+                        task, agent, position=1, episode_idx=episode_idx,
+                        episode_seed=ep["seed"], episode_id=ep["id"], is_anchor=ep["anchor"],
+                    )
+                except Exception as e:  # noqa: BLE001 -- one episode must not void the run
+                    tb = traceback.format_exc()
+                    logging.error("episode %s aborted: %s\n%s", ep.get("id"), e, tb)
+                    episode_log = self._record_aborted(ep, e, tb)
                 results[env_name].append(episode_log)
                 pbar.update(1)
         return results
@@ -249,7 +325,14 @@ class EvaluatorManager:
 
         while tasks_completed < total_tasks:
             result = results_queue.get()
-            if "error" in result:
+            if result.get("aborted"):
+                # A crashed episode arrives as a NORMAL row (see _worker) so it is
+                # counted and scored 0.0; only the log line differs.
+                logging.error(
+                    "episode %s aborted in %s", result.get("episode_id"), result.get("process_num")
+                )
+                results[result["env_name"]].append(result)
+            elif "error" in result:
                 logging.error(f"Error in task {result['task']} processed by {result['process_num']}: {result['error']}")
                 logging.error(f"Traceback:\n{result['traceback']}")
             else:
@@ -320,16 +403,15 @@ class EvaluatorManager:
                 results_queue.put(result)
             except Exception as e:
                 tb = traceback.format_exc()
-                logging.error(f"Error in worker processing task {task}: {e}\n{tb}")  # pyright: ignore
-                results_queue.put(
-                    {
-                        "env_name": env_name,  # pyright: ignore
-                        "task": task,
-                        "error": str(e),
-                        "traceback": tb,
-                        "process_num": process_num,
-                    }
-                )
+                logging.error(f"Error in worker processing episode {item.get('id')}: {e}\n{tb}")
+                # A crashed episode is still a PLAYED (lost) episode: hand back a
+                # normal log row so the master aggregates it instead of dropping it
+                # (a dropped episode silently shrinks the denominator, which is the
+                # opposite of what the framework's score means).
+                aborted_log = self._record_aborted(item, e, tb)
+                aborted_log["process_num"] = process_num
+                aborted_log["env_name"] = item["env"]
+                results_queue.put(aborted_log)
 
 
 class Evaluator:

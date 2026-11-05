@@ -38,6 +38,38 @@ _OUTPUT_SOURCE_MARKERS = frozenset({
     ".env", ".git", "agent", "baselines", "datasets", "domains", "gan",
 })
 
+# Filesystems that are NOT Linux-native: a WSL mount of a Windows drive (9p /
+# drvfs), plus the generic SMB/NFS-ish prefixes. Every sandboxed child process
+# re-imports the interpreter's site-packages from scratch, so the prefix's
+# read latency is multiplied by the number of child processes -- and a step-based
+# domain (balrog) spawns one child PER ENVIRONMENT STEP.
+_SLOW_FS_PREFIXES = ("/mnt/", "/media/", "/net/")
+
+# Measured 2026-11-04 on this repo, same venv (`cp -a` byte copy), same host:
+#   `import agent.llm`   ext4 3.0 s   vs   /mnt/d (drvfs) 67.5 s
+#   `import litellm`     ext4 4.5 s   vs   /mnt/d (drvfs) 67.5 s
+# Scripts: scripts/local/probe_import_cost.sh + probe_venv_fs.sh.
+_SLOW_FS_MEASURED = ("measured 2026-11-04: `import agent.llm` costs 3.0s from an "
+                     "ext4 prefix and 67.5s from the same venv under /mnt/d")
+
+
+def _slow_prefix_note(prefix: str) -> Optional[str]:
+    """Note when the interpreter prefix sits on a non-native filesystem.
+
+    Corollary: `python3 -m venv` inside the repo (which lives on /mnt/d in WSL)
+    puts ~1.3 GB of site-packages behind 9p, and every sandboxed child pays the
+    import again. Correctness is unaffected -- this is a pure cost warning, so
+    it never blocks a run.
+    """
+    real = os.path.realpath(prefix or "")
+    if not real or not real.startswith(_SLOW_FS_PREFIXES):
+        return None
+    return (f"python prefix {real} is on a host-shared filesystem "
+            f"({', '.join(_SLOW_FS_PREFIXES)}): every sandboxed child re-imports it "
+            f"from scratch [{_SLOW_FS_MEASURED}]. A step-based domain pays this per "
+            "STEP. Recreate the venv on a Linux-native path (e.g. /home/<user>/venv_nat, "
+            "see README 'Setup') and run the driver with it.")
+
 
 def _private_driver_umask(func: Any) -> Any:
     @wraps(func)
@@ -785,6 +817,11 @@ def run_gan_driver(
         raise RuntimeError(f"trusted Python executable is not executable: {python_executable}")
     if os.path.commonpath([python_prefix, python_executable]) != python_prefix:
         raise RuntimeError("trusted Python executable is outside its canonical prefix")
+    # Cost warning only (never fatal): a slow prefix makes every sandboxed child
+    # pay the import again. See _slow_prefix_note for the measured numbers.
+    slow_prefix_note = _slow_prefix_note(python_prefix)
+    if slow_prefix_note:
+        print(f"WARNING: {slow_prefix_note}", flush=True)
 
     models = {
         "task": model_registry.resolve("gan.task"),
@@ -1091,6 +1128,11 @@ def run_gan_driver(
                                 "resume": resume, "force": force,
                                 "latest_completed_outer": (newest["index"] if newest else None),
                                 "start_outer": start,
+                                # Recorded so a slow run is diagnosable after the
+                                # fact: the prefix's filesystem multiplies every
+                                # sandboxed child's startup cost.
+                                "python_prefix": python_prefix,
+                                "python_prefix_slow_fs": slow_prefix_note,
                                 "ablation": _ablation_active,
                                 "cfg_overrides": cfg_overrides or {},
                                 "effective": _effective,
