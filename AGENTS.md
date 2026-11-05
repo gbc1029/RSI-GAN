@@ -65,8 +65,12 @@ live under `scripts/dgmh/`.
   canonical list is unreachable by construction and the fallback preset
   replay always runs on the pristine real list — docs/19 §12.36; the P1
   texts layer survives as the escape-tier tripwire, so
-  ``canonical_mutated`` can no longer fire for named turns) and
-  agent-owned turns are reconciled at turn end
+  ``canonical_mutated`` can no longer fire for named turns), and the
+  portal's ``register_outgoing`` returns a SNAPSHOT copy of the block —
+  the live universe object is unreachable by construction too, with the
+  reconcile's fifth question (registration identity) as the escape-tier
+  backstop and the overrun counters riding the P1 counters tuple
+  (docs/19 §12.38) — and agent-owned turns are reconciled at turn end
   (P1 snapshot/reconcile/restore on BOTH the named-assembly branch and the
   custom policy tail — also the backstop for attribute-level escapes: a
   ``_s``-escape on the policy path is caught, restored, contract-struck;

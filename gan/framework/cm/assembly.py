@@ -48,6 +48,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 #              canonical list is unreachable by construction
 #   outgoing — the raw user text for this call
 #   tokens_used / budget — the chat loop's live usage + armed budget
+#
+# The portal's register_outgoing likewise returns a SNAPSHOT copy of the
+# block, never the live universe object (docs/19 §12.38): reads are
+# identical, writes land on the assembly's own scratch copy.
 AssembleFn = Callable[..., Tuple[List[Dict[str, Any]], str]]
 
 

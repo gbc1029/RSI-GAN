@@ -611,6 +611,11 @@ class CMSession:
                                               compare=False)
     # identity-keyed bookkeeping: rewritten shallow copies are not re-registered
     _by_fp: Dict[str, str] = field(default_factory=dict)  # content fp -> bid
+    # R5 backstop (docs/19 §12.38): each turn_output block's REGISTRATION
+    # fingerprint, keyed by block_id — the reconcile's identity question
+    # compares it against the block's CURRENT text (a live-object leak that
+    # mutates block.text in place desynchronizes the two and is caught).
+    _reg_fp: Dict[str, str] = field(default_factory=dict)
     # Custom methods: registered per session from the
     # named modules' METHODS export — same-level, same-callee surface. The
     # assembly's harvest registers first; the policy's merges at its first
@@ -847,6 +852,7 @@ class CMSession:
                 self._seen_user = True
             block.msg_index = i
             self._by_fp[fp] = block.block_id
+            self._reg_fp[block.block_id] = fp
 
     def _baked_entry_text(self, block: Block) -> str:
         """What a WHOLE-ENTRY rendered copy of this block looks like right
@@ -900,8 +906,19 @@ class CMSession:
         block = self.universe.register("turn_output", outgoing, self.turn,
                                        source="user", pinned=first_user)
         self._seen_user = True
-        self._by_fp[_fingerprint(outgoing)] = block.block_id
-        return block
+        fp_out = _fingerprint(outgoing)
+        self._by_fp[fp_out] = block.block_id
+        self._reg_fp[block.block_id] = fp_out
+        # R5 (docs/19 §12.38): return a SNAPSHOT, never the live Block — the
+        # universe object anchors render span-matching, drop floors and the
+        # reconcile's identity question, and a live hand-out let an
+        # assembly's in-place field write corrupt all of that invisibly
+        # (none of the reconcile questions covered block fields). The copy
+        # makes the live object unreachable BY CONSTRUCTION (the P2 posture,
+        # same as the msgs boundary copy and the ctx faces' to_meta reads):
+        # every legitimate read (block_id/chars/pinned/text) sees identical
+        # values, and a write lands on the assembly's own scratch copy.
+        return copy.deepcopy(block)
 
     def materialize_traj(self, files: List[Tuple[str, str]]) -> int:
         """Snapshot the seat's visible trajectory files into the universe.
@@ -1095,7 +1112,7 @@ class CMSession:
                 violations = self._reconcile_turn(msgs, snap)
                 if violations:
                     self._note_violations(violations)
-                    self._restore_turn(snap, msgs)
+                    self._restore_turn(snap, msgs, outgoing_text=outgoing)
                     raise assembly.AssemblyError(
                         "assembly violated the seam contract: "
                         + ",".join(kind for kind, _refs in violations))
@@ -1113,7 +1130,7 @@ class CMSession:
                 # A crashed or violating attempt may have mutated state before
                 # it raised: go back to the turn-start state BEFORE the preset
                 # replays (idempotent — the violation path already restored).
-                self._restore_turn(snap, msgs)
+                self._restore_turn(snap, msgs, outgoing_text=outgoing)
                 self._note_assembly_failure(ops.clip_diag(str(e), 160), phase=phase,
                                             exc=e,
                                             timed_out=isinstance(
@@ -1272,8 +1289,14 @@ class CMSession:
                  isinstance(m.get("text"), str),
                  isinstance(m.get("content"), str))
                 for m in (msgs or [])],
+            # R7a (docs/19 §12.38): the overrun counters ride the snapshot —
+            # their band-① increment happens AFTER this snapshot and BEFORE
+            # the reconcile, so a contract-rejected turn must roll them back
+            # too (they used to survive the restore: a rejected turn kept
+            # its +1).
             "counters": (self.ops_total, self.ops_applied, self.ops_refused,
-                         self.violations, self.est_chars_saved),
+                         self.violations, self.est_chars_saved,
+                         self.assembly_overruns, self.policy_overruns),
             "refs": set(self._recorded_refs),
             # pinned FLAG of every block existing at snapshot time (docs/19
             # §12.18: the restore surface covers the pre-existing pins — a
@@ -1287,8 +1310,14 @@ class CMSession:
         }
 
     def _restore_turn(self, snap: Optional[Dict[str, Any]],
-                      msgs: List[Dict[str, Any]]) -> None:
-        """Undo everything the failed attempt did, back to the last legal state."""
+                      msgs: List[Dict[str, Any]],
+                      outgoing_text: Optional[str] = None) -> None:
+        """Undo everything the failed attempt did, back to the last legal state.
+
+        ``outgoing_text`` (docs/19 §12.38, R5 backstop) is the seam's
+        outgoing payload — the pristine source for restoring an UNBOUND
+        turn_output block whose fields were mutated in place; bound blocks
+        restore from their canonical msg carrier."""
         if not snap:
             return
         self.view.forms.clear()
@@ -1301,10 +1330,14 @@ class CMSession:
                 self.view.forms[_bid] = "head_tail"
         self.view.rules.clear()
         self.view.rules.update(snap.get("rules") or {})
+        cnt = list(snap.get("counters") or ())
+        defaults = (self.ops_total, self.ops_applied, self.ops_refused,
+                    self.violations, self.est_chars_saved,
+                    self.assembly_overruns, self.policy_overruns)
+        cnt += defaults[len(cnt):]   # tolerate an older 5-field snapshot
         (self.ops_total, self.ops_applied, self.ops_refused, self.violations,
-         self.est_chars_saved) = snap.get("counters") or (
-             self.ops_total, self.ops_applied, self.ops_refused,
-             self.violations, self.est_chars_saved)
+         self.est_chars_saved, self.assembly_overruns,
+         self.policy_overruns) = cnt
         self._recorded_refs.clear()
         self._recorded_refs.update(snap.get("refs") or ())
         # pinned flags of blocks that EXISTED at snapshot time (docs/19
@@ -1316,6 +1349,28 @@ class CMSession:
             block = self.universe.blocks.get(bid)
             if block is not None:
                 block.pinned = bool(was_pinned)
+        # R5 backstop (docs/19 §12.38): a turn_output block whose text no
+        # longer fingerprints to its registration value (or whose chars
+        # desynced) was mutated in place — restore from the pristine
+        # source: the canonical msg carrier for bound blocks, the seam's
+        # outgoing payload for the unbound one. Pure backstop: the portal
+        # hands out snapshots, so agent code cannot reach here.
+        for block in self.universe.blocks.values():
+            if block.kind != "turn_output":
+                continue
+            intact = (self._reg_fp.get(block.block_id)
+                      == _fingerprint(block.text))
+            if intact:
+                continue
+            if block.msg_index is not None and block.msg_index < len(msgs or []):
+                entry = (msgs or [])[block.msg_index]
+                if isinstance(entry, dict):
+                    restored = _msg_text(entry)
+                    if restored:
+                        block.text = restored   # chars derives from text
+            elif outgoing_text and block.block_id == self._by_fp.get(
+                    _fingerprint(outgoing_text)):
+                block.text = outgoing_text  # chars derives from text
         # canonical: put the original text back where the attempt rewrote it
         # (``texts is None`` = the snapshot carried no canonical reference —
         # the policy path without ``msgs``; the layer is simply skipped)
@@ -1339,7 +1394,7 @@ class CMSession:
                         snap: Optional[Dict[str, Any]],
                         check_closure: bool = True
                         ) -> List[Tuple[str, List[str]]]:
-        """The four seam-contract questions (docs/19 §12.14, §12.27).
+        """The five seam-contract questions (docs/19 §12.14, §12.27, §12.38).
 
         1. every non-full form must be explained by a recorded op;
         2. a pinned block may only be ``full`` (or ``dedup``: the prefix-elision
@@ -1399,6 +1454,19 @@ class CMSession:
                 moved = [f"msgs[{i}]" for i, (a, b) in enumerate(zip(before, after))
                          if a != b]
                 out.append(("canonical_mutated", moved[:8]))
+        # 5. registration identity (docs/19 §12.38, R5 backstop): a
+        # turn_output block's text must still fingerprint to its
+        # registration value — the portal hands
+        # out SNAPSHOT copies, so this can only fire through a future
+        # live-object leak (a new portal method handing out state) or a
+        # direct caller. Restored by _restore_turn from the pristine
+        # source (canonical msg carrier / the seam's outgoing payload).
+        tampered = sorted(
+            block.block_id for block in self.universe.blocks.values()
+            if block.kind == "turn_output"
+            and self._reg_fp.get(block.block_id) != _fingerprint(block.text))
+        if tampered:
+            out.append(("block_tampered", tampered))
         return out
 
     def _note_violations(self, violations: List[Tuple[str, List[str]]],
