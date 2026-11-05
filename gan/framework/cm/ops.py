@@ -497,9 +497,28 @@ def fetch(universe: Universe, view: View, block_id: str,
         return {"op": "fetch", "refs": [block_id], "ok": False,
                 "error": "unknown block"}
     if form == "full":
+        # R4 (docs/19 §12.37): a restore REFUNDS the prior form's credit —
+        # the block ships FULL from now on, so this op's net sent-text delta
+        # is minus whatever the current form was saving. Unbound blocks never
+        # render (⑤): no sent effect, no refund. A no-op restore (already
+        # full) records 0. Net accounting: count_ops and the agent-face
+        # handle audit both accept negative saved.
+        prev_form = view.form_of(block_id)
+        if prev_form == "full" or block.msg_index is None:
+            saved = 0
+        elif prev_form == "dedup":
+            # The dedup form is RENDER-anchored: its baked width depends on
+            # the session's system prefix, which a session-free primitive
+            # cannot see (bake() has no dedup branch by design). The refund
+            # records 0 — a documented residual (docs/19 §12.37): the small
+            # dedup credit (prefix minus marker) survives a restore.
+            saved = 0
+        else:
+            saved = -form_saving(block, prev_form,
+                                 view.rules.get(block_id, "fetch"), keep=keep)
         view.set(block_id, "full", "fetch")
         return {"op": "fetch", "refs": [block_id], "ok": True,
-                "text": block.text, "chars": block.chars}
+                "text": block.text, "chars": block.chars, "saved": saved}
     rec = substitute(universe, view, block_id, form, "fetch", 0, keep=keep)
     if rec.get("ok"):
         # The trim's own delivery: the record used to carry no text, so a

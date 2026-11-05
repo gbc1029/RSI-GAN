@@ -180,22 +180,28 @@ def child_visible_traj(files: Iterable[Any], *, output_dir: str, role: str,
                        ) -> Tuple[List[Tuple[str, str]], List[str]]:
     """Split the seat's visible trajectory set into (materializable, skipped).
 
-    ``materialize_traj`` reads whole files. Under driver mode the seat child
-    can only open the trajectory subtree ``role_broker`` binds for it, so any
-    file outside it must be DROPPED BEFORE the transport — otherwise the child
-    would report an unreadable file and the parent would report a good one for
-    the same session.
+    "The seat can open it" is decided by the ONE mount truth table —
+    ``role_broker._seat_mounts``, the same (writable, readonly) allocation
+    ``launch`` turns into bwrap binds (docs/19 §12.37, R6: this filter used
+    to keep its own hand-copied prefix model, which silently drifted when
+    F5 emptied the seat's trajectory mounts — the parent kept files the
+    child could not open and the loss only surfaced as a child-side report
+    field). A file is materializable when it sits under ANY bound root;
+    existence is checked in the CALLER's namespace (the parent filters
+    pre-transport, the child re-checks post-transport — with one table the
+    two can no longer disagree about the MODEL, only about the namespace).
 
     Returns ``(kept, skipped_labels)``. The reasons are the caller's: this
-    function answers only "is this path inside the seat's bind".
+    function answers only "is this path under a bound root (and present
+    here)".
     """
-    root = os.path.realpath(seat_traj_dir(output_dir, role, instance, seat,
-                                          outer=outer))
-    # A SECOND read-only root is bound for the self seat: the PREVIOUS outer's
-    # own-session dir (docs/19 §12.11 decision Q1). Materializing "your last
-    # outer" needs exactly that mount, so the filter accepts the same subtree
-    # under any outer_<O> — nothing else.
-    outers_root = os.path.join(os.path.realpath(output_dir), "trajectory")
+    from gan.framework.role_broker import _seat_mounts
+    try:
+        writable, readonly = _seat_mounts(role, seat, instance, outer)
+    except Exception:  # noqa: BLE001 -- advisory: fail CLOSED (skip, never ship blind)
+        writable, readonly = [], []
+    roots = [os.path.realpath(os.path.join(output_dir, rel))
+             for rel in list(writable) + list(readonly)]
     kept: List[Tuple[str, str]] = []
     skipped: List[str] = []
     for item in files or []:
@@ -206,17 +212,10 @@ def child_visible_traj(files: Iterable[Any], *, output_dir: str, role: str,
         if not label or not path:
             continue
         real = os.path.realpath(str(path))
-        inside = real == root or real.startswith(root + os.sep)
-        if not inside and seat == "self_improve" and real.startswith(outers_root + os.sep):
-            rest = real[len(outers_root) + 1:].split(os.sep)
-            if len(rest) >= 2 and rest[0].startswith("outer_"):
-                tail = os.sep.join(rest[1:])
-                inside = tail.startswith(
-                    os.sep.join(("roles", role, seat)) + os.sep)
-        if inside:
-            if os.path.isfile(real):
-                kept.append((str(label), str(path)))
-                continue
+        inside = any(real == r or real.startswith(r + os.sep) for r in roots)
+        if inside and os.path.isfile(real):
+            kept.append((str(label), str(path)))
+            continue
         skipped.append(str(label))
     return kept, skipped
 

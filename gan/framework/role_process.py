@@ -1359,6 +1359,15 @@ def _worker_main() -> None:
                           "policy": bool(cm_report.get("policy_path")),
                           "traj_kept": int(cm_report.get("traj_kept") or 0),
                           "traj_skipped": list(cm_report.get("traj_skipped") or [])})
+                if cm_report.get("traj_skipped"):
+                    # R6 (docs/19 §12.37): the child-side demotion rides its
+                    # OWN event, symmetric with the parent-side
+                    # cm_traj_skipped — a fields-only signal is invisible to
+                    # event scans, and "parent says kept, child says
+                    # skipped" must be loud from BOTH sides.
+                    _cm_sink({"type": "cm_traj_skipped", "side": "child",
+                              "count": len(cm_report["traj_skipped"]),
+                              "labels": list(cm_report["traj_skipped"])[:20]})
             args = list(request["args"])
             kwargs = dict(request["kwargs"])
             if request["has_broker"]:

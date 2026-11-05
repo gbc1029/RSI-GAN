@@ -374,11 +374,20 @@ class ViewHandle:
         recorded-refs set: the P1 turn reconciliation must be able to explain
         a non-full form even when the caller forgot to thread the record
         through ``finalize_turn`` (or when the op happened inside a custom
-        METHOD, whose own record carries no refs)."""
+        METHOD, whose own record carries no refs).
+
+        Agent-face ok records ALSO land their ``saved`` delta in the
+        session's net accounting (docs/19 §12.37, R4): agent-face records
+        never flow through ``finalize_turn``/``count_ops`` (the only other
+        accumulator), so the handle is where an agent trim credits and a
+        full restore refunds. Policy/assembly records are counted by
+        ``count_ops`` — accumulating here too would double-count."""
         if rec.get("ok"):
             refs = rec.get("refs") or []
             if refs:
                 self._s._recorded_refs.update(str(r) for r in refs)
+            if self.face == "agent" and "saved" in rec:
+                self._s.est_chars_saved += int(rec.get("saved") or 0)
             return rec
         if self.face == "policy":
             self._s.note_violation(rec)
@@ -1829,6 +1838,15 @@ class CMSession:
         run dedup without the window)."""
         if not self.system_prefix:
             return []
+        # R4 (docs/19 §12.37): the render's dedup branch replaces exactly the
+        # head prefix occurrence with the marker — the ACTUAL sent delta is
+        # prefix minus marker, never the bare prefix length. A prefix shorter
+        # than the marker would GROW every old turn: refuse the whole stage
+        # (the same "saves nothing" semantics as compact's MIN_COMPACT_SAVE
+        # gate; realistic tool-use headers are far longer than the marker).
+        head_saving = len(self.system_prefix) - len(_DEDUP_MARKER)
+        if head_saving <= 0:
+            return []
         out: List[Dict[str, Any]] = []
         blocks = [b for b in self.universe.ordered()
                   if b.kind == "turn_output"]
@@ -1847,7 +1865,7 @@ class CMSession:
             self.view.set(block.block_id, "dedup", "system_prefix")
             out.append({"op": "dedup", "refs": [block.block_id], "ok": True,
                         "rule": "system_prefix",
-                        "saved": len(self.system_prefix)})
+                        "saved": head_saving})
         return out
 
     def render(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
