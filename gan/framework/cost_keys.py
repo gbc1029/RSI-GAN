@@ -153,9 +153,15 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
     "cm_policy": {
         "type": "str", "max_len": 64, "default": None,
         "consumer": ("cm seam (custom mode: stems the policy module in "
-                     "gan/components/<role>/cm/; named slot, delivered as "
-                     "cm_policy.py — the sort-first legacy scan is only the "
-                     "unnamed fallback)"),
+                     "gan/components/<role>/cm/; NAMED SLOT ONLY — an unnamed "
+                     "or unresolvable stem is a loud cm_module_unresolved and "
+                     "the custom->slice keys rewrite, never a scan fallback "
+                     "(role side: loop._build_cm_session / "
+                     "cm_wiring.resolve_named). The sort-first legacy scan "
+                     "survives ONLY on the TASK-side snapshot delivery for "
+                     "UNNAMED designs (task_execution.materialize_cm_snapshot, "
+                     "reported as policy_selection=legacy_sort_first); a named "
+                     "module ships there under the fixed name cm_policy.py)"),
     },
     "cm_assembly": {
         "type": "str", "max_len": 64, "default": None,

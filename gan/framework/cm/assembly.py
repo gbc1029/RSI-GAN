@@ -43,7 +43,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # An assembly function's frozen contract (positional, per CMSession.assemble_turn):
 #   session  — the live CMSession (primitive surface + clamped parameters)
-#   msgs     — the canonical history (raw dicts; never mutated — 双记)
+#   msgs     — a per-turn BOUNDARY COPY of the canonical history (docs/19
+#              §12.36): the assembly owns its composition on the copy; the
+#              canonical list is unreachable by construction
 #   outgoing — the raw user text for this call
 #   tokens_used / budget — the chat loop's live usage + armed budget
 AssembleFn = Callable[..., Tuple[List[Dict[str, Any]], str]]

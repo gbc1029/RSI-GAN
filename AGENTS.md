@@ -61,7 +61,12 @@ live under `scripts/dgmh/`.
   stats; policy failures ride ``policy_report`` → ``recent["cm_policy"]``
   into both self-improve prompts (mirror of the assembly report channel);
   the agent-owned assembly receives the P2 ``SessionPortal``
-  (narrowed facade) and agent-owned turns are reconciled at turn end
+  (narrowed facade) and a per-turn BOUNDARY COPY of msgs (deepcopy; the
+  canonical list is unreachable by construction and the fallback preset
+  replay always runs on the pristine real list — docs/19 §12.36; the P1
+  texts layer survives as the escape-tier tripwire, so
+  ``canonical_mutated`` can no longer fire for named turns) and
+  agent-owned turns are reconciled at turn end
   (P1 snapshot/reconcile/restore on BOTH the named-assembly branch and the
   custom policy tail — also the backstop for attribute-level escapes: a
   ``_s``-escape on the policy path is caught, restored, contract-struck;
@@ -442,7 +447,8 @@ non-repeatable:
   (and `docs/cost_tem.md`); `docs/19_CM问题与解决.md` (CM audit ledger +
   §12 batch records — the authority for CM done/open status; the `outer=2`
   real-round acceptance is PASSED (§12.22); still open there:
-  F5 anti-tamper user-deferred, T3 process isolation deferred;
+  T3 process isolation deferred (F5 — audit-stream write authority +
+  parent-side hash chain — has since landed in §12.28, see below);
   CM-08 trajectory seat reads CLOSED in §12.24 (segment index/query RPC,
   offset/fetch/tail/head/grep, per-request 120k cap); CM-06 CLOSED in
   §12.25 — usage face renamed ctx_budget→ctx_usage (budget = runtime cap,

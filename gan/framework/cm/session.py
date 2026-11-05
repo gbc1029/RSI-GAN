@@ -951,6 +951,36 @@ class CMSession:
         return registered
 
     # -------------------------------------------------------------- the seam
+    def _boundary_copy(self, msgs):
+        """The per-turn defensive copy handed to the agent-owned assembly
+        (docs/19 §12.36, R1): the seam's ``msgs`` is a list-local shell whose
+        ENTRY DICTS are shared with the loop's ``raw_history`` — handing the
+        live objects to agent code would let an in-place field write corrupt
+        the cross-turn canonical (the P1 restore covers the text carriers
+        only), and a list grow/shrink survives the restore into the preset
+        replay. The copy makes the canonical unreachable BY CONSTRUCTION;
+        the P1 texts layer stays as the escape-tier tripwire (§12.27
+        pattern: backstop, never the primary guard), and the fallback
+        preset replay at the end of :meth:`assemble_turn` runs on the
+        PRISTINE real list.
+
+        deepcopy (not ``dict(m)``): under the flat str-valued msgs contract
+        the two are equivalent (strings are atomic — deepcopy returns them
+        unchanged, so long texts are never copied), and deepcopy also
+        isolates a future nested-mutable value instead of reopening the
+        write-through channel (N5c posture). A non-copyable entry is OUT of
+        contract: loud ``cm_msg_contract_violation`` envelope + TypeError,
+        raised OUTSIDE the P1 catch (a framework/contract break is never a
+        module strike)."""
+        try:
+            return [copy.deepcopy(m) for m in msgs]
+        except Exception as e:  # noqa: BLE001 -- out-of-contract shape: loud, no strike
+            self._emit({"type": "cm_msg_contract_violation", "turn": self.turn,
+                        "where": "boundary_copy",
+                        "detail": ops.clip_diag(str(e), 160)})
+            raise TypeError(
+                f"cm msgs contract violated at boundary_copy: {e}") from e
+
     def assemble_turn(self, msgs: List[Dict[str, Any]],
                       outgoing: str,
                       tokens_used: int = 0,
@@ -980,7 +1010,16 @@ class CMSession:
         failed module and keeps the rest (docs/19 §12.30 rule 1) — and
         leaves a durable trace: ``cm_assembly_failed`` per failing turn,
         ``degraded`` on that turn's ``cm_view``, ``assembly_disabled`` in
-        every subsequent ``cm_view`` — a fallback is never silent."""
+        every subsequent ``cm_view`` — a fallback is never silent.
+
+        The assembly never sees the live ``msgs``: it receives a per-turn
+        BOUNDARY COPY (``_boundary_copy``, docs/19 §12.36) whose entries
+        share nothing with the loop's ``raw_history``, so the cross-turn
+        canonical is unreachable by construction and the fallback replay
+        always runs on the pristine real list. The P1 snapshot/reconcile
+        stays as the escape-tier tripwire (view forms, pins, counters,
+        refs — and the canonical texts layer, which can now only fire for
+        direct callers)."""
         self._require_msg_dicts(msgs, "assemble_turn")
         self.turn += 1
         self._turn_degraded = False
@@ -1013,14 +1052,21 @@ class CMSession:
             # except the block universe, which is add-only by contract (its
             # extra blocks are unreferenced and never sent).
             snap = self._snapshot_turn(msgs)
+            # R1 (docs/19 §12.36): the agent-owned assembly receives a
+            # BOUNDARY COPY, never the live list — the canonical is
+            # unreachable by construction, and the fallback preset replay at
+            # the end of this method runs on the PRISTINE real list. The
+            # copy failure raises OUTSIDE the P1 try on purpose (a contract
+            # break is never a module strike).
+            assembly_msgs = self._boundary_copy(msgs)
             try:
                 # P2: the agent-owned assembly gets the PORTAL, not the live
                 # session (the published primitive surface + read-only
                 # parameters; ``emit_view``/``count_ops``/state fields are
                 # refused). The parameter name stays ``session``.
                 result, over_ms = assembly.run_assembly(
-                    named, self._portal(), msgs, outgoing, tokens_used, budget,
-                    self.assembly_exec_ms)
+                    named, self._portal(), assembly_msgs, outgoing,
+                    tokens_used, budget, self.assembly_exec_ms)
                 if not (isinstance(result, tuple) and len(result) == 2
                         and isinstance(result[0], list)
                         and isinstance(result[1], str)):

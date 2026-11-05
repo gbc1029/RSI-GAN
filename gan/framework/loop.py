@@ -3988,10 +3988,17 @@ class GanLoop:
                         # session files (the read_session_trajectory face) over
                         # the declared universe: this outer + the previous outer
                         # (L65 ruling — "self improve should read the previous
-                        # outer's trajectory"). Under a cross-process seat the
-                        # previous outer's tree is NOT inside the seat bind, so
-                        # the parent drops it (and says so) instead of shipping
-                        # a file the child cannot open.
+                        # outer's trajectory"). Bind reality (docs/19 §12.13 +
+                        # §12.28 F5): the PREVIOUS outer's own-session dir is
+                        # bound READ-ONLY for the self seat, so those files
+                        # ship and materialize; the CURRENT outer's trajectory
+                        # dir is mounted NOT AT ALL since F5 (rows are
+                        # protocol-forwarded to the parent now), so a
+                        # current-outer own-session file (which only exists on
+                        # a resumed/re-run outer) is kept by this parent-side
+                        # filter and demoted CHILD-side to
+                        # cm_session_built.traj_skipped — the loss is loud
+                        # there, not here.
                         self._seat_cm_install(
                             role_obj, role, ck_si, seat="self_improve",
                             outer=outer, traj_genids=si_refs,

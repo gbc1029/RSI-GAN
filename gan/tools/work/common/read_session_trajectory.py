@@ -478,6 +478,46 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
                 + f" chars={entry['chars']}")
         return f"{meta}\n{clip_head(entry['text'], cap)}"
 
+    if tail or head or grep:
+        # §12.36 (R2): content ops serve in ANY mode on BOTH arms — the
+        # in-process ladder previously dropped these three parameters into
+        # the index/blob path with no note. One scan over the visible
+        # sessions, payload first, archived-file fallback (the seat arm's
+        # Tier 1/Tier 2 sources and caps).
+        sess = _active_traj_session()
+        segs = _payload_segments(sess, entries) if sess is not None else None
+        if segs is not None:
+            def _lookup(seg):
+                bid = sess.traj_segments.get(seg["seg_id"])
+                blk = sess.universe.get(bid) if bid else None
+                return blk.text if blk is not None else None
+        else:
+            paths = [p for _l, p in entries if os.path.isfile(p)]
+            if not paths:
+                qnote = _quarantine_note(
+                    _quarantined_labels(output_dir, outer, outers, role))
+                msg = "No session trajectories in your visible outers yet."
+                return msg + ("\n" + qnote if qnote else "")
+            from gan.framework.cm.traj_index import (build_traj_index,
+                                                     segment_entry)
+            segs = (build_traj_index(paths, labels=sorted(labels))
+                    .get("segments") or [])
+            by_label = dict(entries)
+
+            def _lookup(seg):
+                src = by_label.get(seg.get("file"))
+                entry = (segment_entry(src, seg.get("line_no"))
+                         if src else None)
+                return entry["text"] if entry else None
+        from gan.framework.cm.traj_index import grep_page, tail_head_page
+        if grep:
+            try:
+                return grep_page(segs, _lookup, grep)
+            except ValueError as e:
+                return f"Error: {e}"
+        return tail_head_page(segs, _lookup, n=int(tail or head or 1),
+                              tail=bool(tail), max_chars=cap)
+
     if genid is not None:
         try:
             req_outer, req_genid = _parse_genid_ref(genid, outer)

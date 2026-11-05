@@ -239,6 +239,32 @@ def _serve_fetch(output_dir, fetch, allowed, genid_param, cap, sess):
     return f"{meta}\n{clip_head(entry['text'], cap)}"
 
 
+def _inproc_segments(output_dir, genid, sess):
+    """``(segments, text_lookup)`` for ONE genid on the in-process arm —
+    payload first (the session's materialized scan), archived-file fallback.
+    Mirrors the seat arm's Tier 1/Tier 2 sources so BOTH arms serve the SAME
+    segments (docs/19 §12.36, R2). ``(None, None)`` = nothing servable."""
+    segs = _payload_segments(sess, genid) if sess is not None else None
+    if segs is not None:
+        def _lookup(seg):
+            bid = sess.traj_segments.get(seg["seg_id"])
+            blk = sess.universe.get(bid) if bid else None
+            return blk.text if blk is not None else None
+        return segs, _lookup
+    path = _traj_path(output_dir, genid)
+    if not path or not os.path.isfile(path):
+        return None, None
+    from gan.framework.cm.traj_index import build_traj_index, segment_entry
+    segs = (build_traj_index([path],
+                             labels=[f"{genid}/{os.path.basename(path)}"])
+            .get("segments") or [])
+
+    def _lookup(seg):
+        entry = segment_entry(path, seg.get("line_no"))
+        return entry["text"] if entry else None
+    return segs, _lookup
+
+
 def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
                   flag=None, offset=0, tail=None, head=None, grep=None,
                   **kwargs):
@@ -368,10 +394,29 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
                 f"(this session runs {mode or 'passthrough'})\n")
     sess = _active_traj_session() if slice_mode else None
 
-    if slice_mode and not fetch:
-        return _serve_index(output_dir, genid, cap, filt, sess, mode)
     if fetch:
         return _serve_fetch(output_dir, fetch, allowed, genid, cap, sess)
+    if tail or head or grep:
+        # §12.36 (R2): content ops serve in ANY mode on BOTH arms — the
+        # in-process ladder previously dropped these three parameters into
+        # the blob/index path with no note (an ignored parameter reads as
+        # taken effect). One scan, payload first, archive fallback — the
+        # SAME sources the seat arm's Tier 1/Tier 2 serve from, with the
+        # seat arm's caps (tail/head page = the tool's max_chars; grep =
+        # its documented 100-result / 16k stop boundary).
+        segs, lookup = _inproc_segments(output_dir, genid, sess)
+        if segs is None:
+            return f"No archived trajectory for generation {genid}."
+        from gan.framework.cm.traj_index import grep_page, tail_head_page
+        if grep:
+            try:
+                return grep_page(segs, lookup, grep)
+            except ValueError as e:
+                return f"Error: {e}"
+        return tail_head_page(segs, lookup, n=int(tail or head or 1),
+                              tail=bool(tail), max_chars=cap)
+    if slice_mode:
+        return _serve_index(output_dir, genid, cap, filt, sess, mode)
 
     blob = read(output_dir, genid, max_chars=cap, role="task")
     if not blob:
