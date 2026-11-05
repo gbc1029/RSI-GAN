@@ -502,9 +502,13 @@ def _cm_latch_scan(staged_lines: str) -> bool:
     """True when staged seam-event lines show a named-assembly failure.
 
     The trigger matches the p/e latch (``assembly_failures > 0``): only
-    strike-counted failures latch. A plain load failure speaks once as
-    ``cm_assembly_fallback`` and is CHEAP to retry (no budget burn, no
-    leaked thread), so it deliberately does not latch here."""
+    strike-counted failures latch. EVERY ``cm_assembly_failed`` is
+    strike-counted, the LOAD phase included — ``_note_assembly_failure(
+    phase="load")`` counts it and emits the same event (docs/19
+    §12.17/§12.30: load-once caches the module failure, so a reload of
+    byte-identical module code would just fail again; the one-strike latch
+    is the intended semantics). The presence of the event alone is
+    therefore the trigger, exactly like the policy scan below."""
     return '"cm_assembly_failed"' in (staged_lines or "")
 
 

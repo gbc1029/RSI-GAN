@@ -485,8 +485,12 @@ non-repeatable:
   `CMSession.view_text` source (primitives carry no `saved`; dedup /
   derived_host anchored forms + stale-reference re-points are included;
   C.1's small-block widening is recorded honestly instead of clamped).
-  Remaining F3-F7 audit items are NOT landed (seam empty-history edge,
-  registry text, harness comment, cost aggregation/whitelist).
+  The F4/F5 description-face items (agent-facing registry descriptions /
+  params_schema, the `_cm_latch_scan` docstring) and the doc/comment
+  errata are closed by the TEXT-ONLY batch (§12.41 — zero behavior change);
+  still NOT landed: F3 (seam empty-history edge, a real defect) and F6/F7
+  (cost aggregation caliber + cost-record whitelist, both need a
+  code/caliber decision).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

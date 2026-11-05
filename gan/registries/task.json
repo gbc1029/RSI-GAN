@@ -29,7 +29,7 @@
     {
       "name": "ctx_usage",
       "module": "task/cm/ctx_usage.py",
-      "description": "Session cost meter: tokens used, tool calls, active budgets, headroom.",
+      "description": "Session usage meter: tokens used (input/output/reasoning split when the provider reports it; an unreported counter stays absent), tool calls, wallclock, and the runtime budget state (budget_armed/budget). Read-only.",
       "params_schema": {},
       "kind": "cm"
     },

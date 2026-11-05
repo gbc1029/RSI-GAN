@@ -31,14 +31,18 @@
     {
       "name": "ctx_index",
       "module": "evaluator/cm/ctx_index.py",
-      "description": "Enumerate this session's context blocks (metadata only).",
-      "params_schema": {},
+      "description": "Enumerate this session's context blocks (metadata only): id, kind, size, flags. Page with offset/cap (cap up to 500; a clamp is reported); totals are page-local (total/returned/hidden_after + next_offset).",
+      "params_schema": {
+        "kind": "string",
+        "offset": "integer",
+        "cap": "integer"
+      },
       "kind": "cm"
     },
     {
       "name": "ctx_fetch",
       "module": "evaluator/cm/ctx_fetch.py",
-      "description": "Materialize one context block into the conversation (full/head_tail/excerpt).",
+      "description": "Fetch one context block by id into the conversation: form=full restores the whole content; head_tail trims it to the session keep. Only full and head_tail are accepted (the eviction forms belong to the assembly/policy layer; excerpt is retired).",
       "params_schema": {
         "block_id": "string",
         "form": "string"
@@ -48,14 +52,14 @@
     {
       "name": "ctx_usage",
       "module": "evaluator/cm/ctx_usage.py",
-      "description": "Session cost meter: tokens used, tool calls, active budgets, headroom.",
+      "description": "Session usage meter: tokens used (input/output/reasoning split when the provider reports it; an unreported counter stays absent), tool calls, wallclock, and the runtime budget state (budget_armed/budget). Read-only.",
       "params_schema": {},
       "kind": "cm"
     },
     {
       "name": "ctx_pin",
       "module": "evaluator/cm/ctx_pin.py",
-      "description": "Pin/unpin a context block so view assembly must keep it.",
+      "description": "Pin a context block so its content is kept (assembly must not elide it; unpin releases). Pinning an already elided/trimmed block RESTORES it to full — dedup is the only exempt non-full form.",
       "params_schema": {
         "block_id": "string",
         "note": "string",
@@ -77,7 +81,7 @@
     {
       "name": "ctx_view",
       "module": "evaluator/cm/ctx_view.py",
-      "description": "Show the last assembled view: kept/elided/compacted blocks + stats.",
+      "description": "Show the session's current persistent view: each block's form + its rule tag, and the head_tail keep. This is the live view, not a per-turn stats summary.",
       "params_schema": {},
       "kind": "cm"
     }

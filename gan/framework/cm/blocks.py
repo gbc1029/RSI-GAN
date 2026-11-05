@@ -10,9 +10,12 @@ Kinds (closed vocabulary — audit texts and policies may only use these;
 RETAINED names nothing materializes yet are marked, so an agent-facing kind
 list must not advertise them):
 ``turn_output``  one LLM turn's text (assistant/user message content)
-``tool_output``  one tool result carried into the conversation (in THIS chat
-                 protocol tool results ride inside user turns, so this kind
-                 never materializes here — vocabulary retained, docs/10 §11.5)
+``tool_output``  one tool result carried into the conversation. In the chat
+                 protocol this seam serves, tool results usually ride inside
+                 the next user turn, so this kind materializes only when the
+                 client returns a genuine tool-role entry (the session's
+                 role→kind map; docs/10 §11.5) — vocabulary retained either
+                 way.
 ``traj_seg``     one segment of a prebuilt trajectory index (fetch materializes)
 ``kb_note``      RETAINED vocabulary, never materialized (knowledge notes are
                  read via the knowledge tool, not as blocks — docs/10 §12.3 T2)
@@ -28,11 +31,16 @@ list must not advertise them):
                  block: consumed nodes never re-compact, keeping the lineage
                  a tree, not a DAG)
 
-View forms: ``full`` | ``head_tail`` | ``placeholder`` | ``template``.
-Rendering is PURE: every form derives from the block's own text or is a
-content-free placeholder — no new content can enter a view (§5.2 不变量 1).
-The single source of every form's SENT TEXT is ``bake()``; the single
-source of every saving number is ``form_saving()`` (docs/19 §12.21).
+View forms: ``full`` | ``head_tail`` | ``placeholder`` | ``template`` (plus the
+two session-anchored forms ``dedup`` and ``derived_host``, whose text depends
+on session state). Rendering is PURE: every form derives from the block's own
+text or is a content-free placeholder — no new content can enter a view
+(§5.2 不变量 1). ``bake()`` is the single source of the CONTEXT-FREE forms'
+SENT TEXT; the session-anchored ones are resolved by ``CMSession.view_text``,
+which is the single source for ALL forms, and the accounting funnel there
+books the SAVING as a signed transition width — ``form_saving()`` is only a
+gate helper ("how much would this form save vs full"), never an op's saved
+(docs/19 §12.40).
 """
 from __future__ import annotations
 
