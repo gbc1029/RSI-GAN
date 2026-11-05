@@ -82,7 +82,7 @@ def _ctx_view(handle):
 
 _SPECS: dict = {
     "ctx_index": {
-        "description": ("Enumerate the context blocks of this session (history turns, tool outputs, trajectory segments, your notes, derived compaction products): id, kind, size, flags — metadata only, no content. Capped pages say so: total/hidden/capped + next_offset (None = no further page); page with offset, widen with cap (up to 500; a clamp is reported via cap_clamped). Use it to see what can be fetched or pinned."),
+        "description": ("Enumerate the context blocks of this session (history turns, tool outputs, trajectory segments, your notes, derived compaction products): id, kind, size, flags — metadata only, no content. Paging is page-local: total/returned/hidden_after (blocks AFTER this page)/capped (this page filled to its cap) + next_offset (None = no further page); an offset past the end returns beyond_end. Page with offset, widen with cap (up to 500; a clamp is reported via cap_clamped). Use it to see what can be fetched or pinned."),
         "input_schema": {
             "type": "object",
             "properties": {"kind": {"type": "string", "description": "optional kind filter (turn_output|tool_output|traj_seg|note|derived — derived blocks are materialized by compact merge/template)"}, "offset": {"type": "integer", "description": "page start (0-based); continue from a previous page's next_offset"}, "cap": {"type": "integer", "description": "max blocks on this page (default 200; widened up to 500)"}},

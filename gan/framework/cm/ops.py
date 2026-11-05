@@ -389,13 +389,23 @@ def index_blocks(universe: Universe, kinds: Optional[List[str]] = None,
                  offset: int = 0) -> Dict[str, Any]:
     """Metadata-only enumeration (mirrors list_dir's entry cap).
 
-    Honest capping + paging (docs/19 §12.19): ``total`` counts the kind-
-    filtered set, ``returned``/``hidden``/``capped`` describe THIS page
-    (``capped`` = the response does not include every match), and
-    ``next_offset`` is None when no further page exists — the loop exit.
-    A past-the-end offset returns a clean empty page, not an error; ``cap``
-    widens up to ``INDEX_CAP_MAX`` (clamped with ``cap_clamped``, never
-    silently); invalid offset/cap are structured refusals, never raises."""
+    Honest paging with PAGE-LOCAL accounting (docs/19 §12.39, R3 redesign
+    of the §12.19 fields): ``total`` counts the kind-filtered set and
+    ``returned`` this page's size; ``hidden_after`` counts the blocks
+    AFTER this page (reachable via ``next_offset`` — the old ``hidden``
+    re-counted already-delivered pages: page 2 of a 26-block universe at
+    cap 20 claimed 20 hidden with no next page); ``capped`` says the cap
+    was the binding constraint on THIS page (``returned == cap``, the
+    effective post-clamp cap echoed as ``cap``) — pure page arithmetic,
+    never a cross-page completeness claim, so a page ending exactly with
+    the set reads capped=True with next_offset=None; ``next_offset`` is
+    None when no further page exists — the loop exit. An offset at or
+    past the end returns the empty page with ``beyond_end: True`` — the
+    requested page DOES NOT EXIST (an explicitly non-page, not a normal-
+    but-empty one; the marker also covers an empty set's first page).
+    ``cap`` widens up to ``INDEX_CAP_MAX`` (clamped with ``cap_clamped``,
+    never silently); invalid offset/cap are structured refusals, never
+    raises."""
     if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
         return {"op": "index", "ok": False, "error": f"invalid cap {cap!r}"}
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -406,12 +416,20 @@ def index_blocks(universe: Universe, kinds: Optional[List[str]] = None,
     blocks = universe.ordered(kinds)
     total = len(blocks)
     page = blocks[offset:offset + cap]
-    next_offset = offset + len(page) if offset + len(page) < total else None
     out: Dict[str, Any] = {"op": "index", "ok": True,
                            "blocks": [b.to_meta() for b in page],
                            "total": total, "returned": len(page),
-                           "hidden": total - len(page), "capped": len(page) < total,
-                           "offset": offset, "next_offset": next_offset}
+                           # R3 (docs/19 §12.39): page-local fields — see
+                           # the docstring; hidden_after/capped/beyond_end
+                           # replace the old cross-page-ambiguous hidden.
+                           "capped": len(page) == cap,
+                           "hidden_after": max(0, total - (offset + len(page))),
+                           "offset": offset, "cap": cap,
+                           "next_offset": (offset + len(page)
+                                           if offset + len(page) < total
+                                           else None)}
+    if offset >= total:
+        out["beyond_end"] = True   # the requested page does not exist
     if clamped:
         out["cap_clamped"] = True
     return out
