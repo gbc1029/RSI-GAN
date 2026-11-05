@@ -360,6 +360,11 @@ class DomainTaskRunner:
         # API compatibility only; the declared/formula budget wins.
         self.timeout = tx.harness_total_timeout(self.domain_cfg, self.num_samples)
         self.score_key = self.domain_cfg.get("score_key")
+        # Declared report scale (domains.yaml ``score_divisor``; the balrog family
+        # reports percentages in 0-100, everything else already scores 0-1).
+        # Passing it explicitly removes the hard-coded domain SET that used to
+        # live in ``extract_score`` (P1-7).
+        self.score_divisor = float(self.domain_cfg.get("score_divisor") or 1.0)
         self.output_contract = self.domain_cfg.get("output_contract") or {}
         self.task_brief = self.domain_cfg.get("task_brief") or ""
         # Framework-owned final-answer requirement (F4/C1): one derivation,
@@ -951,7 +956,8 @@ class DomainTaskRunner:
             from utils.soft_fail import soft_fail
             soft_fail(f"report.json exists but is unparseable for genid {genid} "
                       f"(score will read None/failed): {report_path}")
-        score = tx.extract_score(report, self.score_key, self.domain)
+        score = tx.extract_score(report, self.score_key, self.domain,
+                                 score_divisor=self.score_divisor)
         report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
         # polyglot patch-gate aggregate (counts only): one durable event per
         # generation so the repaired/rejected rates are greppable in

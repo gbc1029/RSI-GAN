@@ -445,6 +445,44 @@ with a GAN-native data layer.
   the per-question convention).
 - Seeds/ids never reach an agent face: the archived transcript qid stays
   `env__task__epNN` and `report_summary` carries no episode ids.
+- **Runnable-domain gate (P1-8)**: `task_execution.domain_runnable_error` is the
+  ONE answer to "can this domain run in the secure driver". `balrog_babyai` /
+  `balrog_babaisai` are wired (sandboxed per-step agent factory +
+  `domains.yaml` section + installer); `balrog_minihack` / `balrog_nle` /
+  `balrog_crafter` / `balrog_textworld` are named by the upstream config and by
+  the harness argparse but wire NOTHING — without the gate they fell back to the
+  IN-PROCESS `AgentFactory` (no bwrap nesting, no scoped proxy token), a silent
+  downgrade that voids "capability = existence". The driver refuses them before
+  any sandbox side effect, `domains/harness.py` refuses them again (it cannot
+  import `gan`, so it keeps `_SANDBOXED_BALROG_MODULES`; the offline guard
+  asserts the two lists agree), and the registry keeps `balrog_minihack` /
+  `balrog_nle` family stubs so the error is "not wired", never "unknown". Those
+  stubs SHADOW the generic `balrog` family (longest prefix wins), so every key
+  the generic family carries (`score_key`, `score_divisor`) must be repeated.
+- **Report scale is DECLARED (P1-7)**: `families.balrog.score_divisor: 100` and
+  `DomainTaskRunner` passes it to `extract_score`. The old hard-coded
+  `_SANDBOXED_BALROG_DOMAINS` set meant any balrog domain added later silently
+  kept a 0-100 value where every other domain scores 0-1.
+- **Episode output contract + objective facts (P1-9)**: both wired balrog
+  domains declare `output_contract.kind: action` with the env's own
+  `language_action_space` (the offline guard asserts the two agree), so the
+  task child is told the exact action vocabulary and `compute_report_summary`
+  derives balrog's analogues of the label facts: `coverage` =
+  episodes_played / episodes_requested (the plan, NOT the runner's per-task
+  `num_samples`), `contract_ok` = "every step produced a legal action" (from
+  `failed_candidates`), `label_distribution.prediction` = the ACTION share (so
+  `policy.constant-output` becomes decidable), `overall_accuracy` = solve rate.
+  `design.contract-format` / `cost.truncation` / `policy.constant-output` stop
+  being UNKNOWN; `policy.{accept,reject}-bias` stay question-domain only
+  (their labels do not exist in an action vocabulary).
+- **The report no longer parses the output dir (P2-14/P2-15)**: the dead
+  in-context-learning path is GONE (`domains/balrog/dataset.py` deleted, its
+  `icl_*` config keys removed — it was constructed but never used, its
+  `records/` never existed, and enabling it divided by zero), and
+  `collect_and_summarize_results` takes its coverage denominator from the run's
+  own `episode_plan.json` instead of re-composing `config.yaml` with hydra. A
+  missing plan falls back to what actually ran (previous behaviour), a missing
+  `config.yaml` no longer breaks anything.
 - **Fixed-root evaluation (the eval layer, wired 2026-11-05)**: an episode domain
   has no question dataset to hold out, so its evaluation set is a frozen
   `<task>#<seed>` list instead. `domains.yaml eval_episodes_per_task` (per-task

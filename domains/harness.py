@@ -1368,8 +1368,24 @@ if __name__ == "__main__":
     # Balrog game domains
     elif "balrog" in domain:
         env_name = domain.split("_")[-1]
+        # FAIL CLOSED on a balrog domain this framework does not wire (P1-8).
+        # ``config.yaml`` names minihack / nle / crafter / textworld and argparse
+        # accepts them, but only the domains below have a sandboxed per-step agent
+        # factory. Falling through used to build the IN-PROCESS ``AgentFactory``
+        # (no bwrap nesting, no scoped proxy token): with the package installed
+        # that silently runs an untokened agent instead of failing. This list is
+        # the harness-local copy of ``task_execution._SANDBOXED_BALROG_DOMAINS``
+        # (the task child cannot import ``gan``); the offline guard test asserts
+        # the two agree.
+        if domain not in _SANDBOXED_BALROG_MODULES:
+            raise RuntimeError(
+                f"{domain} is not wired for the sandboxed balrog harness: only "
+                f"{sorted(_SANDBOXED_BALROG_MODULES)} have a per-step agent "
+                f"factory and an installer path. Refusing instead of silently "
+                f"falling back to the in-process agent factory."
+            )
         agent_factory = None
-        if domain in _SANDBOXED_BALROG_MODULES and args.dataset_root is not None:
+        if args.dataset_root is not None:
             _require_sandboxed_balrog_runtime(domain)
             # ``proxy_token`` (resolved above), NOT ``args.proxy_token``: in the
             # secure broker path the credential arrives as a sealed memfd and is

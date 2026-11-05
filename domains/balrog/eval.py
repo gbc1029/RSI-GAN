@@ -72,9 +72,12 @@ def harness_balrog(config, agent_factory=None, sample_seed=None, anchor_ids=None
 
     return output_dir
 
-def report_balrog(output_dir):
-    # Collect and summarize results
-    summary = collect_and_summarize_results(output_dir)
+def report_balrog(output_dir, planned_counts=None):
+    # Collect and summarize results. ``planned_counts`` is the coverage
+    # denominator; default = the run's own episode_plan.json, so the report no
+    # longer depends on the harness having saved config.yaml into output_dir
+    # (P2-15).
+    summary = collect_and_summarize_results(output_dir, planned_counts=planned_counts)
     print_summary_table(summary)
 
 @hydra.main(config_path="config", config_name="config", version_base="1.1")

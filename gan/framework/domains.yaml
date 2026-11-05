@@ -286,6 +286,23 @@ domains:
     # 代价：每轮评估 = 5 task x N episode x (≤128 step)。N=1 已经是一个完整
     # 生成的数量级 ⇒ 默认 1，要更细就抬 loop.yaml eval.episodes_per_task 或这里。
     eval_episodes_per_task: 1
+    # OUTPUT CONTRACT (P1-9). A balrog prediction is ONE environment action per
+    # step, so the requirement is expressed structurally instead of falling back
+    # to the universal "return your final answer" sentence: the labelled
+    # vocabulary below is `language_action_space`
+    # (`domains/balrog/environments/babyai_text/clean_lang_wrapper.py:4`), and
+    # `contract_ok` then means "every step produced a legal action" -- which is
+    # what makes `issue_checks.design.contract-format` decidable for this domain.
+    # The offline guard test asserts this list matches the env's own vocabulary.
+    output_contract:
+      kind: action
+      allowed_labels:
+        - "turn left"
+        - "turn right"
+        - "go forward"
+        - "pick up"
+        - "drop"
+        - "toggle"
     task_brief: >-
       Play the BabyAI navigation environment. At each step, inspect the mission
       and observation and respond with exactly one valid environment action.
@@ -349,6 +366,18 @@ domains:
     # outer_select.enabled 时才会跑；运营者要更大评估集请显式抬这里或
     # loop.yaml eval.episodes_per_task。
     eval_episodes_per_task: 1
+    # OUTPUT CONTRACT (P1-9): see balrog_babyai above. Vocabulary =
+    # `BABAISAI_ACTION_SPACE` (`domains/balrog/environments/babaisai/base.py:9`,
+    # `[a.name for a in baba.grid.BabaIsYouEnv.Actions]`, measured
+    # 2026-11-05: idle/up/right/down/left).
+    output_contract:
+      kind: action
+      allowed_labels:
+        - "idle"
+        - "up"
+        - "right"
+        - "down"
+        - "left"
     task_brief: >-
       Play the Baba Is AI puzzle environment. At each step, inspect the active
       rules and object positions and respond with exactly one valid action.
@@ -357,6 +386,12 @@ domains:
 families:
   balrog:
     score_key: average_progress
+    # REPORT SCALE (P1-7): the balrog harness reports `average_progress` as a
+    # 0-100 PERCENTAGE while every other domain scores 0-1. This is DECLARED here
+    # (inherited by every balrog domain) instead of being hard-coded as a domain
+    # SET inside `task_execution.extract_score`, which silently left any domain
+    # added later on the wrong scale.
+    score_divisor: 100
     ensembled: false
     stagedeval_samples: 1
     stagedeval_frac: 0.1            # default for babyai; minihack overrides below
@@ -367,9 +402,33 @@ families:
       gpu: none
       read_only_assets: []
   balrog_minihack:
+    # NOT WIRED (P1-8): the upstream config declares minihack tasks and the
+    # harness argparse still accepts the name, but there is no entry in
+    # `domains/harness.py:_SANDBOXED_BALROG_MODULES`, no per-domain section below,
+    # and no installer path. `task_execution.domain_runnable_error` REFUSES the
+    # driver run until all three exist; wiring it needs NLE (C extension + ~2GB
+    # game data) first.
+    # NOTE: resolution picks the LONGEST matching prefix ONLY, so this family
+    # SHADOWS `balrog` -- every key the generic family carries must be repeated
+    # here (score_key/score_divisor were silently missing before 2026-11-05).
+    score_key: average_progress
+    score_divisor: 100
     stagedeval_frac: 0.2
     # resolve_domain selects only the longest family prefix, so repeat the
     # balrog sandbox contract for this more-specific family.
+    sandbox:
+      enabled: true
+      disabled_reason: null
+      network: none
+      gpu: none
+      read_only_assets: []
+  balrog_nle:
+    # NOT WIRED (P1-8) -- same reason as balrog_minihack. Declared explicitly so
+    # "which balrog domains exist and which are usable" has ONE answer in the
+    # registry (it previously fell through to the plain `balrog` family and
+    # looked supported). Keys repeated for the same shadowing reason.
+    score_key: average_progress
+    score_divisor: 100
     sandbox:
       enabled: true
       disabled_reason: null

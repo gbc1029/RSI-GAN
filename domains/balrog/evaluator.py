@@ -14,7 +14,6 @@ import numpy as np
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from domains.balrog.dataset import InContextDataset
 from domains.balrog.environments import make_env
 from domains.balrog.utils import get_unique_seed
 from utils.episode_seed import anchor_seeds_by_task, plan_episodes
@@ -439,7 +438,12 @@ class Evaluator:
         self.num_workers = config.eval.num_workers
         self.max_steps_per_episode = config.eval.max_steps_per_episode
 
-        self.dataset = InContextDataset(self.config, self.env_name, original_cwd=original_cwd)
+        # NOTE: the upstream in-context-learning dataset was REMOVED (P2-14).
+        # `InContextDataset` was constructed here but never used by
+        # `run_episode`, its `records/` directory does not exist in this repo,
+        # and enabling it divided by zero (`i % len([])`). Dead capability that
+        # looks configurable is worse than none: `eval.icl_*` keys are gone from
+        # `domains/balrog/config/config.yaml` too.
 
     def run_episode(self, task, agent, process_num=None, position=0, episode_idx=0,
                     episode_seed=None, episode_id=None, is_anchor=False):

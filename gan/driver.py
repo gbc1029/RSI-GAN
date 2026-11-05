@@ -738,6 +738,15 @@ def run_gan_driver(
         raise ValueError(
             f"domain {domain!r} has no registered sandbox profile; refusing secure launch"
         )
+    # Fail-closed on a domain the FRAMEWORK cannot serve end to end (P1-8): the
+    # upstream balrog config also names minihack / nle / crafter / textworld, but
+    # only babyai / babaisai have a sandboxed per-step agent factory, a
+    # domains.yaml section and an installer. Without this check the run passed
+    # validation and only failed later inside the harness -- or, with the package
+    # installed, fell back to an UNTOKENED in-process agent.
+    runnable_error = task_execution.domain_runnable_error(domain)
+    if runnable_error:
+        raise ValueError(runnable_error)
     domain_config = resolve_domain(reg, domain)
     sandbox_profile = task_execution.validate_domain_sandbox_profile(
         domain, domain_config.get("sandbox"), repo_root,

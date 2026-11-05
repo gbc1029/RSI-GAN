@@ -72,6 +72,17 @@ _PARENT_SCORED_DOMAINS = {
     "paper_review", "search_arena", "imo_grading", "polyglot",
 }
 _SANDBOXED_BALROG_DOMAINS = {"balrog_babyai", "balrog_babaisai"}
+# Balrog domains the UPSTREAM config names but this framework does NOT wire.
+# ``domains/balrog/config/config.yaml`` declares minihack/nle/crafter/textworld
+# tasks and ``domains/harness.py``'s argparse still accepts them, but nothing
+# else exists: no entry in ``_SANDBOXED_BALROG_MODULES`` (so the harness would
+# fall back to the IN-PROCESS ``AgentFactory`` -- no bwrap nesting, no scoped
+# proxy token), no ``domains.yaml`` section (task_brief / episode_tasks /
+# budgets), and no installer path. That silent downgrade violates the
+# "capability = existence" axiom, so they are REFUSED fail-closed by
+# ``domain_runnable_error`` until they are wired for real.
+_UNWIRED_BALROG_DOMAINS = ("balrog_minihack", "balrog_nle", "balrog_crafter",
+                           "balrog_textworld")
 _SANDBOXED_HARNESS_DOMAINS = _SANDBOXED_BALROG_DOMAINS | {
     "imo_proof", "imo_proof_grading",
 }
@@ -1131,6 +1142,42 @@ def run_polyglot_eval(
 
 def uses_parent_scoring(domain: str) -> bool:
     return domain in _PARENT_SCORED_DOMAINS
+
+
+def domain_runnable_error(domain: str) -> Optional[str]:
+    """Why this domain cannot run in the secure driver, or ``None``.
+
+    Only the balrog family needs this today, but the check is phrased as a
+    general gate: a domain is RUNNABLE when the framework can give it the full
+    contract (sandboxed agent factory + ``domains.yaml`` section + installer).
+    Refusing early is the cheap half of P1-8: without it a driver run with
+    ``--domains balrog_minihack`` passes domain/sandbox validation and only
+    fails later inside the harness -- and, once the package is installed,
+    would fall back to an UNTOKENED in-process agent instead of failing.
+
+    Pure (no I/O): the driver and the offline tests share it.
+    """
+    name = str(domain or "")
+    if "balrog" not in name:
+        return None
+    if name in _SANDBOXED_BALROG_DOMAINS:
+        return None
+    if name in _UNWIRED_BALROG_DOMAINS:
+        return (
+            f"domain {name!r} is not wired yet: only "
+            f"{sorted(_SANDBOXED_BALROG_DOMAINS)} have a sandboxed per-step "
+            f"agent factory, a domains.yaml section (task_brief / "
+            f"episode_tasks / per-sample budgets) and an installer path. "
+            f"Running it would silently fall back to the IN-PROCESS agent "
+            f"factory (no bwrap, no scoped proxy token) -- refusing instead of "
+            f"degrading. Wire it first (P1-8), or use one of the two wired "
+            f"balrog domains."
+        )
+    return (
+        f"domain {name!r} is not a known balrog domain; the wired set is "
+        f"{sorted(_SANDBOXED_BALROG_DOMAINS)} (unwired upstream names: "
+        f"{list(_UNWIRED_BALROG_DOMAINS)})"
+    )
 
 
 def derive_sample_seed(base_seed: int, genid: str) -> int:
@@ -3325,8 +3372,17 @@ def read_report(report_path: str) -> Optional[Dict[str, Any]]:
 
 
 def extract_score(report: Optional[Dict[str, Any]], score_key: str,
-                  domain: Optional[str] = None) -> Optional[float]:
-    """Numeric objective score, or None when absent/NaN."""
+                  domain: Optional[str] = None,
+                  score_divisor: Optional[float] = None) -> Optional[float]:
+    """Numeric objective score, or None when absent/NaN.
+
+    ``score_divisor`` is the domain's DECLARED report scale
+    (``domains.yaml score_divisor``, e.g. 100 for a 0-100 percentage): the
+    framework must not hard-code a domain SET here, because a domain added
+    later would silently keep a 0-100 value where every other domain scores
+    0-1 (P1-7). ``domain`` stays as a deprecated fallback for callers that
+    still pass it without the divisor.
+    """
     if not isinstance(report, dict) or not score_key:
         return None
     val = report.get(score_key)
@@ -3338,8 +3394,15 @@ def extract_score(report: Optional[Dict[str, Any]], score_key: str,
         return None
     if math.isnan(f) or math.isinf(f):
         return None
-    if domain in _SANDBOXED_BALROG_DOMAINS:
-        f /= 100.0
+    divisor = score_divisor
+    if divisor is None:
+        divisor = 100.0 if domain in _SANDBOXED_BALROG_DOMAINS else 1.0
+    try:
+        divisor = float(divisor)
+    except (TypeError, ValueError):
+        divisor = 1.0
+    if divisor and divisor != 1.0:
+        f /= divisor
     return f
 
 
@@ -3384,6 +3447,18 @@ def derive_response_contract(domain: Optional[str],
         if labels:
             return ("The response must be exactly one of: "
                     + " / ".join(labels) + ".")
+    if contract.get("kind") == "action":
+        # EPISODE domains (balrog): the prediction is one environment ACTION per
+        # step, and the vocabulary is the env's ``language_action_space`` --
+        # declared in domains.yaml so this stays a framework-owned sentence
+        # (the loop never imports an env module). An unparseable action is
+        # defaulted by the env AND recorded as a contract violation, which is
+        # what `contract_ok` then reports.
+        labels = [str(a) for a in (contract.get("allowed_labels") or [])
+                  if str(a).strip()]
+        if labels:
+            return ("The response must be exactly one action, spelled as one "
+                    "of: " + " / ".join(labels) + ".")
     if domain == "polyglot":
         return ("Your written solution files are the deliverable - the response "
                 "only needs a 1-3 sentence summary. Do NOT paste code or diffs.")
@@ -3414,6 +3489,53 @@ def compute_report_summary(
         "random_guess_accuracy": None,
     }
     if not isinstance(report, dict):
+        return summary
+
+    # EPISODE domains (balrog): one "question" is one EPISODE, so the coverage
+    # denominator the runner passed (``num_samples`` = episodes PER TASK) is the
+    # wrong basis -- the real denominator is the number of PLANNED episodes
+    # (tasks x per_task). The report carries both counts itself, so the summary
+    # is derived from them instead (P1-9): without this every balrog generation
+    # reported coverage=None, which turned `cost.truncation` / `contract.format`
+    # / `policy.*` into UNKNOWN and left the evaluator with two usable checkers.
+    played = report.get("episodes_played")
+    planned = report.get("episodes_requested")
+    if isinstance(played, (int, float)) and planned not in (None, 0):
+        played = int(played)
+        planned = int(planned)
+        summary["episodes_requested"] = planned
+        summary["episodes_played"] = played
+        summary["episodes_solved"] = report.get("episodes_solved")
+        summary["mean_progression"] = report.get("mean_progression")
+        summary["invalid_action_rate"] = report.get("invalid_action_rate")
+        summary["action_distribution"] = report.get("action_distribution")
+        summary["sample_n_valid"] = played
+        # The runner's ``requested`` is the PER-TASK episode count, which is not
+        # a sample count in this shape: report the planned total instead so
+        # requested/valid/coverage tell one consistent story.
+        summary["sample_n_requested"] = planned
+        if planned > 0:
+            summary["coverage"] = played / planned
+            summary["invalid_rate"] = 1.0 - (played / planned)
+        if isinstance(summary["episodes_solved"], (int, float)) and played > 0:
+            # Solve rate is the episode-domain analogue of accuracy: the fraction
+            # of PLAYED episodes that reached full progression.
+            summary["overall_accuracy"] = float(summary["episodes_solved"]) / played
+        # Action share rides the SAME label_distribution channel the label
+        # domains use, so `policy.constant-output` and `policy.accept/reject-bias`
+        # work unchanged (a policy that answers "turn left" forever is a real
+        # balrog defect, and until now it was invisible).
+        dist = report.get("action_distribution")
+        if isinstance(dist, dict) and dist:
+            summary["label_distribution"] = {"prediction": dict(dist)}
+        if contract.get("kind") == "action":
+            rate = report.get("invalid_action_rate")
+            # `contract_ok` = the agent actually produced a legal action on every
+            # step (an unparseable one is defaulted by the env and counted in
+            # ``failed_candidates``). This is what makes `design.contract-format`
+            # decidable for balrog.
+            summary["contract_ok"] = (None if rate is None
+                                      else bool(float(rate) == 0.0))
         return summary
 
     summary["overall_accuracy"] = report.get("overall_accuracy")

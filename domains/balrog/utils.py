@@ -3,28 +3,60 @@ import json
 import math
 import os
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
-from hydra import compose, initialize_config_dir
 
 
-def collect_and_summarize_results(output_dir):
+def planned_episode_counts(output_dir):
+    """Per-``(env, task)`` PLANNED episode counts, read from the run's own plan.
+
+    This is the coverage denominator. It used to come from re-composing
+    ``config.yaml`` out of the output dir with hydra
+    (``initialize_config_dir(output_dir)``), which only worked because the
+    harness saves that file as its very last step -- any skipped save made the
+    REPORT itself crash (P2-15). ``episode_plan.json`` is written BEFORE the
+    first episode and lists exactly what was intended, so it is both a better
+    source and an independent one.
+
+    Returns ``{}`` when there is no plan (legacy direct harness run); callers
+    then fall back to the counts that actually ran, exactly as the old code did
+    when the config key was missing.
+    """
+    counts = {}
+    try:
+        with open(os.path.join(output_dir, "episode_plan.json"), "r", encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return counts
+    for ep in (plan.get("episodes") or []):
+        if not isinstance(ep, dict):
+            continue
+        env = str(ep.get("env") or "")
+        task = str(ep.get("task") or "")
+        if env and task:
+            counts[(env, task)] = counts.get((env, task), 0) + 1
+    return counts
+
+
+def collect_and_summarize_results(output_dir, planned_counts=None):
     """Collect and summarize results from JSON files in the output directory.
 
     Args:
         output_dir (str): Directory containing per-episode results in JSON format.
+        planned_counts (dict, optional): ``{(env, task): n}`` planned episode
+            counts. Defaults to the run's own ``episode_plan.json`` (see
+            :func:`planned_episode_counts`); ``{}`` means "use what ran".
 
     Returns:
         dict: A summary dictionary containing average progress, standard errors, and token usage.
     """
     results_summaries = defaultdict(list)
 
-    # Load config
-    # NOTE: Get the number of tasks that should have been run instead of what was successfully run
-    config_dir = os.path.abspath(output_dir)
-    with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
-        cfg = compose(config_name="config")
-    expected_task_counts = cfg["eval"]["num_episodes"]
+    # Coverage denominator: the number of episodes that SHOULD have run. The
+    # report must not depend on the harness having saved config.yaml (P2-15).
+    if planned_counts is None:
+        planned_counts = planned_episode_counts(output_dir)
+    expected_task_counts = dict(planned_counts)
 
     # Collect per-episode results
     for env_name in os.listdir(output_dir):
@@ -108,7 +140,11 @@ def collect_and_summarize_results(output_dir):
             for run in task_runs:
                 failed_action_candidates += run.get("failed_candidates", [])
             # task_count = len(task_runs)
-            task_count = expected_task_counts.get(env_name, len(task_runs))
+            # Denominator per TASK: the number of episodes PLANNED for this
+            # (env, task) pair, so an episode that produced no log at all still
+            # counts as a played-and-lost episode (the denominator must not
+            # shrink). Falls back to what ran when there is no plan.
+            task_count = expected_task_counts.get((env_name, task_name), len(task_runs))
             env_total_episodes += task_count
             avg_task_progress = (
                 sum(task_episode_progress) / task_count if task_count else 0.0
@@ -134,7 +170,7 @@ def collect_and_summarize_results(output_dir):
         # Add missing tasks with 0 progression
         for expected_task in expected_tasks:
             if expected_task not in env_task_summaries:
-                task_count = expected_task_counts.get(env_name, 0)
+                task_count = expected_task_counts.get((env_name, expected_task), 0)
                 env_task_summaries[expected_task] = {
                     "progression_percentage": 0.0,
                     "standard_error": 0.0,
@@ -223,6 +259,9 @@ def collect_and_summarize_results(output_dir):
     question_points = {}
     episodes = []
     aborted_episodes = []
+    action_distribution = Counter()
+    steps_total = 0
+    invalid_actions_total = 0
     _idx = 0
     for env_name, episode_logs in results_summaries.items():
         for episode_log in episode_logs:
@@ -242,6 +281,20 @@ def collect_and_summarize_results(output_dir):
                 "steps": episode_log.get("num_steps"),
                 "invalid_actions": len(episode_log.get("failed_candidates") or []),
             }
+            # Objective facts for the evaluator (P1-9). The ACTION stream is
+            # balrog's analogue of a predicted label: aggregated here so
+            # ``policy.constant-output`` / ``policy.*-bias`` and
+            # ``design.contract-format`` become decidable for this domain
+            # (previously every one of them was UNKNOWN).
+            freq = episode_log.get("action_frequency") or {}
+            if isinstance(freq, dict):
+                for act, n in freq.items():
+                    try:
+                        action_distribution[str(act)] += int(n)
+                    except (TypeError, ValueError):
+                        continue
+            steps_total += int(episode_log.get("num_steps") or 0)
+            invalid_actions_total += row["invalid_actions"]
             # An ABORTED episode is scored 0.0 (it was played and lost) but it is
             # flagged, so "the agent fails this task" and "the infrastructure
             # killed this episode" stay distinguishable offline.
@@ -259,6 +312,29 @@ def collect_and_summarize_results(output_dir):
         k for k, v in question_points.items() if v < 1.0 - 1e-9)
     summary["episodes"] = episodes
     summary["episodes_aborted"] = aborted_episodes
+
+    # --- episode-domain objective facts (P1-9) -------------------------------
+    # The contract `compute_report_summary` (gan/framework/task_execution.py)
+    # turns into `coverage` / `contract_ok` / `label_distribution` /
+    # `overall_accuracy`. All of them are MEASUREMENTS over this run's own
+    # episodes, never an interpretation:
+    #   episodes_requested -- planned (episode_plan.json); the coverage
+    #                         denominator that the runner's per-task
+    #                         num_samples cannot express;
+    #   episodes_played    -- rows that produced a log (aborted included);
+    #   episodes_solved    -- progression == 1.0;
+    #   invalid_action_rate -- failed_candidates / steps (contract violations);
+    #   action_distribution -- sanitized action counts (constant-policy signal).
+    summary["episodes_requested"] = int(sum(expected_task_counts.values())
+                                        or len(episodes))
+    summary["episodes_played"] = len(episodes)
+    summary["episodes_solved"] = sum(
+        1 for e in episodes if float(e["progression"]) >= 1.0 - 1e-9)
+    summary["mean_progression"] = summary["average_progress"]
+    summary["steps_total"] = steps_total
+    summary["invalid_action_rate"] = (
+        (invalid_actions_total / steps_total) if steps_total else 0.0)
+    summary["action_distribution"] = dict(action_distribution)
 
     summary_filename = os.path.join(output_dir, "report.json")
     with open(summary_filename, "w") as f:

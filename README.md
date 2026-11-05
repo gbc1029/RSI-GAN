@@ -222,7 +222,15 @@ Known constraints:
   `domains/balrog/config/config.yaml` `babaisai_tasks` for cheap runs.
 - `balrog_minihack` / `balrog_nle` / `crafter` / `textworld` are **not** wired
   into the GAN path and are not covered by this script (`post_install.py`
-  downloads their data from GitHub/Drive and needs network).
+  downloads their data from GitHub/Drive and needs network). This is now
+  **fail-closed**: `task_execution.domain_runnable_error` refuses a driver run on
+  any balrog domain other than the two above (and `domains/harness.py` refuses it
+  again), because without the per-step sandboxed agent factory the harness would
+  silently fall back to an in-process agent with no proxy token. Wiring one needs
+  three things together — a `_SANDBOXED_BALROG_MODULES` entry, a `domains.yaml`
+  section (`task_brief` / `episode_tasks` / `output_contract` / per-sample
+  budgets), and an installer path (NLE adds a C extension plus ~2 GB of game
+  data).
 
 ### 4) Docker (only needed for the original HyperAgents container flow)
 
