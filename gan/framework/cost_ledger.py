@@ -113,6 +113,19 @@ def _llm_sidecar_metrics(path: str) -> Optional[Dict[str, Any]]:
             "llm_time_s": round(total_s, 3)}
 
 
+def _last_cumulative_est(rows: List[Dict[str, Any]], key: str = "kind") -> int:
+    """R-C2 (docs/19 §12.39.6): the LAST cm_view's cumulative
+    ``est_saved_session`` — not the sum of per-turn ``saved_chars``, which
+    systematically misses between-turn handle ops (agent-face ctx_* ops
+    book into the session cumulative without a cm_view row). Residual
+    (declared): ops in the final tool phase after the last cm_view."""
+    est = 0
+    for r in rows:
+        if r.get(key) == "cm_view":
+            est = int((r.get("stats") or {}).get("est_saved_session") or 0)
+    return est
+
+
 def _cm_summary(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Aggregate the session's ``cm_*`` trajectory rows (docs/10 §11 D12).
 
@@ -131,8 +144,7 @@ def _cm_summary(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
                                  + _count(rows, "cm_assembly_disabled")
                                  + _count(rows, "cm_assembly_overrun")),
         "cm_budget_warnings": _count(rows, "cm_budget_checkpoint"),
-        "est_chars_saved": sum(int(r.get("stats", {}).get("saved_chars") or 0)
-                               for r in rows if r.get("kind") == "cm_view"),
+        "est_chars_saved": _last_cumulative_est(rows),
     }
 
 
@@ -158,8 +170,7 @@ def cm_summary_from_events(events: List[Dict[str, Any]]) -> Optional[Dict[str, A
                                  + _count("cm_assembly_disabled")
                                  + _count("cm_assembly_overrun")),
         "cm_budget_warnings": _count("cm_budget_checkpoint"),
-        "est_chars_saved": sum(int((e.get("stats") or {}).get("saved_chars") or 0)
-                               for e in events if e.get("type") == "cm_view"),
+        "est_chars_saved": _last_cumulative_est(events, key="type"),
     }
 
 

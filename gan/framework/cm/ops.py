@@ -93,11 +93,14 @@ def drop(universe: Universe, view: View, block_id: str, rule: str,
         return {"op": "drop", "refs": [block_id], "ok": False,
                 "error": f"below drop floor ({floor_chars})"}
     view.set(block_id, "placeholder", rule or "drop")
-    # ⑤ (docs/19 §12.21): a block not bound to canonical history never
-    # renders, so eliding it saves nothing — saved counts render-visible
-    # blocks only (the same口径 as render's msg_index skip).
+    # ⑤, refined to the RENDER-VISIBILITY caliber (docs/19 §12.39.6): a
+    # block books its actual bake delta when it renders NOW (bound) or
+    # necessarily NEXT turn (the unbound outgoing block — the fingerprint
+    # bind is guaranteed by the chat protocol); never-rendering blocks
+    # (notes/derived) book nothing.
+    renders = block.msg_index is not None or block.kind == "turn_output"
     saved = (form_saving(block, "placeholder", rule or "drop")
-             if block.msg_index is not None else 0)
+             if renders else 0)
     return {"op": "drop", "refs": [block_id], "ok": True,
             "rule": rule or "drop", "saved": saved}
 
@@ -139,10 +142,13 @@ def substitute(universe: Universe, view: View, block_id: str, form: str,
         return {"op": "substitute", "refs": [block_id], "ok": True,
                 "rule": rule or "restore", "saved": 0}
     # saved = the ACTUAL sent-text delta through bake() (single source, incl.
-    # the render suffix); a block not bound to history never renders → saves
-    # nothing (⑤, docs/19 §12.21).
+    # the render suffix), under the RENDER-VISIBILITY caliber (docs/19
+    # §12.39.6): renders now (bound) or necessarily next turn (the unbound
+    # outgoing) books; never-rendering blocks (notes/derived) book nothing
+    # (the ⑤ half that survives).
+    renders = block.msg_index is not None or block.kind == "turn_output"
     saved = (form_saving(block, form, rule or "substitute", keep=keep)
-             if block.msg_index is not None else 0)
+             if renders else 0)
     view.set(block_id, form, rule or "substitute")
     return {"op": "substitute", "refs": [block_id], "ok": True,
             "rule": rule or "substitute", "saved": saved, "form": form}
@@ -394,18 +400,17 @@ def index_blocks(universe: Universe, kinds: Optional[List[str]] = None,
     ``returned`` this page's size; ``hidden_after`` counts the blocks
     AFTER this page (reachable via ``next_offset`` — the old ``hidden``
     re-counted already-delivered pages: page 2 of a 26-block universe at
-    cap 20 claimed 20 hidden with no next page); ``capped`` says the cap
-    was the binding constraint on THIS page (``returned == cap``, the
-    effective post-clamp cap echoed as ``cap``) — pure page arithmetic,
-    never a cross-page completeness claim, so a page ending exactly with
-    the set reads capped=True with next_offset=None; ``next_offset`` is
-    None when no further page exists — the loop exit. An offset at or
-    past the end returns the empty page with ``beyond_end: True`` — the
-    requested page DOES NOT EXIST (an explicitly non-page, not a normal-
-    but-empty one; the marker also covers an empty set's first page).
-    ``cap`` widens up to ``INDEX_CAP_MAX`` (clamped with ``cap_clamped``,
-    never silently); invalid offset/cap are structured refusals, never
-    raises."""
+    cap 20 claimed 20 hidden with no next page); ``next_offset`` is None
+    when no further page exists — the loop exit. The old ``capped`` field
+    was REMOVED post-landing (docs/19 §12.39 追记): except exact alignment
+    it duplicated next_offset's complement, and it was derivable from the
+    echoed ``returned``/``cap`` either way. An offset at or past the end
+    returns the empty page with ``beyond_end: True`` — the requested page
+    DOES NOT EXIST (an explicitly non-page, not a normal-but-empty one;
+    the marker also covers an empty set's first page). ``cap`` widens up
+    to ``INDEX_CAP_MAX`` (clamped with ``cap_clamped``, never silently)
+    and is echoed as ``cap``; invalid offset/cap are structured
+    refusals, never raises."""
     if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
         return {"op": "index", "ok": False, "error": f"invalid cap {cap!r}"}
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
@@ -420,9 +425,8 @@ def index_blocks(universe: Universe, kinds: Optional[List[str]] = None,
                            "blocks": [b.to_meta() for b in page],
                            "total": total, "returned": len(page),
                            # R3 (docs/19 §12.39): page-local fields — see
-                           # the docstring; hidden_after/capped/beyond_end
-                           # replace the old cross-page-ambiguous hidden.
-                           "capped": len(page) == cap,
+                           # the docstring; hidden_after/beyond_end replace
+                           # the old cross-page-ambiguous hidden/capped.
                            "hidden_after": max(0, total - (offset + len(page))),
                            "offset": offset, "cap": cap,
                            "next_offset": (offset + len(page)
@@ -522,21 +526,29 @@ def fetch(universe: Universe, view: View, block_id: str,
         # full) records 0. Net accounting: count_ops and the agent-face
         # handle audit both accept negative saved.
         prev_form = view.form_of(block_id)
-        if prev_form == "full" or block.msg_index is None:
+        renders = block.msg_index is not None or block.kind == "turn_output"
+        if prev_form == "full" or not renders:
             saved = 0
         elif prev_form == "dedup":
             # The dedup form is RENDER-anchored: its baked width depends on
             # the session's system prefix, which a session-free primitive
             # cannot see (bake() has no dedup branch by design). The refund
-            # records 0 — a documented residual (docs/19 §12.37): the small
-            # dedup credit (prefix minus marker) survives a restore.
+            # books 0 here and the session layer re-derives it (docs/19
+            # §12.39.5 — the ViewHandle.fetch fixup; §12.37's residual is
+            # closed).
             saved = 0
         else:
             saved = -form_saving(block, prev_form,
                                  view.rules.get(block_id, "fetch"), keep=keep)
         view.set(block_id, "full", "fetch")
-        return {"op": "fetch", "refs": [block_id], "ok": True,
-                "text": block.text, "chars": block.chars, "saved": saved}
+        rec = {"op": "fetch", "refs": [block_id], "ok": True,
+               "text": block.text, "chars": block.chars, "saved": saved}
+        if prev_form == "dedup":
+            # C.3 (docs/19 §12.39.5): flag the render-anchored prev form —
+            # the session layer re-derives this restore's refund from the
+            # prefix (conditional field: absence = a bake-backed prev form).
+            rec["prev_form"] = "dedup"
+        return rec
     rec = substitute(universe, view, block_id, form, "fetch", 0, keep=keep)
     if rec.get("ok"):
         # The trim's own delivery: the record used to carry no text, so a

@@ -352,13 +352,31 @@ class SessionPortal:
             f"framework-owned)")
 
 
+def _dedup_head_saving(prefix: str) -> int:
+    """The dedup form's ACTUAL sent delta (docs/19 §12.39.5, C.3 fix): the
+    render replaces exactly the head prefix occurrence with the marker.
+    The SINGLE formula — ``dedup_prefix`` credits it, the
+    ``ViewHandle.fetch`` fixup refunds it (the render-anchored form cannot
+    be re-baked by the session-free primitive)."""
+    return max(0, len(prefix) - len(_DEDUP_MARKER))
+
+
 class ViewHandle:
     """The primitive facade handed to BOTH faces (agent ctx_* tools and the
     assembly-time custom policy). Face membership decides what is callable
     (ops.AGENT_FACES / ops.POLICY_FACES); the policy face carries the
     per-turn op budget (``cm_max_ops_per_turn``). Every op returns a
     structured record that never carries block content (peek/note reads are
-    the explicit content requests)."""
+    the explicit content requests).
+
+    The policy budget is an ATTEMPTS quota (ruled, docs/19 §12.39.4 R7b):
+    READ ops draw from the same pool as writes; a refused attempt counts
+    and is NOT refunded (the decrement precedes the primitive's
+    validation); exhaustion and parameter errors record as violation
+    events — DISPLAY-ONLY (the session counter and the cost line's
+    aggregate): no strike, latch or disable reads them (those consume the
+    reconcile's return and the ``cm_*_failed`` counters). The agent face
+    carries no budget."""
 
     def __init__(self, session: "CMSession", face: str):
         self._s = session
@@ -369,6 +387,17 @@ class ViewHandle:
     def _audit(self, rec: Dict[str, Any]) -> Dict[str, Any]:
         """Policy-face refusals are violations wherever they happen (the
         wedge breaker counts them via the session, not only in the seam).
+
+        Event vocabulary (docs/19 §12.39.4, R7b): THIS path emits the
+        generic ``cm_violation`` — the OP-REFUSAL family (an attempt that
+        did NOT take effect). The reconcile's detections are a different
+        family — contract breaches by an effect that DID happen — emitted
+        per-subsystem as ``cm_assembly_violation``/``cm_policy_violation``
+        (§12.17.1, N5a) by ``_note_violations``. Two concepts, not two
+        encodings: a scanner counting a session's refusals must subscribe
+        to both, and the cost line's ``cm_violations`` aggregate counts
+        ONLY this op-refusal family (declared half-count; widening it is
+        a recorded pending option, not done).
 
         Successful MUTATING ops also publish their refs to the session's
         recorded-refs set: the P1 turn reconciliation must be able to explain
@@ -446,8 +475,21 @@ class ViewHandle:
                 "op": "fetch", "refs": [block_id], "ok": False,
                 "error": (f"invalid form {form!r} on the agent face "
                           f"(allowed: {', '.join(ops.AGENT_FETCH_FORMS)})")})
-        return self._audit(ops.fetch(self._s.universe, self._s.view, block_id,
-                                     form, keep=self._s.head_tail_keep))
+        rec = ops.fetch(self._s.universe, self._s.view, block_id,
+                        form, keep=self._s.head_tail_keep)
+        # C.3 (docs/19 §12.39.5): a full restore FROM the dedup form books
+        # its refund HERE, where the prefix lives — the render-anchored form
+        # cannot be re-baked by the session-free primitive (ops.fetch books 0
+        # and flags prev_form). This is the single fetch funnel (agent +
+        # policy faces; the portal has no fetch), so the fixup runs before
+        # _audit/count_ops see the record. The bound check is defensive: an
+        # unbound block cannot be in dedup form (dedup requires rounds).
+        if (rec.get("ok") and rec.get("prev_form") == "dedup"
+                and self._s.system_prefix):
+            blk = self._s.universe.get(block_id)
+            if blk is not None and blk.msg_index is not None:
+                rec["saved"] = -_dedup_head_saving(self._s.system_prefix)
+        return self._audit(rec)
 
     def pin(self, block_id: str, note: str = "") -> Dict[str, Any]:
         if err := self._gate("pin"):
@@ -552,6 +594,14 @@ class CMSession:
     policy_failures: int = 0
     policy_disabled: bool = False
     violations: int = 0
+    # Cumulative NET of booked management-op deltas, under the
+    # RENDER-VISIBILITY caliber (docs/19 §12.39.6): a block books its bake
+    # delta when it renders now or necessarily next turn; never-rendering
+    # blocks and non-savings (refusals, breaches) book nothing. A FLOW
+    # ledger — it can decrease (refunds) and go negative transiently is
+    # impossible by construction (credits precede their refunds); the
+    # STATE quantity (current-view net savings) is independently observable
+    # from the per-turn render deltas.
     est_chars_saved: int = 0
     emit_failures: int = 0
     # CM-03 leak observability: an exec-budget timeout leaks its worker
@@ -1912,7 +1962,7 @@ class CMSession:
         # than the marker would GROW every old turn: refuse the whole stage
         # (the same "saves nothing" semantics as compact's MIN_COMPACT_SAVE
         # gate; realistic tool-use headers are far longer than the marker).
-        head_saving = len(self.system_prefix) - len(_DEDUP_MARKER)
+        head_saving = _dedup_head_saving(self.system_prefix)
         if head_saving <= 0:
             return []
         out: List[Dict[str, Any]] = []
@@ -2020,7 +2070,12 @@ class CMSession:
     def note_violation(self, rec: Dict[str, Any]) -> None:
         """Count + emit one op refusal (idempotent with the seam path: the
         seam's ``count_ops`` only emits for records that did NOT come from a
-        handle audit — tracked via the record marker below)."""
+        handle audit — tracked via the record marker below).
+
+        This is the OP-REFUSAL family (``cm_violation``): an attempt that
+        did not take effect. The reconcile's contract-breach family is
+        ``_note_violations`` (per-subsystem event types, §12.17.1) — see
+        the vocabulary map on :meth:`_audit`."""
         if rec.get("_audited"):
             return
         rec["_audited"] = True
