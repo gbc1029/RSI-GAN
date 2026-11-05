@@ -1380,7 +1380,13 @@ class GanLoop:
                 for path in cm_wiring.candidate_paths(
                         role,
                         stem if isinstance(stem, str) and stem.strip() else None,
-                        committed_root=getattr(self, "code_root", None),
+                        # N5e: watch the tree the session ACTUALLY resolves
+                        # from (_roles_root — the roles repo in split
+                        # layout), not the task tree: in split layout the
+                        # role modules do not exist under code_root, so the
+                        # committed candidate silently vanished and
+                        # committed edits could never release the latch.
+                        committed_root=self._roles_root(),
                         workspace_root=ws_root) or []:
                     if path not in seen:
                         seen.add(path)
@@ -3526,6 +3532,15 @@ class GanLoop:
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to planner_failed
                 except Exception as e:
+                    # N5d: a FAILED session must feed the latch the same way
+                    # a successful one does — a recoverable failure has the
+                    # proxy-stashed summary, and it is dropped by the clear
+                    # below unless read first. Best-effort: a hard child
+                    # crash has no summary and the latch learns nothing
+                    # (advisory). The cost record stays success-only.
+                    self._seat_cm_summary(self.planner, role="planner",
+                                          seat="plan", keys=plan_ck,
+                                          outer=outer)
                     self._seat_cm_clear(self.planner)  # no stamp leak
                     self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
@@ -3719,6 +3734,11 @@ class GanLoop:
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to evaluator_failed
                 except Exception as e:
+                    # N5d: same latch feed as the plan failure path (read
+                    # the stashed summary BEFORE the clear drops it).
+                    self._seat_cm_summary(self.evaluator, role="evaluator",
+                                          seat="evaluate", keys=eval_ck,
+                                          outer=outer)
                     self._seat_cm_clear(self.evaluator)  # no stamp leak
                     child.valid_parent = False
                     child.meta["invalid"] = True
@@ -4009,6 +4029,15 @@ class GanLoop:
                         role, "self_improve", outer, None,
                         cm_summary=_si_cm_summary)
                 except Exception as e:  # noqa: BLE001 -- classified after join
+                    # N5d: feed the latch from a failed self-improve session
+                    # before the finally's clear drops the summary (the
+                    # success path feeds via _seat_cm_summary below the call).
+                    try:
+                        self._seat_cm_summary(
+                            role_obj, role=role, seat="self_improve",
+                            keys=ck_si, outer=outer)
+                    except Exception:  # noqa: BLE001 -- advisory feed
+                        pass
                     session_errors[role] = e
                 finally:
                     self._seat_cm_clear(role_obj)

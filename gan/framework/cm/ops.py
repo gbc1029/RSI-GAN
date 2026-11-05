@@ -57,7 +57,14 @@ _SHRINK_OPS = ("drop", "compact", "substitute")
 
 
 def _faces_for(face: str) -> Tuple[str, ...]:
-    return AGENT_FACES if face == "agent" else POLICY_FACES
+    # CLOSED FACE VOCABULARY (L2-03, docs/19 §12.32): the old else-branch
+    # handed POLICY_FACES to ANY non-agent face — the full policy surface
+    # WITHOUT the per-turn op budget (which keys off face == "policy") and
+    # WITHOUT auditing (refusals count as violations only on the policy
+    # face). An unknown face now gets an EMPTY surface: every op is
+    # refused with a structured record.
+    return (AGENT_FACES if face == "agent"
+            else POLICY_FACES if face == "policy" else ())
 
 
 def face_allows(face: str, op: str) -> bool:

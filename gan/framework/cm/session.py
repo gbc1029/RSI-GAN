@@ -258,9 +258,11 @@ class _ViewRead:
 class _UniverseRead:
     """READ-ONLY projection of the block universe (P2 portal surface).
 
-    ``get``/``ordered``/iteration return COPIES: a block object carries
-    mutable fields (``pinned``, ``msg_index``), so handing the live objects
-    would re-open the write surface through the back door."""
+    ``get``/``ordered``/iteration return DEEP copies: a block object carries
+    mutable fields (``pinned``, ``msg_index``) AND a mutable container
+    (``sources`` — derived lineage); a shallow copy shares that list, so
+    ``get(...).sources.append(...)`` would write straight through the
+    read-only facade (N5c, docs/19 §12.32)."""
 
     __slots__ = ("_u",)
 
@@ -269,10 +271,10 @@ class _UniverseRead:
 
     def get(self, block_id: str) -> Any:
         block = self._u.blocks.get(str(block_id))
-        return copy.copy(block) if block is not None else None
+        return copy.deepcopy(block) if block is not None else None
 
     def ordered(self) -> List[Any]:
-        return [copy.copy(b) for b in self._u.ordered()]
+        return [copy.deepcopy(b) for b in self._u.ordered()]
 
     def __iter__(self):
         return iter(self.ordered())
@@ -567,6 +569,7 @@ class CMSession:
     assembly_failures: int = 0
     assembly_disabled: bool = False  # wedge-broken for the session
     assembly_violations: int = 0     # seam-contract violations this session
+    policy_violations: int = 0       # policy-tail reconcile violations (N5a)
     _assembly_strikes: int = 0
     # P1 turn reconciliation (docs/19 §12.14): turn-start snapshot + the op
     # refs the post segment recorded. Named-assembly turns only (presets never
@@ -663,6 +666,8 @@ class CMSession:
                "policy_disabled": self.policy_disabled,
                "violations": self.violations,
                "est_chars_saved": self.est_chars_saved}
+        if self.policy_violations:
+            out["policy_violations"] = self.policy_violations
         if self.emit_failures:
             # Conditional audit field (absence = a healthy sink): a session
             # whose event sink dropped lines must not read as fully audited.
@@ -719,6 +724,7 @@ class CMSession:
             out["policy_report"] = {
                 "stem": os.path.basename(str(self.policy_path)).split(".")[0],
                 "failures": self.policy_failures,
+                "violations": self.policy_violations,
                 "disabled": self.policy_disabled,
                 "last_error": ops.clip_diag(str(self._policy_last_error.get("error") or ""), 160),
                 "phase": self._policy_last_error.get("phase"),
@@ -744,6 +750,39 @@ class CMSession:
             self.emit_failures += 1
 
     # ---------------------------------------------------- block registration
+    def _require_msg_dicts(self, msgs: Any, where: str) -> None:
+        """The msgs contract (docs/19 §12.32.4): every canonical-history
+        entry is a framework-constructed dict — agent/llm.py wraps strings
+        into dicts at the boundary (user + assistant entries), tool rounds
+        ride user-turn text, and no producer ships a bare entry. The old
+        tolerance (skip unknown shapes silently) was a booby trap: the P1
+        snapshot's texts layer is dict-only COMPRESSED while the restore
+        indexed it by list position, so ONE non-dict entry would shift
+        every later restoration (silent canonical corruption). A violation
+        is now LOUD: the offenders are emitted on the CM event stream and
+        a TypeError aborts the call BEFORE any mutation — no blocks, no
+        view changes, no counters, and deliberately NO strike/latch: a
+        harness-side contract break is not a module failure. (A violation
+        raised from ``finalize_turn`` inside an agent-owned ``assemble`` IS
+        attributed to the module by the P1 catch — the module tampered
+        the list it was given.)"""
+        if not isinstance(msgs, list):
+            self._emit({"type": "cm_msg_contract_violation",
+                        "turn": self.turn, "where": where, "offenders": [],
+                        "detail": f"expected a list, got {type(msgs).__name__}"})
+            raise TypeError(f"cm msgs contract violated at {where}: "
+                            "expected a list, got "
+                            f"{type(msgs).__name__}")
+        bad = [(i, type(m).__name__) for i, m in enumerate(msgs)
+               if not isinstance(m, dict)]
+        if not bad:
+            return
+        detail = ", ".join(f"msgs[{i}] is {t}" for i, t in bad[:5])
+        self._emit({"type": "cm_msg_contract_violation", "turn": self.turn,
+                    "where": where, "offenders": bad[:10],
+                    "detail": ops.clip_diag(detail, 160)})
+        raise TypeError(f"cm msgs contract violated at {where}: {detail}")
+
     def register_history(self, msgs: List[Dict[str, Any]]) -> None:
         """Register NEW message-history entries as blocks (universe add-only).
 
@@ -754,6 +793,7 @@ class CMSession:
         ...`` marker) is RE-BOUND to its block instead of re-registered: the
         rendered copy must not grow a second block or the view would fight
         its own output. Blocks carry their latest msg_index for rendering."""
+        self._require_msg_dicts(msgs, "register_history")
         for i, m in enumerate(msgs):
             content = _msg_text(m)
             if not content:
@@ -937,6 +977,7 @@ class CMSession:
         leaves a durable trace: ``cm_assembly_failed`` per failing turn,
         ``degraded`` on that turn's ``cm_view``, ``assembly_disabled`` in
         every subsequent ``cm_view`` — a fallback is never silent."""
+        self._require_msg_dicts(msgs, "assemble_turn")
         self.turn += 1
         self._turn_degraded = False
         self._method_face = None  # per-turn method-face budget reset
@@ -1154,7 +1195,7 @@ class CMSession:
                   else "text" if isinstance(m.get("text"), str) else None),
                  isinstance(m.get("text"), str),
                  isinstance(m.get("content"), str))
-                for m in (msgs or []) if isinstance(m, dict)],
+                for m in (msgs or [])],
             "counters": (self.ops_total, self.ops_applied, self.ops_refused,
                          self.violations, self.est_chars_saved),
             "refs": set(self._recorded_refs),
@@ -1206,7 +1247,10 @@ class CMSession:
         if texts is None:
             return
         for i, entry in enumerate(msgs or []):
-            if i >= len(texts) or not isinstance(entry, dict):
+            # entries are contract-validated upstream (§12.32.4): texts is
+            # POSITION-ALIGNED with msgs by construction, and a non-dict
+            # here is a bypass that must crash loudly, never skip silently.
+            if i >= len(texts):
                 continue
             value, key, had_text, had_content = texts[i]
             for carrier, had in (("text", had_text), ("content", had_content)):
@@ -1281,11 +1325,19 @@ class CMSession:
                 out.append(("canonical_mutated", moved[:8]))
         return out
 
-    def _note_violations(self, violations: List[Tuple[str, List[str]]]) -> None:
-        """Count + emit each seam-contract violation (never silent)."""
+    def _note_violations(self, violations: List[Tuple[str, List[str]]],
+                         source: str = "assembly") -> None:
+        """Count + emit each seam-contract violation (never silent). The
+        event vocabulary is per-subsystem (docs/19 §12.17.1): the named
+        assembly's reconcile reports ``cm_assembly_violation``, the custom
+        policy tail's reports ``cm_policy_violation`` — a policy escape
+        used to be filed against the assembly (N5a)."""
         for kind, refs in violations:
-            self.assembly_violations += 1
-            self._emit({"type": "cm_assembly_violation", "turn": self.turn,
+            if source == "policy":
+                self.policy_violations += 1
+            else:
+                self.assembly_violations += 1
+            self._emit({"type": f"cm_{source}_violation", "turn": self.turn,
                         "kind": kind, "refs": list(refs)[:20]})
 
     def _note_assembly_failure(self, error: str, phase: str = "run",
@@ -1481,15 +1533,19 @@ class CMSession:
         view/counters/refs only. The closure question is structurally
         delegated to ``finalize_turn`` (the caller invokes it right after
         this returns) — see ``_reconcile_turn(check_closure=False)``."""
+        if msgs is not None:
+            self._require_msg_dicts(msgs, "run_policy")
         if self.policy_disabled:
             return [{"op": "policy", "ok": False,
-                     "error": "policy disabled for this session"}]
+                     "error": "policy disabled for this session",
+                     "_lifecycle": True}]
         if self.policy_path is None:
             # configuration signal, NOT a module failure: the build rewrites
             # custom when nothing is deliverable, so this is only reachable
             # by direct construction. Nothing struck, nothing latched.
             return [{"op": "policy", "ok": False,
-                     "error": "no policy configured for this session"}]
+                     "error": "no policy configured for this session",
+                     "_lifecycle": True}]
         from .failopen import (PolicyTimeout, apply_policy as _apply_policy,
                                timed_load_policy as _timed_load_policy)
         if self._policy_load is None:
@@ -1560,7 +1616,7 @@ class CMSession:
         if violations:
             # mirror the named branch's order: the violation EVENTS land
             # first (durable), then the counters roll back with the restore
-            self._note_violations(violations)
+            self._note_violations(violations, source="policy")
             self._restore_turn(snap, msgs)
             self._note_policy_failure(
                 "policy violated the seam contract: "
@@ -1623,6 +1679,15 @@ class CMSession:
                 self.ops_applied += 1
                 continue
             if not rec.get("ok"):
+                if rec.get("_lifecycle"):
+                    # A lifecycle marker (the module is retired/absent) is
+                    # not a misbehavior: the standing degradation is spoken
+                    # ONCE by cm_policy_disabled + the stats; re-filing it
+                    # per turn is the N7 phantom (the assembly side's
+                    # standing degradation is already silent — docs/19
+                    # §12.30 rule 1 visibility symmetry). The strike
+                    # turn's REAL failure record still counts below.
+                    continue
                 if not rec.get("_audited"):
                     self.ops_refused += 1
                     self.violations += 1
@@ -1654,6 +1719,7 @@ class CMSession:
         from the persistent view by the no-fabrication render (copies only
         — 双记); the outgoing instruction is never substituted except the
         dedup prefix-elision (same frozen form, anchored at the head)."""
+        self._require_msg_dicts(msgs, "finalize_turn")
         saved = self.count_ops(records)
         self.emit_view(saved, records)
         send_history = self.render(msgs)
@@ -1668,10 +1734,20 @@ class CMSession:
 
     def dedup_prefix(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fixed pre-segment: fixed-overhead governance. The tool-use header
-        is re-sent in EVERY user message; for messages older than the pin
-        window it is elided (one in-band marker replaces it) — the newest
-        window keeps the full header so tool behavior is unaffected. This is
-        a form, not a drop: no content is lost except the repeated prefix."""
+        is re-sent in EVERY user message; one in-band marker replaces it on
+        an OLD block, keeping the newest window's full header so tool
+        behavior is unaffected. A form, not a drop: no content is lost
+        except the repeated prefix.
+
+        Population in the PRESET pipelines is narrow by construction
+        (docs/19 §12.32.3): ``window_defaults`` runs FIRST and placeholder's
+        every un-pinned old block (the ``form != "full"`` skip below), so
+        this stage's live surface is the PINNED old blocks — in practice
+        the auto-pinned first user turn (one dedup op per session; probed
+        in §12.32.3). The order is value-correct: the placeholder saves
+        the whole body where dedup saves only the header. As a POLICY-
+        composable primitive the stage is fully alive (a custom policy may
+        run dedup without the window)."""
         if not self.system_prefix:
             return []
         out: List[Dict[str, Any]] = []
@@ -1703,6 +1779,7 @@ class CMSession:
         line — the view cannot fabricate content (§5.2 不变量 1). Idempotent:
         an entry whose content already carries the block's baked artifact is
         left alone."""
+        self._require_msg_dicts(msgs, "render")
         by_msg: Dict[int, List[Block]] = {}
         for block in self.universe.ordered():
             form = self.view.form_of(block.block_id)
