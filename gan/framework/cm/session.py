@@ -297,7 +297,10 @@ class SessionPortal:
     """P2 (docs/19 §12.14): the object an AGENT-OWNED assembly receives.
 
     The published authoring surface is the session's PRIMITIVE METHODS
-    (``cm/assembly.py`` composes exactly those) plus clamped parameters as
+    (``cm/assembly.py`` composes exactly those) plus the refs fold
+    (``record_refs`` — N2 batch, docs/19 §12.33: the baseline pipeline
+    performs the same early fold before ``run_policy``, so the authoring
+    surface must be able to express it too) plus clamped parameters as
     READ-ONLY values. Everything else — the mutable ``view``/``universe``,
     the audit post segment (``emit_view``/``count_ops``), the internal
     bookkeeping — is refused here, so "it cannot bypass the rules" becomes
@@ -314,6 +317,7 @@ class SessionPortal:
         "register_history", "register_outgoing", "budget_checkpoint",
         "window_defaults", "conservative_compaction", "dedup_prefix",
         "run_policy", "call_method", "finalize_turn", "render",
+        "record_refs",
     })
     _PARAMS = frozenset({
         "mode", "system_prefix", "window_k", "head_tail_keep",
@@ -1158,7 +1162,8 @@ class CMSession:
 
     def record_refs(self, records: List[Dict[str, Any]]) -> None:
         """Fold the refs of already-produced stage records into the
-        recorded-refs set (docs/19 §12.18).
+        recorded-refs set (docs/19 §12.18; portal surface since the N2
+        batch, docs/19 §12.33).
 
         The policy-path P1 reconcile runs BEFORE ``finalize_turn``
         (``count_ops``), so form changes made by the baseline stages
@@ -1166,7 +1171,23 @@ class CMSession:
         as unrecorded at snapshot time — count_ops only records their refs
         at closure. Mirrors count_ops's condition exactly (ok + not already
         handle-audited); the later re-recording is an idempotent set
-        update."""
+        update.
+
+        SEMANTICS — explanation, NOT counting (docs/19 §12.33): this only
+        widens the recorded-refs set, the P1 reconcile's explanation
+        channel. The audit counters (``ops_total``/``ops_applied``/
+        ``est_chars_saved``) move ONLY through ``finalize_turn``; an op
+        whose record is folded here but never threaded is explained yet
+        uncounted — exactly the mirror of the handle audit hook, which
+        auto-publishes refs for the same reason. On the SessionPortal
+        because the authoring surface must express the composition the
+        baseline pipeline performs (a shrink stage before ``run_policy``
+        was unexpressible and struck the POLICY with ``unrecorded_view``
+        for the assembly's missing fold — measured repro in §12.33).
+        Residual, accepted and documented: a caller may fold refs it
+        fabricated, lowering the cost of faking a question-1 explanation;
+        the malicious tier's backstop is the reconcile's other three
+        questions (and T3/F5, both user-deferred)."""
         for rec in records:
             if (isinstance(rec, dict) and rec.get("ok")
                     and not rec.get("_audited")):
@@ -1670,10 +1691,23 @@ class CMSession:
     def count_ops(self, records: List[Dict[str, Any]]) -> int:
         """The primitives already validated + mutated the view; this counts,
         emits violations, and sums the estimated savings (audit only — the
-        ledger keeps 实付; savings are a derived indicator, never billing)."""
+        ledger keeps 实付; savings are a derived indicator, never billing).
+
+        N2 (docs/19 §12.33): FULL-fidelity accounting — every record is
+        classified exactly once, wherever it sits. The old
+        ``max_ops_per_turn`` slice + overflow blanket re-labeled tail
+        records as refused AFTER they had already happened at exec time
+        (the cap's exec authority is the handle gate, not the audit): the
+        counters' identity broke (``ops_total`` missed the tail), overflow
+        ``ok`` records lost their saved/refs (P1 false-positive risk for
+        baseline-overflow refs), and the blanket silently absorbed real
+        refusals. Now ``ops_total == ops_applied + ops_refused +
+        lifecycle + audited`` holds for every turn, saved/refs recording
+        is position-independent, and the cap survives ONLY where it can
+        actually enforce (the policy-face handle gate) or present (the
+        ``emit_view`` brief)."""
         saved_total = 0
-        capped = records[:max(1, self.max_ops_per_turn)]
-        for rec in capped:
+        for rec in records or []:
             self.ops_total += 1
             if rec.get("op") == "budget_checkpoint":
                 self.ops_applied += 1
@@ -1703,7 +1737,6 @@ class CMSession:
             # P1: the reconciliation compares the view against EXACTLY what the
             # post segment recorded (cumulative: forms are sticky).
             self._recorded_refs.update(str(r) for r in (rec.get("refs") or []))
-        self.ops_refused += max(0, len(records) - len(capped))
         return saved_total
 
     def finalize_turn(self, msgs: List[Dict[str, Any]],
@@ -1872,9 +1905,15 @@ class CMSession:
         audit: what was kept/dropped, by which rule, addressable by block id
         (docs/10 §5.2.3; the aggregate ``stats`` stay alongside)."""
         ops_brief: List[Dict[str, Any]] = []
-        for rec in (records or [])[:max(1, self.max_ops_per_turn)]:
-            if not rec.get("ok") or rec.get("op") == "policy":
-                continue  # refusals ride cm_violation; the run itself is not a view op
+        # N2 (docs/19 §12.33): filter BEFORE the cap. Refusals ride
+        # cm_violation and the policy run itself is not a view op, but the
+        # old slice-first order let them waste brief slots and pushed real
+        # applied mutations out of the 对账 half. The brief is the first
+        # ``max_ops_per_turn`` APPLIED mutations; the accounting (count_ops)
+        # stays full-fidelity regardless of this presentation cap.
+        applied = [rec for rec in (records or [])
+                   if rec.get("ok") and rec.get("op") != "policy"]
+        for rec in applied[:max(1, self.max_ops_per_turn)]:
             brief = {"op": rec.get("op"),
                      "refs": list(rec.get("refs") or []),
                      "rule": str(rec.get("rule")

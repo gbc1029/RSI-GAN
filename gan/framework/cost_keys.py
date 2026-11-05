@@ -131,7 +131,11 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
     },
     "cm_max_ops_per_turn": {
         "type": "int", "min": 1, "max": 200, "default": 32,
-        "consumer": "cm seam (policy op budget per turn; excess ops are refused)",
+        "consumer": ("cm seam (POLICY-face exec op budget per turn — the "
+                     "ViewHandle gate refuses excess policy ops at exec "
+                     "time — plus the cm_view brief presentation cap; the "
+                     "audit accounting is full-fidelity and does NOT "
+                     "consume this key — N2, docs/19 §12.33)"),
     },
     "cm_policy_exec_ms": {
         "type": "int", "min": 10, "max": 10_000, "default": 200,
