@@ -112,7 +112,7 @@ _SPECS: dict = {
         "fn": _ctx_usage,
     },
     "ctx_pin": {
-        "description": ("Pin a context block by id so the view assembly must keep it (the framework guarantees respect); unpin to release. note is an optional SHORT tag (<= 40 chars, stored with the block and readable back via ctx_view; a longer note is refused — use ctx_note for the rationale). Pin sparingly — pinned blocks survive every compaction."),
+        "description": ("Pin a context block by id so its CONTENT is kept: the view assembly must not elide it (the framework guarantees respect); unpin releases. Pinning a block that is already elided or trimmed RESTORES ITS FULL TEXT (the single exemption is dedup, which only strips the repeated system header); the record self-reports restored/restored_from/chars/saved, and restoring costs future tokens — pin only what you need. note is an optional SHORT tag (<= 40 chars, stored with the block and readable back via ctx_view; a longer note is refused — use ctx_note for the rationale). Pin sparingly — pinned blocks survive every compaction."),
         "input_schema": {
             "type": "object",
             "properties": {"block_id": {"type": "string"}, "note": {"type": "string"}, "unpin": {"type": "boolean"}},

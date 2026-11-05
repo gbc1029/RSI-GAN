@@ -93,16 +93,11 @@ def drop(universe: Universe, view: View, block_id: str, rule: str,
         return {"op": "drop", "refs": [block_id], "ok": False,
                 "error": f"below drop floor ({floor_chars})"}
     view.set(block_id, "placeholder", rule or "drop")
-    # ⑤, refined to the RENDER-VISIBILITY caliber (docs/19 §12.39.6): a
-    # block books its actual bake delta when it renders NOW (bound) or
-    # necessarily NEXT turn (the unbound outgoing block — the fingerprint
-    # bind is guaranteed by the chat protocol); never-rendering blocks
-    # (notes/derived) book nothing.
-    renders = block.msg_index is not None or block.kind == "turn_output"
-    saved = (form_saving(block, "placeholder", rule or "drop")
-             if renders else 0)
+    # saved is NOT computed here: it is a TRANSITION from the block's current
+    # rendered form and needs session state (docs/19 §12.40, F2). The
+    # session's single accounting funnel fills it (render-visibility ⑤).
     return {"op": "drop", "refs": [block_id], "ok": True,
-            "rule": rule or "drop", "saved": saved}
+            "rule": rule or "drop"}
 
 
 def substitute(universe: Universe, view: View, block_id: str, form: str,
@@ -140,18 +135,13 @@ def substitute(universe: Universe, view: View, block_id: str, form: str,
     if form == "full":
         view.set(block_id, "full", rule or "restore")
         return {"op": "substitute", "refs": [block_id], "ok": True,
-                "rule": rule or "restore", "saved": 0}
-    # saved = the ACTUAL sent-text delta through bake() (single source, incl.
-    # the render suffix), under the RENDER-VISIBILITY caliber (docs/19
-    # §12.39.6): renders now (bound) or necessarily next turn (the unbound
-    # outgoing) books; never-rendering blocks (notes/derived) book nothing
-    # (the ⑤ half that survives).
-    renders = block.msg_index is not None or block.kind == "turn_output"
-    saved = (form_saving(block, form, rule or "substitute", keep=keep)
-             if renders else 0)
+                "rule": rule or "restore"}
+    # saved is session-owned (transition from the CURRENT rendered form —
+    # docs/19 §12.40, F2): a restore refunds, a no-op books 0, a cross-form
+    # move is signed. Never a block-local "vs full" number here.
     view.set(block_id, form, rule or "substitute")
     return {"op": "substitute", "refs": [block_id], "ok": True,
-            "rule": rule or "substitute", "saved": saved, "form": form}
+            "rule": rule or "substitute", "form": form}
 
 
 def compact(universe: Universe, view: View, block_ids: List[str],
@@ -170,9 +160,11 @@ def compact(universe: Universe, view: View, block_ids: List[str],
     placeholder; stale references to consumed derived sources are re-pointed
     the same way (one view representation per piece of content). A derived
     source is PINNED on consumption — consumed nodes never re-compact, the
-    lineage stays a tree, not a DAG. saved is the VIEW DELTA through bake()
-    over render-visible blocks only (⑤); the GATE runs on a nominal rule
-    (the derived id does not exist yet), the recorded saved is exact.
+    lineage stays a tree, not a DAG. The saving number is NOT produced here:
+    the GATE runs on a nominal rule (the derived id does not exist yet),
+    while the recorded ``saved`` is the session's TRANSITION delta over
+    render-visible blocks, computed AFTER all view mutations (including the
+    stale-reference re-points) by ``CMSession`` (docs/19 §12.40, F2).
     Validate first, mutate only on success."""
     if strategy not in ("first_last", "merge", "template"):
         hint = (" (retired docs/19 §12.21; use 'first_last')"
@@ -184,7 +176,7 @@ def compact(universe: Universe, view: View, block_ids: List[str],
     if len(set(block_ids)) != len(block_ids):
         return {"op": "compact", "refs": list(block_ids), "ok": False,
                 "error": "duplicate refs"}
-    saved, blocks = 0, []
+    blocks = []
     for bid in block_ids:
         block = universe.get(bid)
         if block is None:
@@ -205,7 +197,6 @@ def compact(universe: Universe, view: View, block_ids: List[str],
                     "error": f"below drop floor ({floor_chars})"}
         blocks.append(block)
     if strategy == "first_last":
-        saved = 0
         for block in blocks:
             saving = form_saving(block, "head_tail",
                                  rule=f"compacted:{strategy}", keep=keep)
@@ -213,11 +204,10 @@ def compact(universe: Universe, view: View, block_ids: List[str],
                 return {"op": "compact", "refs": list(block_ids), "ok": False,
                         "error": ("compaction saves nothing "
                                   f"({block.block_id} saves {saving})")}
-            saved += saving
         for block in blocks:
             view.set(block.block_id, "head_tail", f"compacted:{strategy}")
         return {"op": "compact", "refs": list(block_ids), "ok": True,
-                "rule": f"compacted:{strategy}", "saved": saved}
+                "rule": f"compacted:{strategy}"}
 
     # -- materializing strategies: build the derived text from the sources --
     if strategy == "merge":
@@ -269,13 +259,9 @@ def compact(universe: Universe, view: View, block_ids: List[str],
     for b in bound:
         if b is not host:
             view.set(b.block_id, "placeholder", rule_ph)
-    # exact recorded saved: the real view delta with the REAL rules (bake
-    # single source; render-visible blocks only)
-    saved = (before
-             - len(bake(host, "derived_host", rule_host,
-                        host_text=derived_text))
-             - sum(len(bake(b, "placeholder", rule_ph))
-                   for b in bound if b is not host))
+    # saved is session-owned: the exact view delta (including the re-points
+    # below) is computed by CMSession after this primitive returns — the
+    # nominal-rule gate above is the only saving number this layer owns.
     if consumed:
         # former hosts / pointers of a consumed derived re-point to the
         # newest representation (one view representation per content)
@@ -291,7 +277,7 @@ def compact(universe: Universe, view: View, block_ids: List[str],
                 view.set(bid, "placeholder",
                          f"merged-into:{dblock.block_id}")
     return {"op": "compact", "refs": list(block_ids), "ok": True,
-            "rule": f"compacted:{strategy}", "saved": saved,
+            "rule": f"compacted:{strategy}",
             "derived": dblock.block_id}
 
 
@@ -519,36 +505,15 @@ def fetch(universe: Universe, view: View, block_id: str,
         return {"op": "fetch", "refs": [block_id], "ok": False,
                 "error": "unknown block"}
     if form == "full":
-        # R4 (docs/19 §12.37): a restore REFUNDS the prior form's credit —
-        # the block ships FULL from now on, so this op's net sent-text delta
-        # is minus whatever the current form was saving. Unbound blocks never
-        # render (⑤): no sent effect, no refund. A no-op restore (already
-        # full) records 0. Net accounting: count_ops and the agent-face
-        # handle audit both accept negative saved.
-        prev_form = view.form_of(block_id)
-        renders = block.msg_index is not None or block.kind == "turn_output"
-        if prev_form == "full" or not renders:
-            saved = 0
-        elif prev_form == "dedup":
-            # The dedup form is RENDER-anchored: its baked width depends on
-            # the session's system prefix, which a session-free primitive
-            # cannot see (bake() has no dedup branch by design). The refund
-            # books 0 here and the session layer re-derives it (docs/19
-            # §12.39.5 — the ViewHandle.fetch fixup; §12.37's residual is
-            # closed).
-            saved = 0
-        else:
-            saved = -form_saving(block, prev_form,
-                                 view.rules.get(block_id, "fetch"), keep=keep)
+        # saved is session-owned (docs/19 §12.40, F2): a restore REFUNDS the
+        # current form's credit as the TRANSITION delta — the session knows
+        # the previous form AND its rendered width (including the anchored
+        # dedup / derived_host forms), which a session-free primitive cannot
+        # see. The record stays shape-compatible (no `prev_form` flag: the
+        # former single-instance fixup is gone).
         view.set(block_id, "full", "fetch")
-        rec = {"op": "fetch", "refs": [block_id], "ok": True,
-               "text": block.text, "chars": block.chars, "saved": saved}
-        if prev_form == "dedup":
-            # C.3 (docs/19 §12.39.5): flag the render-anchored prev form —
-            # the session layer re-derives this restore's refund from the
-            # prefix (conditional field: absence = a bake-backed prev form).
-            rec["prev_form"] = "dedup"
-        return rec
+        return {"op": "fetch", "refs": [block_id], "ok": True,
+                "text": block.text, "chars": block.chars}
     rec = substitute(universe, view, block_id, form, "fetch", 0, keep=keep)
     if rec.get("ok"):
         # The trim's own delivery: the record used to carry no text, so a

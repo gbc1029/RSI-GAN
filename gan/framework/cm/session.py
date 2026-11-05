@@ -352,15 +352,6 @@ class SessionPortal:
             f"framework-owned)")
 
 
-def _dedup_head_saving(prefix: str) -> int:
-    """The dedup form's ACTUAL sent delta (docs/19 §12.39.5, C.3 fix): the
-    render replaces exactly the head prefix occurrence with the marker.
-    The SINGLE formula — ``dedup_prefix`` credits it, the
-    ``ViewHandle.fetch`` fixup refunds it (the render-anchored form cannot
-    be re-baked by the session-free primitive)."""
-    return max(0, len(prefix) - len(_DEDUP_MARKER))
-
-
 class ViewHandle:
     """The primitive facade handed to BOTH faces (agent ctx_* tools and the
     assembly-time custom policy). Face membership decides what is callable
@@ -410,7 +401,14 @@ class ViewHandle:
         never flow through ``finalize_turn``/``count_ops`` (the only other
         accumulator), so the handle is where an agent trim credits and a
         full restore refunds. Policy/assembly records are counted by
-        ``count_ops`` — accumulating here too would double-count."""
+        ``count_ops`` — accumulating here too would double-count.
+
+        ``saved`` is a TRANSITION number (docs/19 §12.40, F2): the handle
+        snapshots the block's previous form BEFORE calling the primitive and
+        fills the record through the session's single accounting funnel
+        (``_book``); primitives no longer carry a block-local "vs full"
+        number, so a repeated / no-op / cross-form op can never double-book.
+        """
         if rec.get("ok"):
             refs = rec.get("refs") or []
             if refs:
@@ -475,26 +473,55 @@ class ViewHandle:
                 "op": "fetch", "refs": [block_id], "ok": False,
                 "error": (f"invalid form {form!r} on the agent face "
                           f"(allowed: {', '.join(ops.AGENT_FETCH_FORMS)})")})
+        prev = self._s._pre_state(block_id)
         rec = ops.fetch(self._s.universe, self._s.view, block_id,
                         form, keep=self._s.head_tail_keep)
-        # C.3 (docs/19 §12.39.5): a full restore FROM the dedup form books
-        # its refund HERE, where the prefix lives — the render-anchored form
-        # cannot be re-baked by the session-free primitive (ops.fetch books 0
-        # and flags prev_form). This is the single fetch funnel (agent +
-        # policy faces; the portal has no fetch), so the fixup runs before
-        # _audit/count_ops see the record. The bound check is defensive: an
-        # unbound block cannot be in dedup form (dedup requires rounds).
-        if (rec.get("ok") and rec.get("prev_form") == "dedup"
-                and self._s.system_prefix):
-            blk = self._s.universe.get(block_id)
-            if blk is not None and blk.msg_index is not None:
-                rec["saved"] = -_dedup_head_saving(self._s.system_prefix)
+        # saved is the session's transition delta — the SAME funnel every
+        # mutation uses (docs/19 §12.40, F2). The former dedup-only fixup
+        # (C.3, §12.39.5) is subsumed: ``_book`` knows every anchored form.
+        self._s._book(rec, block_id, prev)
         return self._audit(rec)
 
     def pin(self, block_id: str, note: str = "") -> Dict[str, Any]:
+        """Pin/unpin. PINNING A NOT-YET-FULL BLOCK RESTORES ITS CONTENT.
+
+        pinned's declared meaning is "content must not be lost" — the ONE
+        exemption is ``dedup`` (it only elides the repeated system header;
+        docs/10 "pin 的唯一豁免是 dedup"). A pin on an already-elided block
+        used to set the flag and buy nothing: the block kept shipping as a
+        placeholder AND the state violated the P1 ``pinned_form`` contract,
+        which struck the NEXT healthy policy/assembly turn as a false
+        contract break (docs/19 §12.40, F1). The pin now converges the
+        block: a form outside {full, dedup} is restored to full (the
+        transition's refund books through the accounting funnel, and the
+        record self-reports it: ``restored`` / ``restored_from`` / ``chars``
+        / ``saved``). ``dedup`` and ``full`` are left untouched.
+        """
         if err := self._gate("pin"):
             return err
-        return self._audit(ops.pin(self._s.universe, self._s.view, block_id, True, note))
+        prev = self._s._pre_state(block_id)
+        rec = ops.pin(self._s.universe, self._s.view, block_id, True, note)
+        blk = self._s.universe.get(block_id)
+        if (rec.get("ok") and blk is not None
+                and prev[0] not in ("full", "dedup")):
+            saving = self._s._transition_saving(
+                blk, prev[0], prev[1], "full", prev[1])
+            ops.fetch(self._s.universe, self._s.view, block_id, "full",
+                      keep=self._s.head_tail_keep)
+            if rec.get("note_stored"):
+                # the restore wrote its own rule tag; the pin annotation is
+                # the durable read-back, so it wins on a restored block
+                self._s.view.rules[block_id] = "pin:" + str(rec["note_stored"])
+            else:
+                # no annotation: a FULL block needs no rule tag (the eviction
+                # reason that applied before the restore lives in the earlier
+                # cm_view event; leaving "fetch" on a full block is noise)
+                self._s.view.rules.pop(block_id, None)
+            rec["restored"] = True
+            rec["restored_from"] = prev[0]
+            rec["chars"] = blk.chars
+            rec["saved"] = saving
+        return self._audit(rec)
 
     def unpin(self, block_id: str) -> Dict[str, Any]:
         if err := self._gate("unpin"):
@@ -504,23 +531,36 @@ class ViewHandle:
     def drop(self, block_id: str, rule: str = "policy") -> Dict[str, Any]:
         if err := self._gate("drop"):
             return err
-        return self._audit(ops.drop(self._s.universe, self._s.view, block_id, rule,
-                        self._s.drop_floor_chars))
+        prev = self._s._pre_state(block_id)
+        rec = ops.drop(self._s.universe, self._s.view, block_id, rule,
+                       self._s.drop_floor_chars)
+        self._s._book(rec, block_id, prev)
+        return self._audit(rec)
 
     def compact(self, block_ids: List[str],
                 strategy: str = "first_last") -> Dict[str, Any]:
         if err := self._gate("compact"):
             return err
-        return self._audit(ops.compact(self._s.universe, self._s.view, list(block_ids),
-                           strategy, self._s.drop_floor_chars, self._s.turn,
-                           keep=self._s.head_tail_keep))
+        # snapshot EVERY block's (form, rule): the materializing strategies
+        # change host/other sources AND re-point stale references, so the
+        # exact delta is computed over all changed blocks after the call.
+        prev_all = self._s._pre_state_all()
+        rec = ops.compact(self._s.universe, self._s.view, list(block_ids),
+                          strategy, self._s.drop_floor_chars, self._s.turn,
+                          keep=self._s.head_tail_keep)
+        if rec.get("ok"):
+            rec["saved"] = self._s._delta_since(prev_all)
+        return self._audit(rec)
 
     def substitute(self, block_id: str, form: str) -> Dict[str, Any]:
         if err := self._gate("substitute"):
             return err
-        return self._audit(ops.substitute(self._s.universe, self._s.view, block_id, form,
-                              "policy", self._s.drop_floor_chars,
-                              keep=self._s.head_tail_keep))
+        prev = self._s._pre_state(block_id)
+        rec = ops.substitute(self._s.universe, self._s.view, block_id, form,
+                             "policy", self._s.drop_floor_chars,
+                             keep=self._s.head_tail_keep)
+        self._s._book(rec, block_id, prev)
+        return self._audit(rec)
 
     def order(self, block_ids: List[str]) -> Dict[str, Any]:
         if err := self._gate("order"):
@@ -594,14 +634,15 @@ class CMSession:
     policy_failures: int = 0
     policy_disabled: bool = False
     violations: int = 0
-    # Cumulative NET of booked management-op deltas, under the
-    # RENDER-VISIBILITY caliber (docs/19 §12.39.6): a block books its bake
-    # delta when it renders now or necessarily next turn; never-rendering
-    # blocks and non-savings (refusals, breaches) book nothing. A FLOW
-    # ledger — it can decrease (refunds) and go negative transiently is
-    # impossible by construction (credits precede their refunds); the
-    # STATE quantity (current-view net savings) is independently observable
-    # from the per-turn render deltas.
+    # Cumulative SIGNED flow of booked management-op deltas: every mutation
+    # books the TRANSITION width (prev rendered form → new rendered form,
+    # docs/19 §12.40 F2), render-visible blocks only (⑤). It can decrease
+    # (refunds: a restore widens the view again) and it CAN be negative
+    # transiently — a shrink that widens a tiny block (C.1) or a cross-form
+    # move books the true signed delta instead of a clamped 0. The STATE
+    # quantity (current view net saving) remains independently observable
+    # from the per-turn render deltas; consumers treat this as a flow, never
+    # as billing.
     est_chars_saved: int = 0
     emit_failures: int = 0
     # CM-03 leak observability: an exec-budget timeout leaks its worker
@@ -719,6 +760,107 @@ class CMSession:
         v = keys.get("cm_note_cap_chars")
         if type(v) is int and v >= 1:
             self.note_cap_chars = v
+
+    # ------------------------------------------------ sent-text + accounting
+    # ONE source for a block's sent text (all forms, incl. the session-
+    # anchored dedup / derived_host), and ONE source for an op's saving
+    # (the TRANSITION from the block's previous rendered form). Render, the
+    # marker re-bind and the audit funnel all consume these (docs/19 §12.40):
+    # the pre-§12.40 split (bake() + block-local form_saving() + a dedup-only
+    # session fixup) booked wrong deltas for repeated/no-op/cross-form ops
+    # and for the derived_host restore.
+    @staticmethod
+    def _renders(block: "Block") -> bool:
+        """⑤ RENDER-VISIBILITY caliber, single-sourced: a block books saving
+        when it renders NOW (bound to the canonical history) or necessarily
+        NEXT turn (the unbound outgoing turn_output — the fingerprint bind is
+        guaranteed by the chat protocol). Notes / derived / traj_seg never
+        render → never book."""
+        return block.msg_index is not None or block.kind == "turn_output"
+
+    def view_text(self, block: "Block", form: str, rule: str = "") -> str:
+        """The text this block contributes to the SENT history in ``form``.
+
+        context-free forms delegate to ``bake`` (the frozen formula source);
+        the two SESSION-ANCHORED forms are resolved here:
+        ``dedup`` — exactly the render's rewrite (head prefix → marker;
+        a non-matching prefix is a no-effect, i.e. the full text);
+        ``derived_host`` — the resolved derived text + the host suffix
+        (the rule carries ``derived=<id>``; a missing host stays raw, the
+        same defensive behavior render has).
+        """
+        rule = str(rule or "")
+        if form == "full":
+            return block.text
+        if form == "dedup":
+            if self.system_prefix and block.text.startswith(self.system_prefix):
+                return _DEDUP_MARKER + block.text[len(self.system_prefix):]
+            return block.text
+        if form == "derived_host":
+            bid = rule[len("derived="):] if rule.startswith("derived=") else None
+            dblock = self.universe.get(bid) if bid else None
+            if dblock is None:
+                return block.text
+            return bake(block, "derived_host", rule, host_text=dblock.text)
+        return bake(block, form, rule, keep=self.head_tail_keep)
+
+    def _transition_saving(self, block: "Block", prev_form: str, prev_rule: str,
+                           new_form: str, new_rule: str) -> int:
+        """Signed sent-width delta of one form transition (SIGNED: a move to
+        a wider form refunds; small-block evictions may legitimately widen —
+        the C.1 phenomenon is now visible instead of clamped, docs/19
+        §12.40). 0 for never-rendering blocks (⑤)."""
+        if not self._renders(block):
+            return 0
+        prev_form = str(prev_form or "full")
+        new_form = str(new_form or "full")
+        if prev_form == new_form and str(prev_rule or "") == str(new_rule or ""):
+            return 0
+        return (len(self.view_text(block, prev_form, prev_rule))
+                - len(self.view_text(block, new_form, new_rule)))
+
+    def _pre_state(self, block_id: str) -> Tuple[str, str]:
+        """The (form, rule) snapshot taken BEFORE a mutation."""
+        return (self.view.form_of(block_id),
+                str(self.view.rules.get(block_id, "") or ""))
+
+    def _pre_state_all(self) -> Dict[str, Tuple[str, str]]:
+        return {b.block_id: self._pre_state(b.block_id)
+                for b in self.universe.ordered()}
+
+    def _book(self, rec: Dict[str, Any], block_id: str,
+              prev: Tuple[str, str]) -> Dict[str, Any]:
+        """THE accounting funnel: fill ``rec["saved"]`` from the transition.
+
+        Only ok mutation records are booked (refusals carry no saving);
+        the record keeps its other fields untouched. Every caller that
+        mutates the view goes through this (ViewHandle + the stage methods),
+        so there is exactly ONE place a saving number is produced.
+        """
+        if rec.get("ok"):
+            block = self.universe.get(block_id)
+            if block is not None:
+                rec["saved"] = self._transition_saving(
+                    block, prev[0], prev[1],
+                    *self._pre_state(block_id))
+        return rec
+
+    def _delta_since(self, prev_all: Dict[str, Tuple[str, str]]) -> int:
+        """Exact summed delta for a multi-block mutation (``compact``): every
+        block whose (form, rule) changed since the snapshot contributes its
+        transition width difference — this includes the stale-reference
+        re-points the materializing strategies perform."""
+        total = 0
+        for block in self.universe.ordered():
+            before = prev_all.get(block.block_id)
+            if before is None:
+                continue   # blocks the op registered have no prior view state
+            now = self._pre_state(block.block_id)
+            if before[0] == now[0] and before[1] == now[1]:
+                continue
+            total += self._transition_saving(block, before[0], before[1],
+                                             now[0], now[1])
+        return total
 
     def summary(self) -> Dict[str, Any]:
         """Session-level CM summary (cost record / receipt ``cm`` node).
@@ -915,17 +1057,17 @@ class CMSession:
         form = self.view.form_of(block.block_id)
         rule = str(self.view.rules.get(block.block_id) or "")
         if form == "head_tail":
-            return bake(block, "head_tail", rule, keep=self.head_tail_keep)
+            return self.view_text(block, "head_tail", rule)
         if form == "placeholder":
-            return bake(block, "placeholder", rule)
+            return self.view_text(block, "placeholder", rule)
         if form == "template":
-            return bake(block, "template", rule)
+            return self.view_text(block, "template", rule)
         if form == "derived_host":
             dblock = (self.universe.get(rule[len("derived="):])
                       if rule.startswith("derived=") else None)
             if dblock is None:
                 return ""  # unreachable (universe add-only): nothing to match
-            return bake(block, "derived_host", rule, host_text=dblock.text)
+            return self.view_text(block, "derived_host", rule)
         return ""
 
     def register_note(self, text: str) -> Tuple[Optional[str], str]:
@@ -1663,9 +1805,11 @@ class CMSession:
                 # block must never drop) does not become violation noise
             if block.chars < self.drop_floor_chars:
                 continue
-            out.append(ops.drop(self.universe, self.view, block.block_id,
-                                f"window_k={self.window_k}",
-                                self.drop_floor_chars))
+            prev = self._pre_state(block.block_id)
+            rec = ops.drop(self.universe, self.view, block.block_id,
+                           f"window_k={self.window_k}",
+                           self.drop_floor_chars)
+            out.append(self._book(rec, block.block_id, prev))
         return out
 
     def conservative_compaction(self) -> List[Dict[str, Any]]:
@@ -1694,10 +1838,12 @@ class CMSession:
             if form_saving(block, "head_tail", rule="compacted:first_last",
                            keep=self.head_tail_keep) < MIN_COMPACT_SAVE:
                 continue  # the trim would save nothing: leave to the window
-            out.append(ops.compact(self.universe, self.view,
-                                   [block.block_id], "first_last",
-                                   self.drop_floor_chars, self.turn,
-                                   keep=self.head_tail_keep))
+            prev = self._pre_state(block.block_id)
+            rec = ops.compact(self.universe, self.view,
+                              [block.block_id], "first_last",
+                              self.drop_floor_chars, self.turn,
+                              keep=self.head_tail_keep)
+            out.append(self._book(rec, block.block_id, prev))
         return out
 
     def usage_snapshot(self, tokens_used: Optional[int] = None,
@@ -1956,15 +2102,13 @@ class CMSession:
         run dedup without the window)."""
         if not self.system_prefix:
             return []
-        # R4 (docs/19 §12.37): the render's dedup branch replaces exactly the
-        # head prefix occurrence with the marker — the ACTUAL sent delta is
-        # prefix minus marker, never the bare prefix length. A prefix shorter
-        # than the marker would GROW every old turn: refuse the whole stage
-        # (the same "saves nothing" semantics as compact's MIN_COMPACT_SAVE
-        # gate; realistic tool-use headers are far longer than the marker).
-        head_saving = _dedup_head_saving(self.system_prefix)
-        if head_saving <= 0:
-            return []
+        # R4/F2 (docs/19 §12.37, §12.40): the ACTUAL sent delta is the
+        # transition width (prefix minus marker), measured by the session
+        # accounting funnel — never the bare prefix length, and never a
+        # second copy of the formula. A prefix shorter than the marker would
+        # GROW the old turn: skip the block (the "saves nothing" semantics
+        # of compact's MIN_COMPACT_SAVE gate; realistic tool-use headers are
+        # far longer than the marker).
         out: List[Dict[str, Any]] = []
         blocks = [b for b in self.universe.ordered()
                   if b.kind == "turn_output"]
@@ -1980,10 +2124,14 @@ class CMSession:
                 continue
             if len(block.text) - len(self.system_prefix) < self.drop_floor_chars:
                 continue
+            prev = self._pre_state(block.block_id)
+            saving = self._transition_saving(block, prev[0], prev[1],
+                                             "dedup", "system_prefix")
+            if saving <= 0:
+                continue
             self.view.set(block.block_id, "dedup", "system_prefix")
             out.append({"op": "dedup", "refs": [block.block_id], "ok": True,
-                        "rule": "system_prefix",
-                        "saved": head_saving})
+                        "rule": "system_prefix", "saved": saving})
         return out
 
     def render(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2020,22 +2168,18 @@ class CMSession:
                 if f"[block {block.block_id} " in content:
                     continue  # already baked in an earlier turn (idempotent)
                 if form == "placeholder":
-                    new_text = bake(block, "placeholder", rule or "view")
+                    new_text = self.view_text(block, "placeholder",
+                                              rule or "view")
                 elif form == "head_tail":
-                    new_text = bake(block, "head_tail", rule or "view",
-                                    keep=self.head_tail_keep)
+                    new_text = self.view_text(block, "head_tail",
+                                              rule or "view")
                 elif form == "derived_host":
                     # the host span renders the DERIVED text IN FULL (the
                     # merge/template already did the compressing). The baked
                     # marker carries the HOST id, so the idempotency check
                     # and the view-marker re-bind above keep working on the
                     # next turn (docs/10 §15).
-                    dblock = (self.universe.get(rule[len("derived="):])
-                              if rule.startswith("derived=") else None)
-                    if dblock is None:
-                        continue  # unreachable (universe add-only): stay raw
-                    new_text = bake(block, "derived_host", rule,
-                                    host_text=dblock.text)
+                    new_text = self.view_text(block, "derived_host", rule)
                 elif form == "dedup":
                     if self.system_prefix and new_content.startswith(self.system_prefix):
                         new_text = _DEDUP_MARKER + new_content[len(self.system_prefix):]
@@ -2045,7 +2189,7 @@ class CMSession:
                     # line never claims a loss); restorable via fetch(full)
                     # like every non-full form (docs/10 form 语义声明,
                     # docs/19 §12.20/§12.21)
-                    new_text = bake(block, "template", rule or "view")
+                    new_text = self.view_text(block, "template", rule or "view")
                 if form == "dedup":
                     new_content = new_text  # prefix elision (anchored at head)
                 elif block.text and block.text in new_content:

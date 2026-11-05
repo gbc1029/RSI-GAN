@@ -41,7 +41,16 @@ live under `scripts/dgmh/`.
   block model, primitives, the per-turn seam (``assemble_turn`` DISPATCHES
   only; the pipeline itself is the baseline assembly ``assembly.py`` — one
   named preset per ``cm_mode``, composed over the session's frozen primitive
-  methods; invariants live in the primitives, never in the pipeline source,
+  methods; invariants live in the primitives, never in the pipeline source;
+  the SENT TEXT of every form and the saving number are single-sourced in
+  the session: ``view_text`` (context-free forms delegate to ``bake``; dedup /
+  derived_host are session-anchored) and the accounting funnel books `saved`
+  as a SIGNED TRANSITION delta from the previous rendered form — primitives
+  carry no ``saved``, a repeated/no-op op books 0, a restore refunds, and
+  ``pin`` on an already-elided block restores it to FULL (dedup the only
+  exempt non-full pinned form; docs/19 §12.40 — the P1 ``pinned_form``
+  invariant is therefore enforced at the entry, never left for the
+  reconcile to misattribute to an innocent module),
   and ``resolve()`` also loads the P2 NAMED agent-owned assembly (``cost.cm_assembly``
   design key → ``gan/components/<role>/cm/<stem>.py``, delivered as
   ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the
@@ -467,7 +476,17 @@ non-repeatable:
   authority moved to the parent (§12.28 — seat trajectory rows arrive as
   protocol messages, task child forwards over the telemetry socket,
   role_broker no longer grants the trajectory dir, parent-side hash chain
-  in gan/framework/traj_chain.py, offline verifier verify_stream).
+  in gan/framework/traj_chain.py, offline verifier verify_stream); the
+  §12.40 F1+F2 batch (2026-11-05 deep-audit follow-up) closed the
+  pin-semantics hole and the saving caliber: ctx_pin on an elided block
+  restores FULL (dedup the only exempt form; entry-level convergence, so
+  `pinned_form` no longer misattributes an innocent module), and
+  `saved` is the SIGNED TRANSITION width delta from the single
+  `CMSession.view_text` source (primitives carry no `saved`; dedup /
+  derived_host anchored forms + stale-reference re-points are included;
+  C.1's small-block widening is recorded honestly instead of clamped).
+  Remaining F3-F7 audit items are NOT landed (seam empty-history edge,
+  registry text, harness comment, cost aggregation/whitelist).
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

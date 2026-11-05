@@ -81,12 +81,19 @@ def placeholder(block: "Block", rule: str) -> str:
 
 def bake(block: "Block", form: str, rule: str = "", keep: Optional[int] = None,
          host_text: Optional[str] = None) -> str:
-    """THE definition of one block's sent text in a view form — render and
-    saved accounting both consume this; no second copy of any formula may
-    exist (docs/19 §12.21). Pure; no new content beyond the declared
-    in-band lines. ``keep`` matters only for head_tail (session key
-    ``cm_head_tail_keep``, default HEAD_TAIL_KEEP); ``host_text`` is the
-    resolved derived text for the derived_host form."""
+    """The sent text of one block in a CONTEXT-FREE view form.
+
+    No second copy of these formulas may exist (docs/19 §12.21). Two forms
+    are SESSION-ANCHORED and cannot be baked here without session state:
+    ``dedup`` (needs the current system prefix) and ``derived_host`` (needs
+    the resolved derived text). ``CMSession.view_text`` is the single source
+    for a block's sent text across ALL forms — render, the marker re-bind
+    and the saving accounting all consume it; this function supplies the
+    context-free half only. ``derived_host`` therefore REQUIRES
+    ``host_text``: a missing host is a programming error, never "render the
+    marker alone" (that silently produced a ~40-char lie for the saved
+    accounting — docs/19 §12.40, F2).
+    """
     rule = str(rule)[:60]
     if form == "full":
         return block.text
@@ -101,7 +108,11 @@ def bake(block: "Block", form: str, rule: str = "", keep: Optional[int] = None,
                 f"chars={meta['chars']}, source={meta['source']}, "
                 f"reason={rule or 'view'}]")
     if form == "derived_host":
-        return ((host_text or "")
+        if host_text is None:
+            raise ValueError(
+                "bake(derived_host) needs the resolved host text; use "
+                "CMSession.view_text (the single source for anchored forms)")
+        return (host_text
                 + f"\n[block {block.block_id} derived_host: {rule}]")
     raise ValueError(f"invalid form {form!r}")
 
@@ -109,10 +120,15 @@ def bake(block: "Block", form: str, rule: str = "", keep: Optional[int] = None,
 def form_saving(block: "Block", form: str, rule: str = "",
                 keep: Optional[int] = None,
                 host_text: Optional[str] = None) -> int:
-    """Actual chars the elision saves vs full, BY DEFINITION: the exact
-    sent-text delta through bake() (includes the render suffix and the rule
-    length). The ONLY saving helper — per-form copies are forbidden
-    (docs/19 §12.21)."""
+    """GATE helper: how much a form would save **relative to full** (clamped
+    at 0). Used by the pipeline's "does this elision save at least
+    MIN_COMPACT_SAVE" gates only.
+
+    It is NOT an op's saving: an op's saved is a TRANSITION from the block's
+    CURRENT rendered form, which needs session state (dedup prefix / derived
+    host) and the previous form — ``CMSession`` owns that single accounting
+    funnel (docs/19 §12.40, F2). Per-form copies are still forbidden.
+    """
     return max(0, block.chars - len(bake(block, form, rule, keep=keep,
                                          host_text=host_text)))
 
