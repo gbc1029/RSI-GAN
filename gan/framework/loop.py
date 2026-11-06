@@ -109,6 +109,10 @@ def _report_view_for_evaluator(report_summary):
 _CM_COST_KEYS = (
     "mode", "turns", "blocks", "ops_total", "ops_applied", "ops_refused",
     "policy_failures", "policy_disabled", "violations", "est_chars_saved",
+    # N4 (docs/19 §12.46): the AGENT-source half of the flow, so the cost row
+    # can attribute (seam half = est_chars_saved - est_saved_agent; the
+    # conditional field stays absent when there is no agent-source flow).
+    "est_saved_agent",
     # F7: the seam's health facts that used to be summary-only.
     "substituted",
     "emit_failures",

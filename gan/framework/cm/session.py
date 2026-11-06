@@ -403,6 +403,13 @@ class ViewHandle:
         full restore refunds. Policy/assembly records are counted by
         ``count_ops`` — accumulating here too would double-count.
 
+        N4 (docs/19 §12.46) SOURCE SPLIT: the agent-face delta is a different
+        SOURCE than the seam's, so it lands in TWO extra places besides the
+        total: ``est_saved_agent`` (the session-level attribution export) and
+        ``_agent_saved_pending`` (per-turn, folded into the NEXT cm_view's
+        ``agent_saved_chars``). The total ``est_chars_saved`` keeps its
+        historical meaning (a flow, never billing).
+
         ``saved`` is a TRANSITION number (docs/19 §12.40, F2): the handle
         snapshots the block's previous form BEFORE calling the primitive and
         fills the record through the session's single accounting funnel
@@ -414,7 +421,10 @@ class ViewHandle:
             if refs:
                 self._s._recorded_refs.update(str(r) for r in refs)
             if self.face == "agent" and "saved" in rec:
-                self._s.est_chars_saved += int(rec.get("saved") or 0)
+                saved = int(rec.get("saved") or 0)
+                self._s.est_chars_saved += saved
+                self._s.est_saved_agent += saved
+                self._s._agent_saved_pending += saved
             return rec
         if self.face == "policy":
             self._s.note_violation(rec)
@@ -643,7 +653,15 @@ class CMSession:
     # quantity (current view net saving) remains independently observable
     # from the per-turn render deltas; consumers treat this as a flow, never
     # as billing.
+    #
+    # N4 (docs/19 §12.46) SOURCE SPLIT: this total mixes the SEAM source
+    # (``count_ops`` records) with the AGENT-tool source (the handle audit,
+    # which never flows through ``finalize_turn``/``count_ops``). The agent
+    # half is exported separately as ``est_saved_agent`` (conditional in
+    # ``summary()``) so a reader can attribute the flow; the seam half is
+    # ``est_chars_saved - est_saved_agent`` (derived, no third field).
     est_chars_saved: int = 0
+    est_saved_agent: int = 0
     emit_failures: int = 0
     # CM-03 leak observability: an exec-budget timeout leaks its worker
     # thread (Python cannot kill threads). ``thread_leaks`` counts the
@@ -700,6 +718,19 @@ class CMSession:
     _turn_degraded: bool = field(default=False, repr=False, compare=False)
     _view_emitted_turn: Optional[int] = field(default=None, repr=False,
                                               compare=False)
+    # N4 (docs/19 §12.46): the turn whose POST SEGMENT (count_ops + emit_view +
+    # render) ran. Basis of the per-turn ``send_source`` fact: a turn that is
+    # not finalized did not send a framework-rendered view (it is either the
+    # passthrough identity or an assembly-authored send). Not the same thing
+    # as ``_view_emitted_turn``: passthrough emits a cm_view WITHOUT running
+    # the post segment, so only ``finalize_turn`` sets this.
+    _finalized_turn: Optional[int] = field(default=None, repr=False,
+                                           compare=False)
+    # N4 source split: agent tool-face deltas accumulate here BETWEEN turns
+    # (the handle audit books them; ``count_ops`` never sees them). The next
+    # cm_view folds the pending delta into its ``agent_saved_chars`` field and
+    # resets it — the session-level export stays in ``est_saved_agent``.
+    _agent_saved_pending: int = field(default=0, repr=False, compare=False)
     # identity-keyed bookkeeping: rewritten shallow copies are not re-registered
     _by_fp: Dict[str, str] = field(default_factory=dict)  # content fp -> bid
     # R5 backstop (docs/19 §12.38): each turn_output block's REGISTRATION
@@ -879,9 +910,14 @@ class CMSession:
         never-active assembly must read as exactly that, None ≠ 0 style).
         Conditional audit fields keep the same rule: ``policy_violations`` /
         ``*_overruns`` / ``thread_leaks`` / ``thread_leaks_live`` /
-        ``thread_leak_delta`` appear only when non-zero (absence = zero/clean),
-        while ``assembly_*`` appear whenever an assembly was configured (they
-        may legitimately read 0)."""
+        ``thread_leak_delta`` / ``est_saved_agent`` appear only when non-zero
+        (absence = zero/clean), while ``assembly_*`` appear whenever an
+        assembly was configured (they may legitimately read 0).
+
+        N4 (docs/19 §12.46): ``est_chars_saved`` is the TOTAL flow (seam +
+        agent tool face); ``est_saved_agent`` exports the agent-source half so
+        a reader can attribute (seam half = total - agent). The per-turn
+        split rides ``cm_view.stats.agent_saved_chars``."""
         out = {"mode": self.mode, "turns": self.turn,
                "blocks": len(self.universe.blocks),
                "ops_total": self.ops_total, "ops_applied": self.ops_applied,
@@ -895,6 +931,8 @@ class CMSession:
                "violations": self.violations,
                "substituted": self._substituted_blocks(),
                "est_chars_saved": self.est_chars_saved}
+        if self.est_saved_agent:
+            out["est_saved_agent"] = self.est_saved_agent
         if self.policy_violations:
             out["policy_violations"] = self.policy_violations
         if self.emit_failures:
@@ -1746,15 +1784,20 @@ class CMSession:
         """Per-turn audit completion for an assembly that returned without
         closing through ``finalize_turn``: one ``cm_view`` brief per
         assembled turn is the framework's contract, so the seam emits the
-        minimal honest brief itself (ops empty; stats marked)."""
+        minimal honest brief itself (ops empty; stats marked).
+
+        This fires ONLY on the LEGAL skip shape — a turn that changed the
+        view without finalizing is already a contract violation
+        (``unclosed_turn`` -> restore + strike + fail-open preset), so it
+        never reaches this method. The stats therefore share the session's
+        single caliber (``_turn_stats``) instead of a hand-built dict
+        (docs/19 §12.46: the old ``len(view.forms)`` counted explicit
+        ``"full"`` entries and made this brief disagree with every other
+        ``cm_view`` about ``substituted``)."""
+        stats = self._turn_stats(0)
+        stats["assembled_by"] = "agent_assembly"
         self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
-                    "ops": [],
-                    "stats": {"blocks": len(self.universe.blocks),
-                              "substituted": len(self.view.forms),
-                              "saved_chars": 0,
-                              "est_saved_session": self.est_chars_saved,
-                              "policy_disabled": self.policy_disabled,
-                              "assembled_by": "agent_assembly"}})
+                    "ops": [], "stats": stats})
         self._view_emitted_turn = self.turn
 
     def assemble(self, msgs: List[Dict[str, Any]],
@@ -2089,8 +2132,16 @@ class CMSession:
         (``cm_view`` brief, no content); the sent history is materialized
         from the persistent view by the no-fabrication render (copies only
         — 双记); the outgoing instruction is never substituted except the
-        dedup prefix-elision (same frozen form, anchored at the head)."""
+        dedup prefix-elision (same frozen form, anchored at the head).
+
+        N4 (docs/19 §12.46): this call IS the per-turn "framework post
+        segment ran" fact. ``_finalized_turn`` lets the audit distinguish
+        three shapers of the sent history — the framework (this method),
+        the passthrough identity, and an assembly-authored return — WITHOUT
+        conflating them with "did ``render`` get invoked" (an assembly may
+        call ``render`` itself and still return its own list)."""
         self._require_msg_dicts(msgs, "finalize_turn")
+        self._finalized_turn = self.turn
         saved = self.count_ops(records)
         self.emit_view(saved, records)
         send_history = self.render(msgs)
@@ -2274,6 +2325,38 @@ class CMSession:
                 # byte-identical — same pattern as degraded/assembly_disabled)
                 brief["derived"] = str(rec.get("derived"))
             ops_brief.append(brief)
+        stats: Dict[str, Any] = self._turn_stats(saved)
+        self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
+                    "ops": ops_brief, "stats": stats})
+        self._view_emitted_turn = self.turn
+
+    def _take_agent_delta(self) -> int:
+        """Read-and-reset the agent tool-face flow booked since the last
+        ``cm_view`` (docs/19 §12.46). The delta is already in the session
+        total; this only moves it into the per-turn export."""
+        delta = self._agent_saved_pending
+        self._agent_saved_pending = 0
+        return delta
+
+    def _turn_stats(self, saved: int) -> Dict[str, Any]:
+        """THE one per-turn ``stats`` shape for BOTH ``cm_view`` paths.
+
+        ``emit_view`` (the post segment closed) and ``_emit_synthetic_view``
+        (an assembly that legally skipped the post segment) used to build
+        their dicts separately — exactly how the synthetic brief's
+        ``substituted`` caliber drifted from the session's (NON-FULL forms vs
+        ``len(view.forms)``; docs/19 §12.46). One builder, one caliber.
+
+        N4 additions (both CONDITIONAL — absence is meaningful, so the
+        default passthrough shape stays byte-identical):
+        * ``agent_saved_chars`` — the agent tool-face source delta folded
+          into this turn (signed; never mixed into the seam-scope
+          ``saved_chars``);
+        * ``send_source`` — who produced this turn's SENT history. ABSENCE =
+          the framework post segment (``finalize_turn`` -> ``render``);
+          ``"identity"`` = passthrough sent the input as-is; ``"author"`` =
+          a named assembly returned its own history.
+        """
         stats: Dict[str, Any] = {"blocks": len(self.universe.blocks),
                                  # docs/19 §12.44 D5: NON-FULL forms only —
                                  # same caliber as summary()'s substituted.
@@ -2288,9 +2371,13 @@ class CMSession:
             stats["degraded"] = True
         if self.assembly_disabled:
             stats["assembly_disabled"] = True
-        self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
-                    "ops": ops_brief, "stats": stats})
-        self._view_emitted_turn = self.turn
+        agent_delta = self._take_agent_delta()
+        if agent_delta:
+            stats["agent_saved_chars"] = agent_delta
+        if self._finalized_turn != self.turn:
+            stats["send_source"] = ("identity" if self.mode == "passthrough"
+                                    else "author")
+        return stats
 
 
 def build_session(keys: Dict[str, Any], *, emit: Optional[Callable] = None,
