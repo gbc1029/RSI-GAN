@@ -34,7 +34,7 @@ import glob
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from gan.framework import paths
 from utils import trajectory_log
@@ -126,52 +126,82 @@ def _last_cumulative_est(rows: List[Dict[str, Any]], key: str = "kind") -> int:
     return est
 
 
+def _cm_node(items: List[Dict[str, Any]], *,
+              type_of: Callable[[Dict[str, Any]], str],
+              stats_of: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]
+                                 ]) -> Dict[str, Any]:
+    """ONE CM event→field mapping for BOTH transports (F6, docs/19 §12.43).
+
+    ``failures`` counts STRIKE events only (``cm_*_failed``); ``overruns`` is
+    the ADVISORY counter (a completed-over-budget run is honored, never a
+    failure); ``disabled`` is a BOOL merging the disabled event, the latch
+    event and the per-turn ``cm_view`` stat (a latched session emits no
+    failed/disabled event, and a role seat may only carry the stat).
+    ``*_violations`` count the contract-breach family (``cm_*_violation``),
+    which is NOT the op-refusal ``cm_violations`` family (docs/19 §12.39.4).
+    """
+    types = [type_of(it) for it in items]
+
+    def n(kind: str) -> int:
+        return types.count(kind)
+
+    view_stats = [stats_of(it) or {} for it in items
+                  if type_of(it) == "cm_view"]
+
+    def disabled(prefix: str) -> bool:
+        return bool(n(f"cm_{prefix}_disabled") or n(f"cm_{prefix}_latched")
+                    or any(bool(s.get(f"{prefix}_disabled"))
+                           for s in view_stats))
+
+    return {
+        "cm_view_turns": n("cm_view"),
+        "cm_violations": n("cm_violation"),
+        "cm_policy_failures": n("cm_policy_failed"),
+        "cm_policy_disabled": disabled("policy"),
+        "cm_policy_overruns": n("cm_policy_overrun"),
+        "cm_policy_violations": n("cm_policy_violation"),
+        "cm_assembly_failures": n("cm_assembly_failed"),
+        "cm_assembly_disabled": disabled("assembly"),
+        "cm_assembly_overruns": n("cm_assembly_overrun"),
+        "cm_assembly_violations": n("cm_assembly_violation"),
+        "cm_budget_warnings": n("cm_budget_checkpoint"),
+    }
+
+
 def _cm_summary(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Aggregate the session's ``cm_*`` trajectory rows (docs/10 §11 D12).
 
     Returns None when the session had no CM rows (None ≠ 0 — a seam-free
     session must not read as a zero-ops one). Content-free: the rows already
-    are; this only counts."""
-    if not any(str(r.get("kind", "")).startswith("cm_") for r in rows):
+    are; this only counts. ``kind`` is the trajectory convention, ``type`` is
+    what a CM event sink appends verbatim (direct ``Role`` construction / old
+    runs) — BOTH are accepted so the fallback aggregation is not dead
+    (docs/19 §12.43). Seat sessions built by the loop sink CM events into
+    ``events.jsonl`` instead, so their authoritative numbers come from
+    ``CMSession.summary`` (docs/19:1272/1630)."""
+    if not any(str(r.get("kind") or r.get("type") or "").startswith("cm_")
+               for r in rows):
         return None
-    return {
-        "cm_view_turns": _count(rows, "cm_view"),
-        "cm_violations": _count(rows, "cm_violation"),
-        "cm_policy_failures": (_count(rows, "cm_policy_failed")
-                               + _count(rows, "cm_policy_disabled")
-                               + _count(rows, "cm_policy_overrun")),
-        "cm_assembly_failures": (_count(rows, "cm_assembly_failed")
-                                 + _count(rows, "cm_assembly_disabled")
-                                 + _count(rows, "cm_assembly_overrun")),
-        "cm_budget_warnings": _count(rows, "cm_budget_checkpoint"),
-        "est_chars_saved": _last_cumulative_est(rows),
-    }
+    out = _cm_node(rows,
+                   type_of=lambda r: str(r.get("kind") or r.get("type") or ""),
+                   stats_of=lambda r: r.get("stats"))
+    out["est_chars_saved"] = _last_cumulative_est(rows)
+    return out
 
 
 def cm_summary_from_events(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Aggregate CM events (the sidecar/ingested form) into a cost-record
-    ``cm`` summary — same shape as :func:`_cm_summary` but keyed on the event
+    ``cm`` summary — same shape as :func:`_cm_summary`, keyed on the event
     ``type`` field: the task child's seam events arrive via events.jsonl
     (role-attributed by task_runner's ingest), not the trajectory. Returns
     None when there are no cm events (None ≠ 0)."""
     if not events:
         return None
-
-    def _count(kind: str) -> int:
-        return sum(1 for e in events if e.get("type") == kind)
-
-    return {
-        "cm_view_turns": _count("cm_view"),
-        "cm_violations": _count("cm_violation"),
-        "cm_policy_failures": (_count("cm_policy_failed")
-                               + _count("cm_policy_disabled")
-                               + _count("cm_policy_overrun")),
-        "cm_assembly_failures": (_count("cm_assembly_failed")
-                                 + _count("cm_assembly_disabled")
-                                 + _count("cm_assembly_overrun")),
-        "cm_budget_warnings": _count("cm_budget_checkpoint"),
-        "est_chars_saved": _last_cumulative_est(events, key="type"),
-    }
+    out = _cm_node(events,
+                   type_of=lambda e: str(e.get("type") or ""),
+                   stats_of=lambda e: e.get("stats"))
+    out["est_chars_saved"] = _last_cumulative_est(events, key="type")
+    return out
 
 
 def task_cm_summary(output_dir: str, genid: Any) -> Optional[Dict[str, Any]]:
