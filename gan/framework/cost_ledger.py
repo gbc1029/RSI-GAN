@@ -139,6 +139,13 @@ def _cm_node(items: List[Dict[str, Any]], *,
     failed/disabled event, and a role seat may only carry the stat).
     ``*_violations`` count the contract-breach family (``cm_*_violation``),
     which is NOT the op-refusal ``cm_violations`` family (docs/19 §12.39.4).
+    ``cm_face_violations`` counts the AGENT tool-face refusals
+    (``cm_face_violation``, docs/19 §12.47/§12.50) — the op-refusal family's
+    UNCOUNTED half. It is deliberately a THIRD key rather than a widening of
+    ``cm_violations``: that key keeps its meaning (the counted half: policy
+    face + seam records), so a reader can never mistake the two, and the
+    refusal is not a strike/disabled fact either (``task_cm_degraded`` must
+    stay False for it).
     ``cm_session_degraded`` is the BUILD-time fact (the child never built a
     seam at all — ``cm_session_degraded`` event, docs/19 §12.47.7); it is a
     BOOL, not a counter, and it is the one key here that is NOT a strike or a
@@ -160,6 +167,7 @@ def _cm_node(items: List[Dict[str, Any]], *,
     return {
         "cm_view_turns": n("cm_view"),
         "cm_violations": n("cm_violation"),
+        "cm_face_violations": n("cm_face_violation"),
         "cm_policy_failures": n("cm_policy_failed"),
         "cm_policy_disabled": disabled("policy"),
         "cm_policy_overruns": n("cm_policy_overrun"),
@@ -241,7 +249,10 @@ def task_cm_degraded(node: Optional[Dict[str, Any]]) -> bool:
     no seam at all — ``cm_session_degraded``, docs/19 §12.47.7; before that
     key existed such a generation read as a HEALTHY zero-turn session and the
     "both roles learn about task CM degradation" promise silently covered only
-    the RUNTIME half). ``None`` / ``{"absent": …}`` is NOT degradation —
+    the RUNTIME half). ``cm_face_violations`` is an op-refusal COUNT and is
+    deliberately NOT read here: a refused attempt is a behavior fact, not a
+    broken seam (docs/19 §12.50). ``None`` / ``{"absent": …}`` is NOT
+    degradation —
     missing evidence is a different fact (cost.json always explains it), and
     a health flag must never be inferred from an absence."""
     if not isinstance(node, dict) or node.get("absent"):

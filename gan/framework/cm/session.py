@@ -1330,7 +1330,13 @@ class CMSession:
             fn, fallback = assembly.resolve(self.mode)
             self._assembly_fn = fn
             if fallback is not None:
+                # O7 (docs/19 §12.49): `where` separates the two meanings of
+                # this event type — RESOLVE degradation (unknown/claim-less
+                # mode -> slice preset, no module involved) vs LOAD failure
+                # (a named module that could not be loaded). Same shape,
+                # different causes; a reader had only `reason`/`turn` to tell.
                 self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                            "where": "resolve",
                             "mode": self.mode, "to": fallback})
         if self.assembly_path and self.mode == "passthrough":
             if not self._assembly_ignored:
@@ -1439,6 +1445,7 @@ class CMSession:
             self._note_assembly_failure(st.error, phase="load",
                                         timed_out=st.timed_out, exc=st.exc)
             self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                        "where": "load",
                         "mode": self.mode, "to": self.mode,
                         "reason": st.error})
             return None
