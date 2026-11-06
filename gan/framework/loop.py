@@ -1222,7 +1222,10 @@ class GanLoop:
         except Exception as e:  # noqa: BLE001 -- advisory
             soft_fail(f"cm session build failed ({role}): {e}",
                       event_path=paths.events_path(self.output_dir),
-                      event_type="cm_session_failed", role=role)
+                      event_type="cm_session_failed", role=role,
+                      # §12.47.7: this type covers THREE distinct build
+                      # sub-cases; without `where` they were one shape.
+                      where="session_build")
             return None
 
     def _traj_materialization_files(self, genids: Any, outer: Any = None,
@@ -1367,7 +1370,8 @@ class GanLoop:
                     pass
                 soft_fail(f"cm descriptor build failed ({role}/{seat}): {e}",
                           event_path=paths.events_path(self.output_dir),
-                          event_type="cm_session_failed", role=role, seat=seat)
+                          event_type="cm_session_failed", role=role, seat=seat,
+                          where="descriptor_build")
             return
         role_obj.cm_session = self._build_cm_session(
             role, keys, outer=outer, seat=seat, instance=instance, genid=genid)
@@ -4218,7 +4222,8 @@ class GanLoop:
                         soft_fail(f"self-seat cm session build failed ({role}): {e}",
                                   event_path=paths.events_path(self.output_dir),
                                   event_type="cm_session_failed", role=role,
-                                  seat="self_improve")
+                                  seat="self_improve",
+                                  where="seat_install")
                         self._seat_cm_clear(role_obj)
                     _si_res = role_obj.self_improve(
                         recent={**recent_payload, "receipt": prev_receipt},

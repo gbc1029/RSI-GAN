@@ -379,16 +379,27 @@ class ViewHandle:
         """Policy-face refusals are violations wherever they happen (the
         wedge breaker counts them via the session, not only in the seam).
 
-        Event vocabulary (docs/19 §12.39.4, R7b): THIS path emits the
-        generic ``cm_violation`` — the OP-REFUSAL family (an attempt that
-        did NOT take effect). The reconcile's detections are a different
-        family — contract breaches by an effect that DID happen — emitted
-        per-subsystem as ``cm_assembly_violation``/``cm_policy_violation``
-        (§12.17.1, N5a) by ``_note_violations``. Two concepts, not two
-        encodings: a scanner counting a session's refusals must subscribe
-        to both, and the cost line's ``cm_violations`` aggregate counts
-        ONLY this op-refusal family (declared half-count; widening it is
-        a recorded pending option, not done).
+        Event vocabulary (docs/19 §12.39.4 R7b + §12.47 F3): the OP-REFUSAL
+        family (an attempt that did NOT take effect) is split by SOURCE, so a
+        reader can always tell where the refusal came from:
+
+        * ``cm_violation`` with ``source="policy_face"`` — a policy-face
+          handle refusal (this path, counted);
+        * ``cm_violation`` with ``source="seam_record"`` — a refusal record
+          produced by the seam pipeline (``count_ops``, counted);
+        * ``cm_face_violation`` with ``face="agent"`` — an AGENT tool-face
+          refusal (``note_face_violation``, NOT counted: agent ops never flow
+          through ``count_ops``, so folding them into ``violations`` /
+          ``ops_refused`` would break the documented alias and the
+          ``ops_total == applied + refused + ...`` invariant).
+
+        The reconcile's detections are a DIFFERENT family — contract breaches
+        by an effect that DID happen — emitted per-subsystem as
+        ``cm_assembly_violation``/``cm_policy_violation`` (§12.17.1, N5a) by
+        ``_note_violations``. A scanner counting a session's refusals must
+        subscribe to both families; the cost line's ``cm_violations``
+        aggregate counts ONLY the counted half of the op-refusal family
+        (declared half-count; widening it is a recorded pending option).
 
         Successful MUTATING ops also publish their refs to the session's
         recorded-refs set: the P1 turn reconciliation must be able to explain
@@ -428,6 +439,11 @@ class ViewHandle:
             return rec
         if self.face == "policy":
             self._s.note_violation(rec)
+        elif self.face == "agent":
+            # F3 (docs/19 §12.47): a CM-semantic refusal on the AGENT tool
+            # face is a real CM decision -- it must be auditable, but it is
+            # NOT part of the seam's counted universe (see note_face_violation).
+            self._s.note_face_violation(rec, face=self.face)
         return rec
 
     def _gate(self, op: str) -> Optional[Dict[str, Any]]:
@@ -581,12 +597,22 @@ class ViewHandle:
     def note_write(self, text: str) -> Dict[str, Any]:
         if err := self._gate("note"):
             return err
-        return ops.note_write(self._s, text, self._s.note_cap_chars)
+        # F3 / B1 (docs/19 §12.47): the note verb used to bypass the audit
+        # hook, so its refusals (text over ``note_cap_chars``) were the ONE
+        # agent-face CM decision with no event at all. It now goes through
+        # ``_audit`` like every other mutating verb; ok records are unchanged
+        # (a note record carries no ``saved`` and no ``refs``).
+        return self._audit(ops.note_write(self._s, text,
+                                          self._s.note_cap_chars))
 
     def note_read(self, note_id: str) -> Dict[str, Any]:
         if err := self._gate("note"):
             return err
-        return ops.note_read(self._s.notes, note_id)
+        # F3 / B1 (docs/19 §12.47): same reason — an unknown note is a CM
+        # semantic refusal and must be auditable. The ok record's ``refs``
+        # only joins the reconciliation's recorded-refs set (note blocks are
+        # pinned + FULL, so the P1 questions are unaffected).
+        return self._audit(ops.note_read(self._s.notes, note_id))
 
     def note_list(self) -> Dict[str, Any]:
         if err := self._gate("note"):
@@ -2106,7 +2132,12 @@ class CMSession:
                 if not rec.get("_audited"):
                     self.ops_refused += 1
                     self.violations += 1
+                    # F3 (docs/19 §12.47): the op-refusal family is split by
+                    # SOURCE so a reader can tell a seam-record refusal from
+                    # a policy-face one (both counted; the agent face has its
+                    # own UNCOUNTED cm_face_violation).
                     self._emit({"type": "cm_violation", "turn": self.turn,
+                                "source": "seam_record",
                                 "op": rec.get("op"), "refs": rec.get("refs"),
                                 "error": rec.get("error")})
                 # already counted + emitted by the handle audit hook
@@ -2282,22 +2313,50 @@ class CMSession:
         return out
 
     def note_violation(self, rec: Dict[str, Any]) -> None:
-        """Count + emit one op refusal (idempotent with the seam path: the
-        seam's ``count_ops`` only emits for records that did NOT come from a
-        handle audit — tracked via the record marker below).
+        """Count + emit one POLICY-FACE op refusal (idempotent with the seam
+        path: the seam's ``count_ops`` only emits for records that did NOT
+        come from a handle audit — tracked via the record marker below).
 
-        This is the OP-REFUSAL family (``cm_violation``): an attempt that
-        did not take effect. The reconcile's contract-breach family is
-        ``_note_violations`` (per-subsystem event types, §12.17.1) — see
-        the vocabulary map on :meth:`_audit`."""
+        This is the COUNTED half of the OP-REFUSAL family (``cm_violation``
+        with ``source="policy_face"``, docs/19 §12.47): an attempt that did
+        not take effect, counted in ``violations``/``ops_refused``. The
+        agent tool face has its own UNCOUNTED event
+        (``note_face_violation``); the reconcile's contract-breach family is
+        ``_note_violations`` (per-subsystem event types, §12.17.1) — see the
+        vocabulary map on :meth:`_audit`."""
         if rec.get("_audited"):
             return
         rec["_audited"] = True
         self.violations += 1
         self.ops_refused += 1
         self._emit({"type": "cm_violation", "turn": self.turn,
+                    "source": "policy_face",
                     "op": rec.get("op"), "refs": rec.get("refs"),
                     "error": rec.get("error")})
+
+    def note_face_violation(self, rec: Dict[str, Any], *,
+                            face: str = "agent") -> None:
+        """Emit one AGENT-TOOL-FACE op refusal (docs/19 §12.47, F3).
+
+        Semantically the same OP-REFUSAL fact as ``cm_violation`` (CM refused
+        an attempt on its own semantic grounds — pinned/note form guards,
+        unknown block, note cap, ...), but a SEPARATE event type and NO
+        counter increment on purpose: agent tool-face records never flow
+        through ``finalize_turn``/``count_ops``, so folding them into
+        ``violations``/``ops_refused`` would break the documented alias and
+        the ``ops_total == applied + refused + ...`` invariant (§12.44 D5).
+        Scanners counting a session's refusals must subscribe to both event
+        types (the two-family pattern of §12.39.4).
+
+        Not deduped via the record's ``_audited`` marker: agent records never
+        reach ``count_ops``, so there is no second writer to collide with.
+
+        Call refusals by the tool-dispatch layer (unknown/missing parameters)
+        and the no-session refusal are NOT this fact — they never reach CM
+        (L1/L3 layers)."""
+        self._emit({"type": "cm_face_violation", "turn": self.turn,
+                    "face": face, "op": rec.get("op"),
+                    "refs": rec.get("refs"), "error": rec.get("error")})
 
     def emit_view(self, saved: int,
                   records: Optional[List[Dict[str, Any]]] = None) -> None:

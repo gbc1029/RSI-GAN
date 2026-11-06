@@ -139,6 +139,10 @@ def _cm_node(items: List[Dict[str, Any]], *,
     failed/disabled event, and a role seat may only carry the stat).
     ``*_violations`` count the contract-breach family (``cm_*_violation``),
     which is NOT the op-refusal ``cm_violations`` family (docs/19 §12.39.4).
+    ``cm_session_degraded`` is the BUILD-time fact (the child never built a
+    seam at all — ``cm_session_degraded`` event, docs/19 §12.47.7); it is a
+    BOOL, not a counter, and it is the one key here that is NOT a strike or a
+    per-turn stat: a build failure has no module and no turn to strike.
     """
     types = [type_of(it) for it in items]
 
@@ -164,6 +168,7 @@ def _cm_node(items: List[Dict[str, Any]], *,
         "cm_assembly_disabled": disabled("assembly"),
         "cm_assembly_overruns": n("cm_assembly_overrun"),
         "cm_assembly_violations": n("cm_assembly_violation"),
+        "cm_session_degraded": bool(n("cm_session_degraded")),
         "cm_budget_warnings": n("cm_budget_checkpoint"),
     }
 
@@ -232,14 +237,19 @@ def task_cm_degraded(node: Optional[Dict[str, Any]]) -> bool:
     """The task child's seam was DEGRADED in this generation (docs/19 §12.44).
 
     Reads the event-shape ``task_cm`` node (``_cm_node`` keys, docs/19 §12.43):
-    any strike/disabled fact . ``None`` / ``{"absent": …}`` is NOT degradation
-    — missing evidence is a different fact (cost.json always explains it), and
+    any strike/disabled fact OR the BUILD-time degradation (the child ran with
+    no seam at all — ``cm_session_degraded``, docs/19 §12.47.7; before that
+    key existed such a generation read as a HEALTHY zero-turn session and the
+    "both roles learn about task CM degradation" promise silently covered only
+    the RUNTIME half). ``None`` / ``{"absent": …}`` is NOT degradation —
+    missing evidence is a different fact (cost.json always explains it), and
     a health flag must never be inferred from an absence."""
     if not isinstance(node, dict) or node.get("absent"):
         return False
     return bool(node.get("cm_policy_failures") or node.get("cm_policy_disabled")
                 or node.get("cm_assembly_failures")
-                or node.get("cm_assembly_disabled"))
+                or node.get("cm_assembly_disabled")
+                or node.get("cm_session_degraded"))
 
 
 def _wallclock(rows: List[Dict[str, Any]]) -> Optional[float]:
