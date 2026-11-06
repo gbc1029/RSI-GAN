@@ -54,7 +54,12 @@ live under `scripts/dgmh/`.
   consumed ONCE (depth-N derivation is legal) and the consumption pin —
   which keeps the lineage a tree, ≤1 consumer per node — is EXEMPT from
   the reconcile's fourth question via the primitive's own `pinned`
-  evidence set (docs/19 §12.52, N1),
+  evidence set (docs/19 §12.52, N1); a block's ``msg_index`` is its
+  RENDER ADDRESS — ``register_history`` accepts only the canonical
+  prefix (``cm_register_history_refused``), the address map rides the
+  snapshot/restore, and the sixth reconcile question
+  (``msg_index_moved``) allows only same-text / own-baked-form /
+  unbound-binds-to-own-text moves (docs/19 §12.53, N2),
   and ``resolve()`` also loads the P2 NAMED agent-owned assembly (``cost.cm_assembly``
   design key → ``gan/components/<role>/cm/<stem>.py``, delivered as
   ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the

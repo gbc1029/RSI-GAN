@@ -739,6 +739,12 @@ class CMSession:
     # ``ViewHandle.compact`` from the primitive's own record, never by a
     # face, so an escape cannot forge it.
     _op_pinned: set = field(default_factory=set, repr=False, compare=False)
+    # A/N2 (docs/19 §12.53): the canonical text sequence of THIS turn. Every
+    # ``msg_index`` must address it; ``register_history`` refuses a list that
+    # is not a prefix-compatible view of it. ``None`` = no turn entry was
+    # seen (direct construction / tests) -> the check is skipped.
+    _turn_canonical: Optional[List[str]] = field(default=None, repr=False,
+                                                 compare=False)
     _assembly_last_error: Dict[str, Any] = field(default_factory=dict,
                                                  repr=False, compare=False)
     _portal_cache: Any = field(default=None, repr=False, compare=False)
@@ -1096,8 +1102,31 @@ class CMSession:
         to one block). An entry showing a baked view artifact (``[block bN
         ...`` marker) is RE-BOUND to its block instead of re-registered: the
         rendered copy must not grow a second block or the view would fight
-        its own output. Blocks carry their latest msg_index for rendering."""
+        its own output. Blocks carry their latest msg_index for rendering.
+
+        A/N2 (docs/19 §12.53): ``msg_index`` is a render ADDRESS, so the list
+        must be the CANONICAL history (or a canonical PREFIX plus appended
+        entries). When the turn entry captured the canonical sequence, any
+        other list (reordered / truncated / replaced) is REFUSED as a whole —
+        registering it would bind blocks to entries that ``render`` will
+        never visit — and the refusal is emitted
+        (``cm_register_history_refused``). Direct construction without a turn
+        entry keeps the historical behaviour (no check)."""
         self._require_msg_dicts(msgs, "register_history")
+        canon = self._turn_canonical
+        if canon is not None:
+            got = [_msg_text(m) for m in msgs if isinstance(m, dict)]
+            # PREFIX equality: "canonical + appended entries" stays legal
+            # (indices still address the same messages); a reorder, a
+            # truncation or a replacement makes every index untrustworthy.
+            if got[:len(canon)] != canon:
+                first = next((i for i, (a, b) in enumerate(zip(canon, got))
+                              if a != b), len(canon))
+                self._emit({"type": "cm_register_history_refused",
+                            "reason": "not_canonical",
+                            "got": len(got), "want": len(canon),
+                            "first_diff": first})
+                return
         for i, m in enumerate(msgs):
             content = _msg_text(m)
             if not content:
@@ -1333,6 +1362,12 @@ class CMSession:
         refs — and the canonical texts layer, which can now only fire for
         direct callers)."""
         self._require_msg_dicts(msgs, "assemble_turn")
+        # A (docs/19 §12.53): the ONE list every block address must point
+        # into. Captured BEFORE the preset/assembly runs, so the framework's
+        # own ``register_history`` call and the assembly's boundary copy both
+        # validate against it.
+        self._turn_canonical = [_msg_text(m) for m in msgs
+                                if isinstance(m, dict)]
         self.turn += 1
         self._turn_degraded = False
         self._method_face = None  # per-turn method-face budget reset
@@ -1606,6 +1641,12 @@ class CMSession:
             # evidence that could exempt a later escape pin (docs/19 §12.52).
             "pinned_state": {bid: block.pinned
                              for bid, block in self.universe.blocks.items()},
+            # B/N2 (docs/19 §12.53): the block->entry ADDRESS is turn-mutable
+            # too (``register_history`` re-binds it), so a rollback must put
+            # it back — otherwise a rejected attempt keeps rendering at the
+            # retargeted position.
+            "msg_index": {bid: block.msg_index
+                          for bid, block in self.universe.blocks.items()},
         }
 
     def _restore_turn(self, snap: Optional[Dict[str, Any]],
@@ -1653,6 +1694,12 @@ class CMSession:
             block = self.universe.blocks.get(bid)
             if block is not None:
                 block.pinned = bool(was_pinned)
+        # B/N2: the address map too (only blocks that existed at snapshot
+        # time; blocks the attempt registered are not in it).
+        for bid, was_index in (snap.get("msg_index") or {}).items():
+            block = self.universe.blocks.get(bid)
+            if block is not None:
+                block.msg_index = was_index
         # R5 backstop (docs/19 §12.38): a turn_output block whose text no
         # longer fingerprints to its registration value (or whose chars
         # desynced) was mutated in place — restore from the pristine
@@ -1698,7 +1745,8 @@ class CMSession:
                         snap: Optional[Dict[str, Any]],
                         check_closure: bool = True
                         ) -> List[Tuple[str, List[str]]]:
-        """The five seam-contract questions (docs/19 §12.14, §12.27, §12.38).
+        """The six seam-contract questions (docs/19 §12.14, §12.27, §12.38,
+        §12.53).
 
         1. every non-full form must be explained by a recorded op;
         2. a pinned block may only be ``full`` (or ``dedup``: the prefix-elision
@@ -1719,6 +1767,13 @@ class CMSession:
            Every OTHER pinned delta on a block that existed at snapshot time
            (either direction) is a ``_s``-escape: detected here, restored by
            the caller, strike-counted.
+        6. a block's ``msg_index`` (the entry its form renders into) may only
+           move to an entry carrying the SAME text (duplicate re-bind) or the
+           block's own baked form (rendered-copy re-bind), and an UNBOUND
+           block (``None``) may bind only to an entry carrying its own text
+           (the normal ``register_outgoing`` transition); any other move is
+           an escape (docs/19 §12.53, N2) — the snapshot's ``msg_index`` map
+           lets the caller restore it.
 
         ``check_closure=False`` (the POLICY path) skips the turn-closure
         question: a policy's ops are closed by ``assemble_custom``'s
@@ -1786,6 +1841,43 @@ class CMSession:
             and self._reg_fp.get(block.block_id) != _fingerprint(block.text))
         if tampered:
             out.append(("block_tampered", tampered))
+        # 6. msg_index binding (docs/19 §12.53, N2): the block->entry ADDRESS
+        # is what ``render`` writes a form into, so a retargeted address
+        # silently elides the WRONG message (or, out of range, none at all
+        # while the view still counts it as substituted). TWO legal moves:
+        #   * the new entry carries the SAME text as the old one (duplicate
+        #     re-bind — the fingerprint-uniqueness behaviour);
+        #   * the new entry carries the block's own baked form (a rendered
+        #     copy re-bound at a new position — the marker behaviour).
+        # Anything else is a violation (restored by the caller; the snapshot
+        # carries the address map).
+        mi_before = (snap or {}).get("msg_index")
+        if mi_before is not None and msgs is not None:
+            moved = []
+            for bid, old_i in mi_before.items():
+                block = self.universe.blocks.get(bid)
+                if block is None or block.msg_index == old_i:
+                    continue
+                new_i = block.msg_index
+                ok_move = False
+                if isinstance(new_i, int) and 0 <= new_i < len(msgs):
+                    new_text = _msg_text(msgs[new_i])
+                    baked = self._baked_entry_text(block)
+                    if old_i is None:
+                        # an UNBOUND block (``register_outgoing``) becomes
+                        # bound when its own text enters the canonical
+                        # history — the normal outgoing transition
+                        ok_move = new_text == block.text or new_text == baked
+                    else:
+                        old_text = (_msg_text(msgs[old_i])
+                                    if 0 <= old_i < len(msgs) else None)
+                        ok_move = ((old_text is not None
+                                    and new_text == old_text)
+                                   or new_text == baked)
+                if not ok_move:
+                    moved.append(bid)
+            if moved:
+                out.append(("msg_index_moved", sorted(moved)[:20]))
         return out
 
     def _note_violations(self, violations: List[Tuple[str, List[str]]],
