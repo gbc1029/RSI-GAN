@@ -27,9 +27,11 @@ list must not advertise them):
                  stays form-level. register_derived is NOT on any
                  face, so no caller can fabricate derived text — no-
                  fabrication by construction. A derived block becomes PINNED
-                 the moment it is consumed as a source of a higher derived
-                 block: consumed nodes never re-compact, keeping the lineage
-                 a tree, not a DAG)
+                 WHEN it is consumed as a source of a higher derived block —
+                 depth-N derivation IS legal (the first consumption is the
+                 normal level-2 step); the pin only blocks a SECOND
+                 consumption, so each derived node has at most one consumer
+                 and the lineage is a tree, not a DAG. docs/19 §12.52)
 
 View forms: ``full`` | ``head_tail`` | ``placeholder`` | ``template`` (plus the
 two session-anchored forms ``dedup`` and ``derived_host``, whose text depends
@@ -223,7 +225,10 @@ class Universe:
         primitive builds ``text`` from the sources only, so no-fabrication
         holds by construction (docs/10 §15). Sources must already exist
         (the caller validates); the shared counter keeps ids unique, so the
-        lineage is acyclic by construction. Depth = 1 + max(parent depths)."""
+        lineage is acyclic by construction (ids increase, sources must
+        already exist). Depth = 1 + max(parent depths). The consumption pin
+        additionally makes the lineage a TREE: at most one consumer per node
+        (docs/19 §12.52)."""
         self._counter += 1
         srcs = [str(s) for s in sources]
         parent_depth = max((self.blocks[s].depth for s in srcs

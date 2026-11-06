@@ -576,6 +576,10 @@ class ViewHandle:
                           keep=self._s.head_tail_keep)
         if rec.get("ok"):
             rec["saved"] = self._s._delta_since(prev_all)
+            # N1: the primitive reports WHICH derived sources it pinned on
+            # consumption; that is the evidence the reconcile's fourth
+            # question needs (docs/19 §12.52).
+            self._s._op_pinned.update(str(b) for b in (rec.get("pinned") or []))
         return self._audit(rec)
 
     def substitute(self, block_id: str, form: str) -> Dict[str, Any]:
@@ -728,6 +732,13 @@ class CMSession:
     # non-full on turn 3 without a new record. The reconciliation therefore
     # needs the CUMULATIVE set of recorded refs, not just this turn's.
     _recorded_refs: set = field(default_factory=set, repr=False, compare=False)
+    # N1 (docs/19 §12.52): blocks a RECORDED op pinned this turn — the
+    # evidence the reconcile's fourth question consults. ``compact`` pins a
+    # consumed derived source (one consumer per node -> a tree); that pin is
+    # a framework fact, not a policy escape. Written only by
+    # ``ViewHandle.compact`` from the primitive's own record, never by a
+    # face, so an escape cannot forge it.
+    _op_pinned: set = field(default_factory=set, repr=False, compare=False)
     _assembly_last_error: Dict[str, Any] = field(default_factory=dict,
                                                  repr=False, compare=False)
     _portal_cache: Any = field(default=None, repr=False, compare=False)
@@ -1580,13 +1591,19 @@ class CMSession:
                          self.violations, self.est_chars_saved,
                          self.assembly_overruns, self.policy_overruns),
             "refs": set(self._recorded_refs),
+            # the op-pin evidence rides the snapshot: a restored turn must
+            # not leave evidence behind (a later escape pin of the same
+            # block would otherwise be exempted for the rest of the session)
+            "op_pinned": set(self._op_pinned),
             # pinned FLAG of every block existing at snapshot time (docs/19
             # §12.18: the restore surface covers the pre-existing pins — a
             # crashed attempt's pin/unpin of an EXISTING block is undone).
             # Blocks the attempt REGISTERED (note blocks are auto-pinned)
             # stay as-is: the universe is add-only, and a note's block and
             # its ``notes`` entry must stay consistent (notes persist by
-            # design — scratchpad semantics).
+            # design — scratchpad semantics). The op-pin EVIDENCE rides the
+            # same snapshot (``op_pinned``): a restored turn must not leave
+            # evidence that could exempt a later escape pin (docs/19 §12.52).
             "pinned_state": {bid: block.pinned
                              for bid, block in self.universe.blocks.items()},
         }
@@ -1622,10 +1639,15 @@ class CMSession:
          self.policy_overruns) = cnt
         self._recorded_refs.clear()
         self._recorded_refs.update(snap.get("refs") or ())
+        self._op_pinned.clear()
+        self._op_pinned.update(snap.get("op_pinned") or ())
         # pinned flags of blocks that EXISTED at snapshot time (docs/19
         # §12.18): the attempt's pin/unpin of a pre-existing block is undone;
         # blocks it registered (note blocks) stay as-is — the universe is
-        # add-only and note blocks must keep their auto-pin.
+        # add-only and note blocks must keep their auto-pin. A RECORDED
+        # primitive's consumption pin (``compact``) is undone here too; the
+        # evidence set is restored alongside so the reconcile stays exact
+        # (docs/19 §12.52).
         pinned_state = snap.get("pinned_state") or {}
         for bid, was_pinned in pinned_state.items():
             block = self.universe.blocks.get(bid)
@@ -1683,11 +1705,20 @@ class CMSession:
            form, which loses only the repeated header);
         3. the canonical history must be untouched;
         4. the pinned set of PRE-EXISTING blocks is policy-immutable (D8
-           direction (b): the policy face has no pin/unpin — a pinned delta
-           on a block that existed at snapshot time is a ``_s``-escape:
-           detected here, restored by the caller, strike-counted). Blocks the
-           attempt REGISTERED keep their add-only auto-pin (the universe is
-           never rolled back).
+           direction (b): the policy face has no pin/unpin), with TWO
+           exemptions (docs/19 §12.52, N1):
+
+           * blocks the attempt REGISTERED keep their add-only auto-pin (the
+             universe is never rolled back);
+           * blocks a RECORDED PRIMITIVE pinned this turn — ``compact`` pins
+             a consumed derived source so that each derived node has at most
+             one consumer (tree, not DAG). That pin is the framework's own
+             fact, not an escape: the evidence set (``_op_pinned``) is filled
+             only from the primitive's record and rides the snapshot/restore.
+
+           Every OTHER pinned delta on a block that existed at snapshot time
+           (either direction) is a ``_s``-escape: detected here, restored by
+           the caller, strike-counted.
 
         ``check_closure=False`` (the POLICY path) skips the turn-closure
         question: a policy's ops are closed by ``assemble_custom``'s
@@ -1721,11 +1752,17 @@ class CMSession:
         # 4. pinned delta on pre-existing blocks (docs/19 §12.27): BOTH
         # directions — an escape pin (protection the policy must not grant)
         # and an escape unpin (protection the policy must not remove).
+        # EXEMPT (docs/19 §12.52, N1): a pin a RECORDED PRIMITIVE applied
+        # this turn — ``compact`` pins a consumed derived source so each
+        # derived node has at most one consumer (tree, not DAG). That is a
+        # framework fact, not an escape; the evidence set is written only
+        # from the primitive's own record and rides the snapshot/restore.
         pinned_before = (snap or {}).get("pinned_state") or {}
         pinned_delta = sorted(
             bid for bid, block in self.universe.blocks.items()
             if bid in pinned_before
-            and bool(pinned_before[bid]) != bool(block.pinned))
+            and bool(pinned_before[bid]) != bool(block.pinned)
+            and bid not in self._op_pinned)
         if pinned_delta:
             out.append(("unrecorded_pin", pinned_delta))
         snap_texts = (snap or {}).get("texts")

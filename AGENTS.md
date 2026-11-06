@@ -50,7 +50,11 @@ live under `scripts/dgmh/`.
   ``pin`` on an already-elided block restores it to FULL (dedup the only
   exempt non-full pinned form; docs/19 §12.40 — the P1 ``pinned_form``
   invariant is therefore enforced at the entry, never left for the
-  reconcile to misattribute to an innocent module),
+  reconcile to misattribute to an innocent module); a DERIVED node may be
+  consumed ONCE (depth-N derivation is legal) and the consumption pin —
+  which keeps the lineage a tree, ≤1 consumer per node — is EXEMPT from
+  the reconcile's fourth question via the primitive's own `pinned`
+  evidence set (docs/19 §12.52, N1),
   and ``resolve()`` also loads the P2 NAMED agent-owned assembly (``cost.cm_assembly``
   design key → ``gan/components/<role>/cm/<stem>.py``, delivered as
   ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the

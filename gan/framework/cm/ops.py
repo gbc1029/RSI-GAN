@@ -159,8 +159,13 @@ def compact(universe: Universe, view: View, block_ids: List[str],
     compressing); every other canonical source becomes a ``merged-into``
     placeholder; stale references to consumed derived sources are re-pointed
     the same way (one view representation per piece of content). A derived
-    source is PINNED on consumption — consumed nodes never re-compact, the
-    lineage stays a tree, not a DAG. The saving number is NOT produced here:
+    source is PINNED WHEN it is consumed — depth-N derivation IS legal (the
+    first consumption of a derived node is the normal level-2 step); the pin
+    only blocks a SECOND consumption, so each derived node has at most one
+    consumer and the lineage is a tree, not a DAG. The ok record carries the
+    pinned ids (``pinned``) so the session can tell the reconcile's fourth
+    question that this pin is a recorded primitive's fact, not an escape
+    (docs/19 §12.52). The saving number is NOT produced here:
     the GATE runs on a nominal rule (the derived id does not exist yet),
     while the recorded ``saved`` is the session's TRANSITION delta over
     render-visible blocks, computed AFTER all view mutations (including the
@@ -252,7 +257,7 @@ def compact(universe: Universe, view: View, block_ids: List[str],
     consumed = {b.block_id for b in blocks if b.kind == "derived"}
     for b in blocks:
         if b.kind == "derived":
-            b.pinned = True   # consumed node: never re-compact (tree, not DAG)
+            b.pinned = True   # consumed: never consumed AGAIN (tree, not DAG)
     rule_host = f"derived={dblock.block_id}"
     rule_ph = f"merged-into:{dblock.block_id}"
     view.set(host.block_id, "derived_host", rule_host)
@@ -276,9 +281,11 @@ def compact(universe: Universe, view: View, block_ids: List[str],
             if target in consumed:
                 view.set(bid, "placeholder",
                          f"merged-into:{dblock.block_id}")
-    return {"op": "compact", "refs": list(block_ids), "ok": True,
-            "rule": f"compacted:{strategy}",
-            "derived": dblock.block_id}
+    rec = {"op": "compact", "refs": list(block_ids), "ok": True,
+           "rule": f"compacted:{strategy}", "derived": dblock.block_id}
+    if consumed:
+        rec["pinned"] = sorted(consumed)
+    return rec
 
 
 def order(universe: Universe, view: View, block_ids: List[str]) -> Dict[str, Any]:

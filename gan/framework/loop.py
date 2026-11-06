@@ -1416,6 +1416,68 @@ class GanLoop:
                 return rep
         return None
 
+    def _fill_self_improve_payloads(self, outer: Any,
+                                    recent_eval: Dict[str, Any],
+                                    recent_plan: Dict[str, Any]) -> None:
+        """Fill both self-improve payloads for THIS outer.
+
+        Two fact classes, two gates (docs/19 §12.51, F6):
+
+        * the cost material (``costs`` + ``cost_statement`` + its injection
+          event) is a USAGE record and stays behind ``cost.record_usage``;
+        * the CM module FAILURE reports (``cm_assembly``/``cm_policy``) are
+          DIAGNOSTIC facts — the agent's own module is latched/disabled and
+          this payload is the ONLY surface that can explain why (events.jsonl
+          is not an agent surface). They therefore ride REGARDLESS of that
+          switch.
+
+        Before this split both sat inside one ``if self.record_usage:`` block,
+        so turning usage recording off silently removed the failure report
+        too — the module stayed disabled with no readable explanation. The
+        cost block still runs FIRST so the default (usage on) prompt keeps its
+        historical key order byte-identical.
+        """
+        if self.record_usage:
+            for role, payload in (("evaluator", recent_eval),
+                                  ("planner", recent_plan)):
+                try:
+                    own = [cost_ledger.compact(r)
+                           for r in cost_ledger.self_session_costs(
+                               self.output_dir, outer, role)]
+                    payload["costs"] = {"own_sessions": [r for r in own if r]}
+                    payload["cost_statement"] = self._cost_statement_self(
+                        role, outer)
+                    # Injection fact (B2, self seat): same bytes audit the
+                    # plan/evaluate statements get (docs/10 §11.5 gap fix).
+                    if payload["cost_statement"]:
+                        self.log_event({"type": "cost_statement",
+                                        "seat": "self_improve", "role": role,
+                                        "bytes": len(payload["cost_statement"])})
+                except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+                    soft_fail(f"self cost payload failed ({role}): {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="cost_statement_build_failed",
+                              seat="self_improve")
+        for role, payload in (("evaluator", recent_eval),
+                              ("planner", recent_plan)):
+            try:
+                # Docs/19 §12.45: reports are (role, scope)-keyed — the MAIN
+                # seat's failure is what self-improve repairs; the eval
+                # round's report is the fallback.
+                cm_assembly_rep = self._cm_report_for(self._cm_assembly_report,
+                                                      role)
+                if cm_assembly_rep:
+                    payload["cm_assembly"] = cm_assembly_rep
+                cm_policy_rep = self._cm_report_for(self._cm_policy_report,
+                                                    role)
+                if cm_policy_rep:
+                    payload["cm_policy"] = cm_policy_rep
+            except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+                soft_fail(f"self cm report payload failed ({role}): {e}",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="cm_report_payload_failed",
+                          seat="self_improve")
+
     def _cm_latch_fingerprint(self, role: str, seat: str,
                               keys: Optional[Dict[str, Any]],
                               outer: Any = None,
@@ -4092,38 +4154,11 @@ class GanLoop:
             recent_plan = {"advantages": self._advantages[-I_max:],
                            "task_tree_size": len(self.task_tree),
                            "toolset_report": getattr(self.planner, "assembly_report", None)}
-            # Self-improve cost statements (B2): each role's OWN sessions this
-            # outer (cost × quality alignment material) + the role's compact
-            # ledger records; the OTHER role's costs are deliberately absent.
-            if self.record_usage:
-                for role, payload in (("evaluator", recent_eval), ("planner", recent_plan)):
-                    try:
-                        own = [cost_ledger.compact(r)
-                               for r in cost_ledger.self_session_costs(self.output_dir, outer, role)]
-                        payload["costs"] = {"own_sessions": [r for r in own if r]}
-                        payload["cost_statement"] = self._cost_statement_self(role, outer)
-                        # Docs/19 §12.45: reports are (role, scope)-keyed now —
-                        # the MAIN seat's failure is what self-improve repairs;
-                        # the eval round's report is the fallback.
-                        cm_assembly_rep = self._cm_report_for(
-                            self._cm_assembly_report, role)
-                        if cm_assembly_rep:
-                            payload["cm_assembly"] = cm_assembly_rep
-                        cm_policy_rep = self._cm_report_for(
-                            self._cm_policy_report, role)
-                        if cm_policy_rep:
-                            payload["cm_policy"] = cm_policy_rep
-                        # Injection fact (B2, self seat): same bytes audit the
-                        # plan/evaluate statements get (docs/10 §11.5 gap fix).
-                        if payload["cost_statement"]:
-                            self.log_event({"type": "cost_statement",
-                                            "seat": "self_improve", "role": role,
-                                            "bytes": len(payload["cost_statement"])})
-                    except Exception as e:  # noqa: BLE001 -- advisory, never fatal
-                        soft_fail(f"self cost payload failed ({role}): {e}",
-                                  event_path=paths.events_path(self.output_dir),
-                                  event_type="cost_statement_build_failed",
-                                  seat="self_improve")
+            # Self-improve payload facts: CM failure reports ride ALWAYS
+            # (diagnostics), the cost material only under cost.record_usage
+            # (docs/19 §12.51 — they used to share one gate, which silently
+            # removed the failure report when usage recording was off).
+            self._fill_self_improve_payloads(outer, recent_eval, recent_plan)
             # visible task trajectories for self-improvement: this outer's gens
             # + the direct parent of the last generation (read-only).
             si_own = list(outer_genids)
