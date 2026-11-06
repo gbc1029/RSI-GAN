@@ -701,6 +701,16 @@ def chat_with_agent(
         raw_history = kwargs.get("msg_history")
         raw_msg = kwargs.get("msg")
         n_viewed = 0
+        # F3 (docs/19 §12.42): "the seam was APPLIED" and "how many entries
+        # the sent view carried" are two different facts. ``n_viewed`` is
+        # ONLY the offset into the client's rebuilt history (the client
+        # constructs ``hist = sent_history + [user, assistant]``, so
+        # ``hist[n_viewed:]`` is exactly the appended pair for ANY view
+        # length, including 0). ``seam_applied`` is the boolean: an EMPTY
+        # view is legitimate (a named assembly may return []) and must still
+        # rebuild the canonical history, or the whole prior conversation is
+        # silently replaced.
+        seam_applied = False
         if cm is not None:
             try:
                 send_history, send_msg = cm.assemble_turn(
@@ -712,6 +722,7 @@ def chat_with_agent(
                 n_viewed = len(send_history)
                 kwargs["msg_history"] = send_history
                 kwargs["msg"] = send_msg
+                seam_applied = True
             except Exception as e:  # noqa: BLE001 -- fail-open
                 logging(f"[cm] seam degraded to raw view: {e}")
         response, hist, info = get_response_fn(**kwargs)
@@ -725,12 +736,18 @@ def chat_with_agent(
             v = usage.get(key)
             if isinstance(v, (int, float)):
                 _usage_parts[field] = (_usage_parts[field] or 0) + int(v)
-        if cm is not None and n_viewed and isinstance(hist, list):
+        if cm is not None and seam_applied and isinstance(hist, list):
             # keep the CANONICAL (raw) history: the seam's copies were only
             # for sending; the user turn is rebuilt RAW, the assistant reply
             # is raw by construction (LLM output). Text-key form — the
             # canonical convention (agent/llm.py returns text-form entries;
             # get_response's entry conversion text->content handles the send).
+            # ``seam_applied`` (NEVER ``n_viewed``) gates this: a legal empty
+            # view has offset 0, so ``hist[0:]`` is the appended pair and
+            # ``raw_history + that`` preserves the prior conversation.
+            # ``raw_msg`` is the AS-SENT user turn (it includes the per-turn
+            # tool-use header by design; canonical never stores view
+            # artifacts such as the dedup marker).
             try:
                 new_entries = list(hist[n_viewed:])
                 if new_entries and isinstance(new_entries[0], dict) \
