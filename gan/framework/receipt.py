@@ -24,6 +24,41 @@ PROMPT_FACT_KEYS = (
     "equals_seed",
 )
 
+# Named projections for the EVALUATOR's receipt (docs/19 §12.44): default-deny,
+# so a new budget/summary field is INVISIBLE until it is listed here on
+# purpose (mirrors the role access allowlist). ``budget.cm`` is a REDUCED
+# summary: counters describing the seam's health, never the planner's module
+# report (``policy_report``/``assembly_report`` carry ``last_error`` text and
+# the module's file:line ``where`` -- the same class the receipt already
+# strips from ``code_patch.rejected_reason``).
+EVALUATOR_BUDGET_KEYS = ("exhausted", "kind", "attempts", "truncated",
+                         "token_budget_exhausted")
+EVALUATOR_CM_KEYS = ("mode", "turns", "blocks", "policy_failures",
+                     "policy_disabled", "violations", "assembly_active",
+                     "assembly_failures", "assembly_disabled",
+                     "est_chars_saved")
+
+
+def project_budget_for_evaluator(budget: Optional[Dict[str, Any]]
+                                 ) -> Dict[str, Any]:
+    """The evaluator's budget projection (docs/19 §12.44).
+
+    Explicit field allowlists: unknown/future keys never ride along, because
+    nothing added to ``_make_receipt``'s budget should reach the evaluator by
+    default. ``cm`` is reduced to ``EVALUATOR_CM_KEYS`` + a derived
+    ``cm_degraded`` bool (the seam's health, not its diagnostics)."""
+    if not isinstance(budget, dict):
+        return {}
+    out = {k: budget[k] for k in EVALUATOR_BUDGET_KEYS if k in budget}
+    cm = budget.get("cm")
+    if isinstance(cm, dict):
+        reduced = {k: cm[k] for k in EVALUATOR_CM_KEYS if k in cm}
+        reduced["cm_degraded"] = bool(
+            cm.get("policy_disabled") or cm.get("policy_failures")
+            or cm.get("assembly_disabled") or cm.get("assembly_failures"))
+        out["cm"] = reduced
+    return out
+
 
 def prompt_change_facts(prev: Any, new: Any, seed: Any = None) -> Dict[str, Any]:
     """Structural facts of a prompt rewrite.
@@ -295,6 +330,11 @@ def render_receipt(receipt: Optional[Dict[str, Any]], max_chars: int = 1500) -> 
         parts.append(f"code patch REJECTED: {cp.get('rejected_reason')}")
     if budget.get("exhausted"):
         parts.append(f"budget exhausted ({budget.get('kind')}, attempts={budget.get('attempts')})")
+    if budget.get("task_cm_degraded"):
+        # Task-side CM fact (docs/19 §12.44 D3): the planner owns the task
+        # agent's cm code/prompt, so the receipt is where this must show up.
+        parts.append("task session context-manager degraded "
+                     "(see cost.json task_cm)")
     cost = receipt.get("cost") or {}
     task_cost = cost.get("task") or {}
     if isinstance(task_cost.get("cost_tokens"), (int, float)):

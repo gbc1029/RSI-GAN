@@ -228,6 +228,20 @@ def task_cm_summary(output_dir: str, genid: Any) -> Optional[Dict[str, Any]]:
     return cm_summary_from_events(events)
 
 
+def task_cm_degraded(node: Optional[Dict[str, Any]]) -> bool:
+    """The task child's seam was DEGRADED in this generation (docs/19 §12.44).
+
+    Reads the event-shape ``task_cm`` node (``_cm_node`` keys, docs/19 §12.43):
+    any strike/disabled fact . ``None`` / ``{"absent": …}`` is NOT degradation
+    — missing evidence is a different fact (cost.json always explains it), and
+    a health flag must never be inferred from an absence."""
+    if not isinstance(node, dict) or node.get("absent"):
+        return False
+    return bool(node.get("cm_policy_failures") or node.get("cm_policy_disabled")
+                or node.get("cm_assembly_failures")
+                or node.get("cm_assembly_disabled"))
+
+
 def _wallclock(rows: List[Dict[str, Any]]) -> Optional[float]:
     ts = [r.get("ts") for r in rows if isinstance(r.get("ts"), (int, float))]
     if len(ts) < 2:

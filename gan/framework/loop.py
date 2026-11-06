@@ -100,6 +100,29 @@ def _report_view_for_evaluator(report_summary):
     return {k: v for k, v in report_summary.items() if k not in banned}
 
 
+# The cost record's ``cm`` CONTRACT (docs/19 §12.43/§12.44): a field absent
+# from this tuple is LOST from cost_sessions.jsonl even though the session
+# reported it (assembly_* / traj_segments / thread_leaks used to be dropped).
+# These are the SUMMARY counters of a role seat; the task child's event-shape
+# node lives in runs/<genid>/cost.json ``task_cm`` (two shapes, one mapping
+# table in docs/19 §12.44).
+_CM_COST_KEYS = (
+    "mode", "turns", "blocks", "ops_total", "ops_applied", "ops_refused",
+    "policy_failures", "policy_disabled", "violations", "est_chars_saved",
+    # F7: the seam's health facts that used to be summary-only.
+    "substituted",
+    "emit_failures",
+    "assembly_active", "assembly_failures", "assembly_disabled",
+    "assembly_violations", "policy_violations",
+    "assembly_overruns", "policy_overruns",
+    "traj_segments",
+    # CM-03 leak observability: a leaked worker thread must not vanish from
+    # the cost record (absence = clean). ``thread_leaks_live`` is the MEASURED
+    # restart signal; the other two are its prediction / census sibling.
+    "thread_leaks", "thread_leaks_live", "thread_leak_delta",
+)
+
+
 def _receipt_for_evaluator(receipt):
     """The evaluator's projection of the plan receipt — outcomes only.
 
@@ -109,9 +132,17 @@ def _receipt_for_evaluator(receipt):
     errors), ``grants`` carry agent free text, and ``design.ops`` duplicate the
     diff_summary channel. The evaluator calibrates on patch OUTCOMES
     (applied/rejected/budget), not on the planner's paperwork.
+
+    ``budget`` is a NAMED projection (docs/19 §12.44): explicit allowlists in
+    ``receipt.project_budget_for_evaluator``, so a future budget/summary field
+    is invisible here until added on purpose. ``budget.cm`` is the REDUCED
+    summary (health counters + ``cm_degraded``), never the planner's module
+    report (its ``last_error``/``where`` text stays on the planner's own
+    ``cm_policy`` channel).
     """
     if not isinstance(receipt, dict):
         return {}
+    from gan.framework.receipt import project_budget_for_evaluator
     cp = receipt.get("code_patch") or {}
     # Cost projection: TASK-ONLY (docs/10 §4). The planner's plan-session
     # cost is the planner's own business; the evaluator never sees it here
@@ -122,7 +153,7 @@ def _receipt_for_evaluator(receipt):
         # current-round events. ``toolset`` stays: it is inherited-baseline
         # context, not a current-round event.
         "round": receipt.get("genid"),
-        "budget": receipt.get("budget") or {},
+        "budget": project_budget_for_evaluator(receipt.get("budget") or {}),
         "cost": {"task": (receipt.get("cost") or {}).get("task")},
         "design_stripped": receipt.get("design_stripped") or [],
         "toolset": receipt.get("toolset") or {},
@@ -816,18 +847,7 @@ class GanLoop:
                         # traj_segments used to be dropped, so a run with a
                         # configured named assembly read exactly like one
                         # without it (both had no assembly fields at all).
-                        rec["cm"] = {k: cm_sum[k] for k in
-                                     ("mode", "turns", "blocks", "ops_total",
-                                      "ops_applied", "ops_refused",
-                                      "policy_failures", "policy_disabled",
-                                      "violations", "est_chars_saved",
-                                      "emit_failures",
-                                      "assembly_active", "assembly_failures",
-                                      "assembly_disabled", "traj_segments",
-                                      # CM-03 leak observability: a leaked
-                                      # worker thread must not vanish from
-                                      # the cost record (absence = clean).
-                                      "thread_leaks", "thread_leak_delta")
+                        rec["cm"] = {k: cm_sum[k] for k in _CM_COST_KEYS
                                      if k in cm_sum}
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass
@@ -858,6 +878,19 @@ class GanLoop:
                       event_path=paths.events_path(self.output_dir),
                       event_type="cost_session_record_failed")
             return None
+
+    def _task_cm_degraded(self, genid: Any) -> bool:
+        """The task child's seam degradation for this generation
+        (docs/19 §12.44 D3) — a PROCESS fact for the evaluator's run_summary
+        and for the plan receipt's ``budget.task_cm_degraded``. Missing /
+        ``{"absent": …}`` evidence is NOT degradation (None ≠ False, but the
+        consumer here needs a 3-way-safe bool: only positive evidence turns
+        it True)."""
+        try:
+            return cost_ledger.task_cm_degraded(
+                cost_ledger.task_cm_summary(self.output_dir, genid))
+        except Exception:  # noqa: BLE001 -- advisory diagnostic fact
+            return False
 
     def _write_gen_cost(self, genid: Any, outer: Any) -> None:
         """``runs/<genid>/cost.json`` (A5): the generation's settled sessions —
@@ -2938,6 +2971,16 @@ class GanLoop:
         }
         if cm_summary:
             budget["cm"] = cm_summary
+        # Task-side CM degradation (docs/19 §12.44 D3): the PLANNER owns the
+        # task agent's cm code/prompt, so the receipt is the channel where it
+        # becomes visible. Conditional (absence = not degraded) keeps a
+        # healthy round's receipt bytes unchanged.
+        try:
+            if cost_ledger.task_cm_degraded(
+                    cost_ledger.task_cm_summary(self.output_dir, genid)):
+                budget["task_cm_degraded"] = True
+        except Exception:  # noqa: BLE001 -- advisory diagnostic fact
+            pass
         # Cost facts of THIS round (B6): the task child (proxy audit) and the
         # planner's OWN plan session. The evaluator's session cost is
         # deliberately NOT here — the receipt feeds the PLANNER's next prompt,
@@ -3710,6 +3753,12 @@ class GanLoop:
                                 "report_summary": report_view,
                                 "score_status": child.value.score_status,
                                 "imputed": bool(child.meta.get("imputed")),
+                                # Task-side CM health (docs/19 §12.44 D3):
+                                # a process fact for attribution (the agent
+                                # ran on the fail-open preset this round). The
+                                # receipt's budget projection deliberately
+                                # does NOT carry this key (no duplicate).
+                                "task_cm_degraded": self._task_cm_degraded(genid),
                                 # Projection, not the whole receipt —
                                 # `code_patch.rejected_reason` quotes the planner's own
                                 # artifacts, `grants` carries agent free text, and

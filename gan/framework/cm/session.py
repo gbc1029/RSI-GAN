@@ -862,19 +862,38 @@ class CMSession:
                                              now[0], now[1])
         return total
 
+    def _substituted_blocks(self) -> int:
+        """Blocks currently carrying a NON-FULL view form (docs/19 §12.44 D5).
+
+        ``len(view.forms)`` counted FULL entries too: ``fetch(full)``/unpin/
+        a restore writes an explicit ``"full"`` form, so the old number mixed
+        "blocks addressed by the view" with "blocks compacted". One name, one
+        caliber: the count of forms that actually differ from ``full``."""
+        return sum(1 for form in self.view.forms.values() if form != "full")
+
     def summary(self) -> Dict[str, Any]:
         """Session-level CM summary (cost record / receipt ``cm`` node).
 
         The assembly fields materialize only when an assembly was CONFIGURED
         (the design claim creates the observability duty: a configured-but-
-        never-active assembly must read as exactly that, None ≠ 0 style)."""
+        never-active assembly must read as exactly that, None ≠ 0 style).
+        Conditional audit fields keep the same rule: ``policy_violations`` /
+        ``*_overruns`` / ``thread_leaks`` / ``thread_leaks_live`` /
+        ``thread_leak_delta`` appear only when non-zero (absence = zero/clean),
+        while ``assembly_*`` appear whenever an assembly was configured (they
+        may legitimately read 0)."""
         out = {"mode": self.mode, "turns": self.turn,
                "blocks": len(self.universe.blocks),
                "ops_total": self.ops_total, "ops_applied": self.ops_applied,
                "ops_refused": self.ops_refused,
                "policy_failures": self.policy_failures,
                "policy_disabled": self.policy_disabled,
+               # ``violations`` is the OP-REFUSAL export of the SAME counter
+               # as ``ops_refused`` (both are incremented together at exactly
+               # two sites: count_ops' unaudited branch and note_violation;
+               # docs/19 §12.44 D4). Kept as an alias -- no third writer.
                "violations": self.violations,
+               "substituted": self._substituted_blocks(),
                "est_chars_saved": self.est_chars_saved}
         if self.policy_violations:
             out["policy_violations"] = self.policy_violations
@@ -2256,7 +2275,9 @@ class CMSession:
                 brief["derived"] = str(rec.get("derived"))
             ops_brief.append(brief)
         stats: Dict[str, Any] = {"blocks": len(self.universe.blocks),
-                                 "substituted": len(self.view.forms),
+                                 # docs/19 §12.44 D5: NON-FULL forms only —
+                                 # same caliber as summary()'s substituted.
+                                 "substituted": self._substituted_blocks(),
                                  "saved_chars": saved,
                                  "est_saved_session": self.est_chars_saved,
                                  "policy_disabled": self.policy_disabled}
