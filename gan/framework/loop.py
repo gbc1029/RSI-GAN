@@ -223,21 +223,31 @@ class GanLoop:
         self.evaluator = evaluator
         # P1/P2 trust hardening (docs/19 §12.14): a module that failed once is
         # NOT re-attempted until its CONFIGURATION actually changes. The latch
-        # is keyed by (role, seat) and stores the fingerprint of (effective
-        # cm_* keys, assembly module bytes): a change releases it, which is
-        # exactly "p/e keeps the latch for the whole outer" (their writer is
-        # the once-per-outer self_improve) without any outer-boundary plumbing.
+        # stores the fingerprint of (effective cm_* keys, module bytes): a
+        # change releases it, which is exactly "p/e keeps the latch for the
+        # whole outer" (their writer is the once-per-outer self_improve)
+        # without any outer-boundary plumbing.
         # The TASK seat is session-scoped inside ``CMSession`` (one failed
         # attempt per generation): its session is built by the task runner,
         # whose config path the loop does not own. (p/e latch table moved to
         # the kind-keyed `_cm_agent_latch`, docs/19 §12.17.)
-        # Last settled "your CM module failed" facts per role (docs/19 §12.14
-        # feedback): the next self-improve session reads them as a to-do.
-        self._cm_assembly_report: Dict[str, Dict[str, Any]] = {}
-        self._cm_policy_report: Dict[str, Dict[str, Any]] = {}
+        # The tables below are keyed by ``(role, seat, SCOPE)`` — scope is
+        # "main" for the outer's seats and "eval" for the fixed-root
+        # evaluation's own throwaway seat (docs/19 §12.45): those two seats
+        # resolve DIFFERENT workspaces (``outer_<N>__<seat>`` vs
+        # ``outer_<N>_eval__<seat>``), so a shared entry would let either seat
+        # release the other's latch and overwrite its failure report. Scope is
+        # part of the KEY only: a scope entry still persists across outers,
+        # exactly like the main one.
+        # Last settled "your CM module failed" facts per (role, scope)
+        # (docs/19 §12.14 feedback): the next self-improve session reads the
+        # MAIN seat's entry (``_cm_report_for``), falling back to the eval one.
+        self._cm_assembly_report: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._cm_policy_report: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # kind-keyed fingerprint latch (docs/19 §12.17): one table for BOTH
         # agent-owned CM modules; entry shape {kind: {fp, stem, reason, ...}}.
-        self._cm_agent_latch: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+        self._cm_agent_latch: Dict[Tuple[str, str, str],
+                                   Dict[str, Dict[str, Any]]] = {}
         self.task_runner = task_runner
         # Separate runner for the fixed-root evaluation (docs/14 §5.5). It is
         # pinned to the run-persistent EVALUATION question set (held-out val
@@ -1312,9 +1322,11 @@ class GanLoop:
             pass
         try:
             latched = self._cm_latch_consume(role, seat, keys, outer,
-                                             kind="assembly")
+                                             kind="assembly",
+                                             instance=instance)
             latched_pol = self._cm_latch_consume(role, seat, keys, outer,
-                                                 kind="policy")
+                                                 kind="policy",
+                                                 instance=instance)
         except Exception:  # noqa: BLE001 -- advisory: never fail the seat
             latched = False
             latched_pol = False
@@ -1369,17 +1381,54 @@ class GanLoop:
                                session_role=session_role,
                                session_outers=session_outers, seat=seat)
 
+    # -- seat scopes: the fixed-root evaluation is its OWN seat ----------------
+    @staticmethod
+    def _cm_seat_scope(instance: Any) -> str:
+        """Latch/report scope for ONE seat instance.
+
+        The outer's seats are "main"; the fixed-root evaluation's throwaway
+        planner is an INSTANCE-SUFFIXED seat (``outer_<N>_eval``) with its own
+        workspace and trajectory tree (docs/19 §12.45), so it gets "eval".
+        Anything else (direct construction, no instance) is "main"."""
+        return "eval" if str(instance or "").endswith("_eval") else "main"
+
+    def _cm_report_for(self, store: Dict[Tuple[str, str], Dict[str, Any]],
+                       role: str) -> Optional[Dict[str, Any]]:
+        """The failure report a role's self-improve should read.
+
+        MAIN first, eval as the fallback: the self-improve repairs the role's
+        own design/module, which the main seat ran on last; the eval round's
+        report is the same module and still worth surfacing when the main seat
+        never failed. Deterministic (sorted) fallback."""
+        main = store.get((role, "main"))
+        if main:
+            return main
+        for (r, _scope), rep in sorted(store.items()):
+            if r == role:
+                return rep
+        return None
+
     def _cm_latch_fingerprint(self, role: str, seat: str,
                               keys: Optional[Dict[str, Any]],
                               outer: Any = None,
-                              kind: str = "assembly") -> str:
+                              kind: str = "assembly",
+                              *, instance: Optional[str] = None) -> str:
         """Fingerprint of what an agent-owned CM module CONFIGURATION would
         deliver (kind = "assembly" | "policy").
 
         Effective ``cm_*`` keys + the bytes of the module that would be
         resolved (seat-suffixed workspace first, then committed). Both the
         design keys and the module are agent-editable; a change in either
-        means "a different attempt is worth one try", so the latch releases."""
+        means "a different attempt is worth one try", so the latch releases.
+
+        The ``instance`` decides WHICH live workspace is watched (docs/19
+        §12.45): a seat resolves ``workspaces/<role>/<instance>__<seat>/src``
+        (``cm_wiring.workspace_node``), so the fixed-root evaluation's
+        ``outer_<N>_eval`` seat has a workspace the main seat never touches.
+        Fingerprinting the main path for it made an eval-workspace fix
+        invisible to the eval latch (the F4 blind spot, docs/19 §12.45.2).
+        ``instance=None`` keeps the legacy ``outer_<O>__<seat>`` +
+        ``outer_<O>`` candidates for direct-construction callers."""
         import hashlib
         import json as _json
         from gan.framework import cm_wiring
@@ -1392,19 +1441,27 @@ class GanLoop:
             blobs = []
             workspace_roots: List[str] = []
             try:
-                if self.output_dir and role and outer is not None and seat:
-                    # workspace-first then committed: BOTH are agent-editable,
-                    # so a change in either must release the latch. The live
-                    # workspace is SEAT-SUFFIXED (``outer_<O>__<seat>/src`` --
-                    # the same key _prepare_paths/role_broker create); the
-                    # legacy unsuffixed layout is kept as a fallback so an
-                    # old run's latch still releases.
-                    workspace_roots.append(os.path.join(
-                        self.output_dir, "workspaces", role,
-                        "outer_%s__%s" % (outer, seat), "src"))
-                    workspace_roots.append(os.path.join(
-                        self.output_dir, "workspaces", role,
-                        "outer_%s" % outer, "src"))
+                if self.output_dir and role and seat and (instance or outer is not None):
+                    if instance:
+                        # The tree the session ACTUALLY resolves from: the
+                        # seat-keyed workspace of THIS instance (the same node
+                        # _prepare_paths / role_broker create).
+                        workspace_roots.append(os.path.join(
+                            self.output_dir, "workspaces", role,
+                            f"{instance}__{seat}", "src"))
+                    else:
+                        # workspace-first then committed: BOTH are
+                        # agent-editable, so a change in either must release
+                        # the latch. The live workspace is SEAT-SUFFIXED
+                        # (``outer_<O>__<seat>/src``); the legacy unsuffixed
+                        # layout stays as a fallback so an old run's latch
+                        # still releases.
+                        workspace_roots.append(os.path.join(
+                            self.output_dir, "workspaces", role,
+                            "outer_%s__%s" % (outer, seat), "src"))
+                        workspace_roots.append(os.path.join(
+                            self.output_dir, "workspaces", role,
+                            "outer_%s" % outer, "src"))
             except Exception:  # noqa: BLE001 -- advisory
                 workspace_roots = []
             paths: List[str] = []
@@ -1438,68 +1495,84 @@ class GanLoop:
     def _cm_latch_consume(self, role: str, seat: str,
                           keys: Optional[Dict[str, Any]],
                           outer: Any = None,
-                          kind: str = "assembly") -> bool:
+                          kind: str = "assembly",
+                          *, instance: Optional[str] = None) -> bool:
         """True when this seat must start with the named module DISABLED
-        (kind = "assembly" | "policy"; docs/19 §12.17)."""
+        (kind = "assembly" | "policy"; docs/19 §12.17).
+
+        ``instance`` selects the (role, seat, scope) latch slot AND the live
+        workspace the fingerprint watches, so the main seat and the fixed-root
+        evaluation's ``outer_<N>_eval`` seat never release each other."""
         stem_key = "cm_assembly" if kind == "assembly" else "cm_policy"
-        slot = self._cm_agent_latch.get((role, seat), {})
+        scope = self._cm_seat_scope(instance)
+        slot = self._cm_agent_latch.get((role, seat, scope), {})
         latch = slot.get(kind)
         if not latch:
             return False
         if not (keys or {}).get(stem_key):
             return False
-        fingerprint = self._cm_latch_fingerprint(role, seat, keys, outer, kind)
+        fingerprint = self._cm_latch_fingerprint(role, seat, keys, outer, kind,
+                                                 instance=instance)
         if fingerprint and fingerprint == latch.get("fp"):
             return True
         # the configuration changed -> the module deserves one fresh try
         slot.pop(kind, None)
         if not slot:
-            self._cm_agent_latch.pop((role, seat), None)
-        soft_fail(f"cm {kind} latch released ({role}/{seat}): the "
+            self._cm_agent_latch.pop((role, seat, scope), None)
+        soft_fail(f"cm {kind} latch released ({role}/{seat}/{scope}): the "
                   f"configuration changed",
                   event_path=paths.events_path(self.output_dir),
                   event_type=f"cm_{kind}_released", role=role, seat=seat,
-                  stem=latch.get("stem"))
+                  scope=scope, stem=latch.get("stem"))
         return False
 
     def _cm_latch_record(self, role: str, seat: str,
                          keys: Optional[Dict[str, Any]],
                          summary: Optional[Dict[str, Any]],
                          outer: Any = None,
-                         kind: str = "assembly") -> None:
+                         kind: str = "assembly",
+                         *, instance: Optional[str] = None) -> None:
         """Latch a seat whose agent-owned module (kind) failed at least once
         this call, and keep the actionable report for the next self-improve
-        session."""
+        session.
+
+        The report/latch are scoped by ``instance`` (docs/19 §12.45): the eval
+        round's failure is stored under its OWN scope, so the MAIN seat's
+        report is not overwritten by a seat it never ran on."""
         report_key = "assembly_report" if kind == "assembly" else "policy_report"
         stem_key = "cm_assembly" if kind == "assembly" else "cm_policy"
         fail_key = "assembly_failures" if kind == "assembly" else "policy_failures"
         report_store = (self._cm_assembly_report if kind == "assembly"
                         else self._cm_policy_report)
+        scope = self._cm_seat_scope(instance)
         report = (summary or {}).get(report_key)
         if report:
-            report_store[role] = {
-                **report, "seat": seat,
-                "latched": kind in self._cm_agent_latch.get((role, seat), {}),
+            report_store[(role, scope)] = {
+                **report, "seat": seat, "scope": scope,
+                "latched": kind in self._cm_agent_latch.get(
+                    (role, seat, scope), {}),
             }
         if not summary or not summary.get(fail_key):
             return
         if not (keys or {}).get(stem_key):
             return
-        slot = self._cm_agent_latch.setdefault((role, seat), {})
+        slot = self._cm_agent_latch.setdefault((role, seat, scope), {})
         if kind in slot:
             return
-        entry = {"fp": self._cm_latch_fingerprint(role, seat, keys, outer, kind),
+        entry = {"fp": self._cm_latch_fingerprint(role, seat, keys, outer, kind,
+                                                  instance=instance),
                  "stem": keys.get(stem_key),
                  "reason": str(report.get("last_error") or "")[:160],
                  "phase": report.get("phase"), "where": report.get("where")}
         if not entry["fp"]:
             return
         slot[kind] = entry
-        soft_fail(f"cm {kind} latched for {role}/{seat} "
+        soft_fail(f"cm {kind} latched for {role}/{seat}/{scope} "
                   f"({entry['stem']}: {entry['reason']}) — it will not be "
                   f"re-attempted until its configuration changes",
                   event_path=paths.events_path(self.output_dir),
                   event_type=f"cm_{kind}_latched", role=role, seat=seat,
+                  scope=scope,
                   **{k: entry[k] for k in ("stem", "reason", "phase", "where")})
 
     def _seat_cm_summary(self, role_obj: Any, *,
@@ -1516,15 +1589,17 @@ class GanLoop:
 
         When ``role``/``seat``/``keys`` are supplied it ALSO maintains the
         failure LATCH (docs/19 §12.14): one failed attempt keeps the module
-        off until its configuration changes."""
+        off until its configuration changes. The latch/report slot is keyed by
+        the role object's ``instance`` (main vs the eval round's own seat)."""
         from gan.framework import cm_wiring
         summary = cm_wiring.summary_of(role_obj)
         if role and seat:
+            instance = getattr(role_obj, "instance", None)
             try:
                 self._cm_latch_record(role, seat, keys, summary, outer,
-                                      kind="assembly")
+                                      kind="assembly", instance=instance)
                 self._cm_latch_record(role, seat, keys, summary, outer,
-                                      kind="policy")
+                                      kind="policy", instance=instance)
             except Exception:  # noqa: BLE001 -- advisory bookkeeping
                 pass
         return summary
@@ -1540,6 +1615,74 @@ class GanLoop:
                 setattr(role_obj, attr, None)
             except Exception:  # noqa: BLE001 -- advisory
                 pass
+
+    def _plan_seat_cm_open(self, role_obj: Any, *, outer: Any, genid: Any,
+                           traj_genids: Any) -> Dict[str, Any]:
+        """The ONE seat wiring for a planner ``plan()`` session — MAIN and the
+        fixed-root evaluation's throwaway planner alike (docs/19 §12.45).
+
+        Clamps the planner's OWN design cost keys (single authority), stamps
+        the per-session token soft stop + ``session_cm_mode``, installs the CM
+        session/descriptor, and records ``cost_keys_applied``. Every step is
+        advisory: a wiring failure degrades to "no seam" and SPEAKS — it never
+        fails the seat call. Returns the effective keys (the caller threads
+        ``patch_retry_k`` / ``max_tool_calls`` from them, so the eval seat
+        honours the same design keys the main seat does).
+        """
+        plan_ck: Dict[str, Any] = {}
+        plan_clamps: List[Dict[str, Any]] = []
+        try:
+            plan_ck, plan_clamps = self._effective_cost_keys("planner", {
+                "plan_max_tool_calls": self.plan_max_tool_calls,
+                "patch_retry_k": self.patch_retry_k,
+                "plan_token_budget": None,
+            })
+        except Exception as e:  # noqa: BLE001 -- advisory: no seam on doubt
+            soft_fail(f"cost-key clamp failed (planner/plan): {e}")
+        try:
+            role_obj.session_token_budget = plan_ck.get("plan_token_budget")
+            # slice 前端档位归座 (docs/10 §11.5): the PLAN session's
+            # read_trajectory presentation follows the planner's own design
+            # cm_mode (stamped onto the AccessContext by the role) — visible
+            # sets are untouched. The eval seat runs the SAME design, so it
+            # must not silently present as passthrough.
+            role_obj.session_cm_mode = plan_ck.get("cm_mode")
+        except Exception as e:  # noqa: BLE001 -- advisory stamp
+            soft_fail(f"session cost stamp failed (planner/eval: token "
+                      f"budget / cm_mode): {e}")
+        self._seat_cm_install(role_obj, "planner", plan_ck, seat="plan",
+                              outer=outer, genid=genid,
+                              traj_genids=traj_genids)
+        try:
+            self._emit_cost_keys_applied("planner", "plan", genid,
+                                         plan_ck, plan_clamps)
+        except Exception as e:  # noqa: BLE001 -- audit emit is advisory
+            soft_fail(f"cost_keys_applied emit failed (planner/plan): {e}")
+        return plan_ck
+
+    def _plan_seat_cm_close(self, role_obj: Any, *, outer: Any,
+                            keys: Optional[Dict[str, Any]]
+                            ) -> Optional[Dict[str, Any]]:
+        """Settled summary + stamp clear for a planner ``plan()`` session.
+
+        MUST run on success AND failure (N5d): a failed session's
+        proxy-stashed summary is dropped by the clear otherwise, so its CM
+        failure would never reach the latch/report. Returns the summary.
+        """
+        summary = None
+        try:
+            if keys is not None:
+                summary = self._seat_cm_summary(role_obj, role="planner",
+                                                seat="plan", keys=keys,
+                                                outer=outer)
+        finally:
+            self._seat_cm_clear(role_obj)
+            for attr in ("session_token_budget", "session_cm_mode"):
+                try:
+                    setattr(role_obj, attr, None)
+                except Exception:  # noqa: BLE001 -- advisory
+                    pass
+        return summary
 
     def _task_budget_keys(self, parent: Any) -> Optional[Dict[str, Any]]:
         """Effective TASK-side reserved keys of the design the child will
@@ -2381,25 +2524,51 @@ class GanLoop:
                     # outer_select meaningless. Same empty plan as the main line.
                     plan_result = self._empty_plan_result(eval_cfg)
                 else:
-                    plan_result = eval_planner.plan(
-                        parent_summary=(self._parent_summary(initial) if initial else {}),
-                        parents=[],
-                        parent_feedback=None,
-                        evaluator_issues=None,
-                        config=eval_cfg,
-                        node_id=genid,
-                        broker=self.broker,
-                        task_brief=self.task_brief,
-                        response_contract=(self.task_runner.response_contract
-                                           if self.task_runner else None),
-                        trajectory_genids=[],
-                        receipt=None,
-                        parent_predicted_score=None,
-                        parent_benchmark_score=None,
-                        patch_retry_k=self.patch_retry_k,
-                        max_tool_calls=self.plan_max_tool_calls,
-                        tool_repeat_limit=self.tool_repeat_limit,
-                    ) or {}
+                    # F5 (docs/19 §12.45): the fixed-root evaluation's planner
+                    # seat is a REAL planner seat, so it runs the SAME wiring
+                    # the main plan seat runs (design-clamped cost keys, the
+                    # session cm_mode stamp, the CM session/descriptor, the
+                    # latch, `cost_keys_applied`). It used to call `.plan()`
+                    # directly, which silently ran that seat without any seam
+                    # and without the design's own budget/tool caps.
+                    plan_ck: Optional[Dict[str, Any]] = None
+                    plan_ck = self._plan_seat_cm_open(
+                        eval_planner, outer=outer, genid=genid,
+                        # The eval planner plans from `initial`; it never reads
+                        # task trajectories (same [] the plan CALL passes).
+                        traj_genids=[])
+                    try:
+                        plan_result = eval_planner.plan(
+                            parent_summary=(self._parent_summary(initial) if initial else {}),
+                            parents=[],
+                            parent_feedback=None,
+                            evaluator_issues=None,
+                            config=eval_cfg,
+                            node_id=genid,
+                            broker=self.broker,
+                            task_brief=self.task_brief,
+                            response_contract=(self.task_runner.response_contract
+                                               if self.task_runner else None),
+                            trajectory_genids=[],
+                            receipt=None,
+                            parent_predicted_score=None,
+                            parent_benchmark_score=None,
+                            # the DESIGN's clamped values (main-seat parity),
+                            # not the loop's global fallbacks.
+                            patch_retry_k=plan_ck.get("patch_retry_k",
+                                                      self.patch_retry_k),
+                            max_tool_calls=plan_ck.get("plan_max_tool_calls",
+                                                       self.plan_max_tool_calls),
+                            tool_repeat_limit=self.tool_repeat_limit,
+                        ) or {}
+                    finally:
+                        # N5d parity: a FAILED eval plan session still feeds
+                        # its latch/report (the main seat closes on both
+                        # paths). No cost_sessions row: evaluation rounds are
+                        # cost-isolated by design (docs/14 §5.5) — the CM
+                        # summary is only settled onto the latch/report.
+                        self._plan_seat_cm_close(eval_planner, outer=outer,
+                                                 keys=plan_ck)
                 try:
                     child = self.eval_runner(plan=plan_result, parent=initial,
                                              genid=genid, base=eval_base)
@@ -3495,32 +3664,11 @@ class GanLoop:
                 # effective values from the planner's OWN design (fallbacks =
                 # the loop.yaml values), passed into the session + stamped on
                 # the instance; the applied/clamped record rides the ledger.
-                plan_ck, plan_clamps = self._effective_cost_keys("planner", {
-                    "plan_max_tool_calls": self.plan_max_tool_calls,
-                    "patch_retry_k": self.patch_retry_k,
-                    "plan_token_budget": None,
-                })
-                # Stamp the token soft stop for THIS session only; _self_session
-                # clears it before self-improve (the stamp is otherwise inherited
-                # by a session that has no design key of its own).
-                try:
-                    self.planner.session_token_budget = plan_ck.get("plan_token_budget")
-                    # slice 前端档位归座 (docs/10 §11.5): the PLAN session's
-                    # read_trajectory presentation follows the PLANNER's own
-                    # design cm_mode (stamped onto the AccessContext by the
-                    # role) — visible sets are untouched.
-                    self.planner.session_cm_mode = plan_ck.get("cm_mode")
-                except Exception as e:  # noqa: BLE001 -- advisory stamp
-                    soft_fail(f"session cost stamp failed (planner: token "
-                              f"budget / cm_mode): {e}")
-                # Context-management session for THIS plan call (docs/10 §11
-                # D11); cleared right after the call (no stamp leak into
-                # self-improve), like ``session_token_budget``.
-                self._seat_cm_install(self.planner, "planner", plan_ck,
-                                      seat="plan", outer=outer, genid=genid,
-                                      traj_genids=parent_ref)
-                self._emit_cost_keys_applied("planner", "plan", genid,
-                                             plan_ck, plan_clamps)
+                # ONE wiring helper (docs/19 §12.45): the fixed-root evaluation's
+                # plan seat calls the SAME one, so the two can never drift.
+                plan_ck = self._plan_seat_cm_open(
+                    self.planner, outer=outer, genid=genid,
+                    traj_genids=parent_ref)
 
                 # Cost statement for the plan session (B2): framework-rendered
                 # facts only; the role injects the text verbatim. Resume-safe:
@@ -3578,13 +3726,11 @@ class GanLoop:
                     # N5d: a FAILED session must feed the latch the same way
                     # a successful one does — a recoverable failure has the
                     # proxy-stashed summary, and it is dropped by the clear
-                    # below unless read first. Best-effort: a hard child
-                    # crash has no summary and the latch learns nothing
-                    # (advisory). The cost record stays success-only.
-                    self._seat_cm_summary(self.planner, role="planner",
-                                          seat="plan", keys=plan_ck,
-                                          outer=outer)
-                    self._seat_cm_clear(self.planner)  # no stamp leak
+                    # unless read first (the ONE close helper does it). Best-
+                    # effort: a hard child crash has no summary and the latch
+                    # learns nothing (advisory). Cost record stays success-only.
+                    self._plan_seat_cm_close(self.planner, outer=outer,
+                                             keys=plan_ck)
                     self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
@@ -3593,14 +3739,13 @@ class GanLoop:
                 # and the ledger instead of becoming a silent "unjudged".
                 self._normalize_plan_issue_refs(plan_result, parent_feedback)
                 # Settled plan session -> cost ledger (A5). Success-only: a
-                # planner_failed round has no settled session to record.
-                plan_cm_summary = self._seat_cm_summary(
-                    self.planner, role="planner", seat="plan",
-                    keys=plan_ck, outer=outer)
+                # planner_failed round has no settled session to record. The
+                # close settles the summary AND clears the stamps in one place.
+                plan_cm_summary = self._plan_seat_cm_close(
+                    self.planner, outer=outer, keys=plan_ck)
                 plan_cost_rec = self._record_session_cost(
                     "planner", "plan", outer, genid,
                     cm_summary=plan_cm_summary)
-                self._seat_cm_clear(self.planner)
 
                 try:
                     child = self.task_runner(plan=plan_result, parent=parent, genid=genid,
@@ -3949,10 +4094,17 @@ class GanLoop:
                                for r in cost_ledger.self_session_costs(self.output_dir, outer, role)]
                         payload["costs"] = {"own_sessions": [r for r in own if r]}
                         payload["cost_statement"] = self._cost_statement_self(role, outer)
-                        if self._cm_assembly_report.get(role):
-                            payload["cm_assembly"] = self._cm_assembly_report[role]
-                        if self._cm_policy_report.get(role):
-                            payload["cm_policy"] = self._cm_policy_report[role]
+                        # Docs/19 §12.45: reports are (role, scope)-keyed now —
+                        # the MAIN seat's failure is what self-improve repairs;
+                        # the eval round's report is the fallback.
+                        cm_assembly_rep = self._cm_report_for(
+                            self._cm_assembly_report, role)
+                        if cm_assembly_rep:
+                            payload["cm_assembly"] = cm_assembly_rep
+                        cm_policy_rep = self._cm_report_for(
+                            self._cm_policy_report, role)
+                        if cm_policy_rep:
+                            payload["cm_policy"] = cm_policy_rep
                         # Injection fact (B2, self seat): same bytes audit the
                         # plan/evaluate statements get (docs/10 §11.5 gap fix).
                         if payload["cost_statement"]:

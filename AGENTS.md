@@ -86,20 +86,28 @@ live under `scripts/dgmh/`.
   the baseline stages' refs are folded before the policy snapshot so the
   reconcile does not false-positive on their form changes — docs/19 §12.18);
   in-process p/e seats resolve the SAME named slots
-  workspace-first at session build (``loop._resolve_cm_module(seat)``, no
-  sort-order discovery — an unresolved claim is a loud
-  ``cm_module_unresolved`` and custom degrades to the slice preset with
-  its keys rewritten), while DRIVER-mode p/e seats build the session in
+  workspace-first at session build (``cm_wiring.resolve_named`` reached from
+  ``loop._build_cm_session``, no sort-order discovery — an unresolved claim
+  is a loud ``cm_module_unresolved`` and custom degrades to the slice preset
+  with its keys rewritten), while DRIVER-mode p/e seats build the session in
   the CHILD from the parent-computed descriptor (``role_state.cm``,
   protocol 2 → ``cm_wiring.build_from_descriptor``; stems resolve
-  child-side, workspace ``outer_<O>__<seat>`` first then committed), with
+  child-side, workspace ``<instance>__<seat>`` first then committed), with
   per-path sys.modules keys
   for the parallel self-improve threads and a preflight pool gate; named
   modules may export a ``METHODS`` dict of custom methods (harvested
   all-or-nothing with ``cm_methods_refused``, assembly > policy shadowing,
   invoked same-level/same-callee via ``handle.call``/``session.call_method``
   — the caller's own privilege, never an escalation), fail-open policy
-  runner, trajectory index (``materialize_traj`` snapshots the seat's visible
+  runner, and ONE shared plan-seat wiring (``loop._plan_seat_cm_open/_close``)
+  for BOTH the main plan seat AND the fixed-root evaluation's throwaway
+  planner (``outer_<N>_eval``): design-clamped cost keys, the cm_mode stamp,
+  the CM session/descriptor, the latch, and ``cost_keys_applied`` all apply
+  there too — while evaluation stays cost-isolated (no ``cost_sessions``
+  row); the latch/report tables are keyed ``(role, seat, scope)`` (main vs
+  eval) and the fingerprint watches the EVAL seat's own workspace bytes,
+  so the two seats can never release each other's latch (docs/19 §12.45),
+  trajectory index (``materialize_traj`` snapshots the seat's visible
   trajectories as pinned ``traj_seg`` blocks — one scan per session; the
   read tools and the ``ctx_`` faces share that single genid-qualified
   address space); the seat layer bounds what the budgets cannot (CM-03
@@ -507,7 +515,11 @@ non-repeatable:
   carries the violation/overrun families + `thread_leaks_live` +
   `substituted`, and `substituted` is the NON-FULL form count in BOTH
   `summary()` and `cm_view.stats` (`violations` is documented as the
-  `ops_refused` alias).
+  `ops_refused` alias). F5 (the fixed-root evaluation's plan seat ran without
+  any CM/cost-key wiring) is closed by §12.45: the main plan seat's wiring was
+  extracted into one helper used by BOTH seats, and the latch/report tables
+  became `(role, seat, scope)`-keyed (closing the F4 instance blind spot) —
+  evaluation still writes no `cost_sessions` row.
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license
