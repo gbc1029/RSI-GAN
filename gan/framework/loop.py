@@ -1627,9 +1627,15 @@ class GanLoop:
         report_path = (archived_report if os.path.isfile(archived_report)
                        else node.meta.get("report_path"))
         points = self._read_per_question(node.genid).get(str(qid))
+        qid_evaluated = points is not None
         return {
             "qid": str(qid),
             "points": points,
+            # Coverage/status are normally generation-wide.  Challenge
+            # adjudication must use the challenged qid's own evidence so an
+            # unrelated missing proof cannot make this edge undecidable.
+            "qid_coverage": 1.0 if qid_evaluated else 0.0,
+            "qid_score_status": "ok" if qid_evaluated else "missing",
             "coverage": node.value.coverage,
             "score_status": node.value.score_status,
             "imputed": bool(node.meta.get("imputed")),

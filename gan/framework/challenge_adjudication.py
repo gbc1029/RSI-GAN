@@ -27,12 +27,18 @@ def _evidence_ok(evidence: Optional[Mapping[str, Any]]) -> bool:
         return False
     if bool(evidence.get("imputed")):
         return False
-    if evidence.get("score_status") not in {"ok"}:
+    # A generation may have partial coverage because an unrelated qid failed.
+    # Challenge settlement is qid-bound, so prefer the runner's per-qid
+    # evidence when it is available instead of rejecting every qid on that
+    # edge because of the generation-wide status.
+    score_status = evidence.get("qid_score_status", evidence.get("score_status"))
+    if score_status not in {"ok"}:
         return False
     if evidence.get("points") is None:
         return False
     try:
-        return float(evidence.get("coverage")) >= 1.0
+        coverage = evidence.get("qid_coverage", evidence.get("coverage"))
+        return float(coverage) >= 1.0
     except (TypeError, ValueError):
         return False
 

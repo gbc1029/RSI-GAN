@@ -480,3 +480,13 @@ imo_proof 专用：`qid`、proof 缺陷字段、0–7 grader、proof adjudicator
 paper-review search 后续应绑定 review item/证据片段。
 polyglot 后续应绑定测试用例/失败断言。
 不会把 IMO 的评分公式或字段强行放进其他领域。
+
+## 5.首轮实现问题
+1.Challenge 在 planner prompt 中被截断，导致planner 并没有稳定地“完整看到所有 challenge”
+2.UNDECIDABLE 被 generation 级 coverage 错误放大，导致undeciable率显著提高，直接导致challenge gate无法满足，challenge fitness一直没有启动，导致本轮challenge始终没有对planner产生实质性选择压力
+其他结构性问题
+- 普通 issue 必须逐条调用 respond_issue，但 challenge 没有对应的 respond_challenge 契约。framework 无法区分 planner 是接受、争议、推迟，还是根本忽略某条 challenge。
+- task agent 只收到题目，不收到 challenge 内容。planner 必须把最多 5 个异构、题目特定的缺陷压缩成一个全局通用设计修改。
+- hardcoding audit 又禁止把 qid 或具体答案写进 task 修改。这是正确的防作弊措施，但意味着诸如“用 CRT 完成这道题”或“处理这个特定几何构型”实际上很难通过通用 prompt 修复。
+- fixed adjudicator 的 actionable 校准可疑：当前 72 个有 verdict 的 challenge 全部是 actionable=true，没有一个 false。很多 repair criterion 明显包含题目特定方法，因此这个判定可能过宽。
+- challenge repair 没有 no-op 对照。同一个 task design 重新生成同一道题，也可能随机从有缺陷变成无缺陷，或反过来。因此不能把每个 VERIFIED_REPAIR/UNRESOLVED 完全归因于 planner 修改。

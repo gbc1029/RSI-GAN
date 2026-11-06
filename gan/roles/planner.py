@@ -133,7 +133,10 @@ class Planner(Role):
                 "framework-carried train evidence, not grader scores or validation "
                 "information. Prefer a reusable repair that generalizes beyond the "
                 "listed qids; do not hard-code a qid or copy a reference solution.\n"
-                f"```json\n{json.dumps(parent_challenges, ensure_ascii=False, indent=2)[:4000]}\n```"
+                # Challenges are an atomic input contract.  Do not truncate the
+                # serialized list: slicing JSON can hide a claim/criterion or
+                # leave the planner with malformed JSON at the end of the block.
+                f"```json\n{json.dumps(parent_challenges, ensure_ascii=False, indent=2)}\n```"
             )
         if challenge_results:
             parts.append(
@@ -141,7 +144,7 @@ class Planner(Role):
                 "These are framework-adjudicated public states from earlier fixes. "
                 "Use them to avoid repeating failed local repairs. They contain no "
                 "grader score, reference solution, grading guideline, or val data.\n"
-                f"```json\n{json.dumps(challenge_results, ensure_ascii=False, indent=2)[:4000]}\n```"
+                f"```json\n{json.dumps(challenge_results, ensure_ascii=False, indent=2)}\n```"
             )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
             parts.append(
