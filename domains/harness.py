@@ -487,15 +487,43 @@ def _sandbox_command(run_root, agent_path, proxy_socket=None,
 
 
 # CM-03 generation latch (docs/19 §12.16): set when ANY question of this
-# harness process produced a ``cm_assembly_failed`` seam event. The CM
-# snapshot is fixed for the whole generation (module bytes cannot change),
-# so later questions in the same generation must not re-attempt the named
-# assembly — each attempt would burn the exec budget and leak a worker
-# thread for an outcome that cannot differ. The flag crosses to the agent
-# child as ``GAN_CM_ASSEMBLY_DISABLED=1``; the child honors it at session
-# build (``task_worker._build_cm_session``).
-_CM_ASSEMBLY_LATCH = False
-_CM_POLICY_LATCH = False
+# harness process produced a ``cm_assembly_failed`` / ``cm_policy_failed``
+# seam event. The CM snapshot is fixed for the whole generation (module bytes
+# cannot change), so later questions in the same generation must not
+# re-attempt the named module — each attempt would burn the exec budget and
+# leak a worker thread for an outcome that cannot differ. The flags cross to
+# the agent child as ``GAN_CM_*_DISABLED=1``; the child honors them at
+# session build (``task_worker._build_cm_session``).
+#
+# A MUTABLE HOLDER on purpose (docs/19 §12.54-A). Both flags are written from
+# ``_run_sandboxed_agent``, and a module-level REBINDING there needs one
+# ``global`` declaration per name: the missing one turned the read below into
+# ``UnboundLocalError`` on EVERY task question, the per-question isolation
+# swallowed it into a blank prediction, and the whole generation failed
+# silently while reading as a bad agent. Items of a dict cannot hit that class
+# at all — no name is ever rebound, so no declaration can be forgotten.
+_CM_LATCH = {"assembly": False, "policy": False}
+
+# kind -> the child env key that carries it (task_worker whitelists both).
+_CM_LATCH_ENV = {
+    "assembly": "GAN_CM_ASSEMBLY_DISABLED",
+    "policy": "GAN_CM_POLICY_DISABLED",
+}
+
+
+def _apply_cm_latches(env, latch=None):
+    """Project the generation latch onto one child env (docs/19 §12.16 C3).
+
+    ONE place owns the latch->env mapping, so the two kinds can never drift
+    apart and a regression test can assert the contract without spawning a
+    sandbox. Only ``True`` writes the flag: the child compares ``=="1"``, so a
+    cleared latch must write NOTHING rather than a ``"0"`` that would read as
+    set. Mutates and returns ``env`` (the caller owns the dict)."""
+    latch = _CM_LATCH if latch is None else latch
+    for kind, key in _CM_LATCH_ENV.items():
+        if latch.get(kind):
+            env[key] = "1"
+    return env
 
 
 def _cm_latch_scan(staged_lines: str) -> bool:
@@ -525,7 +553,9 @@ def _cm_policy_latch_scan(staged_lines: str) -> bool:
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
                          reasoning_effort=None, cost_overrides=None,
                          cm_events_target=None):
-    global _CM_ASSEMBLY_LATCH
+    # (No ``global`` needed: the generation latch lives in the ``_CM_LATCH``
+    # holder, so this function never REBINDS a module-level name — the class
+    # of bug that killed every task question once docs/19 §12.54-A.)
     # Private run ancestors deliberately remain non-traversable to the
     # sandbox uid. Bubblewrap also cannot reliably open bind sources through
     # /proc/self/fd, so stage only the allowlisted inputs in a private /tmp
@@ -560,13 +590,10 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
             payload["token_budget"] = int(cost_overrides["token_budget"])
     child_env = _task_child_env(os.environ)
     # CM-03 generation latch: an earlier question of THIS generation failed
-    # its named assembly — later questions get the latch flag (the child
-    # keeps the design claim but never loads the module; every cm_view then
-    # reads assembly_disabled=true, so the latch is loud, not silent).
-    if _CM_ASSEMBLY_LATCH:
-        child_env["GAN_CM_ASSEMBLY_DISABLED"] = "1"
-    if _CM_POLICY_LATCH:
-        child_env["GAN_CM_POLICY_DISABLED"] = "1"
+    # its named assembly / policy — later questions get the latch flag (the
+    # child keeps the design claim but never loads the module; every cm_view
+    # then reads <kind>_disabled=true, so the latch is loud, not silent).
+    _apply_cm_latches(child_env)
 
     # The result channel is an anonymous temporary file. Only the trusted
     # task_worker receives its fd; the TaskAgent child is spawned later with
@@ -670,14 +697,15 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
             _latch_text = "".join(
                 json.dumps(e, ensure_ascii=False, default=str) + "\n"
                 for e in cm_received)
-            if _cm_latch_scan(_latch_text) and not _CM_ASSEMBLY_LATCH:
-                _CM_ASSEMBLY_LATCH = True
-                print("[cm] assembly latched for the rest of this "
-                      "generation (cm_assembly_failed seen)", flush=True)
-            if _cm_policy_latch_scan(_latch_text) and not _CM_POLICY_LATCH:
-                _CM_POLICY_LATCH = True
-                print("[cm] policy latched for the rest of this "
-                      "generation (cm_policy_failed seen)", flush=True)
+            # CM-03 generation latch feed: ONE kind-symmetric loop (docs/19
+            # §12.30 rule 3 promises symmetry; two hand-copied blocks are
+            # exactly how the policy half was broken once).
+            for kind, scan in (("assembly", _cm_latch_scan),
+                               ("policy", _cm_policy_latch_scan)):
+                if scan(_latch_text) and not _CM_LATCH[kind]:
+                    _CM_LATCH[kind] = True
+                    print(f"[cm] {kind} latched for the rest of this "
+                          f"generation (cm_{kind}_failed seen)", flush=True)
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
                 raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
@@ -779,6 +807,40 @@ def _failure_phase(e):
     if "TaskAgent child" in s or "Trusted TaskAgent worker" in s:
         return "result_channel"
     return "unknown"
+
+
+def _write_failure_summary(failures_path, failures, attempted):
+    """Append ONE generation-level summary line to ``eval_failures.jsonl``.
+
+    Per-question records are diagnostics; this line is the FACT the parent
+    needs to tell an infrastructure break from model noise (docs/19 §12.54-A):
+    a generation in which EVERY attempted question died with the SAME
+    non-domain error (the observed shape: 20/20 ``UnboundLocalError``,
+    per-question isolation turning it into blank predictions, score 0 — i.e.
+    "the agent is bad") must not be indistinguishable from ordinary failures.
+    ``all_failed`` plus a single dominant ``error_type`` is that signal.
+
+    Advisory end to end: a write failure never fails the run, and an absent
+    summary line means "no failures recorded" (absence = healthy, per the
+    no-silent-fail / None-is-not-0 rule)."""
+    error_types = {}
+    for rec in failures or []:
+        kind = str(rec.get("error_type") or "unknown")
+        error_types[kind] = error_types.get(kind, 0) + 1
+    summary = {
+        "kind": "question_failures_summary",
+        "attempted": int(attempted or 0),
+        "failed": len(failures or []),
+        "all_failed": bool(attempted) and len(failures or []) >= int(attempted),
+        "error_types": error_types,
+    }
+    try:
+        with open(failures_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    except OSError as exc:  # audit sidecar only: never fail the run
+        print(f"[WARN] failure summary not written ({failures_path}): {exc}",
+              flush=True)
+    return summary
 
 
 def _dump_failure_log(evals_folder, qid, e):
@@ -1038,6 +1100,7 @@ def harness(
 
     if failures:
         append_pending_failures()
+        _write_failure_summary(failures_path, failures, len(futures))
         print(f"{len(failures)} question(s) failed and were isolated (see eval_failures.jsonl)")
 
     return output_folder

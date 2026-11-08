@@ -62,12 +62,14 @@ def assemble_passthrough(session, msgs, outgoing,
     """``passthrough`` preset — the identity view.
 
     Register everything for the audit face, send everything, substitute
-    nothing. The sent history is per-ENTRY copies: the LLM client's
-    text->content conversion POPS keys from the dicts it is handed
-    (agent/llm.py), so the canonical history must stay raw (双记)."""
+    nothing. The sent history is per-ENTRY copies (双记): the canonical stays
+    raw, and only the throw-away copies are ever sent. Even the identity view
+    claims what it sends (docs/19 §12.54-C), so the send fact covers the case
+    where the client mangles an unchanged history too."""
     session.register_history(msgs)
     session.register_outgoing(outgoing)
     session.emit_view(0)
+    session.claim_send(msgs, outgoing)
     return [dict(m) if isinstance(m, dict) else m for m in msgs], outgoing
 
 

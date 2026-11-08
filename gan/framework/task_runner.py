@@ -47,6 +47,90 @@ def _modify_depth(records: List[Dict[str, Any]]) -> int:
 TASK_PATCH_REJECTED_NO_COMMIT = "no new code commit (patch rejected or absent)"
 
 
+def summarize_question_failures(path: str) -> Optional[Dict[str, Any]]:
+    """Fold the harness's per-question failure sidecar into ONE event payload.
+
+    Why this exists (docs/19 §12.54-A): the harness isolates a failed question
+    into a blank prediction, so a generation in which EVERY question died (e.g.
+    the task child could not be spawned at all) used to reach the loop as
+    "score 0 / worse agent" — an infrastructure break wearing a task-quality
+    costume. These counts are the durable evidence that separates the two:
+    ``all_failed`` plus a single dominant ``error_type`` is a systemic break;
+    the same failures spread over several error types are ordinary noise.
+
+    Reads the sidecar the harness writes (``eval_failures.jsonl``: per-question
+    records + one ``question_failures_summary`` line, docs/19 §12.54-A).
+    Returns None when the file is missing/empty/record-free — absence is "no
+    failures recorded", the only honest reading of a missing sidecar
+    (None is not 0). Never raises."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().splitlines()
+    except OSError:
+        return None
+    records: List[Dict[str, Any]] = []
+    summary_line: Optional[Dict[str, Any]] = None
+    for line in raw:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue          # a torn last line must not sink the whole summary
+        if not isinstance(row, dict):
+            continue
+        if row.get("kind") == "question_failures_summary":
+            summary_line = row
+        else:
+            records.append(row)
+    if not records:
+        # The summary line is appended AFTER the per-question records, so an
+        # empty record half means either "no failures" or "the records did not
+        # survive". Trust the harness's own counts in the latter case instead
+        # of reading the absence as health (a missing record is not a healthy
+        # round when the summary says N>0 died).
+        failed = int((summary_line or {}).get("failed") or 0)
+        if summary_line and failed > 0:
+            out: Dict[str, Any] = {
+                "failed": failed,
+                "records_missing": True,
+                "error_types": dict(summary_line.get("error_types") or {}),
+            }
+            out["attempted"] = summary_line.get("attempted")
+            out["all_failed"] = bool(summary_line.get("all_failed"))
+            if out["all_failed"] and len(out["error_types"]) == 1:
+                out["systemic"] = True
+                out["error_type"] = next(iter(out["error_types"]))
+            return out
+        return None
+    error_types: Dict[str, int] = {}
+    phases: Dict[str, int] = {}
+    for row in records:
+        kind = str(row.get("error_type") or "unknown")
+        error_types[kind] = error_types.get(kind, 0) + 1
+        phase = str(row.get("phase") or "unknown")
+        phases[phase] = phases.get(phase, 0) + 1
+    out = {
+        "failed": len(records),
+        "error_types": error_types,
+        "phases": phases,
+        "questions": [str(r.get("question_id")) for r in records][:20],
+    }
+    if summary_line:
+        # The harness's own denominator: it counts what THIS run attempted, so
+        # "all failed" is exact instead of being inferred from predictions.csv.
+        out["attempted"] = summary_line.get("attempted")
+        out["all_failed"] = bool(summary_line.get("all_failed"))
+    if out.get("all_failed") and len(error_types) == 1:
+        # Every attempted question died the SAME way: no agent behaviour
+        # produces that shape (it is one broken spawn/transport, not a bad
+        # policy). Downstream issue-checkers consume it as an infra fact.
+        out["systemic"] = True
+        out["error_type"] = next(iter(error_types))
+    return out
+
+
 def pool_check(domain: str, domain_cfg: Dict[str, Any], num_samples: int,
                dataset_root: Optional[str] = None, subset: str = "") -> None:
     """Fail fast when a domain's candidate pool cannot satisfy --num_samples.
@@ -631,6 +715,26 @@ class DomainTaskRunner:
                                      os.path.join(archive_dir, name))
                     except OSError:
                         pass  # evidence is best-effort; never fail the run
+                    if name == "eval_failures.jsonl" and evals_dir == eval_sources[0][0]:
+                        # Docs/19 §12.54-A: a generation where EVERY question
+                        # was isolated by the same non-domain error is an
+                        # infrastructure break, not a worse agent. ONE durable
+                        # event carries the counts so the loop (and the
+                        # offline reconcilers) can tell the two apart without
+                        # opening the evidence tree.
+                        try:
+                            qf = summarize_question_failures(
+                                os.path.join(evals_dir, name))
+                            if qf:
+                                self._event("question_failures",
+                                            genid=str(genid), **qf)
+                        except Exception as exc:  # noqa: BLE001 -- advisory
+                            from utils.soft_fail import soft_fail
+                            soft_fail(f"question-failure summary failed "
+                                      f"(genid {genid}): {exc}",
+                                      event_path=paths.events_path(self.output_dir),
+                                      event_type="question_failures_fold_failed",
+                                      genid=str(genid))
         # Merge the CHILD-reported load outcome into the toolset report (the
         # assembly stage can only report what it copied). Failures are classified
         # by owner: a component (or a role-owned always-on tool) is an agent-fixable

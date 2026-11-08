@@ -174,24 +174,89 @@ def _fingerprint(content: str) -> str:
     return hashlib.sha1(content.encode("utf-8", "replace")).hexdigest()
 
 
-def _msg_text(m: Any) -> Optional[str]:
-    """The text of one history entry, in EITHER key convention.
+# The SINGLE raw text carrier of a history entry (docs/19 §12.54-B). ``text``
+# is a retired spelling: two spellings of one value with OPPOSITE precedence in
+# the two layers (this session read ``content`` first, the client's conversion
+# let ``text`` win) meant a rendered view written under one of them was
+# silently discarded by the other.
+_RAW_KEY = "content"
+# The framework-owned SEND PROJECTION: written ONLY by ``render``, on the
+# throw-away copies a turn sends, and consumed ONLY by the payload builder
+# (``agent/llm.py:_payload_messages``, which strips it). It never exists in a
+# canonical history, so "raw" and "rendered" are two keys with two meanings
+# instead of one key with two.
+_SENT_KEY = "_cm_sent"
 
-    This repo's canonical history is ``text``-keyed (``agent/llm.py`` converts
-    content->text on return; ``task_agent`` reads ``['text']``) while the
-    seam's user-turn rebuild in the chat loop writes ``content`` — the binding
-    must not depend on which form a given entry happens to carry (docs/10
-    §11.5 erratum: the seam previously read ``content`` only and silently
-    failed to bind the canonical history)."""
+
+def _msg_text(m: Any) -> Optional[str]:
+    """The RAW text of one history entry — one carrier: ``content``.
+
+    ``_cm_sent`` is deliberately NOT read here: it is the send projection, not
+    the entry's text, and reading it would put the rendered form back into the
+    layer that must stay raw (that confusion is exactly docs/19 §12.54-B).
+
+    A legacy ``text``-only entry is still understood (``_entry_text`` — the
+    normalizer rewrites it once at the turn boundary), but nothing in this
+    module ever WRITES ``text``."""
+    return _entry_text(m)
+
+
+def _entry_text(m: Any) -> Optional[str]:
+    """Raw text of an entry, tolerating the retired ``text`` spelling."""
     if not isinstance(m, dict):
         return None
-    v = m.get("content")
-    if isinstance(v, str) and v:
-        return v
-    v = m.get("text")
-    if isinstance(v, str) and v:
-        return v
+    for key in (_RAW_KEY, "text"):
+        v = m.get(key)
+        if isinstance(v, str) and v:
+            return v
     return None
+
+
+def _shipped_text(m: Any) -> Optional[str]:
+    """The text a SEND COPY actually ships: the CM projection, else the raw.
+
+    Used by the send fact's CLAIM side only (docs/19 §12.54-C). Reading the
+    projection here is the whole point: a claim measured on ``content`` would
+    describe the raw history, not what the turn promised to send — and the
+    difference between the two IS the saving the fact exists to verify."""
+    if isinstance(m, dict):
+        proj = m.get(_SENT_KEY)
+        if isinstance(proj, str):
+            return proj
+    return _entry_text(m)
+
+
+def _normalize_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """One carrier, one spelling (docs/19 §12.54-B, I1/I2/I5/I6).
+
+    Returns ``(entry, note)`` where ``note`` is ``""`` (nothing to say),
+    ``"legacy"`` (a ``text``-only entry was rewritten to ``content``) or
+    ``"projection"`` (a ``_cm_sent`` was stripped: a fed-back send list is
+    legal, the projection is recomputed from the raw bytes).
+
+    A dual-carrier entry is NOT normalized here — it is the ambiguous state
+    this change exists to remove; ``_entries_conflict`` detects it and the
+    turn refuses loudly.
+    """
+    note = ""
+    if _SENT_KEY in entry:
+        entry.pop(_SENT_KEY, None)
+        note = "projection"
+    if "text" in entry:
+        value = entry["text"]
+        if not isinstance(entry.get(_RAW_KEY), str) \
+                and isinstance(value, str) and value:
+            entry[_RAW_KEY] = value
+        entry.pop("text", None)
+        note = note or "legacy"
+    return entry, note
+
+
+def _entries_conflict(entry: Dict[str, Any]) -> bool:
+    """Both carriers present with DIFFERENT text: refuse (I5)."""
+    content, text = entry.get(_RAW_KEY), entry.get("text")
+    return (isinstance(content, str) and isinstance(text, str)
+            and content and text and content != text)
 
 
 _LEGAL_ROLES = ("system", "user", "assistant", "tool")
@@ -214,11 +279,17 @@ def _validate_sent_history(history: Any) -> Optional[str]:
             return f"history[{i}] carries no role"
         if role not in _LEGAL_ROLES:
             return f"history[{i}] role {role!r} is not a chat role"
-        for key in ("text", "content"):
-            if key in entry and entry[key] is not None \
-                    and not isinstance(entry[key], str):
-                return (f"history[{i}][{key!r}] is {type(entry[key]).__name__}, "
-                        f"not text")
+        # ONE text carrier (docs/19 §12.54-B). A non-str ``content`` is legal
+        # (``None``/multimodal); the CM layer reads it as "no text".
+        if _RAW_KEY in entry and entry[_RAW_KEY] is not None \
+                and not isinstance(entry[_RAW_KEY], str):
+            return (f"history[{i}][{_RAW_KEY!r}] is "
+                    f"{type(entry[_RAW_KEY]).__name__}, not text")
+        if "text" in entry and entry["text"] is not None \
+                and not isinstance(entry["text"], str):
+            return (f"history[{i}]['text'] is "
+                    f"{type(entry['text']).__name__}, not text "
+                    f"(allowed entry keys: ['role', {_RAW_KEY!r}])")
     return None
 
 
@@ -318,6 +389,11 @@ class SessionPortal:
         "window_defaults", "conservative_compaction", "dedup_prefix",
         "run_policy", "call_method", "finalize_turn", "render",
         "record_refs",
+        # DELIBERATELY ABSENT (docs/19 §12.54-C): ``claim_send`` and
+        # ``note_send_fact`` are the two halves of the SEND FACT. An assembly
+        # that could write either would be able to make the audit agree with
+        # itself — the claim is set by the post segment / the passthrough
+        # preset, and the fact is folded by the chat-loop seam.
     })
     _PARAMS = frozenset({
         "mode", "system_prefix", "window_k", "head_tail_keep",
@@ -800,6 +876,20 @@ class CMSession:
     # resolved assembly (cache: mode is clamped upstream and never mutates)
     _assembly_fn: Optional[Callable] = field(default=None, repr=False,
                                              compare=False)
+    # SEND FACT (docs/19 §12.54-C): the width vector the framework CLAIMED to
+    # send this turn (post segment / passthrough identity), compared against
+    # the widths the client reports having put on the wire. ``None`` = this
+    # turn's send was not produced by the framework (an assembly authored its
+    # own history, or the seam failed open) -> nothing to compare.
+    _send_expect: Optional[List[int]] = field(default=None, repr=False,
+                                              compare=False)
+    # session-lifetime audit counters (conditional in ``summary()``)
+    send_mismatches: int = 0
+    send_drift_chars: int = 0
+    # one-shot "the entries carried a retired/forged spelling" announcements
+    _entry_legacy_seen: bool = field(default=False, repr=False, compare=False)
+    _entry_projection_seen: bool = field(default=False, repr=False,
+                                         compare=False)
 
     # ------------------------------------------------------------------- config
     def __post_init__(self) -> None:
@@ -998,6 +1088,17 @@ class CMSession:
             out["assembly_overruns"] = self.assembly_overruns
         if self.policy_overruns:
             out["policy_overruns"] = self.policy_overruns
+        # SEND FACT (docs/19 §12.54-C): conditional audit fields (absence =
+        # "every turn's rendered view reached the wire"). ``send_mismatches``
+        # counts the turns whose SENT widths disagreed with the render's
+        # claim; ``send_drift_chars`` is their signed total. A non-zero value
+        # is a FRAMEWORK bug (the seam rendered, the client shipped something
+        # else) — never a policy/module failure, so it is deliberately NOT
+        # part of ``cm_degraded``.
+        if self.send_mismatches:
+            out["send_mismatches"] = self.send_mismatches
+        if self.send_drift_chars:
+            out["send_drift_chars"] = self.send_drift_chars
         # The MEASURED leak signal (docs/19 §12.31): how many of the
         # workers abandoned at T are STILL alive. A timed-out worker may
         # finish normally after the wait was abandoned (band ② — the wait
@@ -1362,15 +1463,49 @@ class CMSession:
         refs — and the canonical texts layer, which can now only fire for
         direct callers)."""
         self._require_msg_dicts(msgs, "assemble_turn")
+        self.turn += 1
+        self._turn_degraded = False
+        self._send_expect = None   # set by whoever produces THIS turn's send
+        self._method_face = None  # per-turn method-face budget reset
+        # ONE CARRIER, ONE SPELLING (docs/19 §12.54-B): normalize at the turn
+        # boundary, in place and position-preserving (every address computed
+        # below indexes this list). A retired ``text`` spelling is rewritten to
+        # ``content`` and a fed-back send projection is dropped — both spoken
+        # ONCE per session, because a silent rewrite is how the two-spelling
+        # era stayed invisible. Two carriers that DISAGREE are refused loudly:
+        # that is the ambiguity this change exists to remove.
+        for i, entry in enumerate(msgs or []):
+            if not isinstance(entry, dict):
+                continue
+            if _entries_conflict(entry):
+                self._emit({"type": "cm_entry_carrier_conflict", "turn": self.turn,
+                            "refs": [f"msgs[{i}]"],
+                            "allowed": ["role", _RAW_KEY]})
+                raise ValueError(
+                    f"history[{i}] carries BOTH {_RAW_KEY!r} and 'text' with "
+                    f"different text; allowed entry keys: "
+                    f"['role', {_RAW_KEY!r}] (+ the framework-private "
+                    f"{_SENT_KEY!r}, which is never read from the canonical)")
+            _, note = _normalize_entry(entry)
+            if note == "legacy" and not self._entry_legacy_seen:
+                self._entry_legacy_seen = True
+                self._emit({"type": "cm_entry_legacy_key", "turn": self.turn,
+                            "refs": [f"msgs[{i}]"],
+                            "detail": "entry carried the retired 'text' "
+                                      "spelling; normalized to 'content'"})
+            elif note == "projection" and not self._entry_projection_seen:
+                self._entry_projection_seen = True
+                self._emit({"type": "cm_entry_projection_stripped",
+                            "turn": self.turn, "refs": [f"msgs[{i}]"],
+                            "detail": f"{_SENT_KEY!r} is the framework-owned "
+                                      "SEND projection; recomputed per send, "
+                                      "never read from a history"})
         # A (docs/19 §12.53): the ONE list every block address must point
         # into. Captured BEFORE the preset/assembly runs, so the framework's
         # own ``register_history`` call and the assembly's boundary copy both
         # validate against it.
         self._turn_canonical = [_msg_text(m) for m in msgs
                                 if isinstance(m, dict)]
-        self.turn += 1
-        self._turn_degraded = False
-        self._method_face = None  # per-turn method-face budget reset
         fn = self._assembly_fn
         if fn is None:
             fn, fallback = assembly.resolve(self.mode)
@@ -1606,16 +1741,14 @@ class CMSession:
         return {
             "forms": dict(self.view.forms),
             "rules": dict(self.view.rules),
-            # (value, carrier_key, had_text, had_content): restoration must
-            # also undo a key the attempt ADDED (``content`` grafted onto an
-            # entry that carries ``text`` would otherwise survive, because
-            # ``_msg_text`` prefers ``content``).
+            # (value, had_content): the canonical text of every entry plus
+            # whether it CARRIED the carrier at all, so a restore can also
+            # undo a ``content`` the attempt grafted onto a text-less entry.
+            # One carrier now (docs/19 §12.54-B): the old 4-tuple tracked two
+            # spellings, and a tamper of the non-dominant one was invisible to
+            # BOTH the snapshot and the reconcile.
             "texts": None if msgs is None else [
-                (_msg_text(m),
-                 ("content" if isinstance(m.get("content"), str)
-                  else "text" if isinstance(m.get("text"), str) else None),
-                 isinstance(m.get("text"), str),
-                 isinstance(m.get("content"), str))
+                (_msg_text(m), isinstance(m.get(_RAW_KEY), str))
                 for m in (msgs or [])],
             # R7a (docs/19 §12.38): the overrun counters ride the snapshot —
             # their band-① increment happens AFTER this snapshot and BEFORE
@@ -1734,12 +1867,16 @@ class CMSession:
             # here is a bypass that must crash loudly, never skip silently.
             if i >= len(texts):
                 continue
-            value, key, had_text, had_content = texts[i]
-            for carrier, had in (("text", had_text), ("content", had_content)):
-                if not had and carrier in entry:
-                    entry.pop(carrier, None)   # the attempt ADDED this carrier
-            if key is not None and entry.get(key) != value:
-                entry[key] = value
+            value, had_content = texts[i]
+            # the retired spelling and a forged projection are never legal in
+            # the canonical: the restore removes them rather than leaving a
+            # second text source behind (docs/19 §12.54-B)
+            entry.pop("text", None)
+            entry.pop(_SENT_KEY, None)
+            if not had_content and _RAW_KEY in entry:
+                entry.pop(_RAW_KEY, None)   # the attempt ADDED the carrier
+            if value is not None and entry.get(_RAW_KEY) != value:
+                entry[_RAW_KEY] = value
 
     def _reconcile_turn(self, msgs: List[Dict[str, Any]],
                         snap: Optional[Dict[str, Any]],
@@ -1966,7 +2103,13 @@ class CMSession:
                  tokens_used: int = 0,
                  budget: Optional[int] = None) -> List[Dict[str, Any]]:
         """Direct-form seam (tests / non-chat callers): render the history
-        only; passthrough returns ``msgs`` unchanged."""
+        only; passthrough returns ``msgs`` unchanged.
+
+        No send claim is set here: the direct form has no outgoing message and
+        no client call following it, so a ``cm_send_fact`` from a LATER call
+        must not be compared against a stale vector — ``_send_expect`` is
+        cleared (``compare:false`` on an unrelated fact beats a false drift)."""
+        self._send_expect = None
         if self.mode == "passthrough":
             self.turn += 1
             self.register_history(msgs)
@@ -2287,6 +2430,57 @@ class CMSession:
             self._recorded_refs.update(str(r) for r in (rec.get("refs") or []))
         return saved_total
 
+    # ------------------------------------------------------ send fact (audit)
+    def claim_send(self, send_history: List[Dict[str, Any]],
+                   send_msg: str) -> None:
+        """Record what THIS turn CLAIMS to send (docs/19 §12.54-C).
+
+        Called by the post segment and by the passthrough preset — the two
+        places where the framework produces the sent list. The widths become
+        the left-hand side of the send fact: the client reports the widths it
+        actually built, and a difference means the rendered view did not reach
+        the wire (the silent no-op that used to be invisible). One place
+        computes it, so the claim can never drift from the render.
+
+        The widths are measured on what each send copy SHIPS (``_cm_sent``
+        when one is attached, else the raw text): a claim measured on the raw
+        carrier would describe the history, not the promise — and the gap
+        between the two is precisely the saving this fact verifies."""
+        self._send_expect = (
+            [len(_shipped_text(m) or "") for m in (send_history or [])]
+            + [len(str(send_msg or ""))])
+
+    def note_send_fact(self, sent: Dict[str, Any]) -> None:
+        """Compare the claim with the FACT the client measured on the wire.
+
+        Content-free by construction (docs/19 §12.54-C): counts and widths,
+        never text. Emitted once per LLM call; the per-entry detail
+        materialises ONLY on drift, so the steady-state record stays tiny.
+        ``compare: false`` marks the turns where there is nothing to compare
+        (an assembly authored its own history, or the seam failed open) — the
+        fact is still recorded there, because "sent N chars with no framework
+        claim" is itself auditable.
+        """
+        exp = self._send_expect
+        chars = int(sent.get("chars") or 0)
+        row: Dict[str, Any] = {"turn": self.turn, "sent_chars": chars,
+                               "sent_entries": sent.get("entries")}
+        if isinstance(sent.get("nonstr"), int) and sent["nonstr"]:
+            row["sent_nonstr"] = sent["nonstr"]
+        if exp is not None and sent.get("entries") == len(exp):
+            row["expect_chars"] = sum(exp)
+            row["drift"] = chars - sum(exp)
+            if row["drift"]:
+                widths = sent.get("widths") or []
+                row["mismatch"] = [
+                    {"i": i, "expect": e, "sent": w}
+                    for i, (e, w) in enumerate(zip(exp, widths)) if e != w][:20]
+                self.send_mismatches += 1
+                self.send_drift_chars += row["drift"]
+        else:
+            row["compare"] = False
+        self._emit({"type": "cm_send_fact", **row})
+
     def finalize_turn(self, msgs: List[Dict[str, Any]],
                       outgoing: str,
                       out_block: Optional["Block"],
@@ -2319,6 +2513,9 @@ class CMSession:
             # like an old turn (same frozen form, anchored at the head)
             if self.system_prefix and outgoing.startswith(self.system_prefix):
                 send_msg = _DEDUP_MARKER + outgoing[len(self.system_prefix):]
+        # the claim side of the send fact (docs/19 §12.54-C): what THIS turn
+        # says it is sending, measured on the rendered view it just produced
+        self.claim_send(send_history, send_msg)
         return send_history, send_msg
 
     def dedup_prefix(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2402,7 +2599,9 @@ class CMSession:
             for block in blocks:
                 form = self.view.form_of(block.block_id)
                 rule = self.view.rules.get(block.block_id, "")
-                if f"[block {block.block_id} " in content:
+                # idempotency looks at what would ACTUALLY be sent: the
+                # projection when one is already attached, else the raw text
+                if f"[block {block.block_id} " in (m.get(_SENT_KEY) or content):
                     continue  # already baked in an earlier turn (idempotent)
                 if form == "placeholder":
                     new_text = self.view_text(block, "placeholder",
@@ -2440,11 +2639,12 @@ class CMSession:
                     break
             if new_content != content:
                 shallow = dict(m)
-                # write back under the entry's OWN key: the canonical history
-                # mixes ``text``-form and ``content``-form entries, and the
-                # client's text->content conversion keys off exactly these
-                shallow["content" if isinstance(m.get("content"), str)
-                        else "text"] = new_content
+                # THE PROJECTION, never a carrier (docs/19 §12.54-B, I3):
+                # ``content`` keeps the canonical bytes; ``_cm_sent`` carries
+                # what this call ships. The payload builder consumes and
+                # strips it, so the two meanings live in two keys instead of
+                # fighting over one.
+                shallow[_SENT_KEY] = new_content
                 out[idx] = shallow
         return out
 
@@ -2551,6 +2751,12 @@ class CMSession:
           the framework post segment (``finalize_turn`` -> ``render``);
           ``"identity"`` = passthrough sent the input as-is; ``"author"`` =
           a named assembly returned its own history.
+
+        The QUANTITATIVE half of that same question is NOT here: the
+        claim-vs-wire comparison rides its own ``cm_send_fact`` event (per LLM call,
+        docs/19 §12.54-C), because ``cm_view`` is emitted during assembly —
+        before the payload exists. Keeping them apart avoids an event that
+        describes one turn's promise with another turn's fact.
         """
         stats: Dict[str, Any] = {"blocks": len(self.universe.blocks),
                                  # docs/19 §12.44 D5: NON-FULL forms only —

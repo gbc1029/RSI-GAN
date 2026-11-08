@@ -164,8 +164,15 @@ def _cm_node(items: List[Dict[str, Any]], *,
                     or any(bool(s.get(f"{prefix}_disabled"))
                            for s in view_stats))
 
+    facts = [it for it in items if type_of(it) == "cm_send_fact"]
+
     return {
         "cm_view_turns": n("cm_view"),
+        "cm_send_facts": len(facts),
+        # SEND FACT (docs/19 §12.54-C): turns where the client's measured
+        # payload disagreed with the render's claim. A framework bug, not a
+        # module failure — deliberately NOT part of ``cm_degraded``.
+        "cm_send_mismatches": sum(1 for f in facts if f.get("drift")),
         "cm_violations": n("cm_violation"),
         "cm_face_violations": n("cm_face_violation"),
         "cm_policy_failures": n("cm_policy_failed"),

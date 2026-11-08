@@ -435,6 +435,84 @@ def _llm_call_record(ctx: _CallContext, outcome: str, *,
     return rec
 
 
+# The message history speaks ONE text carrier: ``content`` (docs/19 §12.54-B).
+# ``text`` is gone — it was a second spelling of the same value, and the two
+# spellings had opposite precedence here vs. in the CM seam, so a rendered
+# view written under one of them was silently discarded by the other.
+# ``_cm_sent`` is the CONTEXT-MANAGEMENT SEND PROJECTION (framework-private):
+# it exists only on the throw-away copies a CM turn hands us, carries the
+# rendered text of that entry, and is consumed here and stripped — it never
+# reaches the provider and never enters a canonical history.
+_CM_SENT_KEY = "_cm_sent"
+_STRIPPED_KEYS = ("content", "text", _CM_SENT_KEY)
+
+
+def _payload_messages(msg_history):
+    """Build the provider payload: projection applied, carriers normalized.
+
+    * a CM send projection (``_cm_sent``) WINS over the entry's raw text —
+      that is the whole point of the split (raw stays raw in the canonical,
+      the projection carries what this call actually ships);
+    * every text carrier is stripped and re-emitted as the provider's own
+      ``content``, so a stale ``text`` can never shadow the projection and an
+      unknown key can never reach a strict gateway;
+    * entries are always FRESH dicts (this function must not mutate the
+      caller's history — the copies the seam hands us are disposable, but a
+      direct caller's list is not);
+    * a non-str ``content`` (``None`` for tool-call-only replies, or a
+      multimodal list) is passed through untouched: the CM layer treats a
+      non-str as "no text", never as an empty string.
+    """
+    out = []
+    for entry in msg_history or []:
+        if not isinstance(entry, dict):
+            out.append(entry)
+            continue
+        projection = entry.get(_CM_SENT_KEY)
+        if isinstance(projection, str):
+            body = projection
+        elif isinstance(entry.get("content"), str):
+            body = entry["content"]
+        else:
+            # LEGACY READ (docs/19 §12.54-B, I6): a ``text``-only entry is
+            # still a message, and dropping it to ``content=None`` would send
+            # an empty turn. The canonical normalizer converts the spelling
+            # once and speaks; this fallback only protects callers that reach
+            # the client WITHOUT a CM seam (``cm=None``) or directly.
+            body = entry.get("text") if isinstance(entry.get("text"), str) \
+                else entry.get("content")
+        row = {k: v for k, v in entry.items() if k not in _STRIPPED_KEYS}
+        row["content"] = body
+        out.append(row)
+    return out
+
+
+def _sent_fact(payload) -> dict:
+    """Content-free facts about the payload this call is about to send.
+
+    THE send-side measurement (docs/19 §12.54-C): taken on the exact list
+    handed to ``litellm.completion`` in the same frame, so nothing can mutate
+    it in between. ``len()`` only — never text. The CM seam compares it with
+    what its render CLAIMED to send; a difference means the rendered view did
+    not reach the wire (a silent no-op that used to be invisible).
+    """
+    widths = []
+    chars = 0
+    nonstr = 0
+    for entry in payload or []:
+        if not isinstance(entry, dict):
+            continue
+        body = entry.get("content")
+        if isinstance(body, str):
+            widths.append(len(body))
+            chars += len(body)
+        else:
+            widths.append(-1)
+            nonstr += 1
+    return {"entries": len(payload or []), "chars": chars,
+            "nonstr": nonstr, "widths": widths}
+
+
 def get_response_from_llm(
     msg: str,
     model: str,
@@ -447,13 +525,13 @@ def get_response_from_llm(
     if msg_history is None:
         msg_history = []
 
-    # Convert text to content, compatible with LITELLM API
-    msg_history = [
-        {**msg, "content": msg.pop("text")} if "text" in msg else msg
-        for msg in msg_history
-    ]
+    msg_history = _payload_messages(msg_history)
 
     new_msg_history = msg_history + [{"role": "user", "content": msg}]
+    # The send-side FACT (content-free; docs/19 §12.54-C) is captured before
+    # the call, on the list that goes out — retries resend the same payload,
+    # so this is one fact per CALL, not per attempt.
+    sent = _sent_fact(new_msg_history)
 
     # Recording lifecycle: one `llm_call` record per call, success AND failure
     # (finally semantics — a timeout/dead gateway still leaves its record).
@@ -495,15 +573,17 @@ def get_response_from_llm(
     except AttributeError:
         pass
 
-    # Convert content to text, compatible with MetaGen API
-    new_msg_history = [
-        {**msg, "text": msg.pop("content")} if "content" in msg else msg
-        for msg in new_msg_history
-    ]
-
+    # NO second conversion: the history is ``content``-keyed end to end
+    # (docs/19 §12.54-B). The old ``content->text`` pass was what turned every
+    # entry into a dual-key dict and handed the CM seam two spellings to
+    # disagree about.
     return response_text, new_msg_history, {"reasoning": reasoning, "finish_reason": finish_reason,
                                             "reasoning_tokens": reasoning_tokens,
                                             "usage": _usage_dict(response),
+                                            # SEND FACT (content-free): the CM seam
+                                            # compares these widths with what its
+                                            # render claimed to send.
+                                            "sent": sent,
                                             # per-call record join keys (agent/llm.py
                                             # recording lifecycle; consumers optional)
                                             "call_id": ctx.call_id,

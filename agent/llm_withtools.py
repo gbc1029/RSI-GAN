@@ -736,12 +736,23 @@ def chat_with_agent(
             v = usage.get(key)
             if isinstance(v, (int, float)):
                 _usage_parts[field] = (_usage_parts[field] or 0) + int(v)
+        if cm is not None and seam_applied and isinstance(info, dict) \
+                and isinstance(info.get("sent"), dict):
+            # SEND FACT (docs/19 §12.54-C): what the client ACTUALLY put on the
+            # wire, compared by the session against what its render claimed.
+            # Audit only -- a comparison failure must never break the call.
+            try:
+                cm.note_send_fact(info["sent"])
+            except Exception as e:  # noqa: BLE001
+                logging(f"[cm] send fact not recorded: {e}")
         if cm is not None and seam_applied and isinstance(hist, list):
             # keep the CANONICAL (raw) history: the seam's copies were only
             # for sending; the user turn is rebuilt RAW, the assistant reply
-            # is raw by construction (LLM output). Text-key form — the
-            # canonical convention (agent/llm.py returns text-form entries;
-            # get_response's entry conversion text->content handles the send).
+            # is raw by construction (LLM output). ``content``-keyed — the
+            # single carrier (docs/19 §12.54-B); ``_cm_sent`` is the send
+            # projection and must never survive into the canonical, so it is
+            # stripped here as well (defence in depth: the client already
+            # consumed it).
             # ``seam_applied`` (NEVER ``n_viewed``) gates this: a legal empty
             # view has offset 0, so ``hist[0:]`` is the appended pair and
             # ``raw_history + that`` preserves the prior conversation.
@@ -752,8 +763,14 @@ def chat_with_agent(
                 new_entries = list(hist[n_viewed:])
                 if new_entries and isinstance(new_entries[0], dict) \
                         and new_entries[0].get("role") == "user":
-                    new_entries[0] = {"role": "user", "text": raw_msg}
-                hist = list(raw_history or []) + new_entries
+                    new_entries[0] = {"role": "user", "content": raw_msg}
+                rebuild = []
+                for entry in (list(raw_history or []) + new_entries):
+                    if isinstance(entry, dict) and "_cm_sent" in entry:
+                        entry = {k: v for k, v in entry.items()
+                                 if k != "_cm_sent"}
+                    rebuild.append(entry)
+                hist = rebuild
             except Exception:  # noqa: BLE001 -- history shapes vary
                 pass
         return response, hist, info
