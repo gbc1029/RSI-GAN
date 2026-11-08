@@ -14,6 +14,10 @@ from typing import Any, Mapping, Optional
 
 from gan.framework import challenge_adjudication as framework_adjudication
 
+_ACTIONABILITY_BASES = frozenset({
+    "transferable_strategy", "instance_specific_content", "uncertain",
+})
+
 
 def _mapping(value: Any) -> Optional[Mapping[str, Any]]:
     return value if isinstance(value, Mapping) else None
@@ -74,7 +78,13 @@ def _extract_side(verdict: Optional[Mapping[str, Any]], *, side: str,
     actionable = verdict.get("actionable")
     if not isinstance(actionable, bool):
         return None
-    return {presence_key: verdict[presence_key], "actionable": actionable}
+    basis = verdict.get("actionability_basis")
+    if basis not in _ACTIONABILITY_BASES:
+        return None
+    if actionable != (basis == "transferable_strategy"):
+        return None
+    return {presence_key: verdict[presence_key], "actionable": actionable,
+            "actionability_basis": basis}
 
 
 def adjudicate(
@@ -95,9 +105,13 @@ def adjudicate(
     parent_present = parent_side.get("parent_present") if parent_side else None
     child_present = child_side.get("child_present") if child_side else None
     actionable = None
+    actionability_basis = None
     if parent_side is not None and child_side is not None:
-        if parent_side["actionable"] == child_side["actionable"]:
+        if (parent_side["actionable"] == child_side["actionable"]
+                and parent_side["actionability_basis"] ==
+                child_side["actionability_basis"]):
             actionable = parent_side["actionable"]
+            actionability_basis = parent_side["actionability_basis"]
 
     result = framework_adjudication.adjudicate(
         challenge,
@@ -110,6 +124,7 @@ def adjudicate(
                       f"{child_evidence.get('report_path', '')}"),
     )
     result["adjudicator"] = "imo_proof_fixed_v1"
+    result["actionability_basis"] = actionability_basis
     return result
 
 

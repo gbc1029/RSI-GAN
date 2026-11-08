@@ -488,7 +488,7 @@ polyglot 后续应绑定测试用例/失败断言。
 - 普通 issue 必须逐条调用 respond_issue，但 challenge 没有对应的 respond_challenge 契约。framework 无法区分 planner 是接受、争议、推迟，还是根本忽略某条 challenge。
 - task agent 只收到题目，不收到 challenge 内容。planner 必须把最多 5 个异构、题目特定的缺陷压缩成一个全局通用设计修改。
 - hardcoding audit 又禁止把 qid 或具体答案写进 task 修改。这是正确的防作弊措施，但意味着诸如“用 CRT 完成这道题”或“处理这个特定几何构型”实际上很难通过通用 prompt 修复。
-- fixed adjudicator 的 actionable 校准可疑：当前 72 个有 verdict 的 challenge 全部是 actionable=true，没有一个 false。很多 repair criterion 明显包含题目特定方法，因此这个判定可能过宽。
+- fixed adjudicator 的 actionable 校准可疑：当前 72 个有 verdict 的 challenge 全部是 actionable=true，没有一个 false。原 prompt 没有区分“具体但可迁移的类别策略”和“题目答案/构造”，因此这个判定可能过宽。
 - challenge repair 没有 no-op 对照。同一个 task design 重新生成同一道题，也可能随机从有缺陷变成无缺陷，或反过来。因此不能把每个 VERIFIED_REPAIR/UNRESOLVED 完全归因于 planner 修改。
 
 ## 6. Challenge response 行为审计的增量修复（2026-11）
@@ -546,3 +546,69 @@ framework 还记录每个 challenge 的 `claimed_response_kind`、`response_rece
 
 response contract 不完整时只允许一次补录机会；低 observed action 比例不触发第二次 substantive
 task 修改。`challenge_response_deficit` 仅是诊断标记，不能把“是否修改”误当作“是否修好”。
+
+## 7. Actionable 判定收紧（2026-11）
+
+### 7.1 发现的问题
+
+旧的 fixed adjudicator 只要求输出 `actionable: true|false`，prompt 中的标准是“specific、relevant、
+can be addressed by a general proof-generation strategy”。它没有结构化区分：
+
+1. 具体但可迁移的类别策略；
+2. 当前题目专属的答案、构造或 lemma；
+3. 证据不足、无法判断的情况。
+
+此前观测到 72 个有 verdict 的 challenge 全部为 `actionable=true`，因此旧字段没有提供有效 gate。
+
+### 7.2 最终判别标准
+
+不新增角色，也不新增一次模型调用。继续使用同一个 framework-owned fixed adjudicator，并要求它只在
+以下条件全部满足时输出 `actionable=true`：
+
+1. 缺陷是可从 parent/child proof 观察到的 proof-generation 或 proof-verification 行为缺陷；
+2. `repair_criterion` 描述的是某个结构类别上的可迁移策略，而不是“更认真”“检查一下”之类空泛要求；
+3. 把该策略复制到 qid、数字和答案不同的同类问题上仍然有意义；
+4. 该策略可以通过现有 planner -> task 的 prompt、config 或可复用 component 行为表达；
+5. 不要求当前题目的具体答案、唯一构造、reference-solution 文字或 qid 分支。
+
+具体数学方法本身不构成答案泄露。例如，下面的 CRT 策略是 `actionable=true` 的允许示例：
+
+```text
+当问题涉及多个同余约束时：
+1. 检查模数是否两两互素；
+2. 互素时考虑中国剩余定理；
+3. 不互素时检查同余方程组是否相容；
+4. 求通解并验证原题限制；
+5. 不要直接假设模数互素。
+```
+
+它虽然具体，但针对的是“多个同余约束”这一结构类别，包含适用条件、失败分支和验证步骤；
+具体数字只有在它们被用来编码当前题目的私有答案或唯一构造时才构成泄露。
+
+### 7.3 结构化输出与 framework 校验
+
+fixed adjudicator 现在额外输出：
+
+```text
+actionability_basis =
+  transferable_strategy
+  | instance_specific_content
+  | uncertain
+```
+
+framework 强制一致性：
+
+```text
+actionable=true  <=>  actionability_basis=transferable_strategy
+```
+
+parent/child 两侧的 `actionable` 和 `actionability_basis` 必须同时一致，否则为
+`UNDECIDABLE`。`instance_specific_content` 和 `uncertain` 不计入 supported challenge 分母，
+也不被误计为 evaluator 的虚假 challenge。
+
+### 7.4 与其他审计边界的关系
+
+`actionable` 判断的是 challenge 是否适合由可迁移的 task 策略修复；它不判断 planner 本轮是否真的
+修改。实际 planner patch 仍只用于 hardcoding audit、`observed_action` 和 response consistency。
+这样不会因为 planner 没有行动而反过来改变 challenge 的 actionability，也不会把具体但合法的数学
+策略误判为答案泄露。

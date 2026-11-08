@@ -12,12 +12,33 @@ Judge the named defect only. Use the problem, official solution, and grading
 guidelines as private evidence. Do not assign points and do not propose a fix.
 
 Return whether the challenged defect is present in the parent proof and in the
-child proof. Set actionable=true only when the challenge is specific, relevant
-to the task behavior, and can be addressed by a general proof-generation
-strategy rather than a one-question answer. If either presence judgment is not
-reliably decidable, use null for that field. Return exactly one JSON object:
+child proof. Set actionable=true only when ALL of these hold:
+1. The defect is an observable proof-generation or proof-verification failure.
+2. The repair criterion describes a transferable strategy for a structural
+   class of problems, not merely a vague request to be careful.
+3. The same strategy could be copied to another problem with different qid,
+   numbers, and answer while remaining meaningful.
+4. The strategy can be expressed through the existing planner-to-task design
+   surface (prompt, config, or reusable component behavior).
+5. The criterion does not require a particular answer, unique construction,
+   reference-solution text, or qid-specific branch.
+
+Specific mathematics is allowed. For example, a conditional CRT strategy is
+transferable: check pairwise coprimality, check compatibility otherwise, solve
+the system, and verify the original constraints. Concrete numbers alone are
+NOT answer leakage; they are disallowed only when the criterion depends on the
+current problem's private answer or construction.
+
+Use actionability_basis="transferable_strategy" only when all five conditions
+hold. Use "instance_specific_content" when the criterion depends on this
+problem's answer/construction, and "uncertain" when the evidence is
+insufficient. In the latter two cases actionable MUST be false. If either
+presence judgment is not reliably decidable, use null for that field. Return
+exactly one JSON object:
 {{"parent_present": true|false|null, "child_present": true|false|null,
-  "actionable": true|false, "reason": "short evidence-based reason"}}
+  "actionable": true|false,
+  "actionability_basis": "transferable_strategy|instance_specific_content|uncertain",
+  "reason": "short evidence-based reason"}}
 
 PROBLEM:
 {problem}
@@ -42,7 +63,13 @@ CHILD PROOF:
 
 REPAIR_PROMPT = """Return exactly one JSON object and nothing else:
 {"parent_present": true|false|null, "child_present": true|false|null,
- "actionable": true|false, "reason": "short reason"}"""
+ "actionable": true|false,
+ "actionability_basis": "transferable_strategy|instance_specific_content|uncertain",
+ "reason": "short reason"}"""
+
+_ACTIONABILITY_BASES = {
+    "transferable_strategy", "instance_specific_content", "uncertain",
+}
 
 
 def _parse(raw):
@@ -55,7 +82,8 @@ def _parse(raw):
     except (TypeError, ValueError):
         return None
     if not isinstance(value, dict) or set(value) != {
-            "parent_present", "child_present", "actionable", "reason"}:
+            "parent_present", "child_present", "actionable",
+            "actionability_basis", "reason"}:
         return None
     if not (value["parent_present"] is None
             or isinstance(value["parent_present"], bool)):
@@ -64,6 +92,11 @@ def _parse(raw):
             or isinstance(value["child_present"], bool)):
         return None
     if not isinstance(value["actionable"], bool):
+        return None
+    basis = value.get("actionability_basis")
+    if basis not in _ACTIONABILITY_BASES:
+        return None
+    if value["actionable"] != (basis == "transferable_strategy"):
         return None
     if not isinstance(value["reason"], str) or not value["reason"].strip():
         return None

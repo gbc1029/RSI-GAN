@@ -6,6 +6,10 @@ import os
 
 import pandas as pd
 
+_ACTIONABILITY_BASES = {
+    "transferable_strategy", "instance_specific_content", "uncertain",
+}
+
 
 def report_challenge_adjudication(dname, questions_path=None):
     path = os.path.join(dname, "predictions.csv")
@@ -27,12 +31,15 @@ def report_challenge_adjudication(dname, questions_path=None):
         valid = (
             challenge_id and qid and isinstance(value, dict)
             and set(value) == {"parent_present", "child_present",
-                               "actionable", "reason"}
+                               "actionable", "actionability_basis", "reason"}
             and (value.get("parent_present") is None
                  or isinstance(value.get("parent_present"), bool))
             and (value.get("child_present") is None
                  or isinstance(value.get("child_present"), bool))
             and isinstance(value.get("actionable"), bool)
+            and value.get("actionability_basis") in _ACTIONABILITY_BASES
+            and value.get("actionable") == (
+                value.get("actionability_basis") == "transferable_strategy")
             and isinstance(value.get("reason"), str)
             and bool(value.get("reason", "").strip())
         )
