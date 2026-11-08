@@ -133,6 +133,10 @@ class Planner(Role):
                 "framework-carried train evidence, not grader scores or validation "
                 "information. Prefer a reusable repair that generalizes beyond the "
                 "listed qids; do not hard-code a qid or copy a reference solution.\n"
+                "Call `respond_challenge` exactly once for every challenge_id. "
+                "`acted` means only that a task change was attempted; it is not "
+                "proof of repair. Use `disputed`, `deferred`, or `out_of_scope` "
+                "when you are not claiming a repair.\n"
                 # Challenges are an atomic input contract.  Do not truncate the
                 # serialized list: slicing JSON can hide a claim/criterion or
                 # leave the planner with malformed JSON at the end of the block.
@@ -209,6 +213,8 @@ class Planner(Role):
 
         task_design = config if isinstance(config, dict) else {}
         plan_ctx = PlanContext(config=task_design, node_id=node_id, output_dir=self.output_dir)
+        plan_ctx.configure_challenge_responses(
+            [row.get("challenge_id") for row in (parent_challenges or [])])
         # F4/C1: the framework's output contract rides the design context so
         # the AUTHOR sees it at the point of rewriting the task prompt
         # (soft constraint: known to exist; not a set_config-writable key).
@@ -229,6 +235,7 @@ class Planner(Role):
         attempts = 0
         rejected = None
         exhausted = False
+        challenge_response_retry = False
         # Receipt aggregation (§4.1): a session spans SEVERAL chat runs (main
         # + rejection retries); last_run_info only remembers the LAST one, so
         # a token stop / tool-cap stop in an early run was masked by a
@@ -262,6 +269,23 @@ class Planner(Role):
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
             _absorb_run_flags()
+
+            if parent_challenges:
+                expected = {str(row.get("challenge_id")) for row in parent_challenges}
+                received = {str(row.get("challenge_id"))
+                            for row in plan_ctx.challenge_responses}
+                missing = sorted(expected - received)
+                if missing:
+                    challenge_response_retry = True
+                    hist = self.run(
+                        "# Challenge response ledger incomplete\n"
+                        "Record exactly one `respond_challenge` response for each "
+                        "missing challenge_id below. This is a response-only pass: "
+                        "do not edit the task, change config, or call other tools.\n"
+                        + json.dumps(missing, ensure_ascii=False),
+                        msg_history=hist, max_tool_calls=max_tool_calls,
+                        tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
+                    _absorb_run_flags()
 
             def _build_patch() -> tuple[str, str]:
                 """Return ``(patch, refusal)``.
@@ -354,6 +378,8 @@ class Planner(Role):
         return {
             "records": records,
             "responses": plan_ctx.responses,
+            "challenge_responses": plan_ctx.challenge_responses,
+            "challenge_response_retry": challenge_response_retry,
             "config": task_design,
             "patch": "" if rejected else patch_str,
             "patch_proposed": patch_str,

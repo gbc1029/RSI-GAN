@@ -490,3 +490,59 @@ polyglot 后续应绑定测试用例/失败断言。
 - hardcoding audit 又禁止把 qid 或具体答案写进 task 修改。这是正确的防作弊措施，但意味着诸如“用 CRT 完成这道题”或“处理这个特定几何构型”实际上很难通过通用 prompt 修复。
 - fixed adjudicator 的 actionable 校准可疑：当前 72 个有 verdict 的 challenge 全部是 actionable=true，没有一个 false。很多 repair criterion 明显包含题目特定方法，因此这个判定可能过宽。
 - challenge repair 没有 no-op 对照。同一个 task design 重新生成同一道题，也可能随机从有缺陷变成无缺陷，或反过来。因此不能把每个 VERIFIED_REPAIR/UNRESOLVED 完全归因于 planner 修改。
+
+## 6. Challenge response 行为审计的增量修复（2026-11）
+
+### 6.1 发现的问题
+
+普通 issue 有逐条 `respond_issue` 契约，但 parent challenge 没有逐条响应接口。
+因此 framework 只能看到最终 task diff 和外部 adjudication，不能区分 planner 是明确行动、
+争议、推迟、超出范围，还是遗漏了某条 challenge；也不能判断 planner 的自报行动是否与实际
+task 变化一致。把“调用过工具”直接当作行动同样不可靠，因为 patch 可能被拒绝或 hardcoding
+audit 清空。
+
+### 6.2 方案
+
+新增 framework-owned `respond_challenge` 工具。planner 对每个直接父 challenge 最多记录一次：
+
+```text
+acted | acted_differently | disputed | deferred | out_of_scope
+```
+
+`acted` / `acted_differently` 只表示 planner 声称尝试修改，不表示 challenge 已被修复；
+后者仍只由 fixed adjudicator 的 `VERIFIED_REPAIR` 等状态决定。
+
+若主 planner session 结束时有缺失响应，framework 追加一次 response-only pass，要求只补齐
+缺失的 `challenge_id`。仍缺失的响应保留为缺失记录，generation 不因此失败；非法或缺失响应
+不会改变 proof adjudication，也不会改变 task val。
+
+### 6.3 实现与记录
+
+planner 返回并写入 child metadata 的三个审计指标为：
+
+```text
+claimed_acted_rate          planner 声称 acted/acted_differently 的比例
+observed_action_rate        产生有效 task config 变化或被接受 source patch 的比例
+response_consistency_rate   自报行动与 observed_action 一致的比例
+```
+
+framework 还记录每个 challenge 的 `claimed_response_kind`、`response_received`、
+`observed_action`、`response_consistent`，以及 response retry 和 `challenge_response_deficit`。
+其中 observed action 以 child 的最终 `patch_applied` 或父子 task config 差异为准，不能由 planner
+自报覆盖。
+
+### 6.4 选择压力边界
+
+上述三个指标只进入 child metadata、outer supernode 的 `planner_stats.challenge_response` 和
+事件日志，用于审计、诊断和协议补录；不进入 planner/evaluator fitness，不改变 challenge 的
+真值状态，也不单独淘汰 parent。原因是 claimed 行为可伪报，observed action 只能证明发生修改
+而不能证明修复，consistency 是协议可靠性而不是 proof 能力。
+
+选择压力仍严格使用 §2.9 的 fixed-adjudicator 状态计数：planner 使用
+`planner_adversarial_score`，evaluator 使用 `evaluator_adversarial_score` 与
+`challenge_precision_smoothed`，且只有 §2.12 的 supported/determinate gate 达标后才激活。
+
+### 6.5 约束与边界
+
+response contract 不完整时只允许一次补录机会；低 observed action 比例不触发第二次 substantive
+task 修改。`challenge_response_deficit` 仅是诊断标记，不能把“是否修改”误当作“是否修好”。

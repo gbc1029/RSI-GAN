@@ -1642,6 +1642,63 @@ class GanLoop:
             "report_path": report_path,
         }
 
+    def _record_challenge_response_audit(
+            self, child: Any, parent: Any, challenges: List[Dict[str, Any]],
+            plan_result: Dict[str, Any], parent_cfg: Dict[str, Any]) -> None:
+        """Record planner stance separately from externally judged proof truth."""
+        expected = [str(row.get("challenge_id")) for row in challenges]
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for row in plan_result.get("challenge_responses") or []:
+            if isinstance(row, dict):
+                cid = str(row.get("challenge_id") or "")
+                if cid and cid not in by_id:
+                    by_id[cid] = row
+        child_cfg = plan_result.get("config")
+        try:
+            config_changed = json.dumps(
+                child_cfg if isinstance(child_cfg, dict) else {},
+                ensure_ascii=False, sort_keys=True, default=str) != json.dumps(
+                parent_cfg if isinstance(parent_cfg, dict) else {},
+                ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            config_changed = child_cfg != parent_cfg
+        observed_action = bool(child.meta.get("patch_applied")) or config_changed
+        acted_kinds = {"acted", "acted_differently"}
+        rows: List[Dict[str, Any]] = []
+        claimed_acted = observed = consistent = received = 0
+        for cid in expected:
+            response = by_id.get(cid)
+            kind = str(response.get("response_kind")) if response else None
+            has_response = kind is not None
+            claimed = kind in acted_kinds
+            matches = (claimed == observed_action) if has_response else False
+            claimed_acted += int(claimed)
+            observed += int(observed_action)
+            consistent += int(matches)
+            received += int(has_response)
+            rows.append({
+                "challenge_id": cid,
+                "claimed_response_kind": kind,
+                "response_received": has_response,
+                "observed_action": observed_action,
+                "response_consistent": matches,
+            })
+        total = len(expected)
+        audit = {
+            "challenge_count": total,
+            "response_received_count": received,
+            "claimed_acted_rate": (claimed_acted / total) if total else None,
+            "observed_action_rate": (observed / total) if total else None,
+            "response_consistency_rate": (consistent / total) if total else None,
+            "response_retry_attempted": bool(plan_result.get("challenge_response_retry")),
+            "challenge_response_deficit": bool(
+                total >= 5 and observed_action is False),
+            "rows": rows,
+        }
+        child.meta["challenge_response_audit"] = audit
+        self.log_event({"type": "challenge_response_audit", "genid": str(child.genid),
+                        **{key: value for key, value in audit.items() if key != "rows"}})
+
     def _settle_parent_challenges(self, parent: Any, child: Any) -> List[Dict[str, Any]]:
         """Persist conservative parent/child challenge adjudications."""
         if not getattr(self, "challenge_enabled", False) or parent is None:
@@ -1744,6 +1801,7 @@ class GanLoop:
             coverage = None
             op_dist: Dict[str, int] = {}
             response_kind: Dict[str, int] = {}
+            response_audits: List[Dict[str, Any]] = []
             issues: List[Dict[str, Any]] = []
             eval_points = set()
             predicted: List[float] = []
@@ -1769,6 +1827,9 @@ class GanLoop:
                     if isinstance(r, dict) and r.get("op") == "respond_issue" and r.get("response_kind"):
                         rk = str(r["response_kind"])
                         response_kind[rk] = response_kind.get(rk, 0) + 1
+                audit = (node.meta or {}).get("challenge_response_audit")
+                if isinstance(audit, dict):
+                    response_audits.append(audit)
                 fb = (node.meta or {}).get("feedback") or {}
                 issues.extend(fb.get("issues") or [])
                 eval_points.update(self._read_eval_points(g))
@@ -1818,6 +1879,30 @@ class GanLoop:
                 tr = {"verified": 0, "hits": 0, "unsupported": 0, "judged": 0}
                 verdict_stability = None
             challenge_stats = self._challenge_metrics_for_outer(outer, outer_genids)
+            response_total = sum(int(a.get("challenge_count") or 0)
+                                 for a in response_audits)
+            response_metrics = {
+                "challenge_count": response_total,
+                "claimed_acted_rate": (
+                    sum(float(a.get("claimed_acted_rate") or 0.0)
+                        * int(a.get("challenge_count") or 0)
+                        for a in response_audits) / response_total
+                    if response_total else None),
+                "observed_action_rate": (
+                    sum(float(a.get("observed_action_rate") or 0.0)
+                        * int(a.get("challenge_count") or 0)
+                        for a in response_audits) / response_total
+                    if response_total else None),
+                "response_consistency_rate": (
+                    sum(float(a.get("response_consistency_rate") or 0.0)
+                        * int(a.get("challenge_count") or 0)
+                        for a in response_audits) / response_total
+                    if response_total else None),
+                "response_retry_count": sum(
+                    bool(a.get("response_retry_attempted")) for a in response_audits),
+                "challenge_response_deficit_count": sum(
+                    bool(a.get("challenge_response_deficit")) for a in response_audits),
+            }
 
             payload = {
                 "outer": outer,
@@ -1891,6 +1976,7 @@ class GanLoop:
                                     "planner_adversarial_score",
                                     "mean_anchor_point_gain", "point_gain_count")
                     } if challenge_stats else {},
+                    "challenge_response": response_metrics,
                 },
                 "evaluator_stats": {
                     "issues_per_task": (len(issues) / len(outer_genids)) if outer_genids else None,
@@ -3899,6 +3985,13 @@ class GanLoop:
                     self._save_checkpoint("inner", outer, inner)
                     continue
                 child.meta["consumed_challenge_ids"] = consumed_challenges
+                if parent_challenges:
+                    self._record_challenge_response_audit(
+                        child, parent, parent_challenges, plan_result,
+                        # planner may mutate the local parent_cfg object in
+                        # place; reload the persisted parent snapshot for a
+                        # trustworthy config-diff comparison.
+                        self._parent_config(parent))
 
                 # DAG: record all parents used
                 child.parents = [p.genid for p in parents]

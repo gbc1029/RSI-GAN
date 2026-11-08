@@ -28,6 +28,8 @@ class PlanContext:
     output_dir: Optional[str] = None
     records: List[Dict[str, Any]] = field(default_factory=list)
     responses: List[Dict[str, Any]] = field(default_factory=list)
+    challenge_responses: List[Dict[str, Any]] = field(default_factory=list)
+    challenge_response_ids: frozenset = field(default_factory=frozenset)
 
     def record(self, op: str, **detail: Any) -> None:
         self.records.append({"op": op, **detail})
@@ -39,6 +41,18 @@ class PlanContext:
         self.responses.append({"issue_id": issue_id, "accepted": bool(accepted),
                                "feedback": feedback or "",
                                "response_kind": str(response_kind)})
+
+    def configure_challenge_responses(self, challenge_ids) -> None:
+        self.challenge_response_ids = frozenset(
+            str(value) for value in (challenge_ids or []) if str(value))
+
+    def add_challenge_response(self, challenge_id: str, response_kind: str,
+                               feedback: str = "") -> None:
+        self.challenge_responses.append({
+            "challenge_id": str(challenge_id),
+            "response_kind": str(response_kind),
+            "feedback": feedback or "",
+        })
 
 
 def set_plan_context(ctx: PlanContext):
