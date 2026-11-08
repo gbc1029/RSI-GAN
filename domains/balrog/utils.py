@@ -2,9 +2,52 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+
+from utils.trajectory_log import LLM_CALLS_SIDECAR_SUFFIX
+
+# The GAN framework archives task evidence from exactly ONE place:
+# ``<run>/outputs/<run_id>/agent_evals/chat_history_<qid>.jsonl``
+# (gan/framework/trajectory.py ``collect``). Balrog writes one transcript per
+# EPISODE under ``<output>/<env>/<task>/<task>_run_NN_chat_history.jsonl``, so
+# the episode IS balrog's question and the qid is ``env__task__ep<NN>``.
+AGENT_EVALS_DIRNAME = "agent_evals"
+
+
+def episode_qid(env_name, task, episode_idx):
+    """Filesystem-safe per-EPISODE id (balrog's analogue of a question id)."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(task)).strip("_") or "task"
+    return f"{env_name}__{safe}__ep{int(episode_idx):02d}"
+
+
+def episode_llm_calls(output_dir, env_name, task, episode_idx):
+    """Number of per-call LLM audit rows this episode produced (P2-18).
+
+    Read from the episode's sidecar as mirrored into ``agent_evals/`` by
+    ``evaluator.archive_episode_trajectory``. This is ATTRIBUTION ONLY: it says
+    WHICH episode spent the calls. Money and tokens stay with the root-side
+    proxy audit ledger -- the two are different measurements (the child counts
+    its own calls, the proxy meters the gateway's usage) and must never be
+    summed or reconciled against each other.
+
+    ``None`` when the sidecar is absent (a pre-P2-18 round, an aborted episode
+    that never reached the agent, or a legacy direct harness run).
+    """
+    if episode_idx is None or task is None:
+        return None
+    path = os.path.join(
+        output_dir, AGENT_EVALS_DIRNAME,
+        f"chat_history_{episode_qid(env_name, task, episode_idx)}.jsonl"
+        f"{LLM_CALLS_SIDECAR_SUFFIX}",
+    )
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return sum(1 for line in f if line.strip())
+    except OSError:
+        return None
 
 
 def planned_episode_counts(output_dir):
@@ -259,6 +302,8 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
     question_points = {}
     episodes = []
     aborted_episodes = []
+    sidecar_missing = []
+    llm_calls_total = 0
     action_distribution = Counter()
     steps_total = 0
     invalid_actions_total = 0
@@ -281,6 +326,18 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
                 "steps": episode_log.get("num_steps"),
                 "invalid_actions": len(episode_log.get("failed_candidates") or []),
             }
+            # Per-episode LLM CALL COUNT (P2-18). Attribution only -- see
+            # episode_llm_calls(); the proxy audit ledger stays authoritative
+            # for money and tokens.
+            calls = episode_llm_calls(
+                output_dir, env_name, episode_log.get("task"),
+                episode_log.get("episode_idx"),
+            )
+            row["llm_calls"] = calls
+            if calls is None:
+                sidecar_missing.append(eid)
+            else:
+                llm_calls_total += calls
             # Objective facts for the evaluator (P1-9). The ACTION stream is
             # balrog's analogue of a predicted label: aggregated here so
             # ``policy.constant-output`` / ``policy.*-bias`` and
@@ -312,6 +369,8 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
         k for k, v in question_points.items() if v < 1.0 - 1e-9)
     summary["episodes"] = episodes
     summary["episodes_aborted"] = aborted_episodes
+    summary["episodes_sidecar_missing"] = sidecar_missing
+    summary["llm_calls_total"] = llm_calls_total
 
     # --- episode-domain objective facts (P1-9) -------------------------------
     # The contract `compute_report_summary` (gan/framework/task_execution.py)

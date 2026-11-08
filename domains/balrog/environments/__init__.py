@@ -1,5 +1,13 @@
 # Here we should have an environment manager function that can be used to instantiate
 # environments with the correct wrappers.
+#
+# NOTE (P2-17): ``gym`` (0.23) is still imported HERE for the custom ``Strings``
+# space used by the NLE/textworld observation schemas. It is a module-level
+# legacy dependency, kept deliberately: ``baba`` and ``minihack`` only expose
+# gym-0.23 APIs, so migrating ``Strings`` to ``gymnasium.spaces`` would not
+# remove the dependency, it would only split the two lineages in a file whose
+# whole job is to bridge them. Every env handed to ``EnvWrapper`` is adapted to
+# the Gymnasium step/reset API in its own ``make_*_env`` instead.
 from gym import spaces
 
 from domains.balrog.environments.env_wrapper import EnvWrapper

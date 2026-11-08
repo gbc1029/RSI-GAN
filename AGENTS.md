@@ -524,6 +524,55 @@ with a GAN-native data layer.
   raises ("infrastructure failure rather than a zero score") so the framework
   marks the generation invalid instead of writing a fabricated 0.0 into the
   lineage.
+- **Parallel episodes are a DECLARED budget (P2-16)**, not a literal. The harness
+  used to compose `eval.num_workers = 1 if agent_factory is not None else ...`,
+  so the evaluator's `_run_parallel` existed but no sandboxed deployment could
+  reach it. The number now lives in `domains.yaml`
+  (`harness_episode_workers`: babyai `2`, babaisai `1`), is resolved by
+  `task_execution.episode_worker_limit` and crosses as an explicit
+  `domains.harness --episode_workers`; the harness takes
+  `min(that, --num_workers)`, and an undeclared cap still means ONE episode. The
+  scheduler itself was made fail-safe first: the queue is PRELOADED (episodes +
+  one `None` per worker) so a dead worker's item still reaches a LIVE worker,
+  results are polled with a timeout and the wait ends only when no worker is
+  alive (`_EPISODE_POLL_S`), an episode that never came back is recorded as
+  ABORTED in the master (unless its JSON is already on disk), and workers are
+  joined/terminated in `finally`. `run_episode` also owns and CLOSES the env
+  (`finally`) — a parallel worker reuses its process, so an unclosed env leaked
+  a renderer per episode. Guard `scripts/local/verify_parallel_episodes.py`
+  (22 checks: 1-vs-3-worker parity on the same plan, dead-worker isolation,
+  all-dead round raising, env close on both paths, declaration resolution).
+- **Two gym lineages, one CONTRACT (P2-17).** `nle` / `minihack` / `textworld` /
+  `crafter` / `babaisai` build a gym-0.23 env (`baba` is 0.23-only) and adapt it
+  via `wrappers.gym_compatibility.GymV21CompatibilityV0`; `babyai` is Gymnasium
+  native. `EnvWrapper` now normalizes 1/2-tuple `reset` and 4/5-tuple `step` and
+  raises a NAMED error ("the env is not adapted to the Gymnasium API — wrap it in
+  GymV21CompatibilityV0") instead of a bare unpack failure three frames away;
+  the six-arm dead `_process_observation` chain is replaced by ONE observation
+  contract check (`text.long_term_context` must be a str, error names the env),
+  `check_action_validity` refuses a missing `language_action_space` /
+  `default_action` by name, and `get_instruction_prompt`'s `self.env_namee` typo
+  is fixed. `from gym import spaces` stays (the `Strings` space) — documented as
+  the ONE deliberate legacy import, since migrating it would not remove the
+  dependency. Guard `scripts/local/verify_env_contract.py` (33 checks incl. real
+  babyai/babaisai: seeded reset reproducibility, 5-tuple shape, and
+  `domains.yaml output_contract.allowed_labels` == the env's own vocabulary).
+- **Per-episode cost ATTRIBUTION (P2-18).** `agent/llm_withtools.py` writes its
+  per-call rows to `llm_calls_sidecar(<trajectory>)`, i.e. a SIBLING of the
+  transcript; the sandbox bound only the transcript, so every step child's rows
+  died in the tmpfs. `domains/harness._stage_sidecar` pre-creates/copies it,
+  `_sandbox_command(..., sidecar_path=)` binds it at
+  `/workspace/trajectory.jsonl.llm_calls.jsonl`, and `_copy_back_sidecar`
+  copies it back after the child exits. `archive_episode_trajectory` already
+  mirrored `<transcript>.llm_calls.jsonl` into `agent_evals/`, so
+  `trajectory._collect_llm_calls_sidecar` folds it into the archived sidecar
+  with `qid=<env>__<task>__epNN` — no framework change was needed. The report
+  adds `episodes[].llm_calls` (`None` when absent), `episodes_sidecar_missing[]`
+  and `llm_calls_total`; `episode_idx` rides the episode log so the report can
+  locate the sidecar. **Attribution only**: the child counts its own calls, the
+  root-side proxy meters usage — money/tokens stay the proxy audit's numbers and
+  the two are never summed. Guard
+  `scripts/local/verify_episode_sidecar.py` (26 checks).
 ### Output layout — `gan/framework/paths.py` is the single source
 
 | path | contents |

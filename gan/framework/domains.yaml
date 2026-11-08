@@ -260,6 +260,13 @@ domains:
     # 5 x 128 steps x 20s = 12800s per unit; 5 x 128 x 4 calls = 2560 calls.
     harness_timeout_per_sample_s: 12800
     task_llm_calls_per_sample: 2560
+    # PARALLEL EPISODES (P2-16). Every ENV STEP is its own sandboxed child, so
+    # this is a namespace-tree budget, not a thread count: babyai is 5 tasks x
+    # <=128 steps and was measured at ~10s/step, so two concurrent episodes is
+    # the smallest useful parallelism that still leaves the host headroom. The
+    # value crosses as `domains.harness --episode_workers` and the harness takes
+    # min(that, --num_workers); a domain that declares NOTHING stays at 1.
+    harness_episode_workers: 2
     # EPISODE PLAN (the balrog analogue of paper_review's question sampling):
     # a balrog "question" is one EPISODE, so the anchor core is a frozen list of
     # (task, episode seed) pairs -- `<task>#<seed>` in ckpt/sample_seed.json --
@@ -316,6 +323,11 @@ domains:
     # eval.max_steps_per_episode for the run (neither is silently changed here).
     harness_timeout_per_sample_s: 40000
     task_llm_calls_per_sample: 16000
+    # PARALLEL EPISODES (P2-16): stays at ONE. babaisai is 40 tasks x 100 steps
+    # per unit (~4000 step children), so the pressure is already an order of
+    # magnitude above babyai; raising this needs a measured round first (see
+    # README "成本"), not an optimistic guess.
+    harness_episode_workers: 1
     # Episode plan -- see balrog_babyai above. 40 tasks (config.yaml
     # babaisai_tasks), so at num_samples=2 this freezes 40 anchor episodes and
     # rotates 40 per generation.

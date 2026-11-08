@@ -66,6 +66,7 @@ def _audit_chain():
 import pandas as pd
 from hydra import compose, initialize_config_dir
 from utils.common import summarize_error
+from utils.trajectory_log import LLM_CALLS_SIDECAR_SUFFIX
 
 
 # Per-question wall budget. Default 300s; the GAN parent overrides it per
@@ -1238,6 +1239,12 @@ if __name__ == "__main__":
         "--num_workers", type=int, default=5, help="Number of parallel workers"
     )
     parser.add_argument(
+        "--episode_workers", type=int, default=None,
+        help="Max PARALLEL EPISODES for episode-based domains that declare "
+             "domains.yaml harness_episode_workers (balrog). None = no declared "
+             "cap, which keeps the sandboxed path at one episode at a time.",
+    )
+    parser.add_argument(
         "--resume_from",
         type=str,
         default=None,
@@ -1410,12 +1417,25 @@ if __name__ == "__main__":
         episode_anchor_ids = [a for a in (args.anchor_ids or "").split(",") if a.strip()]
 
         config_dir = os.path.join(os.getcwd(), "./domains/balrog/config")
+        # PARALLEL EPISODES (P2-16). This used to be ``1 if agent_factory is not
+        # None else args.num_workers``: the sandboxed path was pinned to ONE
+        # episode, so the evaluator's parallel implementation existed but no
+        # deployment could reach it. The number is now DECLARED by the framework
+        # (domains.yaml ``harness_episode_workers`` -> ``--episode_workers``) and
+        # never exceeds ``--num_workers``; an undeclared cap still means 1, so a
+        # domain that says nothing gets the old, safe behaviour.
+        if agent_factory is None:
+            eval_workers = args.num_workers
+        elif args.episode_workers is None:
+            eval_workers = 1
+        else:
+            eval_workers = max(1, min(int(args.episode_workers), int(args.num_workers)))
         with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
             cfg = compose(
                 config_name="config",
                 overrides=[
                     f"eval.output_dir={args.output_dir}",
-                    f"eval.num_workers={1 if agent_factory is not None else args.num_workers}",
+                    f"eval.num_workers={eval_workers}",
                     f"envs.names={env_name}",
                     f"eval.run_id={args.run_id if args.run_id is not None else 'null'}",
                     f"model={args.model}",

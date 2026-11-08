@@ -2582,6 +2582,39 @@ def task_llm_call_budget(domain_cfg: Dict[str, Any], num_samples: int,
     return max(1, int(num_samples or 1)) * max(1, calls)
 
 
+def episode_worker_limit(domain: str, requested: int) -> Optional[int]:
+    """Declared cap on PARALLEL EPISODES (``domains.yaml harness_episode_workers``).
+
+    An episode-based domain (balrog) spends one sandboxed child per ENVIRONMENT
+    STEP, so N concurrent episodes means N namespace trees at once. The harness
+    used to pin the sandboxed path to one episode, which made the evaluator's
+    parallel path unreachable; the number therefore belongs to the registry as a
+    DECLARATION, not to a hard-coded literal in the harness.
+
+    ``None`` = this domain declares no cap: ``--episode_workers`` is not sent at
+    all and the harness keeps its own default (one episode when sandboxed).
+    Question-based domains are untouched by construction.
+    """
+    from gan.framework.loader import load_registry, resolve_domain
+    domain_cfg = resolve_domain(load_registry(), domain) or {}
+    declared = domain_cfg.get("harness_episode_workers")
+    if declared is None:
+        return None
+    try:
+        cap = int(declared)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"domains.yaml harness_episode_workers for {domain!r} is not an integer: "
+            f"{declared!r}"
+        )
+    if cap < 1:
+        raise RuntimeError(
+            f"domains.yaml harness_episode_workers for {domain!r} must be >= 1 "
+            f"(got {cap})"
+        )
+    return max(1, min(cap, int(requested)))
+
+
 def effective_token_budget_per_gen(domain_cfg: Dict[str, Any],
                                    cfg: Any) -> Optional[int]:
     """Per-generation token-budget line, resolved per domain (docs/10 §10).
@@ -2707,6 +2740,13 @@ def _run_harness_and_report_local(
         "--num_samples", str(num_samples),
         "--num_workers", str(num_workers),
     ]
+    # PARALLEL EPISODES (P2-16): the cap is DECLARED per domain in domains.yaml
+    # and crosses as an explicit CLI arg -- never as an env variable, and never
+    # as a literal inside the harness (that is what made the whole capability
+    # unreachable in the sandboxed path).
+    episode_workers = episode_worker_limit(domain, num_workers)
+    if episode_workers is not None:
+        harness_args.extend(["--episode_workers", str(episode_workers)])
     if reasoning_effort:
         # Explicit CLI transport (mirrors --model); never an env variable.
         harness_args.extend(["--reasoning_effort", str(reasoning_effort)])

@@ -205,7 +205,7 @@ What it pins, and why (all measured 2026-11-03):
 | Minigrid **fork** | `cf73dd148e51276bd675a37e3bfb0bf2b42329b2` (branch `babyai_text`), tarball | PyPI `minigrid==2.3.1` has neither `BabyAI-MixedTrainLocal-v0` nor `info["descriptions"]` — balrog's BabyAI text wrapper needs both |
 | `gymnasium` | `1.2.0` | minigrid's API base |
 | `pygame` | `>=2.5` | minigrid rendering (`get_pov_render`) |
-| `gym` | `0.23.0`, installed with **`--no-deps`** | `domains/balrog/environments` builds its `Strings` space on old gym; its own `pygame==2.1.0` pin has no cp312 wheel |
+| `gym` | `0.23.0`, installed with **`--no-deps`** | `domains/balrog/environments` builds its `Strings` space on old gym; its own `pygame==2.1.0` pin has no cp312 wheel. Every env handed to `EnvWrapper` is adapted to the Gymnasium `reset/step` API in its own `make_*_env` (`GymV21CompatibilityV0`), and `scripts/local/verify_env_contract.py` asserts that contract for the wired domains |
 | `setuptools` | latest | old gym imports `distutils`, removed from the py3.12 stdlib |
 | `baba-is-ai` (`import baba`) | `40ae1b29dbc67f2ecea06cc161ed5ca51719e5e3`, tarball | babaisai env; git-only project (not on PyPI) |
 
@@ -220,6 +220,22 @@ Known constraints:
 - Cost: one `balrog_babaisai` generation is 40 tasks x 100 steps = 4000 agent
   sessions (the budgets in `gan/framework/domains.yaml` say so out loud). Trim
   `domains/balrog/config/config.yaml` `babaisai_tasks` for cheap runs.
+- **Parallel episodes are DECLARED, not guessed** (`harness_episode_workers` in
+  `domains.yaml`): `balrog_babyai` runs 2 episodes at a time, `balrog_babaisai`
+  stays at 1 (40 tasks x 100 steps per unit — raise it only after a measured
+  round). The harness applies `min(--episode_workers, --num_workers)`, so a
+  domain that declares nothing keeps one episode at a time. Every env STEP is
+  its own sandboxed child, so this is a namespace-tree budget: measure with
+  `scripts/local/run_balrog_real_ext4.sh` (same frozen plan, workers 1 vs N)
+  before raising it. A worker that dies no longer stalls the round — the lost
+  episode is recorded as ABORTED and the denominator never shrinks.
+- **Per-episode cost attribution**: each episode's per-call audit rows
+  (`<transcript>.llm_calls.jsonl`) now survive the sandbox (stage → bind →
+  copy-back), are archived next to the transcript under
+  `agent_evals/chat_history_<env>__<task>__epNN.jsonl.llm_calls.jsonl`, and
+  `report.json` carries `episodes[].llm_calls` / `episodes_sidecar_missing` /
+  `llm_calls_total`. These are CALL COUNTS for attribution only — money and
+  tokens remain the root-side proxy audit's numbers; never sum the two.
 - `balrog_minihack` / `balrog_nle` / `crafter` / `textworld` are **not** wired
   into the GAN path and are not covered by this script (`post_install.py`
   downloads their data from GitHub/Drive and needs network). This is now

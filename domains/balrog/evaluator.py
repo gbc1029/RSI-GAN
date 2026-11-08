@@ -3,8 +3,8 @@ import json
 import logging
 import multiprocessing
 import os
+import queue
 import random
-import re
 import shutil
 import traceback
 from collections import defaultdict
@@ -15,26 +15,21 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from domains.balrog.environments import make_env
-from domains.balrog.utils import get_unique_seed
+from domains.balrog.utils import (
+    AGENT_EVALS_DIRNAME,
+    episode_qid,
+    get_unique_seed,
+)
 from utils.episode_seed import anchor_seeds_by_task, plan_episodes
 from utils.trajectory_log import LLM_CALLS_SIDECAR_SUFFIX
 
 logger = logging.getLogger(__name__)
 
-# The GAN framework archives task evidence from exactly ONE place:
-# ``<run>/outputs/<run_id>/agent_evals/chat_history_<qid>.jsonl``
-# (gan/framework/trajectory.py ``collect``). Balrog writes one transcript per
-# EPISODE under ``<output>/<env>/<task>/<task>_run_NN_chat_history.jsonl``, so
-# without the mirror below every generation died as
-# ``trajectory_archive_failed`` and the evaluator lost its evidence entirely.
-# The episode IS balrog's question, so the qid is ``env__task__ep<NN>``.
-AGENT_EVALS_DIRNAME = "agent_evals"
-
-
-def episode_qid(env_name, task, episode_idx):
-    """Filesystem-safe per-EPISODE id (balrog's analogue of a question id)."""
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(task)).strip("_") or "task"
-    return f"{env_name}__{safe}__ep{int(episode_idx):02d}"
+# ``AGENT_EVALS_DIRNAME`` / ``episode_qid`` live in domains.balrog.utils, not
+# here: the REPORT (utils.collect_and_summarize_results) has to locate each
+# episode's per-call sidecar, and evaluator imports utils (not the reverse), so
+# one definition there keeps the two sides from drifting. They are re-exported
+# below this import block for every existing caller.
 
 
 def archive_episode_trajectory(output_dir, env_name, task, episode_idx):
@@ -64,12 +59,12 @@ def archive_episode_trajectory(output_dir, env_name, task, episode_idx):
     shutil.copyfile(src, dest)
     # Per-call LLM audit rows ride a sidecar next to the transcript (agent/llm.py
     # -> agent/llm_withtools.py). Mirror it when present so the framework's
-    # ``llm_calls`` sidecar fold-in finds it (advisory on absence: sandboxed
-    # step children currently do not hand their sidecar back).
+    # ``llm_calls`` sidecar fold-in finds it.
     src_sidecar = src + LLM_CALLS_SIDECAR_SUFFIX
     if os.path.isfile(src_sidecar):
         shutil.copyfile(src_sidecar, dest + LLM_CALLS_SIDECAR_SUFFIX)
     return dest
+
 
 def to_jsonable(x):
     if isinstance(x, np.ndarray):
@@ -81,6 +76,47 @@ def to_jsonable(x):
     if isinstance(x, (list, tuple)):
         return [to_jsonable(v) for v in x]
     return x
+
+
+# Parallel-episode polling (P2-16). The master blocks on the result queue, so a
+# worker that DIES must not be waited on forever: poll, and stop only when no
+# worker is left alive. A long-but-healthy episode may be silent for many
+# minutes, so liveness -- never silence alone -- is the failure signal.
+_EPISODE_POLL_S = 5.0
+_WORKER_JOIN_S = 30.0
+
+
+def _episode_key(record, env_name=None):
+    """Stable identity of one episode: plan dicts and worker rows differ.
+
+    Plan entries carry ``env``; worker rows carry ``env_name``. ``episode_idx``
+    is the slot (present on both since P2-18); ``episode_id`` is the fallback
+    for any older row so a delivered episode is never double-counted.
+    """
+    env = env_name or record.get("env") or record.get("env_name")
+    idx = record.get("episode_idx")
+    if idx is None:
+        eid = record.get("episode_id") or record.get("id")
+        if eid is not None:
+            return (env, "id", eid)
+    return (env, record.get("task"), idx)
+
+
+def close_env(env, env_name=None, task=None, episode_idx=None):
+    """Close an episode env; never fatal.
+
+    Long-lived parallel workers reuse the process across episodes, so an
+    un-closed env leaks its renderer/pygame surfaces for the whole round. A
+    close failure must not void a score, but it must SPEAK.
+    """
+    close = getattr(env, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as e:  # noqa: BLE001 -- audited, never fatal
+        logging.warning("env.close failed (%s/%s ep%s): %s",
+                        env_name, task, episode_idx, e)
 
 class EvaluatorManager:
     """Manages evaluation of agents across multiple environments and tasks.
@@ -213,6 +249,7 @@ class EvaluatorManager:
             "episode_id": ep.get("id") or f"{task}#{ep.get('seed')}",
             "seed": ep.get("seed"),
             "anchor": bool(ep.get("anchor")),
+            "episode_idx": episode_idx,
             "progression": 0.0,
             "num_steps": 0,
             "episode_return": 0.0,
@@ -282,82 +319,127 @@ class EvaluatorManager:
                 pbar.update(1)
         return results
 
-    def _run_parallel(self, agent_factory):
-        """Run the evaluation in parallel using multiple workers.
+    def _absorb_result(self, result, results, delivered):
+        """Fold one worker row into the aggregate; True when it counted.
 
-        Args:
-            agent_factory (AgentFactory): Factory object to create agents for evaluation.
-
-        Returns:
-            dict: Results of the evaluation aggregated by environment name.
+        Every row a worker hands back is an EPISODE ROW -- including a crash
+        (``_worker`` converts it into an aborted row). An aborted or errored row
+        is appended like any other so the denominator never shrinks; only the
+        log level differs.
         """
-        task_queue = multiprocessing.Queue()
-        results_queue = multiprocessing.Queue()
+        key = _episode_key(result)
+        if key in delivered:
+            return False
+        delivered.add(key)
+        env_name = result.get("env_name") or (key[0] if key[0] else "unknown")
+        if result.get("aborted"):
+            logging.error("episode %s aborted in %s (%s)", result.get("episode_id"),
+                          result.get("process_num"), result.get("error"))
+        elif "error" in result:
+            logging.error("error in task %s (process %s): %s",
+                          result.get("task"), result.get("process_num"), result.get("error"))
+        results[env_name].append(result)
+        return True
 
+    def _run_parallel(self, agent_factory):
+        """Run the evaluation with ``num_workers`` parallel EPISODE workers.
+
+        Three coordination rules, each fixing a way the old hand-off loop could
+        lose or hang a round (P2-16):
+
+        * **No deadlock.** The queue is preloaded with every episode plus one
+          ``None`` sentinel per worker, so the work ahead of a sentinel still
+          reaches a LIVE worker when another one dies. The old loop refilled the
+          queue from the master and then blocked on ``results_queue.get()`` with
+          no timeout, so a dead worker stalled the round forever.
+        * **No silent shrinkage.** An episode that never came back is recorded
+          as ABORTED in the master (a played and lost episode) instead of
+          vanishing from the report; an episode whose JSON is already on disk is
+          left alone (it really did finish).
+        * **No orphans.** Workers are joined -- and terminated if they refuse to
+          exit -- in ``finally``, so an exception in the master can no longer
+          leave step-child-spawning processes behind.
+        """
         ctx = multiprocessing.get_context("fork")
-
-        # Initially fill the task queue with tasks up to the number of workers
-        for item in self.episodes[: self.num_workers]:
-            task_queue.put(item)
-
-        # Create a master progress bar
-        pbar = tqdm(total=len(self.episodes), position=0, leave=True, disable=True)
-
-        # Assign unique positions for progress bars
-        positions = list(range(self.num_workers))
-
-        processes = []
-        for idx in range(self.num_workers):
-            position = positions[idx]
-            p = ctx.Process(
-                target=self._worker,
-                args=(task_queue, results_queue, agent_factory, position),
-            )
-            processes.append(p)
-            p.start()
-
-        results = defaultdict(list)
-        tasks_completed = 0
-        tasks_queued = self.num_workers
+        task_queue = ctx.Queue()
+        results_queue = ctx.Queue()
 
         total_tasks = len(self.episodes)
+        workers = max(1, min(int(self.num_workers or 1), max(1, total_tasks)))
 
-        while tasks_completed < total_tasks:
-            result = results_queue.get()
-            if result.get("aborted"):
-                # A crashed episode arrives as a NORMAL row (see _worker) so it is
-                # counted and scored 0.0; only the log line differs.
-                logging.error(
-                    "episode %s aborted in %s", result.get("episode_id"), result.get("process_num")
-                )
-                results[result["env_name"]].append(result)
-            elif "error" in result:
-                logging.error(f"Error in task {result['task']} processed by {result['process_num']}: {result['error']}")
-                logging.error(f"Traceback:\n{result['traceback']}")
-            else:
-                results[result["env_name"]].append(result)
-            tasks_completed += 1
-
-            # Update progress bar
-            pbar.update(1)
-            pbar.set_description(f"Last task: {result['task']}, Process: {result.get('process_num', 'N/A')}")
-
-            # Queue another task if there are any left
-            if tasks_queued < total_tasks:
-                task_queue.put(self.episodes[tasks_queued])
-                tasks_queued += 1
-
-        # Signal workers to stop
-        for _ in range(self.num_workers):
+        for item in self.episodes:
+            task_queue.put(item)
+        for _ in range(workers):
             task_queue.put(None)
 
-        # Wait for all processes to finish
-        for p in processes:
-            p.join()
+        pbar = tqdm(total=total_tasks, position=0, leave=True, disable=True)
+        processes = []
+        results = defaultdict(list)
+        delivered = set()
+        try:
+            for idx in range(workers):
+                p = ctx.Process(
+                    target=self._worker,
+                    args=(task_queue, results_queue, agent_factory, idx),
+                )
+                processes.append(p)
+                p.start()
 
-        # Close the master bar when done
-        pbar.close()
+            while len(delivered) < total_tasks:
+                try:
+                    result = results_queue.get(timeout=_EPISODE_POLL_S)
+                except queue.Empty:
+                    if not any(p.is_alive() for p in processes):
+                        # Drain whatever is still buffered, then stop: every
+                        # worker is gone, so nothing more can arrive.
+                        while True:
+                            try:
+                                pending = results_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                            if self._absorb_result(pending, results, delivered):
+                                pbar.update(1)
+                        break
+                    continue
+                if self._absorb_result(result, results, delivered):
+                    pbar.update(1)
+                    pbar.set_description(
+                        f"Last task: {result.get('task')}, "
+                        f"Process: {result.get('process_num', 'N/A')}"
+                    )
+        finally:
+            for p in processes:
+                p.join(timeout=_WORKER_JOIN_S)
+            for p in processes:
+                if p.is_alive():
+                    logging.error("balrog worker pid %s did not exit; terminating", p.pid)
+                    p.terminate()
+                    p.join(timeout=5.0)
+            pbar.close()
 
+        missing = [ep for ep in self.episodes if _episode_key(ep) not in delivered]
+        if missing:
+            logging.error(
+                "balrog: %d/%d episode(s) never came back from a worker -- recording "
+                "them as aborted instead of shrinking the denominator",
+                len(missing), total_tasks,
+            )
+            for ep in missing:
+                path = os.path.join(
+                    self.output_dir, ep["env"], ep["task"],
+                    f"{ep['task']}_run_{int(ep['episode_idx']):02d}.json",
+                )
+                if os.path.exists(path):
+                    # The episode DID finish on disk; only its result row was
+                    # lost. Never overwrite real evidence with a 0.0 row.
+                    logging.error("episode %s finished on disk but lost its result row; "
+                                  "keeping the file", ep.get("id"))
+                    continue
+                log = self._record_aborted(
+                    ep, RuntimeError("episode worker died before delivering a result"))
+                # Append it as well: ``run()`` counts aborted rows to decide
+                # whether the whole round is an infrastructure failure.
+                results[ep["env"]].append(log)
         return results
 
     def _worker(self, task_queue, results_queue, agent_factory, position):
@@ -466,8 +548,25 @@ class Evaluator:
         Returns:
             dict: Log of the episode containing statistics and results.
         """
+        # The env is OWNED here and closed in ``finally``: a parallel worker
+        # reuses its process for many episodes, so an un-closed env leaks a
+        # renderer per episode (and the sandboxed children behind it). The body
+        # lives in ``_play_episode`` so the close is unconditional, including on
+        # the exception path (P2-16).
         env = make_env(self.env_name, task, self.config)
+        try:
+            return self._play_episode(
+                env, task, agent, process_num=process_num, position=position,
+                episode_idx=episode_idx, episode_seed=episode_seed,
+                episode_id=episode_id, is_anchor=is_anchor,
+            )
+        finally:
+            close_env(env, self.env_name, task, episode_idx)
 
+    def _play_episode(self, env, task, agent, process_num=None, position=0,
+                      episode_idx=0, episode_seed=None, episode_id=None,
+                      is_anchor=False):
+        """One episode on an ALREADY-OPEN env (``run_episode`` owns closing)."""
         seed = episode_seed
         if seed is None:
             seed = self.config.envs.env_kwargs.seed
@@ -484,6 +583,9 @@ class Evaluator:
             "episode_id": episode_id or f"{task}#{seed}",
             "seed": seed,
             "anchor": bool(is_anchor),
+            # Slot index: the REPORT needs it to locate this episode's per-call
+            # LLM sidecar (agent_evals/chat_history_<qid>.llm_calls.jsonl).
+            "episode_idx": episode_idx,
             "action_frequency": defaultdict(int),
             # "input_tokens": 0,
             # "output_tokens": 0,
