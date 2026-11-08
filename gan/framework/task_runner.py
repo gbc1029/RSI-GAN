@@ -82,6 +82,43 @@ def _final_output_summary(
 TASK_PATCH_REJECTED_NO_COMMIT = "no new code commit (patch rejected or absent)"
 
 
+def _task_change_summary(submitted_patch: Any, config: Any,
+                         parent: Optional[Node]) -> Dict[str, Any]:
+    """Build a bounded, score-free summary for the fixed challenge gate.
+
+    The adjudicator needs to judge the planner's actual task change, but it
+    must not receive an unbounded trajectory or hidden grader data.  Config
+    output is limited to changed keys against the persisted parent snapshot;
+    source patches contain only added lines and are length-capped.
+    """
+    raw_patch = str(submitted_patch or "")
+    added_patch = "\n".join(
+        line[1:] for line in raw_patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++"))
+    parent_config = {}
+    if parent is not None and isinstance(parent.meta, dict):
+        value = parent.meta.get("config_dict")
+        if isinstance(value, dict):
+            parent_config = value
+    current_config = config if isinstance(config, dict) else {}
+    changed = {}
+    for key in sorted(set(parent_config) | set(current_config), key=str):
+        before = parent_config.get(key)
+        after = current_config.get(key)
+        if before != after:
+            try:
+                encoded = json.dumps(after, ensure_ascii=False, sort_keys=True,
+                                     default=str)
+            except (TypeError, ValueError):
+                encoded = str(after)
+            changed[str(key)] = encoded[:2400]
+    return {
+        "submitted_patch_added": added_patch[:6000],
+        "config_changed": changed,
+        "patch_submitted": bool(raw_patch.strip()),
+    }
+
+
 def pool_check(domain: str, domain_cfg: Dict[str, Any], num_samples: int,
                dataset_root: Optional[str] = None, subset: str = "") -> None:
     """Fail fast when a domain's candidate pool cannot satisfy --num_samples.
@@ -395,6 +432,9 @@ class DomainTaskRunner:
                 "Claim": str(challenge.get("claim") or ""),
                 "Evidence Ref": str(challenge.get("evidence_ref") or ""),
                 "Repair Criterion": str(challenge.get("repair_criterion") or ""),
+                "Task Change": json.dumps(
+                    (child.meta or {}).get("task_change") or {},
+                    ensure_ascii=False, sort_keys=True),
             })
         if unresolved:
             self._event(
@@ -456,6 +496,8 @@ class DomainTaskRunner:
         if not isinstance(config, dict):
             config = {}
         patch_str = plan.get("patch", "") or ""
+        submitted_patch = patch_str
+        task_change = _task_change_summary(submitted_patch, config, parent)
         challenge_audit: Dict[str, Any] = {"triggered": False, "reason": None}
         if active_challenge_ids:
             from gan.framework import challenge_ledger
@@ -952,6 +994,7 @@ class DomainTaskRunner:
                 "task_patch_files": task_patch_files,
                 "task_patch_rejected": task_patch_rejected,
                 "challenge_audit": challenge_audit,
+                "task_change": task_change,
                 "records": records,
                 "report_summary": report_summary,
                 "score_status": score_status,

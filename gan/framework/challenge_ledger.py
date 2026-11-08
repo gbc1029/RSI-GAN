@@ -47,9 +47,10 @@ def audit_single_question_hardcoding(
 ) -> Dict[str, Any]:
     """Reject challenge-specific qid/answer leakage in a task response.
 
-    The planner may use general proof methods. This audit only covers explicit
-    challenge identifiers and protected answer/grader fields in the submitted
-    patch or task config; it never reads held-out val data.
+    The planner may use general proof methods. This mechanical pass covers
+    explicit challenge identifiers and protected answer/grader fields in the
+    submitted patch or task config; semantic transferability is judged later
+    by the fixed adjudicator. It never reads held-out val data.
     """
     qids = [str(q).strip() for q in (challenge_qids or []) if str(q).strip()]
     try:
@@ -66,12 +67,15 @@ def audit_single_question_hardcoding(
         if re.search(r"(?<![A-Za-z0-9_])" + re.escape(qid)
                      + r"(?![A-Za-z0-9_])", text):
             return {"triggered": True, "reason": "challenge_qid_embedded",
-                    "qid": qid}
+                    "qid": qid, "hard_gate": True,
+                    "modification_scope": "instance_specific_memory"}
     match = _PROTECTED_RESPONSE_KEYS.search(text)
     if match:
         return {"triggered": True, "reason": "protected_answer_or_grader_field",
-                "token": match.group(0)}
-    return {"triggered": False, "reason": None}
+                "token": match.group(0), "hard_gate": True,
+                "modification_scope": "answer_leakage"}
+    return {"triggered": False, "reason": None, "hard_gate": False,
+            "modification_scope": None}
 
 
 def empty() -> Dict[str, Any]:

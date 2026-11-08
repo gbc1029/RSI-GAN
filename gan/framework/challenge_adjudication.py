@@ -21,6 +21,11 @@ _STATES = frozenset({
     UNSUPPORTED_CHALLENGE, REGRESSION_AFTER_FALSE_CHALLENGE,
 })
 
+_MODIFICATION_SCOPES = frozenset({
+    "transferable_strategy", "instance_specific_memory", "answer_leakage",
+    "uncertain",
+})
+
 
 def _evidence_ok(evidence: Optional[Mapping[str, Any]]) -> bool:
     if not isinstance(evidence, Mapping):
@@ -51,6 +56,7 @@ def adjudicate(
     parent_present: Optional[bool] = None,
     child_present: Optional[bool] = None,
     actionable: Optional[bool] = None,
+    modification_scope: Optional[str] = None,
     evidence_ref: str = "",
 ) -> Dict[str, Any]:
     """Return one auditable state without inferring claim truth from points."""
@@ -59,6 +65,12 @@ def adjudicate(
         state, reason = UNDECIDABLE, "missing_or_unusable_grader_evidence"
     elif parent_present is None or child_present is None or actionable is None:
         state, reason = UNDECIDABLE, "missing_fixed_adjudicator_verdict"
+    elif (modification_scope is not None
+          and modification_scope not in _MODIFICATION_SCOPES):
+        state, reason = UNDECIDABLE, "missing_modification_scope"
+    elif (modification_scope is not None
+          and modification_scope != "transferable_strategy"):
+        state, reason = UNDECIDABLE, "task_change_not_transferable"
     elif not bool(actionable):
         state, reason = UNDECIDABLE, "challenge_not_actionable"
     elif bool(parent_present) and not bool(child_present):
@@ -74,6 +86,7 @@ def adjudicate(
         "reason": reason,
         "qid": qid,
         "actionable": (None if actionable is None else bool(actionable)),
+        "modification_scope": modification_scope,
         "parent_present": (None if parent_present is None else bool(parent_present)),
         "child_present": (None if child_present is None else bool(child_present)),
         "evidence_ref": str(evidence_ref or ""),

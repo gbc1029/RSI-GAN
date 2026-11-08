@@ -612,3 +612,54 @@ parent/child 两侧的 `actionable` 和 `actionability_basis` 必须同时一致
 修改。实际 planner patch 仍只用于 hardcoding audit、`observed_action` 和 response consistency。
 这样不会因为 planner 没有行动而反过来改变 challenge 的 actionability，也不会把具体但合法的数学
 策略误判为答案泄露。
+
+### 7.5 Planner 修改的实例依赖 gate（2026-11）
+
+#### 发现的问题
+
+`actionability_basis` 只判断 challenge 是否适合用可迁移策略修复，不能判断 planner 本轮实际提交的
+task 修改是否把当前题目的答案或唯一构造写进了 prompt/config/source patch。旧的 hardcoding audit
+只会拒绝显式 qid 和 protected answer/grader 字段，并清空 patch；child 仍可能被当作有效 parent。
+
+#### 最终方案
+
+沿用现有 fixed adjudicator，不新增角色或第二次模型调用。每个 adjudication question 额外携带一个
+framework 生成的、有长度上限的 `Task Change` 摘要（新增 patch 行和相对持久化 parent config 的 changed
+keys），并要求 adjudicator 输出独立的：
+
+```text
+modification_scope =
+  transferable_strategy
+  | instance_specific_memory
+  | answer_leakage
+  | uncertain
+```
+
+判定规则如下：
+
+1. 方法名称、具体数字、结构识别条件、条件分支和可复用步骤可以是
+   `transferable_strategy`；task 仍必须识别当前结构、选择参数、完成主要推导并验证结果。
+2. 明确依赖当前 qid、当前题目的唯一对象/构造或仅对当前实例有用的信息是
+   `instance_specific_memory`。
+3. 当前答案、答案等价的关键中间结果、reference-solution 文本或 qid-specific branch 是
+   `answer_leakage`。
+4. 证据不足时为 `uncertain`。
+
+#### parent 安全边界
+
+`instance_specific_memory` 和 `answer_leakage` 是 framework hard gate：child 记录为
+`challenge_modification_hard_gate`、设置 `valid_parent=False`，不进入 parent selection 或 challenge
+repair credit。显式 qid/protected token 由 task 执行前的机械 audit 立即拦截；语义实例依赖由 fixed
+adjudicator 在 settlement 后拦截。`uncertain` 不授予 repair credit，但不抛出全局异常。
+
+gate 使用现有 invalid-child 归档路径，单个违规 child 不会中断其 sibling 或整代；若整代没有可晋升
+child，保留上一有效 parent 并结束该 outer。challenge 本身的 `actionability_basis` 与 planner 修改的
+`modification_scope` 始终分开记录，避免把“challenge 不可迁移”误当成 planner 作弊。
+
+#### 本次修改
+
+- 扩展 fixed adjudicator、CSV parser 和 IMO adapter 的结构化输出与校验；旧 artifact 缺少
+  `modification_scope` 时保持保守的 `UNDECIDABLE`。
+- 在 task runner 记录 bounded `task_change` 摘要，并在 challenge adjudication 输入中传递。
+- 对机械 hardcoding 和 adjudicator 语义 gate 分别接入 child invalid-parent 路径。
+- 增加 CRT/通用策略不触发机械 gate、实例记忆不计 repair、transferable strategy 正常 repair 的回归测试。

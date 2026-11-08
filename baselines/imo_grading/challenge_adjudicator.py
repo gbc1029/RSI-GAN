@@ -38,7 +38,23 @@ exactly one JSON object:
 {{"parent_present": true|false|null, "child_present": true|false|null,
   "actionable": true|false,
   "actionability_basis": "transferable_strategy|instance_specific_content|uncertain",
+  "modification_scope": "transferable_strategy|instance_specific_memory|answer_leakage|uncertain",
   "reason": "short evidence-based reason"}}
+
+Judge the planner's submitted task change separately from challenge
+actionability. Use modification_scope="transferable_strategy" when the change
+teaches a reusable method or conditional strategy while the task still has to
+identify the current structure, choose its parameters, perform the main
+derivation, and verify the result. Concrete theorem names, numbers, and
+structure names are allowed when they describe a class of problems.
+Use "instance_specific_memory" when the change explicitly depends on the
+current qid, the current problem's unique object or construction, or knowledge
+useful only for this instance. Use "answer_leakage" when it supplies the
+current answer, an answer-equivalent intermediate result, reference-solution
+text, or a qid-specific branch. Use "uncertain" when the bounded task change
+is insufficient to decide. The last three scopes receive no challenge repair
+credit; instance_specific_memory and answer_leakage are framework hard-gate
+violations.
 
 PROBLEM:
 {problem}
@@ -54,6 +70,9 @@ CHALLENGE CLAIM: {claim}
 EVIDENCE POINTER: {evidence_ref}
 REPAIR CRITERION: {repair_criterion}
 
+PLANNER TASK CHANGE (bounded framework summary):
+{task_change}
+
 PARENT PROOF:
 {parent_answer}
 
@@ -65,10 +84,15 @@ REPAIR_PROMPT = """Return exactly one JSON object and nothing else:
 {"parent_present": true|false|null, "child_present": true|false|null,
  "actionable": true|false,
  "actionability_basis": "transferable_strategy|instance_specific_content|uncertain",
+ "modification_scope": "transferable_strategy|instance_specific_memory|answer_leakage|uncertain",
  "reason": "short reason"}"""
 
 _ACTIONABILITY_BASES = {
     "transferable_strategy", "instance_specific_content", "uncertain",
+}
+_MODIFICATION_SCOPES = {
+    "transferable_strategy", "instance_specific_memory", "answer_leakage",
+    "uncertain",
 }
 
 
@@ -83,7 +107,7 @@ def _parse(raw):
         return None
     if not isinstance(value, dict) or set(value) != {
             "parent_present", "child_present", "actionable",
-            "actionability_basis", "reason"}:
+            "actionability_basis", "modification_scope", "reason"}:
         return None
     if not (value["parent_present"] is None
             or isinstance(value["parent_present"], bool)):
@@ -97,6 +121,8 @@ def _parse(raw):
     if basis not in _ACTIONABILITY_BASES:
         return None
     if value["actionable"] != (basis == "transferable_strategy"):
+        return None
+    if value.get("modification_scope") not in _MODIFICATION_SCOPES:
         return None
     if not isinstance(value["reason"], str) or not value["reason"].strip():
         return None
@@ -115,7 +141,7 @@ class TaskAgent(AgentSystem):
         required = (
             "problem", "solution", "grading_guidelines", "parent_answer",
             "child_answer", "defect_type", "claim", "evidence_ref",
-            "repair_criterion",
+            "repair_criterion", "task_change",
         )
         if not all(str(inputs.get(key, "")).strip() for key in required):
             return "", []

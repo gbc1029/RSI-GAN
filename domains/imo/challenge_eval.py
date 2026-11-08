@@ -9,6 +9,10 @@ import pandas as pd
 _ACTIONABILITY_BASES = {
     "transferable_strategy", "instance_specific_content", "uncertain",
 }
+_MODIFICATION_SCOPES = {
+    "transferable_strategy", "instance_specific_memory", "answer_leakage",
+    "uncertain",
+}
 
 
 def report_challenge_adjudication(dname, questions_path=None):
@@ -31,7 +35,8 @@ def report_challenge_adjudication(dname, questions_path=None):
         valid = (
             challenge_id and qid and isinstance(value, dict)
             and set(value) == {"parent_present", "child_present",
-                               "actionable", "actionability_basis", "reason"}
+                               "actionable", "actionability_basis",
+                               "modification_scope", "reason"}
             and (value.get("parent_present") is None
                  or isinstance(value.get("parent_present"), bool))
             and (value.get("child_present") is None
@@ -40,6 +45,7 @@ def report_challenge_adjudication(dname, questions_path=None):
             and value.get("actionability_basis") in _ACTIONABILITY_BASES
             and value.get("actionable") == (
                 value.get("actionability_basis") == "transferable_strategy")
+            and value.get("modification_scope") in _MODIFICATION_SCOPES
             and isinstance(value.get("reason"), str)
             and bool(value.get("reason", "").strip())
         )

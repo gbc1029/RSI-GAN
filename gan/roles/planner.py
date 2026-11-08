@@ -56,6 +56,22 @@ _DEEP_PROBE_NOTE = (
     "the round remains valid and the missed probe will only be audited."
 )
 
+_CHALLENGE_DESIGN_NOTE = (
+    "\n## Challenge-to-task design boundary\n"
+    "Translate the listed challenges into a reusable task capability, not a "
+    "qid-specific patch. You may combine several heterogeneous defects as "
+    "separate conditional strategy sections in one prompt/config change. "
+    "The task must still identify the current structure, choose its parameters, "
+    "perform the main derivation, handle boundary cases, and verify the result. "
+    "Method names (for example CRT), applicability checks, structural pattern "
+    "recognition, concrete theorem conditions, and failure branches are allowed. "
+    "Never include a challenge qid, the current problem's unique object or "
+    "construction, a current answer or answer-equivalent intermediate result, "
+    "reference-solution text, or a qid-specific branch in the task change. "
+    "Such instance memory or answer leakage is a framework hard-gate and the "
+    "child cannot become a parent."
+)
+
 
 class Planner(Role):
     def __init__(self, model: str, output_dir: str, instance: Optional[str] = None, **kwargs):
@@ -142,6 +158,7 @@ class Planner(Role):
                 # leave the planner with malformed JSON at the end of the block.
                 f"```json\n{json.dumps(parent_challenges, ensure_ascii=False, indent=2)}\n```"
             )
+            parts.append(_CHALLENGE_DESIGN_NOTE)
         if challenge_results:
             parts.append(
                 "\n## Settled challenge results on this selected parent\n"

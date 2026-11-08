@@ -17,6 +17,10 @@ from gan.framework import challenge_adjudication as framework_adjudication
 _ACTIONABILITY_BASES = frozenset({
     "transferable_strategy", "instance_specific_content", "uncertain",
 })
+_MODIFICATION_SCOPES = frozenset({
+    "transferable_strategy", "instance_specific_memory", "answer_leakage",
+    "uncertain",
+})
 
 
 def _mapping(value: Any) -> Optional[Mapping[str, Any]]:
@@ -83,8 +87,11 @@ def _extract_side(verdict: Optional[Mapping[str, Any]], *, side: str,
         return None
     if actionable != (basis == "transferable_strategy"):
         return None
+    scope = verdict.get("modification_scope")
+    if scope not in _MODIFICATION_SCOPES:
+        return None
     return {presence_key: verdict[presence_key], "actionable": actionable,
-            "actionability_basis": basis}
+            "actionability_basis": basis, "modification_scope": scope}
 
 
 def adjudicate(
@@ -106,12 +113,16 @@ def adjudicate(
     child_present = child_side.get("child_present") if child_side else None
     actionable = None
     actionability_basis = None
+    modification_scope = None
     if parent_side is not None and child_side is not None:
         if (parent_side["actionable"] == child_side["actionable"]
                 and parent_side["actionability_basis"] ==
-                child_side["actionability_basis"]):
+                child_side["actionability_basis"]
+                and parent_side["modification_scope"] ==
+                child_side["modification_scope"]):
             actionable = parent_side["actionable"]
             actionability_basis = parent_side["actionability_basis"]
+            modification_scope = parent_side["modification_scope"]
 
     result = framework_adjudication.adjudicate(
         challenge,
@@ -120,11 +131,13 @@ def adjudicate(
         parent_present=parent_present,
         child_present=child_present,
         actionable=actionable,
+        modification_scope=modification_scope,
         evidence_ref=(f"{parent_evidence.get('report_path', '')} -> "
                       f"{child_evidence.get('report_path', '')}"),
     )
     result["adjudicator"] = "imo_proof_fixed_v1"
     result["actionability_basis"] = actionability_basis
+    result["modification_scope"] = modification_scope
     return result
 
 

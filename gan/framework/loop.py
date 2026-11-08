@@ -1747,6 +1747,7 @@ class GanLoop:
                 "qid": qid,
                 "state": result["state"],
                 "reason": result["reason"],
+                "modification_scope": result.get("modification_scope"),
             })
         if rows:
             challenge_ledger.save(self.output_dir, data, self.ledger_writer)
@@ -4014,6 +4015,20 @@ class GanLoop:
                 child.meta["deep_probe_required"] = require_deep_probe
                 child.meta["deep_probe_patch_proposed"] = bool(
                     plan_result.get("deep_probe_patch_proposed"))
+                # Deterministic qid/answer leakage is a planner-modification
+                # hard gate.  The task run is retained as evidence, but this
+                # child must never be promoted to a parent or evaluated as a
+                # successful repair.  The invalid-child path is local to this
+                # generation, so sibling children and the outer loop continue.
+                direct_audit = (child.meta.get("challenge_audit") or {})
+                if direct_audit.get("hard_gate"):
+                    self._finalize_invalid_node(
+                        child, "challenge_modification_hard_gate",
+                        str(direct_audit.get("reason") or
+                            "challenge modification audit triggered"),
+                        outer, inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
                 if base and self.code_root:
                     # audit: per-generation ref pinned by the patch application
                     self.log_event({"type": "code_branch", "genid": str(genid),
@@ -4244,6 +4259,19 @@ class GanLoop:
                 except challenge_ledger.ChallengeError as e:
                     self._archive_invalid("challenge_adjudication_failed", parent, parents,
                                           genid, str(e), outer=outer, inner=inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
+                modification_gate_rows = [
+                    row for row in (child.meta.get("challenge_adjudications") or [])
+                    if row.get("modification_scope") in {
+                        "instance_specific_memory", "answer_leakage",
+                    }
+                ]
+                if modification_gate_rows:
+                    self._finalize_invalid_node(
+                        child, "challenge_modification_hard_gate",
+                        json.dumps(modification_gate_rows, ensure_ascii=False,
+                                   sort_keys=True), outer, inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
                 run_dir = paths.runs_dir(self.output_dir, genid)

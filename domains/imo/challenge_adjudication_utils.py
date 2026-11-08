@@ -16,5 +16,6 @@ def format_input_dict(row):
         "claim": row["Claim"],
         "evidence_ref": row["Evidence Ref"],
         "repair_criterion": row["Repair Criterion"],
+        "task_change": row.get("Task Change", "{}"),
     }
 

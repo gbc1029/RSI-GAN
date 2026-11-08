@@ -29,6 +29,23 @@ class ChallengeLedgerTest(unittest.TestCase):
             }],
         }
 
+    def test_hardcoding_audit_marks_qid_and_answer_leakage_as_hard_gate(self):
+        qid_result = challenge_ledger.audit_single_question_hardcoding(
+            ["q1"], '+ set_prompt("repair q1")', {})
+        self.assertTrue(qid_result["hard_gate"])
+        self.assertEqual(qid_result["modification_scope"],
+                         "instance_specific_memory")
+        answer_result = challenge_ledger.audit_single_question_hardcoding(
+            ["q1"], '+ reference_solution = "x"', {})
+        self.assertTrue(answer_result["hard_gate"])
+        self.assertEqual(answer_result["modification_scope"], "answer_leakage")
+
+    def test_general_strategy_is_not_deterministically_blocked(self):
+        result = challenge_ledger.audit_single_question_hardcoding(
+            ["q1"], '+ add_prompt("use CRT when congruences are compatible")', {})
+        self.assertFalse(result["hard_gate"])
+        self.assertIsNone(result["modification_scope"])
+
     def test_lock_is_blind_and_qid_bound(self):
         with self.assertRaisesRegex(challenge_ledger.ChallengeError, "revealed"):
             challenge_ledger.lock(
