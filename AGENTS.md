@@ -54,12 +54,20 @@ live under `scripts/dgmh/`.
   consumed ONCE (depth-N derivation is legal) and the consumption pin —
   which keeps the lineage a tree, ≤1 consumer per node — is EXEMPT from
   the reconcile's fourth question via the primitive's own `pinned`
-  evidence set (docs/19 §12.52, N1); a block's ``msg_index`` is its
-  RENDER ADDRESS — ``register_history`` accepts only the canonical
-  prefix (``cm_register_history_refused``), the address map rides the
-  snapshot/restore, and the sixth reconcile question
-  (``msg_index_moved``) allows only same-text / own-baked-form /
-  unbound-binds-to-own-text moves (docs/19 §12.53, N2),
+  evidence set (docs/19 §12.52, N1); a block's ``msg_index`` is its RENDER
+  ADDRESS whose ONLY legal domain is the turn's CANONICAL history — exactly
+  (same length, same ``(role, text)`` per index): the framework registers the
+  canonical itself at the turn boundary (``_open_turn``), a mismatching list
+  from agent code is sent but never registered
+  (``cm_register_history_refused``), and ``render``/``finalize_turn`` refuse to
+  render a non-canonical list at all (``cm_render_off_canonical`` +
+  ``cm_view.stats.send_unrendered`` + ``summary().send_unrendered_turns`` ⇒
+  cost key ``cm_send_unrendered``); the address map rides the
+  snapshot/restore, and the sixth reconcile question (``msg_index_moved``)
+  allows only same-text / own-baked-form / unbound-binds-to-own-text moves
+  (docs/19 §12.53, §12.55 — the old "canonical prefix + appended entries"
+  allowance was removed because an appended entry never enters the next turn's
+  canonical, so its address was a misaddress one turn later, finding C),
   and ``resolve()`` also loads the P2 NAMED agent-owned assembly (``cost.cm_assembly``
   design key → ``gan/components/<role>/cm/<stem>.py``, delivered as
   ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the

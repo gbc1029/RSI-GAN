@@ -226,6 +226,27 @@ def _shipped_text(m: Any) -> Optional[str]:
     return _entry_text(m)
 
 
+def _canon_seq(msgs: Any) -> List[Tuple[str, Optional[str]]]:
+    """The CANONICAL IDENTITY sequence: ``(role, text)`` per entry.
+
+    docs/19 §12.55 (finding C): ``msg_index`` is a render ADDRESS, so the only
+    list an address may point into is the turn's canonical history. Identity is
+    compared BY VALUE — the client rebuilds the list every call, so object
+    identity never survives a turn — and ROLE is part of it: an entry that
+    keeps its text but changes role is a different message, and letting it
+    through would address it from a block that belongs to the old one.
+    """
+    return [(str(m.get("role") or ""), _entry_text(m))
+            for m in (msgs or []) if isinstance(m, dict)]
+
+
+def _canon_diff(canon: List[Tuple[str, Optional[str]]],
+                got: List[Tuple[str, Optional[str]]]) -> int:
+    """Index of the first disagreement (or ``min(len)`` — a length mismatch)."""
+    return next((i for i, (a, b) in enumerate(zip(canon, got)) if a != b),
+                min(len(canon), len(got)))
+
+
 def _normalize_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     """One carrier, one spelling (docs/19 §12.54-B, I1/I2/I5/I6).
 
@@ -890,6 +911,13 @@ class CMSession:
     _entry_legacy_seen: bool = field(default=False, repr=False, compare=False)
     _entry_projection_seen: bool = field(default=False, repr=False,
                                          compare=False)
+    # C (docs/19 §12.55): this turn's send was NOT the canonical list, so the
+    # view was not rendered (a capability refusal, never a strike). The
+    # one-shot flag keeps the event to once per session; the counter is the
+    # session-level audit fact.
+    _turn_unrendered: bool = field(default=False, repr=False, compare=False)
+    _turn_unrendered_seen: bool = field(default=False, repr=False, compare=False)
+    unrendered_turns: int = 0
 
     # ------------------------------------------------------------------- config
     def __post_init__(self) -> None:
@@ -1099,6 +1127,10 @@ class CMSession:
             out["send_mismatches"] = self.send_mismatches
         if self.send_drift_chars:
             out["send_drift_chars"] = self.send_drift_chars
+        # C (docs/19 §12.55): turns whose send was refused rendering (the list
+        # was not the canonical). A framework observation, never degradation.
+        if self.unrendered_turns:
+            out["send_unrendered_turns"] = self.unrendered_turns
         # The MEASURED leak signal (docs/19 §12.31): how many of the
         # workers abandoned at T are STILL alive. A timed-out worker may
         # finish normally after the wait was abandoned (band ② — the wait
@@ -1205,28 +1237,34 @@ class CMSession:
         rendered copy must not grow a second block or the view would fight
         its own output. Blocks carry their latest msg_index for rendering.
 
-        A/N2 (docs/19 §12.53): ``msg_index`` is a render ADDRESS, so the list
-        must be the CANONICAL history (or a canonical PREFIX plus appended
-        entries). When the turn entry captured the canonical sequence, any
-        other list (reordered / truncated / replaced) is REFUSED as a whole —
-        registering it would bind blocks to entries that ``render`` will
-        never visit — and the refusal is emitted
-        (``cm_register_history_refused``). Direct construction without a turn
-        entry keeps the historical behaviour (no check)."""
+        A/N2 + C (docs/19 §12.53, §12.55): ``msg_index`` is a render ADDRESS,
+        so the ONLY list that may be registered is the turn's CANONICAL
+        history — exactly (same length, same ``(role, text)`` at every index).
+        The earlier "canonical PREFIX plus appended entries" allowance is GONE
+        (finding C): an appended entry never enters the next turn's canonical
+        (the client rebuilds ``raw_history + [user, assistant]``), so an
+        address into the appended region is a misaddress one turn later — and
+        §12.53's own sixth reconcile question treats it as an escape, i.e. the
+        documented-legal case became a strike. Appended content may still be
+        SENT (that is the author path's business); it is simply not MANAGED.
+
+        Registration is now FRAMEWORK-OWNED for the canonical: ``_open_turn``
+        registers it before any preset/assembly runs, so a mismatching list
+        from agent code costs nothing but this refusal. Direct construction
+        without a turn entry keeps the historical behaviour (no check).
+        """
         self._require_msg_dicts(msgs, "register_history")
         canon = self._turn_canonical
         if canon is not None:
-            got = [_msg_text(m) for m in msgs if isinstance(m, dict)]
-            # PREFIX equality: "canonical + appended entries" stays legal
-            # (indices still address the same messages); a reorder, a
-            # truncation or a replacement makes every index untrustworthy.
-            if got[:len(canon)] != canon:
-                first = next((i for i, (a, b) in enumerate(zip(canon, got))
-                              if a != b), len(canon))
+            got = _canon_seq(msgs)
+            if got != canon:
                 self._emit({"type": "cm_register_history_refused",
                             "reason": "not_canonical",
                             "got": len(got), "want": len(canon),
-                            "first_diff": first})
+                            "first_diff": _canon_diff(canon, got),
+                            "detail": "the address space is the CANONICAL "
+                                      "history; an appended/reordered list is "
+                                      "sent but never registered"})
                 return
         for i, m in enumerate(msgs):
             content = _msg_text(m)
@@ -1463,49 +1501,7 @@ class CMSession:
         refs — and the canonical texts layer, which can now only fire for
         direct callers)."""
         self._require_msg_dicts(msgs, "assemble_turn")
-        self.turn += 1
-        self._turn_degraded = False
-        self._send_expect = None   # set by whoever produces THIS turn's send
-        self._method_face = None  # per-turn method-face budget reset
-        # ONE CARRIER, ONE SPELLING (docs/19 §12.54-B): normalize at the turn
-        # boundary, in place and position-preserving (every address computed
-        # below indexes this list). A retired ``text`` spelling is rewritten to
-        # ``content`` and a fed-back send projection is dropped — both spoken
-        # ONCE per session, because a silent rewrite is how the two-spelling
-        # era stayed invisible. Two carriers that DISAGREE are refused loudly:
-        # that is the ambiguity this change exists to remove.
-        for i, entry in enumerate(msgs or []):
-            if not isinstance(entry, dict):
-                continue
-            if _entries_conflict(entry):
-                self._emit({"type": "cm_entry_carrier_conflict", "turn": self.turn,
-                            "refs": [f"msgs[{i}]"],
-                            "allowed": ["role", _RAW_KEY]})
-                raise ValueError(
-                    f"history[{i}] carries BOTH {_RAW_KEY!r} and 'text' with "
-                    f"different text; allowed entry keys: "
-                    f"['role', {_RAW_KEY!r}] (+ the framework-private "
-                    f"{_SENT_KEY!r}, which is never read from the canonical)")
-            _, note = _normalize_entry(entry)
-            if note == "legacy" and not self._entry_legacy_seen:
-                self._entry_legacy_seen = True
-                self._emit({"type": "cm_entry_legacy_key", "turn": self.turn,
-                            "refs": [f"msgs[{i}]"],
-                            "detail": "entry carried the retired 'text' "
-                                      "spelling; normalized to 'content'"})
-            elif note == "projection" and not self._entry_projection_seen:
-                self._entry_projection_seen = True
-                self._emit({"type": "cm_entry_projection_stripped",
-                            "turn": self.turn, "refs": [f"msgs[{i}]"],
-                            "detail": f"{_SENT_KEY!r} is the framework-owned "
-                                      "SEND projection; recomputed per send, "
-                                      "never read from a history"})
-        # A (docs/19 §12.53): the ONE list every block address must point
-        # into. Captured BEFORE the preset/assembly runs, so the framework's
-        # own ``register_history`` call and the assembly's boundary copy both
-        # validate against it.
-        self._turn_canonical = [_msg_text(m) for m in msgs
-                                if isinstance(m, dict)]
+        self._open_turn(msgs)
         fn = self._assembly_fn
         if fn is None:
             fn, fallback = assembly.resolve(self.mode)
@@ -2105,16 +2101,25 @@ class CMSession:
         """Direct-form seam (tests / non-chat callers): render the history
         only; passthrough returns ``msgs`` unchanged.
 
+        It shares the SAME turn boundary as ``assemble_turn`` (``_open_turn``):
+        the canonical identity is captured and the framework registers it, so
+        the passthrough direct form can no longer validate against a STALE
+        canonical captured by an earlier call (finding C: it used to refuse
+        every later list with ``not_canonical`` while still returning it,
+        leaving the new entries unregistered and silent).
+
         No send claim is set here: the direct form has no outgoing message and
         no client call following it, so a ``cm_send_fact`` from a LATER call
         must not be compared against a stale vector — ``_send_expect`` is
         cleared (``compare:false`` on an unrelated fact beats a false drift)."""
-        self._send_expect = None
+        self._require_msg_dicts(msgs, "assemble")
         if self.mode == "passthrough":
-            self.turn += 1
-            self.register_history(msgs)
+            self._open_turn(msgs)
             self.emit_view(0)
+            self.claim_send(msgs, "")
             return msgs
+        # non-passthrough: ``assemble_turn`` opens the turn itself (never open
+        # it twice — the turn counter and the per-turn resets must advance once)
         send_history, _msg = self.assemble_turn(msgs, "", tokens_used=tokens_used,
                                                 budget=budget)
         return send_history
@@ -2430,6 +2435,94 @@ class CMSession:
             self._recorded_refs.update(str(r) for r in (rec.get("refs") or []))
         return saved_total
 
+    # ------------------------------------------------------ turn boundary
+    def _open_turn(self, msgs: List[Dict[str, Any]]) -> None:
+        """The ONE turn boundary, shared by ``assemble_turn`` and ``assemble``.
+
+        Owns four facts, in this order (docs/19 §12.54-B, §12.55):
+
+        1. the per-turn resets (degraded flag, send claim, unrendered flag,
+           method-face budget);
+        2. entry normalization — in place and position-preserving, because
+           every address computed below indexes this list (a retired ``text``
+           spelling becomes ``content``; a fed-back send projection is
+           dropped; both are spoken ONCE per session, since a silent rewrite
+           is how the two-spelling era stayed invisible, and two carriers that
+           DISAGREE are refused loudly);
+        3. the CANONICAL IDENTITY of the turn — ``(role, text)`` per entry,
+           captured BEFORE any preset/assembly runs;
+        4. **the framework registers the canonical itself** (finding C): the
+           address space belongs to the framework, so a module that appends,
+           reorders or rebuilds the list cannot cost the turn its
+           registration — its list is simply not registered, loudly.
+        """
+        self.turn += 1
+        self._turn_degraded = False
+        self._send_expect = None   # set by whoever produces THIS turn's send
+        self._turn_unrendered = False
+        self._method_face = None  # per-turn method-face budget reset
+        for i, entry in enumerate(msgs or []):
+            if not isinstance(entry, dict):
+                continue
+            if _entries_conflict(entry):
+                self._emit({"type": "cm_entry_carrier_conflict", "turn": self.turn,
+                            "refs": [f"msgs[{i}]"],
+                            "allowed": ["role", _RAW_KEY]})
+                raise ValueError(
+                    f"history[{i}] carries BOTH {_RAW_KEY!r} and 'text' with "
+                    f"different text; allowed entry keys: "
+                    f"['role', {_RAW_KEY!r}] (+ the framework-private "
+                    f"{_SENT_KEY!r}, which is never read from the canonical)")
+            _, note = _normalize_entry(entry)
+            if note == "legacy" and not self._entry_legacy_seen:
+                self._entry_legacy_seen = True
+                self._emit({"type": "cm_entry_legacy_key", "turn": self.turn,
+                            "refs": [f"msgs[{i}]"],
+                            "detail": "entry carried the retired 'text' "
+                                      "spelling; normalized to 'content'"})
+            elif note == "projection" and not self._entry_projection_seen:
+                self._entry_projection_seen = True
+                self._emit({"type": "cm_entry_projection_stripped",
+                            "turn": self.turn, "refs": [f"msgs[{i}]"],
+                            "detail": f"{_SENT_KEY!r} is the framework-owned "
+                                      "SEND projection; recomputed per send, "
+                                      "never read from a history"})
+        self._turn_canonical = _canon_seq(msgs)
+        # the framework's own registration (idempotent by fingerprint): the
+        # preset/assembly calls become no-ops for the same list, and a
+        # mismatching list is refused without costing the turn anything.
+        self.register_history(msgs)
+
+    def _note_off_canonical(self, msgs: Any, where: str) -> bool:
+        """``True`` when ``msgs`` is NOT this turn's canonical (docs/19 §12.55).
+
+        The address space is the canonical, so a list that is not IDENTICAL to
+        it cannot be rendered into: doing so replaces whichever message
+        happens to sit at a block's index (``render``'s span-drift branch then
+        writes a placeholder over an innocent entry — probed: a reordered list
+        through ``finalize_turn`` elided a message the block never owned, with
+        zero violations before this guard).
+
+        Sets the per-turn flag (so the turn's ``cm_view`` can say it) and
+        speaks ONCE per session; no strike — this is a capability refusal, not
+        an escape.
+        """
+        canon = self._turn_canonical
+        if canon is None:
+            return False
+        got = _canon_seq(msgs)
+        if got == canon:
+            return False
+        if not self._turn_unrendered:
+            self._turn_unrendered = True
+            self.unrendered_turns += 1
+        if not self._turn_unrendered_seen:
+            self._turn_unrendered_seen = True
+            self._emit({"type": "cm_render_off_canonical", "turn": self.turn,
+                        "where": where, "got": len(got), "want": len(canon),
+                        "first_diff": _canon_diff(canon, got)})
+        return True
+
     # ------------------------------------------------------ send fact (audit)
     def claim_send(self, send_history: List[Dict[str, Any]],
                    send_msg: str) -> None:
@@ -2503,6 +2596,10 @@ class CMSession:
         call ``render`` itself and still return its own list)."""
         self._require_msg_dicts(msgs, "finalize_turn")
         self._finalized_turn = self.turn
+        # C (docs/19 §12.55): decide BEFORE ``emit_view`` whether this turn's
+        # send can be rendered, so the turn's own cm_view can say so (the
+        # ``send_unrendered`` stat has to be part of the same brief).
+        self._note_off_canonical(msgs, "finalize_turn")
         saved = self.count_ops(records)
         self.emit_view(saved, records)
         send_history = self.render(msgs)
@@ -2575,8 +2672,16 @@ class CMSession:
         the session keep), the frozen placeholder line, or the catalog-card
         line — the view cannot fabricate content (§5.2 不变量 1). Idempotent:
         an entry whose content already carries the block's baked artifact is
-        left alone."""
+        left alone.
+
+        C (docs/19 §12.55): rendering is only legal on the turn's CANONICAL
+        list. A block's ``msg_index`` is an index into that list, so rendering
+        any other list would write the form over whichever message now sits at
+        that index. A non-canonical list is returned as untouched copies and
+        the refusal is spoken once (``cm_render_off_canonical``)."""
         self._require_msg_dicts(msgs, "render")
+        if self._note_off_canonical(msgs, "render"):
+            return [dict(m) if isinstance(m, dict) else m for m in msgs]
         by_msg: Dict[int, List[Block]] = {}
         for block in self.universe.ordered():
             form = self.view.form_of(block.block_id)
@@ -2778,6 +2883,13 @@ class CMSession:
         if self._finalized_turn != self.turn:
             stats["send_source"] = ("identity" if self.mode == "passthrough"
                                     else "author")
+        # C (docs/19 §12.55): the send could not be rendered because the list
+        # was not the canonical one. Conditional (absence = the view shipped),
+        # and it is the ONLY trace when an assembly feeds a reordered list:
+        # the send fact agrees with itself there (claim and payload are both
+        # the unrendered list), so drift cannot see it.
+        if self._turn_unrendered:
+            stats["send_unrendered"] = True
         return stats
 
 

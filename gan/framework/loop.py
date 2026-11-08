@@ -128,6 +128,9 @@ _CM_COST_KEYS = (
     # render's claim. Conditional in ``summary()`` (absence = clean), so a
     # "rendered but never shipped" session can never read as healthy here.
     "send_mismatches", "send_drift_chars",
+    # C (docs/19 §12.55): turns whose send was not the canonical list, so the
+    # view was refused rendering. Conditional too (absence = the view shipped).
+    "send_unrendered_turns",
 )
 
 

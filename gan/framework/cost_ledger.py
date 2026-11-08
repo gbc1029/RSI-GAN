@@ -173,6 +173,10 @@ def _cm_node(items: List[Dict[str, Any]], *,
         # payload disagreed with the render's claim. A framework bug, not a
         # module failure — deliberately NOT part of ``cm_degraded``.
         "cm_send_mismatches": sum(1 for f in facts if f.get("drift")),
+        # C (docs/19 §12.55): sends refused rendering because the list was not
+        # the canonical one. A capability refusal, never a module failure —
+        # deliberately NOT part of ``cm_degraded``.
+        "cm_send_unrendered": n("cm_render_off_canonical"),
         "cm_violations": n("cm_violation"),
         "cm_face_violations": n("cm_face_violation"),
         "cm_policy_failures": n("cm_policy_failed"),
