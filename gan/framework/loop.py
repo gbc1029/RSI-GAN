@@ -134,6 +134,34 @@ _CM_COST_KEYS = (
 )
 
 
+# U (docs/19 §12.64): the summary keys that are deliberately NOT in the cost
+# record. Both are actionable "fix this module" REPORTS for the next
+# self-improve session (they ride ``policy_report``/``assembly_report`` into the
+# prompt, docs/19 §12.17) — a cost row carries counters, not remedies.
+_CM_SUMMARY_ONLY = ("assembly_report", "policy_report")
+
+
+def _cm_cost_node(cm_sum: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The ``cm`` node of a ``cost_sessions.jsonl`` row: the whitelist transform.
+
+    Extracted from the (very long) cost writer so the CONTRACT is testable in
+    one line: which ``summary()`` keys reach the record, and that a session
+    with **zero turns** still speaks (U, docs/19 §12.64).
+
+    * ``None`` in -> ``None`` out: no session means no node (absence = "CM was
+      never wired" — the meaning ``rec["cm"]`` is missing must keep).
+    * A 0-turn session still yields a node. It used to be gated on
+      ``summary()["turns"]``, so a seat built with a disabled/latched module
+      that died before its first LLM call reported ``policy_disabled: true`` to
+      the receipt while the cost row said nothing at all.
+    * Unknown keys are DROPPED (default-deny): the whitelist is the record's
+      contract, and a field the whitelist does not name is invisible on disk.
+    """
+    if cm_sum is None:
+        return None
+    return {k: cm_sum[k] for k in _CM_COST_KEYS if k in cm_sum}
+
+
 def _receipt_for_evaluator(receipt):
     """The evaluator's projection of the plan receipt — outcomes only.
 
@@ -866,15 +894,21 @@ class GanLoop:
                     cm_sum = None
             if cm_sum is not None:
                 try:
-                    if cm_sum.get("turns"):
-                        # The whitelist is the cost record's CONTRACT: a field
-                        # absent from it is lost from cost_sessions.jsonl even
-                        # though the session reported it. assembly_* /
-                        # traj_segments used to be dropped, so a run with a
-                        # configured named assembly read exactly like one
-                        # without it (both had no assembly fields at all).
-                        rec["cm"] = {k: cm_sum[k] for k in _CM_COST_KEYS
-                                     if k in cm_sum}
+                    # The whitelist is the cost record's CONTRACT: a field
+                    # absent from it is lost from cost_sessions.jsonl even
+                    # though the session reported it. assembly_* /
+                    # traj_segments used to be dropped, so a run with a
+                    # configured named assembly read exactly like one without
+                    # it (both had no assembly fields at all).
+                    #
+                    # U (docs/19 §12.64): gated on "a session EXISTS", never on
+                    # ``turns``. A 0-turn session is legal and can carry
+                    # decision-grade state (a latched/disabled module, a
+                    # degraded build); gating on turns made those rows read as
+                    # "CM was never wired".
+                    node = _cm_cost_node(cm_sum)
+                    if node is not None:
+                        rec["cm"] = node
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass
             # 幂等：同 key 记录已存在时不重复写入文件（防止 reconcile 重复
