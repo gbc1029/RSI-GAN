@@ -1270,11 +1270,23 @@ def run_gan_driver(
         _cost_rollup(output_dir, label="run", since_ts=0.0)  # full-run cumulative
         return code_root
     finally:
+        # docs/19 §12.70: the BROKERS must shut down BEFORE the LLM proxy.
+        # Closing the proxy first left `role_broker`/`task_broker` shutting down
+        # their seats against a dead control socket, so every scoped-token
+        # revocation raced the close and surfaced as
+        # "[ERROR] role sandbox ACL reclaim failed: role proxy revoke failed:
+        #  [Errno 104] Connection reset by peer" — a misleading message (the
+        # ACLs HAD been reclaimed) that also marked the seat scope `failed`
+        # (which refuses later launches). Shutdown order is now
+        # brokers → proxy; each step is still independently attempted so a
+        # failure in one can never skip the others.
         try:
-            proxy.close()
+            task_broker.close()
         finally:
             try:
-                task_broker.close()
-            finally:
                 role_broker.close()
-                shutil.rmtree(proxy_dir, ignore_errors=True)
+            finally:
+                try:
+                    proxy.close()
+                finally:
+                    shutil.rmtree(proxy_dir, ignore_errors=True)

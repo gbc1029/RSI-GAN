@@ -16,7 +16,7 @@ import threading
 import shutil
 import tempfile
 from multiprocessing.connection import Connection
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from gan.framework.sandbox_etc import SANDBOX_HOSTNAME, validate_sandbox_etc
 
@@ -777,7 +777,19 @@ class _RoleBrokerState:
             if scope is not None:
                 scope["state"] = "cleanup"
 
-    def _finish_reclaim(self, pid: int, errors: List[str]) -> None:
+    def _finish_reclaim(self, pid: int, errors: List[str],
+                        revoke_error: Optional[str] = None) -> None:
+        """Close a reclaim: ACL errors decide the STATE, revoke stays separate.
+
+        docs/19 §12.70: ``errors`` means the writable-tree ACLs could not be
+        reclaimed — that is a real failure and keeps ``state="failed"`` (which
+        ``launch`` still refuses). ``revoke_error`` means only "the proxy could
+        not be told to drop the scoped token" (typically because the seat died
+        first, or because teardown already closed the proxy). It is recorded in
+        its own field — never merged into ``cleanup_error`` — and it does not
+        poison the scope. Both are always written, so a stale value from an
+        earlier reclaim can never be read back as current.
+        """
         with self._lock:
             key = self._scope_by_pid.pop(int(pid), None)
             scope = self._scopes.get(key) if key is not None else None
@@ -785,10 +797,16 @@ class _RoleBrokerState:
                 return
             scope["active_pid"] = None
             scope["cleanup_error"] = "; ".join(errors[:5]) if errors else None
+            scope["revoke_error"] = revoke_error
             scope["state"] = "failed" if errors else "idle"
+        if revoke_error:
+            print(f"[WARN] scoped proxy token not revoked ({revoke_error}); the "
+                  f"ACLs were reclaimed — the token stays valid until the proxy "
+                  f"process exits", flush=True)
 
     def _finish_failed_launch(self, scope: Dict[str, Any], errors: List[str], *,
-                              launched: bool) -> None:
+                              launched: bool,
+                              revoke_error: Optional[str] = None) -> None:
         key = self._scope_key(scope)
         with self._lock:
             current = self._scopes.get(key)
@@ -799,7 +817,12 @@ class _RoleBrokerState:
                     0, int(current.get("launch_count", 1)) - 1)
             current["active_pid"] = None
             current["cleanup_error"] = "; ".join(errors[:5]) if errors else None
+            current["revoke_error"] = revoke_error
             current["state"] = "failed" if errors else "idle"
+        if revoke_error:
+            print(f"[WARN] scoped proxy token not revoked after a failed launch "
+                  f"({revoke_error}); the ACLs were reclaimed — the token stays "
+                  f"valid until the proxy process exits", flush=True)
 
     def launch(self, role: str, seat: str, instance: str, *,
                peer_pid: int, peer_uid: int,
@@ -1033,18 +1056,26 @@ class _RoleBrokerState:
                 self._release_traverse(traverse_entries, str(cfg["setfacl"]), role_uid)
             )
             shutil.rmtree(runtime_root, ignore_errors=True)
+            # docs/19 §12.70: a failed PROXY TOKEN revocation is NOT an ACL
+            # reclaim failure and must not be reported as one. It is kept in its
+            # own field (and still raised/logged) so neither fact can hide the
+            # other: an ACL failure stays a hard error, the token race stays
+            # visible as its own sentence.
+            revoke_error = None
             if process is not None:
                 try:
                     self._revoke_proxy(str(scope["proxy_token"]))
                 except Exception as exc:
-                    reclaim_errors.append(f"role proxy revoke failed: {exc}")
+                    revoke_error = f"role proxy revoke failed: {exc}"
             self._finish_failed_launch(
-                scope, reclaim_errors, launched=process is not None)
-            if reclaim_errors:
+                scope, reclaim_errors, launched=process is not None,
+                revoke_error=revoke_error)
+            if reclaim_errors or revoke_error:
                 raise RuntimeError(
                     "role sandbox launch failed and ACL reclaim also failed: "
                     f"{type(launch_error).__name__}: {launch_error}; "
                     + "; ".join(reclaim_errors[:5])
+                    + (f"; {revoke_error}" if revoke_error else "")
                 ) from launch_error
             raise
 
@@ -1073,17 +1104,27 @@ class _RoleBrokerState:
                     os.close(fd)
                 except OSError:
                     pass
+            # docs/19 §12.70: the token revocation is a SEPARATE fact from the
+            # ACL reclaim (which has already finished above). It used to be
+            # appended to ``errors``, which (a) mislabelled a revoked-after-exit
+            # race as "role sandbox ACL reclaim failed" and (b) marked the whole
+            # scope ``state="failed"`` — and ``launch`` REFUSES a failed scope,
+            # so one unreachable token revoke could take the seat down for the
+            # rest of the run. The race is kept visible (own field + WARN), never
+            # folded into the ACL verdict, so a genuine reclaim failure still
+            # reads exactly as before.
+            revoke_error = None
             if pid is not None:
                 proxy_token = self._proxy_tokens_by_pid.pop(pid, None)
                 if proxy_token:
                     try:
                         self._revoke_proxy(proxy_token)
                     except Exception as exc:
-                        errors.append(f"role proxy revoke failed: {exc}")
+                        revoke_error = f"role proxy revoke failed: {exc}"
                 runtime_root = self._runtime_dirs.pop(pid, None)
                 if runtime_root:
                     shutil.rmtree(runtime_root, ignore_errors=True)
-                self._finish_reclaim(pid, errors)
+                self._finish_reclaim(pid, errors, revoke_error=revoke_error)
         if errors:
             raise RuntimeError("; ".join(errors[:5]))
 

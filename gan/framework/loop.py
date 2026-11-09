@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import statistics
 import threading
@@ -207,6 +208,13 @@ from utils.soft_fail import soft_fail
 from utils import prune
 
 _MEASURED = ("ok", "partial")
+
+# A task-child trajectory label as the materialization sees it: the numeric genid
+# dir (main chain) or the fixed-root evaluation round's own dir. Every one of
+# these is EXPECTED to be outside a p/e seat's sandbox bind (docs/19 §12.48 has
+# no task-trajectory mount), which is why the seat-bind demotion is only noisy
+# rather than alarming for exactly this shape (docs/19 §12.70).
+_TASK_TRAJ_LABEL_RE = re.compile(r"^(?:\d+|eval_outer\d+_s\d+)/task\.jsonl$")
 
 
 def stagnation_metric(anchor_child: Optional[float], anchor_parent: Optional[float],
@@ -1475,13 +1483,28 @@ class GanLoop:
                     # sandbox can open (the seat binds only its own tree).
                     # Dropping it silently would make "not visible" and "not
                     # readable" indistinguishable in the audit.
+                    #
+                    # docs/19 §12.70: ONE of those shapes is expected by
+                    # construction — a p/e seat has no task-trajectory mount at
+                    # all (§12.48), so every ``<genid>/task.jsonl`` is skipped
+                    # in EVERY session of EVERY run and the console line became
+                    # constant noise that dilutes real warnings. The event is
+                    # still written either way (nothing hidden); only the
+                    # console line is spared, and ONLY when every label matches
+                    # that known shape. Any other label keeps the warning, so an
+                    # unexpected path can never be masked by this gate.
+                    _expected_only = all(
+                        _TASK_TRAJ_LABEL_RE.match(str(lbl)) for lbl in skipped)
                     soft_fail(
                         f"{len(skipped)} trajectory file(s) outside the "
                         f"{role}/{seat} seat bind are not materialized: "
                         f"{skipped[:4]}",
                         event_path=paths.events_path(self.output_dir),
                         event_type="cm_traj_skipped", role=role, seat=seat,
-                        labels=list(skipped)[:20])
+                        labels=list(skipped)[:20],
+                        reason=("no_task_trajectory_mount" if _expected_only
+                                else "unexpected_path"),
+                        console=not _expected_only)
                 role_obj.cm_descriptor = cm_wiring.descriptor(
                     role, keys, seat=seat, instance=instance, genid=genid,
                     session_cm_mode=(keys or {}).get("cm_mode"),

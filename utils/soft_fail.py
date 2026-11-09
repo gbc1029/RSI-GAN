@@ -17,19 +17,27 @@ from utils import trajectory_log
 
 
 def soft_fail(message: str, *, event_path: str = None, event_type: str = "soft_fail",
-              **fields) -> None:
+              console: bool = True, **fields) -> None:
     """Report-and-continue for Tier-A degradations.
 
     ``message``   : human-readable one-liner (already includes where + error);
     ``event_path``: optional events.jsonl path (caller computes it via
                     ``gan.framework.paths.events_path(output_dir)`` when an
                     output dir is in scope);
+    ``console``   : whether to ALSO print the human line. Default ``True`` keeps
+                    every existing call site byte-identical. ``False`` is only
+                    for conditions that are EXPECTED by construction AND carry
+                    their own structured event — the event is still written, so
+                    nothing is silenced; only the console line is spared. A
+                    caller must never use it to hide an error it has not
+                    classified as expected (docs/19 §12.70);
     ``**fields``  : extra structured fields merged into the event record.
     """
-    try:
-        print(f"[WARN] {message}")
-    except Exception:  # noqa: BLE001 -- printing must never be the failure
-        pass
+    if console:
+        try:
+            print(f"[WARN] {message}")
+        except Exception:  # noqa: BLE001 -- printing must never be the failure
+            pass
     if event_path:
         try:
             trajectory_log.append(event_path, {
