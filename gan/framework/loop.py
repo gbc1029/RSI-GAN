@@ -125,6 +125,9 @@ _CM_COST_KEYS = (
     # the cost record (absence = clean). ``thread_leaks_live`` is the MEASURED
     # restart signal; the other two are its prediction / census sibling.
     "thread_leaks", "thread_leaks_live", "thread_leak_delta",
+    # WHO leaked (docs/19 §12.67): the COUNT alone was unattributable, two real
+    # rounds reported the same "delta=1" on the same seat with no name.
+    "thread_leak_names",
     # SEND FACT (docs/19 §12.54-C): turns whose SENT widths disagreed with the
     # render's claim. Conditional in ``summary()`` (absence = clean), so a
     # "rendered but never shipped" session can never read as healthy here.

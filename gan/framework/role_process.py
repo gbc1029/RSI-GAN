@@ -379,6 +379,17 @@ class RoleProcess:
 
     def _start_worker(self, seat: str) -> None:
         self._stop_worker()
+        # ② (docs/19 §12.65): the seat pin is a WORKER-lifetime fact, not a
+        # host-lifetime one. One RoleProcess legitimately serves the role's
+        # main seat and its self_improve seat in sequence; leaving the pin on
+        # the first seat refused EVERY row of the second one — measured
+        # 2026-11-09 R1: 36 `traj_row_refused{reason:"seat pin mismatch"}`, and
+        # the two self-improve sessions' trajectory (session + llm_calls
+        # sidecar) never landed at all, while the previous accepted round
+        # (pre-F5, 2026-11-03) had 8 such files. Each seat switch starts a NEW
+        # child, and that child may name exactly ONE seat — the guarantee is
+        # unchanged; only the scope of the pin is corrected.
+        self._traj_seat = None
         broker_socket = os.environ.get("GAN_ROLE_BROKER_UNIX", "").strip()
         if not broker_socket:
             raise RoleProcessError("role broker launch capability is required")
@@ -708,7 +719,10 @@ class RoleProcess:
             "role_worker_restart", seat=seat, method=method,
             reason="cm_thread_leak",
             thread_leaks=summary.get("thread_leaks"),
-            thread_leak_delta=summary.get("thread_leak_delta"))
+            thread_leak_delta=summary.get("thread_leak_delta"),
+            # WHO (docs/19 §12.67): the restart event must carry the names, or
+            # the hygiene restart stays a number nobody can act on.
+            thread_leak_names=summary.get("thread_leak_names"))
         try:
             self._stop_worker()
             self._start_worker(seat)

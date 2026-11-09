@@ -421,12 +421,20 @@ class DomainTaskRunner:
         if emitted:
             self._event("cm_events_ingested", genid=str(genid), events=emitted)
         else:
-            # A zero-event sidecar after a real harness run means the child
-            # had no seam session (or its emit never reached the file):
-            # exactly the failure mode that used to be invisible.
+            # A zero-event sidecar after a real harness run has TWO causes that
+            # look identical from here (docs/19 §12.66): the child genuinely had
+            # no seam session, OR the audit channel itself was down and the
+            # child's events died with its tmpfs. Saying only the first
+            # attribution sent a real investigation to the wrong layer for a
+            # whole round, so the reason names the ambiguity and points at the
+            # harness's own "[WARN] f5 audit channel delivered 0" line, which is
+            # the discriminator.
             self._event("cm_events_ingest_empty", genid=str(genid),
-                        reason="sidecar present but no seam events (child "
-                               "ran without a cm session)")
+                        reason="sidecar present but no seam events — either the "
+                               "child ran without a cm session, or the audit "
+                               "telemetry channel delivered nothing (see the "
+                               "harness '[WARN] f5 audit channel delivered 0' "
+                               "line in logs/task_runner.log)")
 
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,

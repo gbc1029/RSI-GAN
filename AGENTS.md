@@ -152,8 +152,14 @@ live under `scripts/dgmh/`.
   signal) plus a post-session hygiene restart when the session summary reports
   leaked worker threads (``thread_leaks``/``thread_leak_delta`` — conditional
   fields, absence = clean; framework plumbing threads are excluded by NAME
-  prefix ``rsi-gan-``/``f5-telemetry``/``role-inactivity-watchdog``, so the
-  census only sees what an agent module actually spawned, docs/19 §12.59); the task seat latches a failed named assembly OR POLICY for the
+  prefix ``rsi-gan-``/``f5-telemetry``/``role-inactivity-watchdog``/
+  ``litellm-logging``, so the
+  census only sees what an agent module actually spawned, docs/19 §12.59; the
+  census also reports WHICH threads: ``thread_leak_names`` is the multiset
+  difference against the build-time name baseline, so a thread already alive
+  when the session opened is never blamed on it — a bare ``delta`` was
+  unattributable and cost two rounds of "something leaked, unknown",
+  docs/19 §12.67); the task seat latches a failed named assembly OR POLICY for the
   REST of the generation (harness-injected ``GAN_CM_ASSEMBLY_DISABLED`` /
   ``GAN_CM_POLICY_DISABLED`` — the agent child is per-question);
   STDLIB-ONLY import contract because it is

@@ -35,6 +35,18 @@ _TASK_ENV_NAMES = {
     # snapshot is fixed per generation) — honored in _build_cm_session,
     # never supplied by the parent.
     "GAN_CM_ASSEMBLY_DISABLED", "GAN_CM_POLICY_DISABLED",
+    # F5 audit channel (docs/19 §12.28): the run-scoped telemetry socket,
+    # HARNESS-ORIGINATED (``bwrap --setenv``, hop 1) and consumed HERE by
+    # ``_init_telemetry``. Missing from this list was a SILENT audit kill:
+    # the socket path died at hop 2, ``_init_telemetry`` returned at its
+    # "no socket requested" branch (indistinguishable from a manual run), no
+    # ``traj_row`` ever reached the harness, every generation became
+    # ``trajectory_archive_failed`` and its score was nulled while the task
+    # answers were CORRECT (measured 2026-11-09 R1: 2/2 correct, report
+    # accuracy 1.0, score null). Guard: scripts/local/test_task_env_mirror.py
+    # now also scans the child runtime for GAN_* env READS that no hop
+    # carries, not just the three whitelists against each other.
+    "GAN_TELEMETRY_UNIX",
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",

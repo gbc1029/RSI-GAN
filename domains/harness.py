@@ -18,7 +18,51 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from datetime import datetime
 from utils.telemetry import TelemetryServer
-from gan.framework.traj_chain import TrajChain
+
+
+def _audit_chain():
+    """The audit hash chain, imported from the STAGED snapshot.
+
+    A″ (docs/19 §12.65): this harness runs INSIDE the sandbox, where ``gan/``
+    does not exist (``task_execution._RUNTIME_DIRS`` copies agent/ + utils/
+    only), so the framework module can never be imported here. The framework
+    therefore COPIES ``gan/framework/traj_chain.py`` into ``.gan_runtime/``
+    (same delivery as the CM core) and this resolves it as a top-level module,
+    exactly like ``domains/task_worker`` resolves ``cm``.
+
+    Loud on failure: the chain is the tamper evidence for the task
+    trajectory, and a silent fail-open would disable it without a trace.
+    """
+    import sys as _sys
+    for cand in (os.environ.get("GAN_AUDIT_SRC") or "",
+                 os.path.join(os.getcwd(), ".gan_runtime")):
+        if cand and os.path.isfile(os.path.join(cand, "traj_chain.py")):
+            if cand not in _sys.path:
+                _sys.path.insert(0, cand)
+            break
+    try:
+        from traj_chain import TrajChain as _Chain  # noqa: F401
+        from traj_chain import stream_fingerprint as _fp  # noqa: F401
+        return _Chain, _fp
+    except ImportError:
+        pass
+    # Root/manual path (the documented `python -m domains.harness` flow, and
+    # every offline test): there is no stage, but the repo IS the tree, so the
+    # framework module is importable. Resolved AFTER the staged copy so a
+    # sandbox never silently uses a different tree than the one it was staged
+    # from.
+    try:
+        from gan.framework.traj_chain import TrajChain as _Chain  # noqa: F401
+        from gan.framework.traj_chain import stream_fingerprint as _fp
+        return _Chain, _fp
+    except ImportError as exc:  # pragma: no cover -- both deliveries broken
+        raise RuntimeError(
+            "audit chain unavailable: neither the staged snapshot "
+            "(.gan_runtime/traj_chain.py, delivered by "
+            "materialize_cm_snapshot) nor gan.framework.traj_chain is "
+            f"importable. A harness that cannot chain the task trajectory is "
+            f"refused loudly, never run unaudited (docs/19 §12.65). ({exc})"
+        ) from exc
 import pandas as pd
 from hydra import compose, initialize_config_dir
 from utils.common import summarize_error
@@ -653,7 +697,8 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
             os.makedirs(os.path.dirname(host_cm_events), exist_ok=True)
             with open(host_cm_events, "a", encoding="utf-8"):
                 pass
-        chain = TrajChain()
+        _Chain, _fp = _audit_chain()
+        chain = _Chain()
         cm_received: list = []
         telemetry_socket = os.path.join(stage_root, "telemetry.sock")
 
@@ -728,6 +773,29 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
                 detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
                 raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
 
+            # A LIVE socket that delivered NOTHING is the exact shape of a dead
+            # audit channel — the socket path dropped at an env hop, a refused
+            # connect, a client that could not be imported, or an agent that
+            # never logs. It used to be silent whenever rc == 0: the child's own
+            # diagnostic ("[f5] telemetry channel not established / up") lives
+            # in a PIPE the harness throws away on success, and the finally-line
+            # below only speaks when the chain is non-empty. Measured cost of
+            # that silence: docs/19 §12.66 — every generation's trajectory
+            # archive came back empty and its CORRECT answer was nulled to
+            # score=null while nothing in the run said why.
+            if _telemetry is not None and _telemetry.rows == 0:
+                _child_diag = "\n".join(
+                    part for part in ((proc.stdout or "").strip(),
+                                      (proc.stderr or "").strip()) if part)
+                print("[WARN] f5 audit channel delivered 0 trajectory rows and "
+                      f"{_telemetry.cm_events} cm events for this question "
+                      f"(connected={_telemetry.connected}, "
+                      f"socket={telemetry_socket}) — the task trajectory will be "
+                      "empty, so the generation's archive will FAIL and its score "
+                      "will be nulled"
+                      + (f"\n[WARN] child diagnostics:\n{_child_diag[-1200:]}"
+                         if _child_diag else ""), flush=True)
+
             result_file.seek(0)
             raw_result = result_file.read()
             # F5 P1: no trajectory copy-back — the telemetry sink wrote the
@@ -735,8 +803,8 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
     finally:
         if _telemetry is not None:
             _telemetry.stop()
-        from gan.framework.traj_chain import stream_fingerprint
-        fseq, fhead, freason = stream_fingerprint(trajectory_source)
+        _, _fp = _audit_chain()
+        fseq, fhead, freason = _fp(trajectory_source)
         if fseq > 0 or freason:
             print(f"[f5] traj rows chained={fseq} head={fhead} "
                   f"reason={freason} cm_events={len(cm_received)}", flush=True)

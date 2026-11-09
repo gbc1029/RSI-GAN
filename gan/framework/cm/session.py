@@ -46,6 +46,7 @@ from __future__ import annotations
 import copy
 import os
 import threading
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -94,24 +95,67 @@ _DEDUP_MARKER = "[gan:system prompt deduplicated]"
 # signal was constant noise. The exclusion is prefix-based only: anything an
 # agent module spawns keeps its own name and still counts, so the leak
 # detection itself is not weakened.
+#
+# §12.67: the name is what lets this tuple stay SMALL and true. The remaining
+# constant was ``litellm-logging_0`` — litellm's own logging worker, spawned
+# lazily on the first provider call, i.e. ALWAYS after a session baseline taken
+# at build. It made every plan/evaluate seat look like it leaked one thread and
+# paid a full worker restart for it (measured 2026-11-09, §12.67.6: the census
+# named it, and the two rounds before that had only "+1" to argue about).
 _FOREIGN_THREAD_EXCLUDE = (
     "ThreadPoolExecutor",   # concurrent.futures pools (framework + libs)
     "cm_exec",              # the CM per-turn exec worker (counted as thread_leaks)
     "rsi-gan-",             # every framework thread: llm-relay, llm-proxy, *-broker
     "f5-telemetry",         # telemetry client pump
     "role-inactivity-watchdog",
+    "litellm-logging",      # litellm's own logging worker (lazy, first call)
 )
 
 
-def _foreign_thread_count() -> int:
-    n = 0
+def _foreign_threads() -> List[str]:
+    """NAMES of the live threads the census counts (one entry per thread).
+
+    The NAME is the whole point of the census: a bare ``thread_leak_delta=1``
+    is unattributable — it cannot say whether the extra thread belongs to the
+    agent's module, to a library, or to framework plumbing the exclusion tuple
+    has not learned yet (measured 2026-11-09: two independent real rounds each
+    reported exactly ``+1`` on the planner's plan seat with no name, so the
+    only possible diagnosis was "something, somewhere"). Duplicate names are
+    kept: a module that spawns two workers must read as 2.
+    """
+    out: List[str] = []
     for t in threading.enumerate():
         if not t.is_alive() or t is threading.main_thread():
             continue
         if t.name.startswith(_FOREIGN_THREAD_EXCLUDE):
             continue
-        n += 1
-    return n
+        out.append(str(t.name))
+    return out
+
+
+def _foreign_thread_count() -> int:
+    return len(_foreign_threads())
+
+
+def _new_thread_names(baseline: List[str], now: List[str]) -> List[str]:
+    """Names alive NOW that the BASELINE did not already account for.
+
+    Multiset difference (``Counter``), so a framework thread that was already
+    running at session build is never reported as this session's leak, and two
+    same-named new threads report twice. A missing baseline (an old snapshot
+    restore) falls back to "everything counted" — which can only over-report
+    on a session that was ALREADY reporting a delta, never invent one.
+    """
+    if not baseline:
+        return sorted(now)
+    remaining = Counter(baseline)
+    new: List[str] = []
+    for name in now:
+        if remaining.get(name, 0) > 0:
+            remaining[name] -= 1
+        else:
+            new.append(name)
+    return sorted(new)
 
 
 class _ModuleLoad:
@@ -837,6 +881,10 @@ class CMSession:
     _timeout_workers: List[Any] = field(default_factory=list, repr=False,
                                         compare=False)
     _thread_baseline: int = field(default=0, repr=False, compare=False)
+    # NAMES of the counted threads alive at build (docs/19 §12.67) — the
+    # multiset the summary's ``thread_leak_names`` is diffed against.
+    _thread_baseline_names: List[str] = field(default_factory=list, repr=False,
+                                              compare=False)
     _policy_strikes: int = 0
     _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
     # Named-assembly bookkeeping (audit fields materialize WITH the
@@ -977,8 +1025,14 @@ class CMSession:
     # ------------------------------------------------------------------- config
     def __post_init__(self) -> None:
         """Anchor the foreign-thread census at session build (CM-03 leak
-        observability; see ``_foreign_thread_count``)."""
-        self._thread_baseline = _foreign_thread_count()
+        observability; see ``_foreign_thread_count``).
+
+        The baseline is captured as NAMES (docs/19 §12.67), not just a count:
+        a count can say "+1 appeared" and nothing else, while the name says
+        which subsystem to look at. The count stays derived, so the two can
+        never disagree."""
+        self._thread_baseline_names = _foreign_threads()
+        self._thread_baseline = len(self._thread_baseline_names)
 
     def apply_keys(self, keys: Dict[str, Any]) -> None:
         """Type-guarded application of ALREADY-CLAMPED effective values."""
@@ -1143,9 +1197,13 @@ class CMSession:
         never-active assembly must read as exactly that, None ≠ 0 style).
         Conditional audit fields keep the same rule: ``policy_violations`` /
         ``*_overruns`` / ``thread_leaks`` / ``thread_leaks_live`` /
-        ``thread_leak_delta`` / ``est_saved_agent`` appear only when non-zero
-        (absence = zero/clean), while ``assembly_*`` appear whenever an
-        assembly was configured (they may legitimately read 0).
+        ``thread_leak_delta`` / ``thread_leak_names`` / ``est_saved_agent``
+        appear only when non-zero (absence = zero/clean), while
+        ``assembly_*`` appear whenever an assembly was configured (they may
+        legitimately read 0). ``thread_leak_names`` always rides WITH
+        ``thread_leak_delta`` (docs/19 §12.67): the count alone is
+        unattributable, and the two can never disagree because both derive
+        from the same ``_foreign_threads()`` reading.
 
         N4 (docs/19 §12.46): ``est_chars_saved`` is the TOTAL flow (seam +
         agent tool face); ``est_saved_agent`` exports the agent-source half so
@@ -1181,9 +1239,19 @@ class CMSession:
         # restart.
         if self.thread_leaks:
             out["thread_leaks"] = self.thread_leaks
-        delta = _foreign_thread_count() - self._thread_baseline
+        now_names = _foreign_threads()
+        delta = len(now_names) - self._thread_baseline
         if delta > 0:
             out["thread_leak_delta"] = delta
+            # WHO (docs/19 §12.67): the census's number alone was a dead end —
+            # a seat that leaked exactly one thread twice in a row produced
+            # "delta=1" and the hygiene restart, with no way to tell an agent
+            # module from unlearned framework plumbing. The NAMES are the
+            # fact that makes the next action obvious; they are diffed against
+            # the build-time multiset so a thread that was already running
+            # when the session opened is never blamed on this session.
+            out["thread_leak_names"] = _new_thread_names(
+                self._thread_baseline_names, now_names)
         if self.assembly_overruns:
             out["assembly_overruns"] = self.assembly_overruns
         if self.policy_overruns:
