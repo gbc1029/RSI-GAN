@@ -16,6 +16,7 @@ throwaway copy is the fallback when no code tree is in play.
 """
 from __future__ import annotations
 
+import csv
 import os
 import json
 import shutil
@@ -38,6 +39,38 @@ def _modify_depth(records: List[Dict[str, Any]]) -> int:
     if records:
         return 1          # operator-level (shallow design)
     return 0
+
+
+def _final_output_summary(
+    predictions_path: str,
+    max_rows: int = 50,
+    tail_chars: int = 96,
+) -> Dict[str, Any]:
+    """Bounded, score-free evidence for checking apparent output truncation."""
+    summary: Dict[str, Any] = {
+        "source": "final_predictions.csv", "rows": [], "omitted_rows": 0,
+    }
+    try:
+        with open(predictions_path, "r", encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            fields = list(reader.fieldnames or [])
+            id_col = "Problem ID" if "Problem ID" in fields else next(
+                (name for name in fields if name != "prediction"), None)
+            for index, row in enumerate(reader):
+                if index >= max_rows:
+                    summary["omitted_rows"] += 1
+                    continue
+                value = str(row.get("prediction") or "")
+                summary["rows"].append({
+                    "question_id": (
+                        str(row.get(id_col) or index) if id_col else str(index)),
+                    "blank": not bool(value.strip()),
+                    "chars": len(value),
+                    "tail": value[-tail_chars:],
+                })
+    except Exception as exc:
+        summary["error"] = f"{type(exc).__name__}: {exc}"[:300]
+    return summary
 
 
 # Only a PROPOSED patch that produced no new code commit is a rejection.
@@ -674,16 +707,36 @@ class DomainTaskRunner:
                               event_type="parent_scoring_failed", genid=str(genid))
         else:
             # Preserve independent harness/evaluator domains.
-            rc, _out = tx.run_harness_and_report(
-                self.python, run_dir, self.domain, run_id, self.subset,
-                self.num_samples, model, env, self.timeout,
-                dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
-                reasoning_effort=self.reasoning_effort,
-            )
+            if self.fixed_question_ids:
+                # Fixed-root evaluation must use the same explicit question
+                # ids on every outer.  The broker receives this file through
+                # the eval scope and must not resample the training subset.
+                questions_path, _ground_truth, sample_info = (
+                    tx.prepare_questions_by_ids(
+                        self.repo_root, run_dir, self.domain, self.subset,
+                        self.fixed_question_ids))
+                rc, _out = tx.run_harness_and_report(
+                    self.python, run_dir, self.domain, run_id, self.subset,
+                    self.num_samples, model, env, self.timeout,
+                    questions_path=questions_path, scope_id=str(genid),
+                    log_path=self.log_path,
+                    reasoning_effort=self.reasoning_effort,
+                )
+            else:
+                sample_info = {}
+                rc, _out = tx.run_harness_and_report(
+                    self.python, run_dir, self.domain, run_id, self.subset,
+                    self.num_samples, model, env, self.timeout,
+                    dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
+                    reasoning_effort=self.reasoning_effort,
+                )
             if self.domain == "imo_proof":
                 self._event("task_harness_done", genid=str(genid), rc=rc,
                             question_timeout_s=question_timeout_s,
-                            harness_timeout_s=self.timeout)
+                            harness_timeout_s=self.timeout,
+                            sample_mode=sample_info.get("mode"),
+                            sampled_ids=sample_info.get("sampled_ids"),
+                            anchor_ids=sample_info.get("anchor_ids"))
             report = None
             if self.domain == "imo_proof":
                 # Proof grading is completed inside the privileged broker with
@@ -802,6 +855,10 @@ class DomainTaskRunner:
                 print(f"[WARN] question_patch_apply event write failed: {e}")
 
         report_sha = scores.sha256_file(report_path)
+        final_output_summary = None
+        if self.domain == "imo_proof":
+            final_output_summary = _final_output_summary(
+                os.path.join(output_path, "predictions.csv"))
         # copy small evidence out of the ephemeral work dir (which is pruned)
         try:
             evid = paths.runs_dir(self.output_dir, genid)
@@ -860,6 +917,7 @@ class DomainTaskRunner:
                 "invalid_reason": invalid_reason,
                 "toolset_report": toolset_report,
                 "design_stripped": design_stripped or None,
+                "final_output_summary": final_output_summary,
                 # Reserved cost keys of this generation (docs/10 §10): the
                 # effective values that governed the child + the clamp records
                 # (the receipt projects the clamps to the planner).

@@ -370,6 +370,37 @@ def lineage_of(code_root: str, ref_name_or_sha: str) -> List[str]:
     return [l for l in r.stdout.splitlines() if l.strip()]
 
 
+def is_ancestor(code_root: str, ancestor: str, tip: str) -> bool:
+    """True when ``ancestor`` is an ancestor of (or equal to) ``tip``."""
+    if not ancestor or not tip:
+        return False
+    r = _git(code_root, "merge-base", "--is-ancestor", str(ancestor), str(tip),
+             check=False)
+    return r.returncode == 0
+
+
+def rev_range_with_subject(code_root: str,
+                           base: str, tip: str) -> Optional[List[Tuple[str, str]]]:
+    """``(sha, subject)`` of every commit in ``base..tip`` (newest first).
+
+    ``None`` when the range is unusable (bad ref / git failure) so callers can
+    tell "empty range" apart from "could not look" — the role-carry base check
+    must never mistake a git hiccup for "nothing to carry".
+    """
+    if not base or not tip:
+        return None
+    r = _git(code_root, "log", "--format=%H %s", f"{base}..{tip}", check=False)
+    if r.returncode != 0:
+        return None
+    out: List[Tuple[str, str]] = []
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        sha, _, subject = line.partition(" ")
+        out.append((sha.strip(), subject.strip()))
+    return out
+
+
 def branch_tips(code_root: str, prefix: str = "task_") -> Dict[str, str]:
     """Map of ``task_*`` ref names to commit SHAs (ref-reconciliation + audit)."""
     r = _git(code_root, "branch", "--list", f"{prefix}*", "--format=%(refname:short) %(objectname)")

@@ -44,6 +44,18 @@ _DISABLE_SHALLOW_NOTE = (
     "(`request_source_access` + `edit_source`)."
 )
 
+_DEEP_PROBE_NOTE = (
+    "\n## Reserved deep-exploration probe\n"
+    "This round follows sustained objective stagnation. Try ONE small, reversible, "
+    "behavior-changing source patch to the task agent (`task_agent.py` or "
+    "`gan/components/task/**`). Use `request_source_access(..., intent=\"modify\")` "
+    "and `edit_source`; prompt/config/knowledge-only edits and view-only grants do "
+    "not satisfy the probe. Prefer a reusable solving or verification mechanism, "
+    "never problem-specific content or grader knowledge. If no responsible deep "
+    "change can be justified after inspection, you may leave the source unchanged; "
+    "the round remains valid and the missed probe will only be audited."
+)
+
 
 class Planner(Role):
     def __init__(self, model: str, output_dir: str, instance: Optional[str] = None, **kwargs):
@@ -64,6 +76,7 @@ class Planner(Role):
         deny_deep: bool = False,
         shallow_prompt_only: bool = False,
         disable_shallow: bool = False,
+        require_deep_patch: bool = False,
         carried_over: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
@@ -92,6 +105,8 @@ class Planner(Role):
             parts.append(_SHALLOW_PROMPT_ONLY_NOTE)
         if disable_shallow:
             parts.append(_DISABLE_SHALLOW_NOTE)
+        if require_deep_patch:
+            parts.append(_DEEP_PROBE_NOTE)
         if parents and len(parents) > 1:
             parts.append(
                 f"\n## Multiple candidate parents (you may CROSSOVER their designs)\n```json\n"
@@ -161,6 +176,7 @@ class Planner(Role):
         max_tool_calls: int = 40,
         tool_repeat_limit: Optional[int] = None,
         cost_statement: str = "",
+        require_deep_patch: bool = False,
         response_contract: Optional[str] = None,
         carried_over: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
@@ -215,6 +231,7 @@ class Planner(Role):
                     if broker is not None else False,
                     disable_shallow=bool(getattr(broker, "disable_shallow", False))
                     if broker is not None else False,
+                    require_deep_patch=require_deep_patch,
                     carried_over=carried_over),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
@@ -256,7 +273,19 @@ class Planner(Role):
                     + ". Re-request those paths with request_source_access(refresh=true) "
                     "and redo the edit on the fresh baseline.")
 
-            patch_str = _build_patch()
+            patch_str, refusal = _build_patch()
+            if require_deep_patch and not patch_str and not refusal:
+                hist = self.run(
+                    "# Deep probe not yet satisfied\n"
+                    "No task-source diff was produced. Inspect the task source and "
+                    "make one small behavior-changing source edit if a responsible "
+                    "change is available. If it is not, state that clearly and stop; "
+                    "do not fabricate a patch or repeat shallow edits.",
+                    msg_history=hist, max_tool_calls=max_tool_calls,
+                    tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
+                _absorb_run_flags()
+                attempts += 1
+                patch_str, refusal = _build_patch()
             last_hash = None
             for attempt in range(patch_retry_k + 1):
                 patch_str, refusal = _build_patch()
@@ -303,6 +332,8 @@ class Planner(Role):
             "patch": "" if rejected else patch_str,
             "patch_proposed": patch_str,
             "patch_rejection": rejected,
+            "deep_probe_required": require_deep_patch,
+            "deep_probe_patch_proposed": bool((patch_str or "").strip()),
             "attempts": attempts,
             "truncated": truncated_any,
             "budget_exhausted": exhausted,

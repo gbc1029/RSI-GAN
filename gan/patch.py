@@ -52,6 +52,47 @@ def _iter_files(root: str):
                 yield os.path.join(dirpath, name)
 
 
+def _file_eol(path: str) -> str:
+    """The ON-DISK line terminator of ``path``: ``"\\r\\n"`` or ``"\\n"``.
+
+    ``_read_lines`` opens in TEXT mode, so universal newlines turn every
+    ``\\r\\n`` into ``\\n`` before the diff is built. The generated hunks then
+    carry LF context/``-`` lines while the working-tree file still holds CRLF
+    bytes, and ``git apply`` (a byte-wise context search) rejects every hunk of
+    an otherwise correct patch with "patch does not apply". Measured in this
+    tree: 168 / 253 text files are CRLF -- including ``gan/registries/*.json``
+    and ``gan/design/schema_ext/*.json``, i.e. exactly the files every deep
+    registry write must touch -- so those patches were refused 100% of the
+    time while LF targets (knowledge notes, ``task_agent.py``) applied fine.
+    Reading the terminator back from the bytes lets the diff keep the file's
+    own EOL instead of normalising the whole tree.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(1 << 16)
+    except OSError:
+        return "\n"
+    return "\r\n" if b"\r\n" in head else "\n"
+
+
+def _with_eol(lines: List[str], eol: str) -> List[str]:
+    """Re-terminate ``lines`` with ``eol`` (a final newline-less line stays so)."""
+    if eol == "\n" or not lines:
+        return lines
+    return [line[:-1] + eol if line.endswith("\n") else line for line in lines]
+
+
+def _align_eol(a_lines: List[str], b_lines: List[str],
+               a_path: str) -> tuple[List[str], List[str]]:
+    """Put BOTH diff sides on the repo file's own EOL (see ``_file_eol``)."""
+    if not a_lines:
+        return a_lines, b_lines  # a genuine addition: no file style to follow
+    eol = _file_eol(a_path)
+    if eol == "\n":
+        return a_lines, b_lines
+    return _with_eol(a_lines, eol), _with_eol(b_lines, eol)
+
+
 def _no_newline_marker_diff(a_lines: List[str], b_lines: List[str],
                             fromfile: str, tofile: str) -> str:
     """Unified diff that can express "no newline at end of file".
@@ -158,7 +199,11 @@ def _no_newline_marker_diff(a_lines: List[str], b_lines: List[str],
 
 
 def _deletion_diff(repo_root: str, rel_file: str) -> str:
-    a_lines = _read_lines(os.path.join(repo_root, rel_file))
+    path = os.path.join(repo_root, rel_file)
+    # A deletion hunk still carries a-side CONTEXT bytes, so it needs the same
+    # EOL alignment as a modification (a CRLF file deleted from the workspace
+    # was unapplicable for the identical reason).
+    a_lines = _with_eol(_read_lines(path), _file_eol(path))
     if not a_lines:
         return ""
     return _no_newline_marker_diff(a_lines, [], f"a/{rel_file}", "/dev/null")
@@ -337,6 +382,11 @@ def build_patch_from_workspace(broker, role: str, node_id,
                     conflicts.append({"path": rel_file, "markers": conflict[:1200]})
             if a_lines == b_lines:
                 continue
+            # Equal CONTENT can still differ BYTE-WISE on disk (text-mode read
+            # normalised the repo file's CRLF). Re-terminate both sides with
+            # the file's own EOL, otherwise `git apply` refuses every hunk.
+            a_lines, b_lines = _align_eol(
+                a_lines, b_lines, os.path.join(repo_root, rel_file))
             diff = _no_newline_marker_diff(
                 a_lines, b_lines,
                 fromfile=f"a/{rel_file}", tofile=f"b/{rel_file}",

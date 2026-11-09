@@ -289,11 +289,13 @@ with a GAN-native data layer.
   - *deep delete* — removes the registry entry + source file via `unregister_component`;
   - *deep add/modify* — new tool or logic; must touch source via the gated `gan/tools/deep/request_source_access`.
 - After a `modify` grant, planner/evaluator edit their granted copies with `edit_source`, confined to the instance workspace `src/`. Roles are never given raw `bash` (it cannot be confined). A repeated `request_source_access` on an already-granted path does NOT re-copy from `code_root` — in-scope edits survive; pass `refresh=true` to discard them and re-sync.
-- **Deep-write recovery (4 layers, so a deep modification can actually land):**
+- **Deep-write recovery (6 layers, so a deep modification can actually land):**
   1. *copy* — `AccessBroker._safe_copy` writes a temp sibling + `os.replace` and only tries `copystat` best-effort, so a refresh can never fail with `Operation not permitted` just because the workspace copy belongs to another uid (the old `shutil.copy2` did).
   2. *backup* — every overwrite (`refresh=true`, session reset, `clear_workspace` at an outer boundary) copies the actually-EDITED files to `workspaces/_backup/<role>/<instance>/<seq>/` **outside** the purged tree, logs `workspace_backup{files,count,reason}`, and names the discarded files in the tool's answer. Nothing a session wrote is deleted silently any more.
   3. *merge* — each grant snapshots the baseline it copied FROM into `workspace/.gan_base/<rel>`. When the baseline has moved by commit time, `build_patch_from_workspace` runs `git merge-file -p <workspace> <grant-time base> <current repo>`: clean → the merged text becomes the b-side (the edit lands on top of the moved baseline); an unedited stale copy emits **no** diff (it used to emit a silent REVERT); a true same-line conflict REFUSES the patch and is reported (`patch_baseline_drift` event + `broker.last_patch_report`), and the session receives the refusal as a retryable reason ("refresh=true and redo") on BOTH seats instead of a silent empty patch.
   4. *visibility* — one unified diff per file means a registry JSON written by both `update_component` and `edit_source` lands only ONE write. `gan/patch.py:multi_writer_paths` derives that from the existing op records (no new IPC surface) and both receipts gain `multi_writer{path: [tools]}` + a `same_field_overwrite` event, so a lossy session is auditable.
+  5. *EOL* — `_read_lines` reads in TEXT mode (universal newlines), so every diff line ends with LF while the working-tree file may hold CRLF bytes; `git apply` compares context BYTE-WISE and refuses each hunk with "patch does not apply". 168 of 253 tracked text files here are CRLF — including every `gan/registries/*.json` and `gan/design/schema_ext/*.json`, i.e. exactly what `register_component` / `unregister_component` / `add_config_key` must write (2026-11-01 `verify_deep_v2`: task-side patches to LF files landed 4/4, both planner self-improve registry patches were refused 0/2). `_file_eol` reads the terminator back from the BYTES and `_align_eol` re-terminates both diff sides with it (deletion hunks included), so the patch is byte-faithful without normalising the tree; guard `scripts/local/test_crlf_patch.py` (18 checks, asserts the pre-fix diff is refused and the aligned one applies against real `git apply`).
+  6. *ACL mask* — the workspace root carries a DEFAULT ACL for the role, but a default ACL is MASKED by the creating process's umask, and the driver's private umask is 0o077: `copyfile`'s 0666 then lands as 0600, the inherited `u:<role>:rwx` entry becomes `#effective:---`, and the role cannot even READ its own granted copy (measured 2026-11-02 `verify_deep_v3`: `_read_lines(b_file)` `PermissionError` killed BOTH planner self-improve seats before the patch was ever built — `sudo -u rsi_gan_planner head` on the live copy = Permission denied). `_safe_copy` re-asserts `0o660` AFTER `copystat` (chmod rewrites the ACL mask, never the ownership), so the inherited role entry stays effective; guard `scripts/local/test_ws_acl_mask.py` (11 checks: a mask-zeroed control is unreadable, the granted copy is readable AND writable, refresh over a role-owned file still works).
 - The task agent has **no always-on tools**; its capabilities are all opt-in tools.
 
 ### Ablation switches (`docs/11_消融实验设计.md` is the authority)
@@ -343,8 +345,32 @@ with a GAN-native data layer.
   stays where it is — `DesignStore.save` is atomic (tmp + `os.replace`), so the
   heal's re-save opens no new torn-file window.
 
-### Knowledge base (pull-based)
+### Code base lineage (task commits + role commits share one tree)
 
+- **Blood line = the selected node's own commit**, but the *working* base is
+  that commit plus the role self-improvements stacked directly above it:
+  `loop._carry_role_commits`. A self-improve commit belongs to the RUN, not to
+  any task node, so returning the bare parent silently reverted every earlier
+  self-upgrade at the next parent switch (measured 2026-11-02 `verify_deep_v4`:
+  planner's `f5ad5a5` — a 125-line tool plus its registry entry — vanished in
+  outer 2, which then produced an `empty_patch` and the exit heal reported the
+  name as "not registered"). Only `checkpoint.code.commit` was carrying it, and
+  only the RESUME path reads that.
+- **The lift is conditional, and the condition is what makes it safe**: a
+  candidate tip is accepted only when it is a descendant of the parent AND every
+  commit in `parent..tip` is a role commit (`_role_commits` or the
+  `self-improve <role>` subject). Using the raw outer-entry HEAD would be wrong:
+  LCB routinely selects an EARLIER node, and the entry HEAD then also carries
+  the later task generations — a base that lineage says belongs to someone else.
+  Unqualified ranges leave the base untouched, so this can only ADD role
+  commits, never move backwards or mix sibling lines. Audited as
+  `code_base_with_roles{parent_commit,base,role_commits}`; guard
+  `scripts/local/test_role_base_carry.py` (18 checks incl. the gen0-selected
+  leak and the sibling-line case).
+- Node `meta["code_commit"]` still records the TASK commit only, so the lineage
+  graph and ref reconciliation are unchanged by the carry.
+
+### Knowledge base (pull-based)
 - `gan/components/<role>/knowledge/*.md` are **data** — not registry entries, no `name=stem` contract, never executed.
 - The planner authors task-side notes via the deep patch channel; the whole committed base is materialized into the task sandbox each generation (`.gan_runtime/knowledge` + `GAN_TASK_KNOWLEDGE_DIR`; per-note/total caps, skips reported).
 - The task agent reads on demand via the opt-in `knowledge` tool. Planner/evaluator read their own (and task-side) notes through the normal access channel (`request_source_access(view)` + `list_dir`/`read_file`) — never an un-audited side door.

@@ -249,9 +249,32 @@ class _TaskBrokerState:
         model = str(self.config["model"])
 
         parent_scored = bool(self.config["parent_scored"])
+        # Fixed-root eval runners materialize their explicit question list
+        # before asking the broker. Treat that scope like a parent-scored run
+        # for input selection, including independent domains such as imo_proof.
+        fixed_eval = scope_id.startswith("eval_outer")
         questions_path = os.path.join(run_dir, "input", "questions.csv")
-        if parent_scored and not os.path.isfile(questions_path):
+        if (parent_scored or fixed_eval) and not os.path.isfile(questions_path):
             raise RuntimeError(f"task questions file is missing: {questions_path}")
+
+        launch_num_samples = int(self.config["num_samples"])
+        grading_subset = str(self.config["subset"])
+        if fixed_eval:
+            seed_path = os.path.join(str(self.config["output_dir"]),
+                                     "ckpt", "sample_seed.json")
+            try:
+                with open(seed_path, "r", encoding="utf-8") as f:
+                    seed_info = json.load(f)
+                eval_ids = list(seed_info.get("eval_anchor_ids") or [])
+            except (OSError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"fixed-root eval seed is unavailable: {seed_path}") from exc
+            if not eval_ids:
+                raise RuntimeError("fixed-root eval has no eval_anchor_ids")
+            launch_num_samples = len(eval_ids)
+            grading_subset = str(
+                seed_info.get("eval_subset") or self.config["subset"]
+            )
 
         total_timeout = int(self.config["timeout"])
         stage_timeout = max(1, total_timeout // 2) if domain == "imo_proof" else total_timeout
@@ -335,7 +358,7 @@ class _TaskBrokerState:
             # from the run-persistent seed file written by the driver.
             sample_seed = None
             anchor_ids = None
-            if (not parent_scored
+            if (not parent_scored and not fixed_eval
                     and str(self.config.get("sampling_mode", "")) == "seeded"):
                 seed_path = os.path.join(str(self.config["output_dir"]),
                                          "ckpt", "sample_seed.json")
@@ -353,12 +376,12 @@ class _TaskBrokerState:
                 domain,
                 f"gan_{scope_id}",
                 str(self.config["subset"]),
-                int(self.config["num_samples"]),
+                launch_num_samples,
                 model,
                 env,
                 stage_timeout,
-                questions_path=questions_path if parent_scored else None,
-                dataset_root=None if parent_scored else str(self.config["repo_root"]),
+                questions_path=questions_path if (parent_scored or fixed_eval) else None,
+                dataset_root=None if (parent_scored or fixed_eval) else str(self.config["repo_root"]),
                 proxy_socket=str(self.config["proxy_socket"]),
                 proxy_token_fd=proxy_token_fd,
                 expected_owner_uid=int(self.config["owner_uid"]),
@@ -381,7 +404,7 @@ class _TaskBrokerState:
                     str(self.config["python"]),
                     run_dir,
                     f"gan_{scope_id}",
-                    int(self.config["num_samples"]),
+                    launch_num_samples,
                     model,
                     env,
                     stage_timeout,
@@ -397,6 +420,8 @@ class _TaskBrokerState:
                     sandbox_etc_dir=str(self.config["sandbox_etc_dir"]),
                     sandbox_profile=dict(self.config["sandbox_profile"]),
                     num_workers=int(self.config["harness_num_workers"]),
+                    dataset_root=str(self.config["repo_root"]),
+                    subset=grading_subset,
                 )
                 output = f"{output}\n[imo_proof_grading]\n{grading_output}"
                 rc = grading_rc

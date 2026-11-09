@@ -73,6 +73,7 @@ _EVALUATOR_META_KEYS = (
     "design_stripped",         # healing record
     "harness_rc", "invalid_reason", "score_status", "imputed",
     "modify_depth",
+    "final_output_summary",
     # deliberately NOT here: "records" (planner rationale), "receipt" (projected
     # separately, see _receipt_for_evaluator), "delta_vs_parent" (selection
     # pressure must not be fittable), "feedback", "run_dir"/"report_path"/
@@ -205,7 +206,7 @@ from utils import prune
 _MEASURED = ("ok", "partial")
 
 
-def stagnation_metric(anchor_child: Optional[int], anchor_parent: Optional[int],
+def stagnation_metric(anchor_child: Optional[float], anchor_parent: Optional[float],
                       score_child: Optional[float],
                       score_parent: Optional[float]) -> Tuple[str, Any, Any]:
     """Pick the (metric, current, previous) triple for the stagnation verdict.
@@ -218,14 +219,59 @@ def stagnation_metric(anchor_child: Optional[int], anchor_parent: Optional[int],
     is cross-generation comparable: coarse but noise-free, and it costs nothing
     because those questions were already answered.
 
-    Falls back to the score comparison whenever the anchor core cannot be
+    The anchor value is a points total, so partial credit is preserved for
+    domains that expose graded per-question results. Falls back to the score
+    comparison whenever the anchor core cannot be
     compared (no anchors configured -- e.g. ``sampling.anchor_k: 0``, a
     non-parent-scored domain, or a parent generation with no report), so the
     legacy behaviour stays reachable by turning anchors off.
     """
     if anchor_child is not None and anchor_parent is not None:
-        return "anchor_correct", anchor_child, anchor_parent
+        return "anchor_points", anchor_child, anchor_parent
     return "benchmark_mean", score_child, score_parent
+
+
+def stagnation_improvement(
+    metric: str,
+    current: Optional[float],
+    previous: Optional[float],
+    anchor_reference: Optional[float],
+    min_anchor_gain: float,
+    epsilon: float,
+) -> Tuple[bool, Optional[float], Optional[float]]:
+    """Judge one inner result and update the outer's accepted anchor level.
+
+    Anchor gains are compared with the last level that reset patience, not the
+    direct parent. Small rebounds therefore cannot reset patience repeatedly;
+    several small gains can still accumulate until they reach the threshold.
+    Domains without a comparable anchor retain the legacy score comparison.
+    """
+    if current is None:
+        return False, anchor_reference, None
+    if metric != "anchor_points":
+        gain = ((current - previous) if previous is not None else None)
+        improved = previous is None or gain > epsilon
+        return improved, anchor_reference, gain
+
+    reference = anchor_reference if anchor_reference is not None else previous
+    gain = ((current - reference) if reference is not None else None)
+    improved = reference is None or gain >= max(0.0, min_anchor_gain)
+    return improved, (current if improved else reference), gain
+
+
+def should_require_deep_probe(
+    no_improve: int,
+    patience: int,
+    attempted: bool,
+    deep_available: bool,
+) -> bool:
+    """Reserve at most one deep probe immediately before stagnation breaks."""
+    return bool(
+        patience > 0
+        and no_improve == patience - 1
+        and not attempted
+        and deep_available
+    )
 
 
 class GanLoop:
@@ -833,10 +879,18 @@ class GanLoop:
         child.meta.setdefault("report_summary", {})
         if child.value.score is not None and status in _MEASURED:
             return
+        # A failed harness/evaluator result may still have a parent score
+        # available for audit or imputation, but it is not evidence that the
+        # child is safe to reproduce. Keep the row and score status visible;
+        # only the parent-selection flag is closed here.
         if status == "invalid":
             child.valid_parent = False
             child.value.score_status = "invalid"
             return
+        if status == "failed":
+            child.valid_parent = False
+            child.meta["invalid_reason"] = (
+                child.meta.get("invalid_reason") or "task_failure")
         # bench missing -> impute; if no basis, mark invalid (cannot be parent)
         imputed = self._impute_score(parent)
         if imputed is None:
@@ -1953,17 +2007,17 @@ class GanLoop:
         )
 
     # -- supernode (docs/13 §2.3) -----------------------------------------
-    def _anchor_correct(self, genid: Any) -> Optional[int]:
-        """Correct answers on the run-persistent anchor core, or ``None``.
+    def _anchor_points(self, genid: Any) -> Optional[float]:
+        """Points earned on the run-persistent anchor core, or ``None``.
 
         R4: ``benchmark.mean`` re-draws its question set every generation
         (``derive_sample_seed``), so comparing two generations on it compares two
         different exams -- at 30 questions the standard error is ~0.16, i.e. a
         "no improvement" verdict on it is mostly question-set noise. The anchor
         core is the only part of the sample held identical across generations,
-        so its correct COUNT is a cross-generation comparable signal: coarse
-        (k=2 gives 0/1/2) but noise-free, and free -- the main line has already
-        answered those questions.
+        so its points total is a cross-generation comparable signal. IMO proof
+        labels retain their granularity (incorrect=0, partial=1, almost=6,
+        correct=7) instead of collapsing every non-correct answer to zero.
 
         An anchor the generation did not answer counts as WRONG (a missing answer
         is a miss, not an incomparable observation); ``None`` means there is
@@ -1974,7 +2028,7 @@ class GanLoop:
         per_q = self._read_per_question(genid)
         if not per_q:
             return None
-        return int(sum(per_q.get(q, 0.0) for q in self.anchor_ids))
+        return float(sum(per_q.get(q, 0.0) for q in self.anchor_ids))
 
     def _anchor_stats(self, genid: Any) -> tuple:
         """``(correct, answered)`` on the anchor core, for PARENT SELECTION.
@@ -2037,7 +2091,7 @@ class GanLoop:
         return stamped
 
     def _read_per_question(self, genid: Any) -> Dict[str, float]:
-        """Reconstruct per-question 0/1 from report.json question_ids_{passed,failed}."""
+        """Read per-question points, with a 0/1 fallback for old reports."""
         try:
             p = os.path.join(paths.runs_dir(self.output_dir, genid), "report.json")
             if not os.path.isfile(p):
@@ -2045,10 +2099,15 @@ class GanLoop:
             with open(p, "r", encoding="utf-8") as f:
                 rep = json.load(f)
             out: Dict[str, float] = {}
+            for qid, points in (rep.get("question_points") or {}).items():
+                try:
+                    out[str(qid)] = float(points)
+                except (TypeError, ValueError):
+                    out[str(qid)] = 0.0
             for qid in rep.get("question_ids_passed") or []:
-                out[str(qid)] = 1.0
+                out.setdefault(str(qid), 1.0)
             for qid in rep.get("question_ids_failed") or []:
-                out[str(qid)] = 0.0
+                out.setdefault(str(qid), 0.0)
             return out
         except Exception:  # noqa: BLE001 -- advisory
             return {}
@@ -3534,17 +3593,74 @@ class GanLoop:
 
         Legacy fallback: a node without a recorded code commit falls back to
         HEAD (behavior identical to the pre-branch time-line; audited).
+
+        The parent's own commit is the lineage answer, but it is NOT the whole
+        working state: a role self-improvement commits ON TOP of the task tip
+        and belongs to the RUN, not to any task node. Returning the bare parent
+        silently reverted every earlier self-improvement at the next parent
+        switch (measured 2026-11-02 verify_deep_v4: planner's f5ad5a5 — a new
+        tool plus its registry entry — vanished in outer 2, which then produced
+        an empty patch and the exit heal reported the name as "not
+        registered"). ``_carry_role_commits`` re-attaches only the role commits
+        that sit directly above the parent.
         """
         from gan.framework import code_repo
         head = code_repo.current_commit(self._task_root())
         if str(parent.genid) == "initial":
+            # The outer-entry pin already contains every earlier role commit.
             return code_repo.outer_base_ref_name(outer)
         sha = (parent.meta or {}).get("code_commit") or (parent.meta or {}).get("task_code_commit")
         if not sha:
             self.log_event({"type": "code_lineage_legacy", "outer": outer,
                             "parent_genid": str(parent.genid), "fallback_base": head})
             return head
-        return sha
+        return self._carry_role_commits(str(sha), outer)
+
+    def _carry_role_commits(self, parent_commit: str, outer: int) -> str:
+        """Lift a task-node base to the newest ROLE-ONLY tip above it.
+
+        A candidate tip is accepted only when BOTH hold:
+
+        1. it is a descendant of ``parent_commit`` (same blood line), and
+        2. every commit in ``parent_commit..tip`` is a role self-improvement
+           commit (recorded in ``_role_commits`` or carrying the
+           ``self-improve <role>`` subject).
+
+        Condition 2 is what makes this safe. The raw outer-entry HEAD is NOT an
+        acceptable base: parent selection routinely picks an EARLIER node (LCB
+        favours the least-visited one), and the entry HEAD then also carries the
+        later task generations — using it would hand the child a base that
+        lineage says belongs to someone else (gen0 selected, gen1's changes
+        included). When no candidate qualifies the parent commit is returned
+        unchanged, so this can only ADD role commits, never move backwards or
+        mix siblings.
+        """
+        if not parent_commit or not self._role_commits:
+            return parent_commit
+        task_root = self._task_root()
+        if not task_root:
+            return parent_commit
+        from gan.framework import code_repo
+        role_set = {str(v) for v in self._role_commits.values() if v}
+        best, best_n = parent_commit, 0
+        for tip in sorted(role_set):
+            if tip == parent_commit:
+                continue
+            if not code_repo.is_ancestor(task_root, parent_commit, tip):
+                continue
+            rows = code_repo.rev_range_with_subject(task_root, parent_commit, tip)
+            if not rows:
+                continue  # empty range or git could not look: stay conservative
+            if not all(sha in role_set or subject.startswith("self-improve ")
+                       for sha, subject in rows):
+                continue
+            if len(rows) > best_n:
+                best, best_n = tip, len(rows)
+        if best != parent_commit:
+            self.log_event({"type": "code_base_with_roles", "outer": outer,
+                            "parent_commit": parent_commit, "base": best,
+                            "role_commits": best_n})
+        return best
 
     def _align_code_base(self, parent: Any, outer: int, genid: Any) -> Optional[str]:
         """Checkout the selected parent's code state before planning; resync workspace.
@@ -3583,6 +3699,7 @@ class GanLoop:
         I_max = int(cfg.get("loop.inner_max", 3))
         patience = int(cfg.get("loop.stagnation_patience", 2))
         eps = float(cfg.get("loop.stagnation_epsilon", 0.005))
+        min_anchor_gain = float(cfg.get("loop.stagnation_min_anchor_gain", 2.0))
         bl = int(cfg.get("tree.branch_limit", 2))
         dl = int(cfg.get("tree.depth_limit", 5))
         method = cfg.get("tree.selection", "lcb")
@@ -3665,6 +3782,8 @@ class GanLoop:
         for outer in range(start_outer, end_outer + 1):
             no_improve = 0
             outer_improved = False
+            anchor_reference: Optional[float] = None
+            deep_probe_attempted = False
             outer_genids: List[Any] = []
             self.log_event({"type": "outer_start", "outer": outer})
             _outer_t0 = time.time()
@@ -3764,6 +3883,17 @@ class GanLoop:
                 parent_ref = [] if str(parent.genid) == "initial" else [parent.genid]
                 # Ablation projections for the plan session (docs/11).
                 disable_plan = self._ab("disable_planner")
+                deep_available = bool(
+                    not disable_plan
+                    and self.broker is not None
+                    and not bool(getattr(self.broker, "deny_deep", False))
+                    and not bool(getattr(self.broker, "deep_view_only", False))
+                    and not bool(getattr(self.broker, "shallow_prompt_only", False))
+                )
+                require_deep_probe = should_require_deep_probe(
+                    no_improve, patience, deep_probe_attempted, deep_available)
+                if require_deep_probe:
+                    deep_probe_attempted = True
                 plan_feedback = parent_feedback
                 plan_issues = evaluator_issues
                 plan_pred = parent_predicted_score
@@ -3818,6 +3948,15 @@ class GanLoop:
                     self.log_event({"type": "cost_statement_skipped", "seat": "plan",
                                     "genid": str(genid),
                                     "reason": "role signature lacks cost_statement"})
+                if require_deep_probe:
+                    if self._accepts_kwarg(self.planner.plan, "require_deep_patch"):
+                        plan_cost_kwargs["require_deep_patch"] = True
+                    else:
+                        self.log_event({
+                            "type": "deep_probe_skipped", "outer": outer,
+                            "inner": inner, "genid": str(genid),
+                            "reason": "planner signature lacks require_deep_patch",
+                        })
 
                 try:
                     if disable_plan:
@@ -3903,6 +4042,9 @@ class GanLoop:
                 child.meta["planner_commit"] = self._role_commits.get("planner")
                 child.meta["evaluator_commit"] = self._role_commits.get("evaluator")
                 child.meta["source_pool"] = "global" if use_global else "subtree"
+                child.meta["deep_probe_required"] = require_deep_probe
+                child.meta["deep_probe_patch_proposed"] = bool(
+                    plan_result.get("deep_probe_patch_proposed"))
                 if base and self.code_root:
                     # audit: per-generation ref pinned by the patch application
                     self.log_event({"type": "code_branch", "genid": str(genid),
@@ -3915,6 +4057,10 @@ class GanLoop:
 
                 # score / imputation / validity
                 self._finalize_child(child, parent)
+                child.meta["deep_probe_patch_applied"] = bool(
+                    require_deep_probe and child.meta.get("patch_applied"))
+                child.meta["deep_probe_missed"] = bool(
+                    require_deep_probe and not child.meta.get("patch_applied"))
                 # Anchor stamp for CROSS-GENERATION parent selection
                 # (``tree.selection=lcb``): computed ONCE here and carried on the
                 # node, so selection never re-reads report.json per candidate and
@@ -4095,6 +4241,15 @@ class GanLoop:
                 packet = self._build_packet(child, ctx)
                 if getattr(ctx, "predicted_score", None) is not None:
                     child.value.potential = ctx.predicted_score
+                # ``hard_failure`` reports (including cannot_run after a
+                # harness/question failure) are retained for evaluator audit,
+                # but must never feed the next parent selection.
+                if any(bool(value) for key, value in packet.penalties.items()
+                       if key in {"cannot_run", "harness_failed",
+                                  "question_timeout", "evaluator_failed"}):
+                    child.valid_parent = False
+                    child.meta["invalid_reason"] = (
+                        child.meta.get("invalid_reason") or "task_failure")
                 # Persist calibration values on the node so a later branch can
                 # use the selected parent's history rather than loop order.
                 child.meta["predicted_score"] = getattr(ctx, "predicted_score", None)
@@ -4142,11 +4297,16 @@ class GanLoop:
                 # The anchor core is identical every generation; benchmark.mean
                 # is a different exam each time. Coarse but noise-free beats
                 # precise but incomparable for a "did it move?" verdict.
-                anc_child = self._anchor_correct(child.genid) if measured else None
-                anc_parent = self._anchor_correct(parent.genid) if measured else None
+                anc_child = self._anchor_points(child.genid) if measured else None
+                anc_parent = self._anchor_points(parent.genid) if measured else None
                 metric, cur, prev = stagnation_metric(anc_child, anc_parent, cs, ps)
-                improved = (measured and (cur is not None)
-                            and (prev is None or (cur - prev) > eps))
+                improved = False
+                stagnation_gain = None
+                if measured:
+                    improved, anchor_reference, stagnation_gain = stagnation_improvement(
+                        metric, cur, prev, anchor_reference,
+                        min_anchor_gain=min_anchor_gain, epsilon=eps,
+                    )
                 outer_improved = outer_improved or improved
                 no_improve = 0 if improved else no_improve + 1
                 if cs is not None and ps is not None:
@@ -4157,13 +4317,24 @@ class GanLoop:
                     "genid": genid, "parent_genid": parent.genid, "parents": child.parents,
                     "score": cs, "parent_score": ps, "improved": improved,
                     "improved_metric": metric,
-                    "anchor_correct": anc_child,
-                    "anchor_parent_correct": anc_parent,
+                    "stagnation_gain": stagnation_gain,
+                    "stagnation_required_gain": (
+                        min_anchor_gain if metric == "anchor_points" else eps),
+                    "stagnation_reference": anchor_reference,
+                    "anchor_points": anc_child,
+                    "anchor_parent_points": anc_parent,
                     "score_status": child.value.score_status, "coverage": child.value.coverage,
                     "imputed": bool(child.meta.get("imputed")),
                     "valid_parent": child.valid_parent,
                     "no_improve": no_improve, "penalties": packet.penalties,
                     "modify_depth": child.modify_depth,
+                    "deep_probe_required": require_deep_probe,
+                    "deep_probe_patch_proposed": bool(
+                        plan_result.get("deep_probe_patch_proposed")),
+                    "deep_probe_patch_applied": bool(
+                        require_deep_probe and child.meta.get("patch_applied")),
+                    "deep_probe_missed": bool(
+                        require_deep_probe and not child.meta.get("patch_applied")),
                     "cost_tokens": child.value.cost_tokens,
                     "cost_wallclock_s": child.value.cost_wallclock_s,
                     "duration_s": round(time.time() - _inner_t0, 1),
@@ -4197,8 +4368,8 @@ class GanLoop:
                     self.log_event({"type": "stagnation_break", "outer": outer,
                                     "inner": inner, "metric": metric,
                                     "no_improve": no_improve,
-                                    "anchor_correct": anc_child,
-                                    "anchor_parent_correct": anc_parent})
+                                    "anchor_points": anc_child,
+                                    "anchor_parent_points": anc_parent})
                     break
 
             # ---------------- outer self-improvement ----------------

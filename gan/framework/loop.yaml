@@ -22,7 +22,9 @@ loop:
                                 # 得把 inner_max 提到 >=3）。判据是锚点答对数（R4）
                                 # 不是 benchmark.mean，见 docs/11 §3.0b。
   stagnation_epsilon: 0.005     # delta threshold；锚点口径下每次变化是 1 个整题，
-                                # 所以任何 +1 都算改进（eps 实际退化为 0）
+                                # 仅用于没有固定锚点时的 benchmark fallback。
+  stagnation_min_anchor_gain: 2 # outer 内相对上次认可的 anchor 水平至少增加
+                                # 2 个原始点才重置 patience；+1 可累计但不单独重置。
   keep_workdirs: false          # false: delete work/<genid> after each generation (space)
   # 座位工具调用预算（2026-10-28 调整：原 5/6/8 对 polyglot 实测过紧——
   # smoke_1022_222630 在 6 即 1/6 会话截断；提到 16/20/12 后 verify_1028_1633 仍有
@@ -92,7 +94,7 @@ loop:
 # ---------------------------------------------------------------------------
 tree:
   branch_limit: 2               # B: max children per node
-  depth_limit: 5                # D: max depth
+  depth_limit: 10               # D: max depth
   num_parents: 1                # >1 enables crossover (DAG, shallow config merge)
   # 父代选择策略（消费者：gan/framework/loop.py -> TreeStore.select_parents）
   #   lcb    -- 默认。置信集选择：按"锚点核上的 Wilson 下界"筛出 {n: LCB >= 最优 - delta}
