@@ -628,30 +628,40 @@ class Evaluator:
                     "prev_action": action,
                 }
                 response_str, _ = agent.forward(inputs)
-                action = env.check_action_validity(response_str)
-                reasoning = ""
+                # ``executed`` is what the ENV will actually do (an unparseable
+                # reply is replaced by ``default_action`` and counted in
+                # ``failed_candidates``). The raw reply is kept separately: the
+                # old code reassigned ``action = response_str`` after the step,
+                # so the next turn advertised "your previous action was <prose>"
+                # while the env had executed the default action, and the CSV
+                # Action column disagreed with ``action_frequency``.
+                executed = env.check_action_validity(response_str)
 
-                episode_log["action_frequency"][action] += 1
+                episode_log["action_frequency"][executed] += 1
 
-                obs, reward, terminated, truncated, info = env.step(action)
+                obs, reward, terminated, truncated, info = env.step(executed)
                 done = terminated or truncated
 
                 episode_return += reward  # pyright: ignore
 
                 # Give feedback on the action (if not valid)
                 obs["text"]["long_term_context"] = (
-                    f"\n\nYour previous output did not contain a valid action. Defaulted to action: {action}\n\nObservation:\n"
+                    f"\n\nYour previous output did not contain a valid action. Defaulted to action: {executed}\n\nObservation:\n"
                     + obs["text"]["long_term_context"]
-                    if (action != response_str) and (self.config.eval.feedback_on_invalid_action)
+                    if (executed != response_str) and (self.config.eval.feedback_on_invalid_action)
                     else obs["text"]["long_term_context"]
                 )
-                action = response_str
-                # Write the step data to the CSV file
+                # ``prev_action`` = the action the ENVIRONMENT EXECUTED.
+                action = executed
+                # Write the step data to the CSV file. Column semantics are now
+                # honest: Action = executed, Reasoning = the model's raw reply
+                # (the only record of an illegal attempt, since a defaulted
+                # action overwrites the Action column with ``default_action``).
                 csv_writer.writerow(
                     [
                         step,
-                        action,
-                        reasoning,
+                        executed,
+                        response_str,
                         obs["text"]["long_term_context"],
                         reward,
                         done,

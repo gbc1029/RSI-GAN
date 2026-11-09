@@ -572,7 +572,38 @@ with a GAN-native data layer.
   locate the sidecar. **Attribution only**: the child counts its own calls, the
   root-side proxy meters usage — money/tokens stay the proxy audit's numbers and
   the two are never summed. Guard
-  `scripts/local/verify_episode_sidecar.py` (26 checks).
+  `scripts/local/verify_episode_sidecar.py` (30 checks).
+- **Every STEP of an episode reaches the archive (2026-11-08).** The task agent
+  truncates its transcript at construction (`agent/base_agent.py`:
+  `trajectory_log.reset`), so a multi-step balrog episode kept only its LAST
+  step — measured on the first real round with the new pipeline
+  (`balrog_verify_1108a`: 10 episodes / 98 step children → 10 transcript rows,
+  which silently blinded the evaluator). `domains.harness._copy_back_transcript`
+  now has two modes: `replace` (one child owns the whole transcript: every
+  question domain) and `append` (the child is ONE STEP — the staged file is
+  created EMPTY, because the child wipes it anyway, and its rows are appended to
+  the host file). `_SandboxedBalrogAgent.forward` selects `append`. Re-measured
+  after the fix (`balrog_verify_1108b`): 55 calls → 55 input + 55 output rows.
+- **The recorded action is the EXECUTED one.** `_play_episode` used to do
+  `action = response_str` after the step, so the next turn's `prev_action` was
+  the model's raw prose while the env had executed `default_action` (the
+  feedback line even admitted the default), and the episode CSV's `Action`
+  column contradicted `action_frequency`. Now: `executed =
+  check_action_validity(reply)` drives `prev_action`, `env.step()`,
+  `action_frequency` and the CSV `Action`; the raw reply is preserved in the CSV
+  `Reasoning` column (the only record of an illegal attempt).
+- **Aborted-round guard (P2-16b).** `episodes_aborted` was written into
+  `report.json` and consumed by NOTHING: 2 of 5 episodes dying to an upstream
+  502 still produced an ordinary, depressed score that entered the lineage.
+  `domains.yaml max_aborted_ratio` (balrog family + both concrete domains, which
+  SHADOW it) is resolved by `task_execution.aborted_round_reason` against
+  `compute_report_summary`'s new `episodes_aborted` / `aborted_ratio` facts;
+  above the limit `task_runner` VOIDS the score (`score: null`,
+  `invalid_reason`, `task_round_degraded` event) while keeping the report on
+  disk for forensics. Undeclared = off, so question domains are byte-identical.
+  Guard `scripts/local/verify_score_integrity.py` (32 checks: the CSV/prev_action
+  semantics on the real episode loop, the threshold table, and
+  longest-prefix declaration resolution).
 ### Output layout — `gan/framework/paths.py` is the single source
 
 | path | contents |

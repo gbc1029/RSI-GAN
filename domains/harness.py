@@ -311,6 +311,11 @@ class _SandboxedBalrogAgent:
             self.proxy_token,
             self.reasoning_effort,
             self.cost_overrides,
+            # ONE STEP of one multi-step episode: the episode transcript is
+            # appended by the parent-side telemetry sink, so this child's
+            # construction-time reset must NOT truncate the earlier steps
+            # (docs/19 §12.28 F5 P1 + balrog P2-18b).
+            trajectory_reset=False,
         )
         return prediction, []
 
@@ -391,6 +396,36 @@ def _add_empty_parents(command, path, created):
     for item in reversed(pending):
         command.extend(["--dir", item])
         created.add(item)
+
+
+def _telemetry_stream_target(msg, trajectory_source):
+    """Host file a telemetry message belongs to (transcript vs llm_calls).
+
+    The task child owns TWO audit streams and they have different audiences:
+    the transcript is the agent's EVIDENCE (rendered to the roles) and the
+    ``.llm_calls.jsonl`` sidecar is per-call ACCOUNTING. Untagged forwarding
+    flattened both into the transcript -- audit rows on the evidence surface,
+    and no host sidecar at all (every episode reported ``llm_calls: null``).
+    """
+    if (msg or {}).get("stream") == "llm_calls":
+        return trajectory_source + LLM_CALLS_SIDECAR_SUFFIX
+    return trajectory_source
+
+
+def _telemetry_reset_allowed(msg, trajectory_reset):
+    """May this telemetry message TRUNCATE its target stream?
+
+    ``trajectory_reset=False`` marks a child that is ONE STEP of a multi-step
+    episode (balrog): its construction-time ``trajectory_log.reset()`` must not
+    wipe the rows the earlier steps of the same episode already delivered.
+    The decision lives on the parent (trusted) side of the sink, so a child
+    that changed its own logging behaviour cannot re-enable the truncation.
+    """
+    if (msg or {}).get("type") != "traj_reset":
+        return False
+    if (msg or {}).get("stream") == "llm_calls":
+        return True
+    return bool(trajectory_reset)
 
 
 def _sandbox_command(run_root, agent_path, proxy_socket=None,
@@ -598,9 +633,15 @@ def _cm_policy_latch_scan(staged_lines: str) -> bool:
 
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
                          reasoning_effort=None, cost_overrides=None,
-                         cm_events_target=None):
+                         cm_events_target=None, trajectory_reset=True):
+    # ``trajectory_reset=False`` marks a child that is ONE STEP of a
+    # multi-step episode (balrog): its construction-time
+    # ``trajectory_log.reset()`` must NOT truncate the host transcript that the
+    # earlier steps of the SAME episode already filled. The suppression lives
+    # on the parent (trusted) side of the telemetry sink, so a child that
+    # changed its own logging behaviour cannot re-enable the truncation.
     # (No ``global`` needed: the generation latch lives in the ``_CM_LATCH``
-    # holder, so this function never REBINDS a module-level name — the class
+    # holder, so this function never REBINDS a module-level name -- the class
     # of bug that killed every task question once docs/19 §12.54-A.)
     # Private run ancestors deliberately remain non-traversable to the
     # sandbox uid. Bubblewrap also cannot reliably open bind sources through
@@ -705,13 +746,24 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
 
         def _on_telemetry(msg):
             mtype = msg.get("type")
+            # STREAM ROUTING (balrog P2-18 / A1): the child owns TWO audit
+            # streams -- its transcript and the per-call ``.llm_calls.jsonl``
+            # sidecar -- and flattening both into the transcript put the
+            # per-call rows on the EVIDENCE surface while the host sidecar was
+            # never created (every episode then reported ``llm_calls: null``).
+            # The stream tag keeps them apart; the chain is keyed by base path,
+            # so each stream keeps its own head (traj_chain docstring).
+            target = _telemetry_stream_target(msg, trajectory_source)
             if mtype == "traj_row" and isinstance(msg.get("record"), dict):
                 from utils import trajectory_log as _tlog
-                _tlog.append(trajectory_source,
-                             chain.stamp(trajectory_source, msg["record"]))
+                _tlog.append(target, chain.stamp(target, msg["record"]))
             elif mtype == "traj_reset":
+                if not _telemetry_reset_allowed(msg, trajectory_reset):
+                    # A multi-step episode keeps appending: dropping the reset
+                    # is what preserves every earlier step in the archive.
+                    return
                 from utils import trajectory_log as _tlog
-                _tlog.reset(trajectory_source)
+                _tlog.reset(target)
             elif mtype == "cm_event" and isinstance(msg.get("event"), dict):
                 cm_received.append(msg["event"])
                 if cm_events_target:

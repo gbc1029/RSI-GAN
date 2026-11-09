@@ -3507,6 +3507,43 @@ def derive_response_contract(domain: Optional[str],
     return _UNIVERSAL_RESPONSE_CONTRACT
 
 
+def aborted_round_reason(report_summary: Optional[Dict[str, Any]],
+                         domain_cfg: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Reason string when a round's ABORTED share exceeds its declaration.
+
+    Episode domains (balrog) declare ``max_aborted_ratio`` in ``domains.yaml``.
+    The evaluator already raises when EVERY episode dies; the dangerous middle
+    is a PARTIAL infrastructure failure: 2/5 aborted episodes are scored 0.0, so
+    the mean drops, the lineage records that lower number as a real result, and
+    nothing in the pipeline ever says "this round lost episodes".
+
+    ``None`` = no declaration, no episode facts, or within budget (the three
+    no-op cases that keep every question domain byte-identical).
+    """
+    if not domain_cfg or not isinstance(report_summary, dict):
+        return None
+    declared = domain_cfg.get("max_aborted_ratio")
+    if declared is None:
+        return None
+    try:
+        limit = float(declared)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"domains.yaml max_aborted_ratio is not a number: {declared!r}")
+    if not 0.0 <= limit <= 1.0:
+        raise RuntimeError(
+            f"domains.yaml max_aborted_ratio must be within [0, 1] (got {limit})")
+    ratio = report_summary.get("aborted_ratio")
+    if ratio is None:
+        return None
+    if float(ratio) <= limit:
+        return None
+    aborted = report_summary.get("episodes_aborted")
+    played = report_summary.get("episodes_played")
+    return (f"{aborted}/{played} episode(s) aborted "
+            f"({float(ratio):.0%} > limit {limit:.0%})")
+
+
 def compute_report_summary(
     report: Optional[Dict[str, Any]],
     requested: int,
@@ -3568,6 +3605,15 @@ def compute_report_summary(
         dist = report.get("action_distribution")
         if isinstance(dist, dict) and dist:
             summary["label_distribution"] = {"prediction": dict(dist)}
+        # An ABORTED episode is a PLAYED (lost) episode: it must stay in the
+        # denominator, but "3 of 5 episodes died to an upstream 502" is an
+        # INFRASTRUCTURE fact, not a play-quality one -- and it was invisible
+        # here, so it silently depressed the generation's score (P2-16b).
+        aborted = report.get("episodes_aborted")
+        if isinstance(aborted, list):
+            summary["episodes_aborted"] = len(aborted)
+            if played > 0:
+                summary["aborted_ratio"] = len(aborted) / played
         if contract.get("kind") == "action":
             rate = report.get("invalid_action_rate")
             # `contract_ok` = the agent actually produced a legal action on every

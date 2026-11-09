@@ -15,6 +15,10 @@ import threading
 import socket
 import time
 
+# ONE definition of the per-call sidecar suffix (utils.trajectory_log). The
+# telemetry forwarder uses it to tell the two audit streams apart.
+from utils.trajectory_log import LLM_CALLS_SIDECAR_SUFFIX as _LLM_CALLS_SUFFIX
+
 
 _TASK_ENV_NAMES = {
     "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -543,14 +547,24 @@ def _init_telemetry() -> None:
     _orig_append, _orig_reset = _tlog.append, _tlog.reset
 
     def _fwd_append(path, record, max_bytes=None):
+        # STREAM TAG (balrog P2-18 / A1): this child owns TWO audit streams --
+        # its transcript and the per-call ``<transcript>.llm_calls.jsonl``
+        # sidecar -- and they have different audiences (the transcript is the
+        # agent's evidence, the sidecar is per-call accounting). Untagged
+        # forwarding flattened both into the transcript: the audit rows leaked
+        # onto the evidence surface AND the host sidecar was never created, so
+        # every balrog episode reported ``llm_calls: null``.
+        stream = "llm_calls" if str(path).endswith(_LLM_CALLS_SUFFIX) else "transcript"
         if _TELEMETRY is not None and _TELEMETRY.send(
-                {"v": 1, "type": "traj_row", "record": record}):
+                {"v": 1, "type": "traj_row", "stream": stream,
+                 "record": record}):
             return
         _orig_append(path, record, max_bytes=max_bytes)
 
     def _fwd_reset(path):
+        stream = "llm_calls" if str(path).endswith(_LLM_CALLS_SUFFIX) else "transcript"
         if _TELEMETRY is not None and _TELEMETRY.send(
-                {"v": 1, "type": "traj_reset"}):
+                {"v": 1, "type": "traj_reset", "stream": stream}):
             return
         _orig_reset(path)
 

@@ -369,6 +369,11 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
         k for k, v in question_points.items() if v < 1.0 - 1e-9)
     summary["episodes"] = episodes
     summary["episodes_aborted"] = aborted_episodes
+    # Guard denominator (P2-16b): the framework voids a round whose aborted share
+    # exceeds ``domains.yaml max_aborted_ratio``; the ratio is stated here too so
+    # offline analysis can see WHY a round was voided without recomputing it.
+    summary["aborted_ratio"] = (
+        len(aborted_episodes) / len(episodes) if episodes else 0.0)
     summary["episodes_sidecar_missing"] = sidecar_missing
     summary["llm_calls_total"] = llm_calls_total
 

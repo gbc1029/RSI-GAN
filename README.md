@@ -236,6 +236,21 @@ Known constraints:
   `report.json` carries `episodes[].llm_calls` / `episodes_sidecar_missing` /
   `llm_calls_total`. These are CALL COUNTS for attribution only — money and
   tokens remain the root-side proxy audit's numbers; never sum the two.
+- **Every step of an episode now reaches the archive.** The task agent truncates
+  its transcript at construction, so a multi-step episode used to keep only its
+  LAST step (measured 2026-11-08: 10 episodes / 98 step children produced 10
+  transcript rows). The balrog step child now appends
+  (`_copy_back_transcript(..., "append")`), which is what lets the evaluator
+  read a whole episode instead of one step.
+- **The CSV / `prev_action` record the EXECUTED action.** They used to carry the
+  model's raw reply, so the agent was told "your previous action was <a
+  sentence>" while the env had executed `default_action`; the raw reply now
+  lives in the `Reasoning` column.
+- **Aborted rounds cannot masquerade as scores.** `domains.yaml
+  max_aborted_ratio: 0.25` (balrog): above that share of aborted episodes the
+  round's score is voided (`score: null`, `invalid_reason`, and a
+  `task_round_degraded` event) instead of letting infrastructure failures enter
+  the lineage as a depressed score.
 - `balrog_minihack` / `balrog_nle` / `crafter` / `textworld` are **not** wired
   into the GAN path and are not covered by this script (`post_install.py`
   downloads their data from GitHub/Drive and needs network). This is now

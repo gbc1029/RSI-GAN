@@ -959,6 +959,27 @@ class DomainTaskRunner:
         score = tx.extract_score(report, self.score_key, self.domain,
                                  score_divisor=self.score_divisor)
         report_summary = tx.compute_report_summary(report, self.num_samples, self.output_contract)
+        # ABORTED-ROUND GUARD (P2-16b). Episode domains declare
+        # ``domains.yaml max_aborted_ratio``; when too many episodes died to
+        # infrastructure the mean is depressed by 0.0 rows, so the round must
+        # NOT enter the lineage as a real score. The report is kept (evidence
+        # copy below), the score is voided, and the reason is in events.jsonl
+        # so "why is this generation null" is greppable without opening
+        # report.json.
+        aborted_reason = tx.aborted_round_reason(report_summary, self.domain_cfg)
+        if aborted_reason:
+            if isinstance(report_summary, dict):
+                report_summary["aborted_round_reason"] = aborted_reason
+            try:
+                self._event("task_round_degraded", genid=str(genid), rc=rc,
+                            reason=aborted_reason,
+                            aborted=report_summary.get("episodes_aborted"),
+                            played=report_summary.get("episodes_played"),
+                            aborted_ratio=report_summary.get("aborted_ratio"),
+                            score_voided=score is not None)
+            except Exception as e:  # noqa: BLE001 -- audit write failure
+                print(f"[WARN] task_round_degraded event write failed: {e}")
+            score = None
         # polyglot patch-gate aggregate (counts only): one durable event per
         # generation so the repaired/rejected rates are greppable in
         # events.jsonl without opening report.json (the small_1028_0046
@@ -993,8 +1014,12 @@ class DomainTaskRunner:
         # score status (unscored taxonomy; imputation is decided by the loop)
         if score is None:
             score_status = "failed"
-            invalid_reason = None if report is not None else (
-                "harness_failed" if rc != 0 else "no_report"
+            # A voided round keeps its report on disk, so the fallback chain
+            # would say invalid_reason=None; name the real cause instead.
+            invalid_reason = aborted_reason or (
+                None if report is not None else (
+                    "harness_failed" if rc != 0 else "no_report"
+                )
             )
         else:
             cov = report_summary.get("coverage")
