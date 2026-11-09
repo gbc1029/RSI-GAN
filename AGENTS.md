@@ -50,7 +50,11 @@ live under `scripts/dgmh/`.
   `k` = 2k entries; the window, the compaction tier and dedup all share ONE
   membership rule, `_window_kept_ids`, docs/19 §12.56; a dedup form that can
   no longer apply is DEMOTED to full with an exact refund rather than left
-  claiming a substitution, docs/19 §12.58) — primitives
+  claiming a substitution, docs/19 §12.58; every `cm_view` carries `view_seq`
+  / `view_in_turn`, and a view rolled back by the fail-open replay is
+  RETRACTED by its own `cm_view_retracted` event rather than rewritten, so
+  `sum(saved_chars) - sum(retracted)` is the authoritative turn delta and "the
+  last view" is decided by the ordinals, never by stream order, docs/19 §12.62) — primitives
   carry no ``saved``, a repeated/no-op op books 0, a restore refunds, and
   ``pin`` on an already-elided block restores it to FULL (dedup the only
   exempt non-full pinned form; docs/19 §12.40 — the P1 ``pinned_form``

@@ -118,11 +118,27 @@ def _last_cumulative_est(rows: List[Dict[str, Any]], key: str = "kind") -> int:
     ``est_saved_session`` — not the sum of per-turn ``saved_chars``, which
     systematically misses between-turn handle ops (agent-face ctx_* ops
     book into the session cumulative without a cm_view row). Residual
-    (declared): ops in the final tool phase after the last cm_view."""
+    (declared): ops in the final tool phase after the last cm_view.
+
+    M (docs/19 §12.62): "last" is decided by the view's OWN ordinals
+    (``(turn, view_seq)``) instead of by stream position, because one turn can
+    emit MORE than one ``cm_view`` (a named assembly that closes the turn and
+    then fails — the fail-open preset replays it; K). Stream order was only
+    right by accident there, and a merged/echoed event stream could invert it.
+
+    Backward compatible: rows written before the ordinals existed carry
+    neither key, so they tie at ``(turn, 0)`` and the file position decides —
+    byte-identical to the old behavior on old logs."""
     est = 0
-    for r in rows:
-        if r.get(key) == "cm_view":
-            est = int((r.get("stats") or {}).get("est_saved_session") or 0)
+    best: Optional[Tuple[int, int, int]] = None
+    for i, r in enumerate(rows):
+        if r.get(key) != "cm_view":
+            continue
+        stats = r.get("stats") or {}
+        cur = (int(r.get("turn") or 0), int(stats.get("view_seq") or 0), i)
+        if best is None or cur >= best:
+            best = cur
+            est = int(stats.get("est_saved_session") or 0)
     return est
 
 

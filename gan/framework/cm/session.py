@@ -961,6 +961,18 @@ class CMSession:
     # acts on blocks whose CURRENT form still is dedup.
     _dedup_credit: Dict[str, int] = field(default_factory=dict, repr=False,
                                           compare=False)
+    # K (docs/19 §12.62): every cm_view is ADDRESSABLE. A turn can emit more
+    # than one view — a named assembly may call finalize_turn (which books ops
+    # and emits) and then raise, so the fail-open preset replays the turn and
+    # emits a SECOND view for the same turn. Summing ``saved_chars`` over the
+    # events then double-counts, and "the last view" is only the authoritative
+    # one by accident of stream order. ``view_seq`` is session-monotonic,
+    # ``view_in_turn`` is 1-based within the turn, and a rolled-back view is
+    # RETRACTED by its own event (never rewritten).
+    view_seq: int = 0
+    _turn_view_seq: int = field(default=0, repr=False, compare=False)
+    _last_view: Optional[Tuple[int, int, int]] = field(
+        default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------- config
     def __post_init__(self) -> None:
@@ -1071,6 +1083,17 @@ class CMSession:
         the record keeps its other fields untouched. Every caller that
         mutates the view goes through this (ViewHandle + the stage methods),
         so there is exactly ONE place a saving number is produced.
+
+        [勘误 2026-11-08, T] "exactly ONE place" is wrong, and deliberately
+        so. ``_book`` is the funnel for the PRIMITIVE/handle path. Two stage
+        paths compute the SAME number from the SAME formula
+        (``_transition_saving``) without calling it: ``dedup_prefix`` writes
+        ``saved`` itself because its value is needed BEFORE the view is
+        mutated, and ``_lapse_forms`` writes ``-credit`` because the formula
+        returns 0 exactly in the lapse case (``view_text`` already models
+        "cannot apply = full width", docs/19 §12.58). The honest invariant is
+        therefore: ONE FORMULA (``_transition_saving``), one funnel per
+        caller SHAPE — never a second formula.
         """
         if rec.get("ok"):
             block = self.universe.get(block_id)
@@ -1442,6 +1465,14 @@ class CMSession:
         materializes, nothing emits). Per-file scan failures skip that file
         and SPEAK (``cm_traj_materialize_failed``); the read tools then fall
         back to building their own index for uncovered genids. Returns the
+
+        [勘误 2026-11-08, T] The "per-file … skip that file" sentence above is
+        WRONG: ``build_traj_materialization`` is called ONCE for the whole
+        list inside a single try/except, so a scan failure is ALL-OR-NOTHING —
+        nothing materializes and one event carries the error. What is per-file
+        is only the PRE-FILTER above (missing labels/paths, duplicates). The
+        read tools' own-index fallback therefore covers the whole seat, not
+        just the failed file. Returns the
         number of segments registered."""
         if self.mode == "passthrough" or not files:
             return 0
@@ -1642,6 +1673,14 @@ class CMSession:
                                             exc=e,
                                             timed_out=isinstance(
                                                 e, assembly.AssemblyTimeout))
+                # K (§12.62): if the failed attempt already CLOSED the turn
+                # (its own finalize_turn emitted a view and booked ops), that
+                # view is undone by the restore above — so it must be
+                # WITHDRAWN, or a consumer summing ``saved_chars`` counts the
+                # same turn twice (probed: 2 views x 319 vs a session delta of
+                # 319). Events are streamed, so the rollback is expressed by a
+                # retraction event, never by rewriting the earlier one.
+                self._retract_last_view(phase=phase)
                 # fall through: the preset re-runs on the CLEAN state (sticky
                 # forms make the replay safe); this turn's cm_view carries
                 # degraded=true
@@ -1930,6 +1969,16 @@ class CMSession:
         """The six seam-contract questions (docs/19 §12.14, §12.27, §12.38,
         §12.53).
 
+        [勘误 2026-11-08, T] The list below numbers the questions 1, 2, 3, 4,
+        6 — the original text never wrote down number 5. The code DOES ask it
+        (it is the escape-tier backstop for the portal's snapshot return):
+
+        **5.** the REGISTRATION IDENTITY of every block must be the object the
+        session owns — a block whose identity the attempt swapped (a copied /
+        re-created ``Block`` that renders the same text but is not in
+        ``universe.blocks``) is a contract breach, restoring the snapshot and
+        strike-counting the attempt (docs/19 §12.38).
+
         1. every non-full form must be explained by a recorded op;
         2. a pinned block may only be ``full`` (or ``dedup``: the prefix-elision
            form, which loses only the repeated header);
@@ -2091,7 +2140,18 @@ class CMSession:
         changed. ``phase`` distinguishes load-stage (module top level) from
         run-stage (``assemble``) from contract refusals; ``timed_out``
         marks the leaked worker thread in the session's leak counters
-        (CM-03)."""
+        (CM-03).
+
+        [勘误 2026-11-08, Q] docs/19 §12.19-C1 claims
+        ``cm_assembly_failed.phase`` takes FOUR values (load/run/contract/
+        TIMEOUT). It takes THREE: a budget expiry is reported as the phase it
+        happened in (``load`` for a top-level hang, ``run`` for an
+        ``assemble`` hang), and the emitted event carries no ``timed_out``
+        field either — the hang is only visible indirectly, as the
+        ``thread_leaks`` / ``thread_leaks_live`` counters (a timeout leaks the
+        abandoned worker, a crash does not). Telling "hung" from "raised"
+        therefore takes a SECOND channel, exactly the lesson in AGENTS.md
+        ("an unexpected tool result is a hypothesis, not a verdict")."""
         self.assembly_failures += 1
         self._assembly_strikes += 1
         # A strike turn IS a degraded turn — its governance came from the
@@ -2123,6 +2183,26 @@ class CMSession:
             self.assembly_disabled = True
             self._emit({"type": "cm_assembly_disabled", "turn": self.turn,
                         "strikes": self._assembly_strikes})
+
+    def _retract_last_view(self, *, phase: str) -> None:
+        """K (docs/19 §12.62): withdraw the view this turn already emitted.
+
+        Fires ONLY when the failed attempt closed the turn itself (a view was
+        emitted for THIS turn by the attempt that is now being rolled back).
+        The event carries the retracted ordinals and the amount that view
+        booked, so ``sum(saved_chars) - sum(retracted.saved_chars)`` is the
+        authoritative turn delta and ``view_seq``/``view_in_turn`` survive the
+        gap (the next view of the turn is ``view_in_turn=2``).
+        """
+        last = self._last_view
+        if last is None or last[2] != self.turn:
+            return                        # nothing of THIS turn to withdraw
+        seq, saved, turn = last
+        self._emit({"type": "cm_view_retracted", "turn": turn,
+                    "view_seq": seq, "saved_chars": saved, "phase": phase,
+                    "detail": "the attempt closed the turn and then failed; "
+                              "the view was rolled back with the turn state"})
+        self._last_view = None            # one retraction per view
 
     def _emit_synthetic_view(self) -> None:
         """Per-turn audit completion for an assembly that returned without
@@ -2536,6 +2616,8 @@ class CMSession:
            registration — its list is simply not registered, loudly.
         """
         self.turn += 1
+        # K (§12.62): the per-turn view ordinal restarts here.
+        self._turn_view_seq = 0
         self._turn_degraded = False
         self._send_expect = None   # set by whoever produces THIS turn's send
         self._turn_unrendered = False
@@ -3003,11 +3085,19 @@ class CMSession:
         before the payload exists. Keeping them apart avoids an event that
         describes one turn's promise with another turn's fact.
         """
+        # K (§12.62): one builder, one place the ordinals advance — every
+        # emitted view (normal OR synthetic) is addressable, and a consumer can
+        # name "the last view of turn T" without relying on stream order.
+        self.view_seq += 1
+        self._turn_view_seq += 1
+        self._last_view = (self.view_seq, int(saved), self.turn)
         stats: Dict[str, Any] = {"blocks": len(self.universe.blocks),
                                  # docs/19 §12.44 D5: NON-FULL forms only —
                                  # same caliber as summary()'s substituted.
                                  "substituted": self._substituted_blocks(),
                                  "saved_chars": saved,
+                                 "view_seq": self.view_seq,
+                                 "view_in_turn": self._turn_view_seq,
                                  "est_saved_session": self.est_chars_saved,
                                  "policy_disabled": self.policy_disabled}
         # conditional audit fields: they materialize only in the states they
