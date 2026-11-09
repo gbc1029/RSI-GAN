@@ -297,15 +297,21 @@ def render_md(r: Dict[str, Any]) -> str:
     L.append("")
 
     if r["outer_table"]:
-        L += ["## 按 outer（角色调用 + 任务代合并到所属 outer；task 含固定根评估轮）", "",
-              "| outer | wallclock s | planner tok | evaluator tok | task tok（其中 eval） | 分数均值 | gens |"
+        L += ["## 按 outer（角色调用 + 任务代合并到所属 outer；task/角色均含固定根评估轮）", "",
+              "| outer | wallclock s | planner tok（其中 eval） | evaluator tok（其中 eval） | task tok（其中 eval） | 分数均值 | gens |"
               + (" 估算 $ |" if r["prices"] else ""),
               "|---|---|---|---|---|---|---|" + ("---|" if r["prices"] else "")]
         for row in r["outer_table"]:
             usd = f" {row['usd']} |" if r["prices"] else ""
             tev = row.get("task_eval") or {}
+            pev = row.get("planner_eval") or {}
+            eev = row.get("evaluator_eval") or {}
+            # docs/19 §12.68: the eval instance FOLDS into its owning outer, so
+            # the share must be VISIBLE where the totals are printed — an
+            # in-memory bucket nobody renders is the same as no attribution.
             L.append(f"| {row['outer']} | {row['wallclock_s']} "
-                     f"| {row['planner']['total_tokens']:,} | {row['evaluator']['total_tokens']:,} "
+                     f"| {row['planner']['total_tokens']:,}（{pev.get('total_tokens', 0):,}） "
+                     f"| {row['evaluator']['total_tokens']:,}（{eev.get('total_tokens', 0):,}） "
                      f"| {row['task']['total_tokens']:,}（{tev.get('total_tokens', 0):,}） "
                      f"| {row['score_mean']} "
                      f"| {','.join(map(str, row['gens']))} |{usd}")
