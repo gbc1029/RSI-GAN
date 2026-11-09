@@ -43,9 +43,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # An assembly function's frozen contract (positional, per CMSession.assemble_turn):
 #   session  — the live CMSession (primitive surface + clamped parameters)
-#   msgs     — the canonical history (raw dicts; never mutated — 双记)
+#   msgs     — a per-turn BOUNDARY COPY of the canonical history (docs/19
+#              §12.36): the assembly owns its composition on the copy; the
+#              canonical list is unreachable by construction
 #   outgoing — the raw user text for this call
 #   tokens_used / budget — the chat loop's live usage + armed budget
+#
+# The portal's register_outgoing likewise returns a SNAPSHOT copy of the
+# block, never the live universe object (docs/19 §12.38): reads are
+# identical, writes land on the assembly's own scratch copy.
 AssembleFn = Callable[..., Tuple[List[Dict[str, Any]], str]]
 
 
@@ -56,12 +62,14 @@ def assemble_passthrough(session, msgs, outgoing,
     """``passthrough`` preset — the identity view.
 
     Register everything for the audit face, send everything, substitute
-    nothing. The sent history is per-ENTRY copies: the LLM client's
-    text->content conversion POPS keys from the dicts it is handed
-    (agent/llm.py), so the canonical history must stay raw (双记)."""
+    nothing. The sent history is per-ENTRY copies (双记): the canonical stays
+    raw, and only the throw-away copies are ever sent. Even the identity view
+    claims what it sends (docs/19 §12.54-C), so the send fact covers the case
+    where the client mangles an unchanged history too."""
     session.register_history(msgs)
     session.register_outgoing(outgoing)
     session.emit_view(0)
+    session.claim_send(msgs, outgoing)
     return [dict(m) if isinstance(m, dict) else m for m in msgs], outgoing
 
 
@@ -91,16 +99,16 @@ def assemble_compact_conservative(session, msgs, outgoing,
                                   tokens_used: int = 0,
                                   budget: Optional[int] = None
                                   ) -> Tuple[List[Dict[str, Any]], str]:
-    """``compact_conservative`` preset — excerpt tier before the window.
+    """``compact_conservative`` preset — head_tail tier before the window.
 
-    History turns older than the pin window whose mechanical excerpt
-    actually saves >= MIN_COMPACT_SAVE chars become EXCERPTS (head+tail
-    kept) instead of the slice preset's whole-turn placeholder. The excerpt
-    pass runs BEFORE the window pass because the window skips
-    already-substituted blocks (sticky forms): an excerpted turn is not
-    placeholder-dropped on top of its excerpt (the compaction target is the
-    old USER turn, which carries the embedded tool outputs in this chat
-    protocol)."""
+    History turns older than the pin window whose mechanical trim actually
+    saves >= MIN_COMPACT_SAVE chars become head_tail-trimmed (head+tail kept
+    at the session ``cm_head_tail_keep``) instead of the slice preset's
+    whole-turn placeholder. The trim pass runs BEFORE the window pass because
+    the window skips already-substituted blocks (sticky forms): a trimmed
+    turn is not placeholder-dropped on top of its trim (the compaction target
+    is the old USER turn, which carries the embedded tool outputs in this
+    chat protocol)."""
     session.register_history(msgs)
     out_block = session.register_outgoing(outgoing)
     records: List[Dict[str, Any]] = []
@@ -130,7 +138,13 @@ def assemble_custom(session, msgs, outgoing,
     records += session.window_defaults()
     if session.system_prefix:
         records += session.dedup_prefix(msgs)
-    records += session.run_policy()
+    # fold the baseline stages' refs BEFORE the policy snapshot: the policy
+    # reconcile runs before count_ops, so the stages' form changes must be
+    # explainable at snapshot time (docs/19 §12.18)
+    session.record_refs(records)
+    # msgs rides along: the policy's P1 snapshot gains the canonical-texts
+    # layer (docs/19 §12.18 — run_policy restores the turn state on failure)
+    records += session.run_policy(msgs)
     return session.finalize_turn(msgs, outgoing, out_block, records)
 
 
@@ -157,7 +171,15 @@ def resolve(mode: str) -> Tuple[AssembleFn, Optional[str]]:
     ``mode`` selects a shipped baseline preset; ``load_assembly`` resolves
     a NAMED agent-owned assembly module through the same contract, budgeted
     and wedge-broken by the session — the baseline presets remain the
-    fail-open target."""
+    fail-open target. THE FAIL-OPEN RULE (docs/19 §12.30 rule 1): the
+    target is the SESSION'S OWN mode preset, and a failed named module is
+    absent from it by construction — no preset ever contained the named
+    assembly, so falling back removes exactly the failed module and keeps
+    the rest (a healthy custom-mode policy keeps running in the fallback
+    turns). ``slice`` is the endpoint only for an UNKNOWN mode here, and
+    for the unified BUILD-TIME degrade of an undeliverable component claim
+    (``cm_wiring.build_from_descriptor`` / ``task_worker`` — docs/19
+    §12.30 rule 2)."""
     fn = BASELINE_ASSEMBLY.get(mode)
     if fn is None:
         return BASELINE_ASSEMBLY["slice"], "slice"
@@ -338,9 +360,11 @@ def load_assembly(path: str) -> Tuple[Callable, Dict[str, Callable], List[str]]:
     raised — a module with an illegal method group still runs as the
     pipeline; the caller speaks the refusal (``cm_methods_refused``)."""
     from .failopen import policy_violations
+    from .ops import clip_diag
     problems = policy_violations(path) + _gan_import_problems(path)
     if problems:
-        raise AssemblyError("assembly refused at load: " + "; ".join(problems)[:200])
+        raise AssemblyError("assembly refused at load: "
+                            + clip_diag("; ".join(problems), 200))
     # sys.modules key UNIQUE PER PATH: parallel in-process sessions (p/e
     # self-improve threads) loading DIFFERENT assemblies must not clobber
     # each other's registration; same path replaces its own entry (the
@@ -364,26 +388,74 @@ def load_assembly(path: str) -> Tuple[Callable, Dict[str, Callable], List[str]]:
     return fn, methods, method_problems
 
 
-def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
-                 outgoing: str, tokens_used: int, budget: Optional[int],
-                 exec_ms: int) -> Tuple[List[Dict[str, Any]], str]:
-    """Execute one agent assembly under its per-turn execution budget
-    (worker thread; same class as the policy runner). Emits
-    ``cm_assembly_overrun`` when the wall exceeded the budget (the result is
-    still honored if it arrived — the budget is advisory for terminating
-    code, binding only through the timeout). Raises on crash/timeout: the
-    session's wedge breaker counts the failure and re-runs the preset."""
+def timed_load_assembly(path: str, exec_ms: int) -> Tuple[Callable, Dict[str, Callable], List[str]]:
+    """Load a named assembly module under the SAME per-turn budget as its
+    execution (CM-03: module-level code IS agent code — ``exec_module`` runs
+    it before ``assemble`` is ever called, so a top-level hang must not sit
+    outside every budget and hang the session unbounded).
+
+    A module-level hang becomes :class:`AssemblyTimeout` (load phase) —
+    strike-counted, fail-open — instead of a hung session. The worker
+    thread leaks exactly like a timed-out ``assemble`` (Python cannot kill
+    threads; CM-03 owns that) and is named ``cm_exec`` so the session's
+    leak observability can tell it apart from framework pools."""
+    from .failopen import _tracked_submit
     import time as _time
     t0 = _time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, session, msgs, outgoing, tokens_used, budget)
-        try:
-            result = future.result(timeout=max(exec_ms, 1) / 1000.0)
-        except concurrent.futures.TimeoutError as e:
-            future.cancel()
-            raise AssemblyTimeout(f"assembly exceeded {exec_ms}ms") from e
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="cm_exec")
+    future, _box = _tracked_submit(pool, load_assembly, path)
+    try:
+        return future.result(timeout=max(exec_ms, 1) / 1000.0)
+    except concurrent.futures.TimeoutError as e:
+        future.cancel()
+        timeout = AssemblyTimeout(f"assembly load exceeded {exec_ms}ms")
+        timeout.candidate_thread = _box[0] if _box else None
+        raise timeout from e
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def run_assembly(fn: AssembleFn, session: Any, msgs: List[Dict[str, Any]],
+                 outgoing: str, tokens_used: int, budget: Optional[int],
+                 exec_ms: int) -> Tuple[Tuple[List[Dict[str, Any]], str], int]:
+    """Execute one agent assembly under its per-turn execution budget
+    (worker thread; same class as the policy runner). Returns
+    ``((history, msg), over_ms)`` — mirrors :func:`failopen.apply_policy`.
+    The ``cm_assembly_overrun`` advisory is owned by the CALLER (the live
+    session): emitting through the assembly-time ``session`` parameter
+    means emitting through the P2 portal, whose ``_emit`` raises — a
+    completed-over-budget run used to die as a false contract failure
+    (docs/19 §12.30.3/N1). Raises on crash/timeout: the session counts
+    the failure and re-runs the preset.
+
+    THE BUDGET BOUNDS THE TURN: on timeout the pool is shut down WITHOUT
+    waiting, so a hanging assembly cannot block the chat loop (it used to:
+    ``with`` implies ``shutdown(wait=True)``). The worker itself may keep
+    running — termination is CM-03's job, this is only about not dragging the
+    session with it."""
+    from .failopen import _tracked_submit
+    import time as _time
+    t0 = _time.monotonic()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                 thread_name_prefix="cm_exec")
+    future, _box = _tracked_submit(pool, fn, session, msgs, outgoing,
+                                   tokens_used, budget)
+    try:
+        result = future.result(timeout=max(exec_ms, 1) / 1000.0)
+    except concurrent.futures.TimeoutError as e:
+        future.cancel()
+        # The budget must bound THIS TURN, not just the decision: a
+            # ``with`` block would run ``shutdown(wait=True)`` on exit and
+            # silently wait for the hung worker (measured: a 3s assembly with
+            # exec_ms=200 blocked the seam 4.16s). Shutting down without
+            # waiting lets the turn proceed; the worker may leak (Python
+        # cannot kill threads — CM-03 owns that, this only stops it from
+        # dragging the session).
+        timeout = AssemblyTimeout(f"assembly exceeded {exec_ms}ms")
+        timeout.candidate_thread = _box[0] if _box else None
+        raise timeout from e
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     over_ms = max(0, int((_time.monotonic() - t0) * 1000) - exec_ms)
-    if over_ms:
-        session._emit({"type": "cm_assembly_overrun", "turn": session.turn,
-                       "over_ms": over_ms})
-    return result
+    return result, over_ms

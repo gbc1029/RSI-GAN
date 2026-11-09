@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 SEGMENT_KINDS = ("turn_output", "tool_call", "tool_output", "plan_ops",
                  "stop_record")
@@ -287,4 +288,97 @@ def render_index_text(index: Dict[str, Any], max_segments: int = 80,
     out = "\n".join(lines)
     if len(out) > max_chars:
         out = out[:max_chars] + "\n...[index truncated; use filters/offset]"
+    return out
+
+
+def _clip_counted(text: str, cap: int) -> str:
+    """Head-only counted clip (docs/17 §17 idiom): a capped excerpt is
+    distinguishable from a short one — the marker names the hidden count."""
+    if len(text) <= cap:
+        return text
+    return text[:cap] + f"\n...[+{len(text) - cap} chars]"
+
+
+def tail_head_page(segments: List[Dict[str, Any]], text_lookup: Callable,
+                   *, n: int, tail: bool, max_chars: int) -> str:
+    """First/last ``n`` segments' CONTENT as one page — the forensic common
+    case (the failure lives in the latest turns). ``text_lookup(seg) -> str|None``
+    supplies each segment's text: the session-payload path reads the universe,
+    the file path re-reads the archived row. Budget: total ``max_chars``,
+    counted clip per segment. Segments whose lookup misses are skipped — a
+    missing row is a loud absence in the header count, never neighboring
+    content."""
+    n = max(1, int(n or 1))
+    picked = list(segments[-n:]) if tail else list(segments[:n])
+    where = "tail" if tail else "head"
+    lines = [f"# trajectory {where} ({len(picked)} of {len(segments)} segments, "
+             f"budget {max_chars} chars)"]
+    budget = max_chars
+    served = 0
+    for seg in picked:
+        text = text_lookup(seg)
+        if text is None:
+            continue
+        if budget <= 200:
+            lines.append(f"- {seg['seg_id']} skipped (page budget exhausted)")
+            continue
+        part = _clip_counted(text, budget - 200)
+        meta = (f"## {seg['seg_id']} kind={seg['kind']}"
+                + (f" tool={seg['tool']}" if seg.get("tool") else "")
+                + f" chars={seg['chars']}"
+                + (f" [flag={seg['flag']}]" if seg.get("flag") else ""))
+        lines.append(meta)
+        lines.append(part)
+        budget -= len(meta) + len(part) + 2
+        served += 1
+    if served == 0:
+        lines.append("(no segment text served)")
+    return "\n".join(lines)
+
+
+def grep_page(segments: List[Dict[str, Any]], text_lookup: Callable,
+              pattern: str, *, max_results: int = 100,
+              max_chars: int = 16000) -> str:
+    """Regex search over segment texts — the workspace grep tool's trajectory
+    sibling (the files live root-side; server-side search is the ONLY way a
+    seat can search them). Returns matching segments as ADDRESSES + the first
+    matching line, so ``grep -> fetch`` composes. A bad regex raises
+    ``ValueError`` (loud, like the workspace grep); the caps are honest
+    (max_results / max_chars, named in the output)."""
+    try:
+        rx = re.compile(str(pattern or ""))
+    except re.error as e:
+        raise ValueError(f"bad regex: {e}") from None
+    scanned = matched = 0
+    lines = [f"# trajectory grep /{pattern}/"]
+    budget = max_chars
+    for seg in segments:
+        if matched >= max_results or budget <= 200:
+            break
+        text = text_lookup(seg)
+        if text is None:
+            continue
+        scanned += 1
+        hit_line = None
+        for line in text.splitlines():
+            if rx.search(line):
+                hit_line = line
+                break
+        if hit_line is None:
+            continue
+        matched += 1
+        flag = f" [flag={seg['flag']}]" if seg.get("flag") else ""
+        row = (f"- {seg['seg_id']} kind={seg['kind']}"
+               + (f" tool={seg['tool']}" if seg.get("tool") else "")
+               + flag + f" : {_clip_counted(hit_line.strip(), 160)}")
+        lines.append(row)
+        budget -= len(row) + 1
+    if matched == 0:
+        lines.append("(no matching segment)")
+    else:
+        lines.append(f"# {matched} matching segment(s), {scanned} scanned"
+                     + (f" (capped at {max_results})" if matched >= max_results else ""))
+    out = "\n".join(lines)
+    if len(out) > max_chars:
+        out = out[:max_chars] + "\n...[+chars; narrow the pattern]"
     return out

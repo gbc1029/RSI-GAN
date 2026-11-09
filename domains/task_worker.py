@@ -30,6 +30,23 @@ _TASK_ENV_NAMES = {
     # audit sidecar (§11.5: rw bind in the sandbox; cwd fallback locally)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
                       "GAN_CM_EVENTS",
+    # CM-03 generation latch (docs/19 §12.16): HARNESS-ORIGINATED (an earlier
+    # question of this generation failed its named assembly or policy; the
+    # snapshot is fixed per generation) — honored in _build_cm_session,
+    # never supplied by the parent.
+    "GAN_CM_ASSEMBLY_DISABLED", "GAN_CM_POLICY_DISABLED",
+    # F5 audit channel (docs/19 §12.28): the run-scoped telemetry socket,
+    # HARNESS-ORIGINATED (``bwrap --setenv``, hop 1) and consumed HERE by
+    # ``_init_telemetry``. Missing from this list was a SILENT audit kill:
+    # the socket path died at hop 2, ``_init_telemetry`` returned at its
+    # "no socket requested" branch (indistinguishable from a manual run), no
+    # ``traj_row`` ever reached the harness, every generation became
+    # ``trajectory_archive_failed`` and its score was nulled while the task
+    # answers were CORRECT (measured 2026-11-09 R1: 2/2 correct, report
+    # accuracy 1.0, score null). Guard: scripts/local/test_task_env_mirror.py
+    # now also scans the child runtime for GAN_* env READS that no hop
+    # carries, not just the three whitelists against each other.
+    "GAN_TELEMETRY_UNIX",
     # timeout plumbing (consumer: agent/llm.py). The thinking-intensity knob
     # does NOT ride the env: it arrives inside the stdin payload.
     "GAN_QUESTION_TIMEOUT_S", "GAN_LLM_TIMEOUT_S",
@@ -457,17 +474,108 @@ def _cm_events_path():
     return os.path.join(os.getcwd(), "cm_events.jsonl")
 
 
+# Last-resort durable channel for a FAILED sidecar append. The sidecar lives
+# in the (read-only for the sandbox uid) run tree; its one write exception is
+# granted by ``_TaskRunLease._grant``. If that ever stops working, the failure
+# must still be recoverable from the host -- the WORK DIR is pruned and the
+# cwd is a tmpfs, so the ONLY durable, host-readable channel this process
+# holds is the task trajectory (bound read-write by the harness and archived
+# by the framework). Set from the payload before the session is built.
+_CM_FALLBACK_PATH = None
+
+
+def _trajectory_note(record):
+    """One diagnostic row on the TASK TRAJECTORY (durable on the host).
+
+    The seam's own sink can be the thing that is broken (that is exactly the
+    failure class CM-02 came from: the child's appends landed in a tmpfs the
+    parent can never read). The trajectory is bound read-write and copied
+    back, so it is the child's only host-readable channel — use it for
+    diagnosis ONLY (never seam content). Readers ignore unknown kinds."""
+    if not _CM_FALLBACK_PATH:
+        return
+    try:
+        with open(_CM_FALLBACK_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dict(record), ensure_ascii=False,
+                              default=str) + "\n")
+    except OSError:
+        pass
+
+
+def _cm_failure_record(target, exc, fallback_landed):
+    """One trajectory row describing a dead audit sink (never seam content).
+
+    The trajectory readers ignore unknown ``kind`` values, so a diagnostic
+    row costs nothing structurally and makes "the sidecar stayed empty"
+    explainable after the fact (it used to be indistinguishable from "the
+    generation had no seam at all" -- CM-02)."""
+    return {"kind": "cm_emit_failed", "target": str(target),
+            "error": str(exc)[:200],
+            "sibling_landed": bool(fallback_landed)}
+
+
+# F5 P1 (docs/19 §12.28): the task child holds NO write authority over its
+# audit streams — trajectory rows and cm events are FORWARDED to the trusted
+# harness over the run-scoped telemetry socket. Local file writes are the
+# FALLBACK (channel lost mid-run: best-effort tmpfs, lost with the
+# namespace — never a session failure, never silent: stderr keeps speaking).
+_TELEMETRY: "TelemetryClient | None" = None
+
+
+def _init_telemetry() -> None:
+    global _TELEMETRY
+    tp = os.environ.get("GAN_TELEMETRY_UNIX") or ""
+    if not tp:
+        return  # local/manual run: local files, DGM-H base behavior
+    try:
+        from utils.telemetry import TelemetryClient
+    except ImportError:
+        print("[f5] telemetry client unavailable (utils.telemetry missing)",
+              flush=True)
+        return
+    client = TelemetryClient(tp)
+    if not client.active:
+        print(f"[f5] telemetry channel not established ({client.connect_error}); "
+              "audit rows fall back to local best-effort", flush=True)
+        return
+    _TELEMETRY = client
+    from utils import trajectory_log as _tlog
+    _orig_append, _orig_reset = _tlog.append, _tlog.reset
+
+    def _fwd_append(path, record, max_bytes=None):
+        if _TELEMETRY is not None and _TELEMETRY.send(
+                {"v": 1, "type": "traj_row", "record": record}):
+            return
+        _orig_append(path, record, max_bytes=max_bytes)
+
+    def _fwd_reset(path):
+        if _TELEMETRY is not None and _TELEMETRY.send(
+                {"v": 1, "type": "traj_reset"}):
+            return
+        _orig_reset(path)
+
+    _tlog.append = _fwd_append
+    _tlog.reset = _fwd_reset
+    print("[f5] telemetry channel up; audit rows forwarded to the harness",
+          flush=True)
+
+
 def _cm_emit(event):
     """Audit sink for the child's seam events (cm_view/cm_violation/...):
     appended to the sidecar and folded into events.jsonl by task_runner.
     The sink must never break the session — but a failed append is not
-    silent either: the line is preserved in a sibling fallback file and
-    echoed to stderr (when the durable channel itself fails, these two are
-    the only channels left in-process; the fallback file shares the work
-    dir's lifetime, so it is best-effort by design)."""
+    silent either: the line is preserved in a sibling fallback file, a
+    diagnostic row lands on the TASK TRAJECTORY (durable on the host), and
+    the failure is echoed to stderr."""
     line = json.dumps(dict(event), ensure_ascii=False, default=str)
+    if _TELEMETRY is not None:
+        if _TELEMETRY.send({"v": 1, "type": "cm_event", "event": dict(event)}):
+            return
+        print("[cm] telemetry send failed; falling back to the local sidecar",
+              flush=True)
+    target = _cm_events_path()
     try:
-        with open(_cm_events_path(), "a", encoding="utf-8") as f:
+        with open(target, "a", encoding="utf-8") as f:
             f.write(line + "\n")
         return
     except OSError as e:
@@ -482,6 +590,13 @@ def _cm_emit(event):
         print(f"[cm] sidecar append failed ({e}); event line "
               + (f"preserved at {fallback}" if landed else "follows")
               + f": {line[:300]}", flush=True)
+        if _CM_FALLBACK_PATH:
+            try:
+                with open(_CM_FALLBACK_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(_cm_failure_record(target, e, landed),
+                                      ensure_ascii=False) + "\n")
+            except OSError:
+                pass  # both durable channels are gone; stderr is all that is left
 
 
 def _degrade(reason: str, consequence: str = "; running without seam") -> None:
@@ -509,6 +624,19 @@ def _build_cm_session():
     a GAN generation — recorded for exactly that reason."""
 
     core = os.environ.get("GAN_CM_CORE") or ""
+    # Sink self-check (once): which path the seam events will go to, and
+    # whether the environment agrees. The sidecar line only lands WHEN the
+    # sink works, so the trajectory carries the same fact unconditionally.
+    _sink = _cm_events_path()
+    _trajectory_note({
+        "kind": "cm_sink_check",
+        "env": os.environ.get("GAN_CM_EVENTS"),
+        "chosen": _sink,
+        "cwd": os.getcwd(),
+        "exists": os.path.isfile(_sink),
+        "core_env": core,
+        "core_isdir": os.path.isdir(core),
+    })
     if not os.path.isdir(core):
         alt = os.path.join(os.getcwd(), ".gan_runtime", "cm")
         if os.path.isdir(alt):
@@ -572,13 +700,19 @@ def _build_cm_session():
                          f"deliverable (env={env_policy!r}, snapshot has no "
                          f"cm_policy.py"
                          + (f", design names {named!r}" if named else "")
-                         + "); running PASSTHROUGH instead")
-                # The degrade CLAIMS passthrough — the keys must say it too,
-                # or apply_keys would still build a custom session whose
-                # every turn fails on the missing policy.
-                mode = "passthrough"
+                         + "); running SLICE instead")
+                # The degrade CLAIMS slice — the keys must say it too, or
+                # apply_keys would still build a custom session whose every
+                # turn fails on the missing policy. Slice, not passthrough:
+                # the unified build-time degrade target for an undeliverable
+                # component claim, same as both role-side paths
+                # (cm_wiring.build_from_descriptor, loop._build_cm_session) —
+                # and a build-time absence must not govern LESS than a
+                # runtime policy failure does, since that fail-open keeps
+                # the slice-structured pre-segment (docs/19 §12.30 rule 2).
+                mode = "slice"
                 keys = dict(keys)
-                keys["cm_mode"] = "passthrough"
+                keys["cm_mode"] = "slice"
     assembly_path = None
     env_asm = os.environ.get("GAN_CM_ASSEMBLY") or ""
     if env_asm and os.path.isfile(env_asm):
@@ -589,17 +723,44 @@ def _build_cm_session():
                  f"baseline preset runs instead")
 
     try:
-        return cmcore.build_session(keys, policy_path=policy_path,
-                                    assembly_path=assembly_path,
-                                    emit=_cm_emit)
+        session = cmcore.build_session(keys, policy_path=policy_path,
+                                       assembly_path=assembly_path,
+                                       emit=_cm_emit)
     except Exception as e:  # noqa: BLE001 -- fail-open
         _degrade(f"session build failed ({e})")
         return None
+    # CM-03 generation latch (docs/19 §12.16): the harness saw a
+    # ``cm_assembly_failed`` in an EARLIER question of this generation and
+    # the snapshot is fixed for the whole generation — re-attempting the
+    # module per question cannot change the outcome, it only re-burns the
+    # exec budget and leaks another worker thread. Keep the design claim
+    # (assembly_path stays) but never load: every cm_view then carries
+    # ``assembly_disabled=true``, so the latch is loud, never silent.
+    if os.environ.get("GAN_CM_ASSEMBLY_DISABLED") == "1":
+        session.assembly_disabled = True
+        _cm_emit({"type": "cm_assembly_latched",
+                  "reason": "harness generation latch: an earlier question "
+                            "of this generation produced "
+                            "cm_assembly_failed"})
+    # Same latch contract for the custom-mode policy (docs/19 §12.30 rule 3
+    # — the persistence layer is kind-symmetric): an earlier question's
+    # ``cm_policy_failed`` latches the policy for the rest of the
+    # generation. Re-attempting per question cannot change the outcome —
+    # the snapshot's module bytes are fixed — it would only re-burn the
+    # exec budget and leak another worker thread per question.
+    if os.environ.get("GAN_CM_POLICY_DISABLED") == "1":
+        session.policy_disabled = True
+        _cm_emit({"type": "cm_policy_latched",
+                  "reason": "harness generation latch: an earlier question "
+                            "of this generation produced "
+                            "cm_policy_failed"})
+    return session
 
 
 def _run_agent_child(result_fd: int) -> None:
     if "GAN_DATASET_ROOT" in os.environ:
         raise RuntimeError("GAN_DATASET_ROOT must not enter the TaskAgent sandbox")
+    _init_telemetry()
 
     payload = json.load(sys.stdin)
     TaskAgent = _load_task_agent(payload["agent_path"])
@@ -635,6 +796,10 @@ def _run_agent_child(result_fd: int) -> None:
     # kwargs -- only when the artifact's __init__ accepts it; a modified
     # artifact dropping the seam degrades to the pre-D behaviour (the design
     # snapshot + the cm_view absence are the offline cross-check).
+    global _CM_FALLBACK_PATH
+    _CM_FALLBACK_PATH = (payload.get("trajectory_path")
+                         if isinstance(payload.get("trajectory_path"), str)
+                         else None)
     cm_session = _build_cm_session()
     if cm_session is not None:
         try:

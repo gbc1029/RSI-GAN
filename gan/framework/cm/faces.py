@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json as _json
 
+from .ops import AGENT_FETCH_FORMS
+
 _NO_SESSION = "Error: no context-management session is active for this chat"
 
 # name -> (tool_info dict WITHOUT the name key duplicated, adapter fn).
@@ -27,8 +29,21 @@ _NO_SESSION = "Error: no context-management session is active for this chat"
 # copy of what used to be three byte-identical per-role files per face.
 
 
-def _ctx_index(handle, kind=None):
-    out = handle.index([str(kind)] if kind else None)
+def _as_int(value, default):
+    """Defensive int coercion for face params: None -> default, coercible
+    strings pass, garbage is forwarded so the primitive refuses it with a
+    clean structured record (never a bare TypeError through the tool)."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _ctx_index(handle, kind=None, offset=0, cap=None):
+    out = handle.index([str(kind)] if kind else None,
+                       offset=_as_int(offset, 0), cap=_as_int(cap, None))
     return _json.dumps(out, ensure_ascii=False)
 
 
@@ -39,8 +54,8 @@ def _ctx_fetch(handle, block_id, form='full'):
     return str(out.get("text") or "")
 
 
-def _ctx_budget(handle):
-    return _json.dumps(handle.budget_query(), ensure_ascii=False)
+def _ctx_usage(handle):
+    return _json.dumps(handle.usage_query(), ensure_ascii=False)
 
 
 def _ctx_pin(handle, block_id, note='', unpin=False):
@@ -67,37 +82,37 @@ def _ctx_view(handle):
 
 _SPECS: dict = {
     "ctx_index": {
-        "description": ("Enumerate the context blocks of this session (history turns, tool outputs, trajectory segments, your notes): id, kind, size, flags — metadata only, no content. Use it to see what can be fetched or pinned."),
+        "description": ("Enumerate the context blocks of this session (history turns, tool outputs, trajectory segments, your notes, derived compaction products): id, kind, size, flags — metadata only, no content. Paging is page-local: total/returned/hidden_after (blocks AFTER this page) + next_offset (None = no further page); an offset past the end returns beyond_end. Page with offset, widen with cap (up to 500; a clamp is reported via cap_clamped). Use it to see what can be fetched or pinned."),
         "input_schema": {
             "type": "object",
-            "properties": {"kind": {"type": "string", "description": "optional kind filter (turn_output|tool_output|traj_seg|note — only kinds this protocol materializes; kb_note/boundary/derived are retained vocabulary, never produced)"}},
+            "properties": {"kind": {"type": "string", "description": "optional kind filter (turn_output|tool_output|traj_seg|note|derived — derived blocks are materialized by compact merge/template)"}, "offset": {"type": "integer", "description": "page start (0-based); continue from a previous page's next_offset"}, "cap": {"type": "integer", "description": "max blocks on this page (default 200; widened up to 500)"}},
             "required": [],
         },
-        "params": ("kind=None",),
+        "params": ("kind=None", "offset=0", "cap=None"),
         "fn": _ctx_index,
     },
     "ctx_fetch": {
-        "description": ("Fetch one context block by id (from ctx_index) into the conversation: form=full restores the whole content; head_tail/excerpt trim it. Fetching costs future tokens — fetch only what you need."),
+        "description": ("Fetch one context block by id (from ctx_index) into the conversation: form=full restores the whole content; head_tail trims it to the session's configured keep. Any [block <id> ...] line already in the conversation (omitted:... or template:...) can be restored the same way with form=full. Only full and head_tail are accepted here — the eviction forms belong to the context-management assembly/policy layer; a trim returns the block's baked line so you can see exactly what is kept. Pinned and note blocks refuse non-full forms — unpin first (ctx_pin unpin=true) if you truly want to trim. Fetching costs future tokens — fetch only what you need. Delivery caliber: the form is a property of the session's VIEW; under cm_mode=passthrough the view is an identity map (the sent context is the raw message, so a trim/pin records state without changing what is sent)."),
         "input_schema": {
             "type": "object",
-            "properties": {"block_id": {"type": "string"}, "form": {"type": "string", "enum": ["full", "head_tail", "excerpt"], "description": "default full"}},
+            "properties": {"block_id": {"type": "string"}, "form": {"type": "string", "enum": list(AGENT_FETCH_FORMS), "description": "default full"}},
             "required": [],
         },
         "params": ("block_id", "form='full'"),
         "fn": _ctx_fetch,
     },
-    "ctx_budget": {
-        "description": ("Report this session's cost accounting: tokens used (with reasoning split when available), tool calls, and the active budget keys with remaining headroom. Pull-based meter."),
+    "ctx_usage": {
+        "description": ("Report this session's usage accounting — a pull-based, READ-ONLY meter: tokens_used (billed total), an input/output/reasoning split when the provider reports the counters (a counter never reported stays ABSENT, never 0), tool calls, wallclock, and the runtime token soft-stop state (budget_armed/budget). It enforces nothing: limits live in the runtime, cost-shaping levers live in design keys (cm_mode, cm_head_tail_keep, reasoning_effort)."),
         "input_schema": {
             "type": "object",
             "properties": {},
             "required": [],
         },
         "params": (),
-        "fn": _ctx_budget,
+        "fn": _ctx_usage,
     },
     "ctx_pin": {
-        "description": ("Pin a context block by id so the view assembly must keep it (the framework guarantees respect); unpin to release. Pin sparingly — pinned blocks survive every compaction."),
+        "description": ("Pin a context block by id so its CONTENT is kept: the view assembly must not elide it (the framework guarantees respect); unpin releases. Delivery caliber: protection applies to the VIEW the active cm_mode sends — under cm_mode=passthrough the view is an identity map, so nothing is elided anyway and a pin only records state. Pinning a block that is already elided or trimmed RESTORES ITS FULL TEXT (the single exemption is dedup, which only strips the repeated system header); the record self-reports restored/restored_from/chars/saved, and restoring costs future tokens — pin only what you need. note is an optional SHORT tag (<= 40 chars, stored with the block and readable back via ctx_view; a longer note is refused — use ctx_note for the rationale). Pin sparingly — pinned blocks survive every compaction."),
         "input_schema": {
             "type": "object",
             "properties": {"block_id": {"type": "string"}, "note": {"type": "string"}, "unpin": {"type": "boolean"}},
@@ -117,7 +132,7 @@ _SPECS: dict = {
         "fn": _ctx_note,
     },
     "ctx_view": {
-        "description": ("Show this session's view state: which blocks are full, elided, compacted or placeholder, and the per-turn assembly stats. Your window into what the framework kept."),
+        "description": ("Show this session's view state: each block's form plus its rule tag (your pin annotations and the op reasons — what the framework kept, and why), and the session's head_tail keep. Form semantics: full = whole content; head_tail = trimmed but recognizable; placeholder = evicted (the reason tag says why — window, merge, span-drift, policy); template = catalog card (metadata + the source address kept instead of content). Forms are sticky across turns; every non-full form restores via ctx_fetch(block_id, form=full)."),
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -145,12 +160,37 @@ def make_face_tool(name: str):
             f"make_face_tool: unknown face {name!r} (known: {sorted(_SPECS)})")
 
     fn = spec["fn"]
+    # The spec's ``params`` declaration becomes ENFORCED here (docs/19
+    # §12.27): declared names, keyword-only. A typo'd or hallucinated
+    # parameter used to die one frame deeper as a raw TypeError — the
+    # frozen core's internal function name leaking into the agent surface,
+    # with no allowed vocabulary to self-correct from; a silently-ignored
+    # parameter would be worse (an ignored parameter reads as taken
+    # effect — the B1 lesson's sibling). Refusals are DATA: same "Error:"
+    # envelope as the faces' business refusals, tool name only.
+    declared = tuple(p.split("=", 1)[0] for p in spec.get("params", ()))
+    declared_set = frozenset(declared)
+    # entries WITHOUT a default are required
+    required = frozenset(p.split("=", 1)[0] for p in spec.get("params", ())
+                         if "=" not in p)
 
     def tool_function(*args, **kwargs):
+        if args:
+            return (f"Error: {name} takes keyword parameters only "
+                    f"({', '.join(declared) if declared else 'none'}).")
+        unknown = sorted(k for k in kwargs if k not in declared_set)
+        if unknown:
+            return (f"Error: {name} got unexpected parameter(s) "
+                    f"{', '.join(unknown)}; allowed: "
+                    f"{', '.join(declared) if declared else 'none'}.")
+        missing = [k for k in required if k not in kwargs]
+        if missing:
+            return (f"Error: {name} is missing required parameter(s) "
+                    f"{', '.join(missing)}.")
         handle = current_handle("agent")
         if handle is None:
             return _NO_SESSION
-        return fn(handle, *args, **kwargs)
+        return fn(handle, **kwargs)
 
     tool_info_dict = {
         "name": name,

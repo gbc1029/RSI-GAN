@@ -77,6 +77,6 @@
 
 
 ## 上下文管理与成本键
-- 你的会话装配有**上下文管理（CM）**：`cost.cm_mode` 设计键选档（`passthrough`=不压缩，`slice`/`compact_conservative` 保留最近 K 轮全文、更早轮换占位，`custom`=你的策略组件）。旧内容不丢——`ctx_index`（列出块）/`ctx_fetch`（按 id 取回全文）随时可取。
-- `ctx_note`（会话内工作笔记，自动 pin 不丢）；`ctx_budget`（已用/余量，meter）；`ctx_pin`（保护关键块）；`ctx_view`（看上一轮装配保留/丢弃了什么）。
+- 你的会话装配有**上下文管理（CM）**：`cost.cm_mode` 设计键选档（`passthrough`=不压缩，`slice`/`compact_conservative` 保留最近 K 轮全文、更早轮做 head_tail 修剪——每侧保留量由 `cm_head_tail_keep` 定（默认 600），修剪省不足时才整块占位，`custom`=你的策略组件）。旧内容不丢——`ctx_index`（列出块）/`ctx_fetch`（按 id 取回全文）随时可取。
+- `ctx_note`（会话内工作笔记，自动 pin 不丢）；`ctx_usage`（已用/余量 meter：tokens 总量与 input/output/reasoning 分项、工具数、时长，实付口径；只读，上限由运行时执行）；`ctx_pin`（保护关键块：pin 一个已被省略/修剪的块会**恢复全文**（dedup 只去重 system 头、属唯一豁免），记录自报 restored/chars/省量，恢复会占用未来 token，按需使用）；`ctx_view`（看当前视图：块的 form 与 rule 理由）。
 - 成本参数也是设计键（`cost.*`，框架预声明）：预算锦标赛按"成本不涨、成绩不降"评价你的设计。

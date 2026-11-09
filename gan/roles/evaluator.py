@@ -296,7 +296,11 @@ class Evaluator(Role):
         digests = (recent or {}).get("digests") or []
         digest_text = "\n\n".join(str(d)[:2000] for d in digests[-3:]) or "(no digests yet)"
         challenge_results = list((recent or {}).get("challenge_results") or [])
-        sessions = outer_session_index(self.output_dir, self.outer, "evaluator")
+        # seat="self_improve": the self seat writes OUTER-level files, so the
+        # prompt must list ITS OWN sessions (not the plan/evaluate ones).
+        sessions = outer_session_index(self.output_dir,
+                                       getattr(self, "traj_outer", None) or self.outer,
+                                       "evaluator", seat="self_improve")
         sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
         rr = render_receipt((recent or {}).get("receipt"))
         cost_stmt = str((recent or {}).get("cost_statement") or "")
@@ -307,6 +311,13 @@ class Evaluator(Role):
         # compact records only — no free text, no other role's costs).
         costs = (recent or {}).get("costs") or {}
         costs_json = json.dumps(costs, ensure_ascii=False) if costs else ""
+        # docs/19 §12.14/§12.17 feedback: a CM module (assembly OR policy)
+        # that FAILED is a to-do for the next session (stem + where + reason),
+        # measured facts only.
+        cm_rep = (recent or {}).get("cm_assembly") or {}
+        cm_json = json.dumps(cm_rep, ensure_ascii=False) if cm_rep else ""
+        cm_pol = (recent or {}).get("cm_policy") or {}
+        cm_pol_json = json.dumps(cm_pol, ensure_ascii=False) if cm_pol else ""
         instruction = (
             "Improve YOURSELF (the evaluator's own design) using only design operators "
             "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
@@ -328,6 +339,12 @@ class Evaluator(Role):
                 "they contain no private reference or val evidence.\n"
                 f"{json.dumps(challenge_results, ensure_ascii=False)[:4000]}\n")
                if challenge_results else "")
+            + ((f"\n## Your context-manager assembly (framework-measured; fix it with "
+                f"`request_source_access` + `edit_source`)\n"
+                f"{cm_json}\n") if cm_json else "")
+            + ((f"\n## Your context-manager policy (framework-measured; fix it with "
+                f"`request_source_access` + `edit_source`)\n"
+                f"{cm_pol_json}\n") if cm_pol_json else "")
             + f"\n## Feedback digests\n{digest_text}"
         )
         # Scaffold (design context, self-seat access, session run, patch retry

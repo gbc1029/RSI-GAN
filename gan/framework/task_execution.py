@@ -385,7 +385,28 @@ def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
     Every refusal lands in ``skipped`` with a reason — a named module that
     cannot be delivered is a LOUD delivery gap, never a silent fallback."""
     report: Dict[str, Any] = {"core_files": [], "policy": None, "skipped": [],
-                              "assembly": None, "policy_selection": None}
+                              "assembly": None, "policy_selection": None,
+                              "audit_files": []}
+    # A″ (docs/19 §12.65): the AUDIT module the harness needs is delivered the
+    # SAME way the CM core is — copied into ``.gan_runtime`` and imported as a
+    # top-level module. ``gan/framework/traj_chain.py`` is stdlib-only and
+    # self-contained, so this is a COPY (one implementation), never a fork.
+    # Why it must exist inside the sandbox at all: the task harness is the one
+    # trusted writer of the task trajectory (F5, §12.28) and it runs in the
+    # stage, where ``gan/`` is deliberately absent (``_RUNTIME_DIRS``). An
+    # import of ``gan.framework.traj_chain`` there is a ModuleNotFoundError at
+    # process start — measured 2026-11-09 R1: rc=1 in 0.3s, every score null.
+    _audit_src = os.path.join(os.path.dirname(__file__), "traj_chain.py")
+    _audit_dst = os.path.join(run_dir, ".gan_runtime", "traj_chain.py")
+    if os.path.isfile(_audit_src):
+        os.makedirs(os.path.dirname(_audit_dst), exist_ok=True)
+        shutil.copy2(_audit_src, _audit_dst)
+        with open(_audit_src, "rb") as fh:
+            _ad = __import__("hashlib").sha256(fh.read()).hexdigest()[:12]
+        report["audit_files"].append({"file": "traj_chain.py", "sha256_12": _ad})
+    else:
+        report["skipped"].append({"file": "traj_chain.py",
+                                  "reason": "missing in framework"})
     core_src = os.path.join(os.path.dirname(__file__), "cm")
     dst_root = os.path.join(run_dir, ".gan_runtime", "cm")
     os.makedirs(dst_root, exist_ok=True)
@@ -699,24 +720,14 @@ def assemble_task_env(
         env["GAN_CM_POLICY"] = "/workspace/.gan_runtime/cm/cm_policy.py"
     if cm_report.get("assembly"):
         env["GAN_CM_ASSEMBLY"] = "/workspace/.gan_runtime/cm/cm_assembly.py"
-    # Task-child CM audit sidecar (docs/10 §11.5): PRE-CREATED so the
-    # sandbox's rw --bind has an existing source; the child appends its seam
-    # events (cm_view/cm_violation/...) and task_runner folds them into
-    # events.jsonl after the child exits. Without the file the child simply
-    # has no audit sink (advisory end to end).
-    try:
-        from gan.framework import paths as _paths
-        open(_paths.cm_events_path(run_dir), "a").close()
-        env["GAN_CM_EVENTS"] = "/workspace/cm_events.jsonl"
-    except OSError as e:
-        # The sidecar is the task child's ONLY durable audit channel — its
-        # absence must be as visible as its activity (no-silent-fail rule).
-        # There is no events path in scope here, so the snapshot report is
-        # the trace vehicle: it rides toolset_report.json -> the
-        # task_toolset_assembled event (task_runner folds the whole report).
-        cm_report["sidecar_unavailable"] = str(e)[:160]
-        print(f"[WARN] cm events sidecar unavailable ({e}); the task child "
-              "has no cm audit sink this generation", flush=True)
+    # Task-child CM audit sidecar (docs/10 §11.5): the SANDBOX path only.
+    # Nothing is pre-created: the host side lives in the harness OUTPUT tree
+    # (``outputs/<run_id>/cm_events.jsonl``), the one tree that is read-write
+    # INSIDE the sandbox namespace, and the harness appends it back there
+    # after each question. A run-dir sidecar cannot work at all — the run
+    # tree is ``--ro-bind`` in there, so a write-back fails with EROFS
+    # (CM-02's real cause).
+    env["GAN_CM_EVENTS"] = "/workspace/cm_events.jsonl"
 
     tools_dir = os.path.join(runtime_dir, "tools")
     # Report what the design selected vs what actually got assembled, PER
@@ -2036,6 +2047,10 @@ class _TaskRunLease:
 
         _task_walk_tree(self.run_fd, grant_read)
         _task_walk_tree(self.output_fd, grant_write)
+        # NOTE: the run tree gets NO write exception, not even for the CM
+        # sidecar — that file lives in the OUTPUT tree now (see
+        # ``paths.task_cm_events_path``), so the "a new file here cannot be
+        # created" preflight invariant stays absolute.
 
     def close(self, *, strict: bool = True) -> None:
         if self.closed:

@@ -26,7 +26,29 @@ from utils import trajectory_log
 #         merged into the tool result (visible to the agent, absent from
 #         stdout/stderr mixing).
 _TOOL_CALL_TIMEOUT_S = 600          # default per-call budget (roles; task passes its own)
-_TOOL_OUTPUT_CAP = 16_000           # chars, tool return text
+_TOOL_OUTPUT_CAP = 16_000           # chars, DEFAULT tool return budget
+# Per-tool delivery ceilings (docs/17 §17, 方案一). The OUTER layer is the
+# framework's context-budget POLICY: keyed by tool name, values are PERMISSION
+# ceilings (>= every inner cap of that tool, so the outer cut never fires
+# below a tool's declared ceiling), never tuned defaults — the tuned defaults
+# live in the tools. Self-held constants: the task sandbox has no ``gan/`` to
+# import from; the trajectory-family value mirrors the frozen
+# ``TRAJ_RENDER_MAX_CHARS`` and is pinned by the guard test
+# (scripts/local/test_tool_output_cap_alignment.py).
+TOOL_OUTPUT_CEILING = 120_000       # trajectory family == TRAJ_RENDER_MAX_CHARS
+# Outer-layer marker token (single source with the guard test; distinct from
+# the tools' inner "[clipped: ...]" so double cuts stay attributable).
+_OUTER_TAG = "truncated by output budget"
+_TOOL_OUTPUT_CAPS = {
+    "read_trajectory": TOOL_OUTPUT_CEILING,
+    "read_session_trajectory": TOOL_OUTPUT_CEILING,
+    "ctx_fetch": TOOL_OUTPUT_CEILING,   # frozen cm face: no inner cap BY DESIGN
+    "read_file": 40_000,                # == read_file.READ_FILE_MAX_CEILING
+    "get_config": 40_000,               # prompt (20k) + seed (~6k) JSON envelope
+    "edit_source": 40_000,              # editor view ceiling (same agent core)
+    "editor": 40_000,
+    "knowledge": 20_000,                # == its inner cap == cost-key authority
+}
 _WEDGE_DISABLE_LIMIT = 2            # wedges per tool before it is disabled for the session
 _TOOL_EXECUTOR = None               # lazily built module-level executor (thread reuse)
 
@@ -241,13 +263,27 @@ def process_tool_call(tools_dict, tool_name, tool_input, timeout_s=None):
         audit["tool_stderr"] = errd
 
     text = result if isinstance(result, str) else str(result)
-    if len(text) > _TOOL_OUTPUT_CAP:
+    cap = _TOOL_OUTPUT_CAPS.get(tool_name, _TOOL_OUTPUT_CAP)
+    if len(text) > cap:
         audit["truncated"] = True
         audit["original_chars"] = len(text)
-        text = (text[:_TOOL_OUTPUT_CAP]
-                + f"\n...[truncated: {len(text)} chars total, showing first "
-                  f"{_TOOL_OUTPUT_CAP}; use read_file/grep with tighter bounds]")
+        text = _outer_clip(text, cap)
     return text, audit
+
+
+def _outer_clip(text: str, cap: int) -> str:
+    """Outer-layer cut + budget marker, in ONE place (guard-testable).
+
+    The marker token differs from the tools' inner ``[clipped: ...]`` so an
+    audit can attribute which layer fired; the advice line is deliberately
+    NEUTRAL — the task child has no ``read_file``/``grep`` (its surfaces are
+    editor/bash/knowledge), and roles reach big content through
+    ``read_trajectory``/``ctx_fetch`` instead of re-reading files.
+    """
+    return (text[:cap]
+            + f"\n...[{_OUTER_TAG}: showing first {cap} of {len(text)} chars "
+              f"(budget {cap}); re-issue with a narrower window "
+              f"(max_chars/view_range/grep pattern) where supported]")
 
 def get_tooluse_prompt(tool_infos=[]):
     """
@@ -445,8 +481,15 @@ def check_for_tool_uses(response):
                 continue
             tool_uses.append({'tool_name': name,
                               'tool_input': {} if inp_null else inp})
-        except json.JSONDecodeError:
-            _note('invalid JSON')
+        except json.JSONDecodeError as e:
+            # Field audit smoke_1030_204345 (go__poker): the bare "invalid
+            # JSON" reason gave the model nothing to act on -- it re-emitted
+            # the byte-identical broken block twice and the loop died on the
+            # 3-strike breaker. The exception already knows the defect and
+            # its position; carry both into the bounded feedback turn so the
+            # model fixes THIS defect instead of guessing (the reason rides
+            # the feedback verbatim via `reason_note` below).
+            _note(f"invalid JSON: {e.msg} (line {e.lineno} column {e.colno})")
     return (tool_uses if tool_uses else None), malformed, reason
 
 def _emit(logging, trajectory_file, kind, **fields):
@@ -486,6 +529,57 @@ def _output_fields(info):
             if usage.get(key) is not None:
                 fields[key] = usage[key]
     return fields
+
+
+def _truncation_feedback(info, response, terminal: bool = False) -> str:
+    """Model-facing feedback for an output-incomplete response (docs/17 §16.7).
+
+    ONE construction point for the retry turn AND the forced-summary turn --
+    two call sites, one f-string (the mirror-drift lesson: separately
+    maintained copies drift). The JUDGMENT (should_retry_tool_use /
+    _json_block_truncated) is unchanged; only the model-facing ADVICE is
+    matrixed on finish_reason, which rides `info` at both call sites:
+
+    - "length": the API itself ruled the response cut by the output limit --
+      keep the size attribution verbatim (re-emitting the same content would
+      re-cut at the same place; shrinking is the only viable advice).
+    - anything else (stop / content_filter / missing): ONE neutral message
+      that names the two concrete hypotheses -- most commonly a missing
+      closing `</json>` tag with otherwise-complete content, or an unbalanced
+      brace/quote -- and requires a COMPLETE block re-emit (a bare `</json>`
+      continuation is not capturable: the extractor needs one paired block in
+      a single response). Non-attributive response-length line lets the model
+      rule the size hypothesis in or out itself (543 chars cannot be a limit
+      problem).
+
+    Length is factual only: chars always; completion_tokens when the usage
+    block exists -- absent stays absent, never 0 (the _output_fields
+    convention).
+    """
+    fr = (info or {}).get("finish_reason")
+    usage = (info or {}).get("usage")
+    ctok = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    length = f"response length: {len(response or '')} chars"
+    if ctok is not None:
+        length += f" / {ctok} tokens"
+    if fr == "length":
+        if terminal:
+            return ("Your last attempts were each cut off mid-JSON: "
+                    f"the response was too long. ({length}) Do NOT call any "
+                    "tool and do NOT paste file contents. Reply with a short "
+                    "final answer only.")
+        return (f"Error: Output context exceeded. Please try again. ({length})")
+    core = ("Error: the tool-call block in your last message was incomplete -- "
+            "either the response was cut by the output limit, or the block is "
+            "structurally incomplete (most commonly a missing closing `</json>` "
+            "tag with the content itself fine, or an unbalanced brace/quote). "
+            "Re-emit the COMPLETE <json>...</json> block; keep the content, do "
+            "not shorten it based on length alone.")
+    if terminal:
+        return (core + f" ({length}) Do NOT call any tool and do NOT paste file "
+                "contents. Reply with a short final answer only.")
+    return core + f" ({length})"
+
 
 def chat_with_agent(
     msg,
@@ -563,12 +657,19 @@ def chat_with_agent(
     # mechanism, no GAN semantics: None (default) keeps today's behaviour.
     tokens_used = 0
     token_budget_exhausted = False
+    # Usage split (docs/19 §12.25): per-provider-reported counters summed
+    # alongside the total. None-initialized — a counter the provider never
+    # reports stays ABSENT from the reader output (never 0), the same rule
+    # the per-row `_output_fields` follow.
+    _usage_parts = {"input_tokens": None, "output_tokens": None,
+                    "reasoning_tokens": None}
 
     # Live meter source for the CM session (docs/10 §11.5): the chat loop owns
     # the authoritative running totals, so it hands the session a reader
     # closure over them instead of letting the meter keep a second counter.
     # Reader contract (gan/framework/cm/session.py): keys tokens_used / budget
-    # / tool_calls / wallclock_s, all optional, 实付口径 (proxy usage sums).
+    # / tool_calls / wallclock_s plus the optional input/output/reasoning
+    # split, all optional, 实付口径 (proxy usage sums).
     cm_started = time.time()
     cm_token = None
 
@@ -576,10 +677,15 @@ def chat_with_agent(
         out = {"tokens_used": tokens_used,
                "tool_calls": num_tool_calls,
                "wallclock_s": round(time.time() - cm_started, 1)}
+        for field, part in _usage_parts.items():
+            if part is not None:
+                out[field] = part
         # budget_armed must be EXPLICIT in both states (no-silent-fail rule):
         # a missing "budget" key alone reads as "a budget exists somewhere
         # else" — it does not; unset means NO token soft stop for this run
-        # (only tool-call caps and the time walls constrain it).
+        # (only tool-call caps and the time walls constrain it). The cap is
+        # runtime-enforced; this meter only reports it (§12.25: the usage
+        # face plans nothing, it shows the dial).
         out["budget_armed"] = isinstance(max_total_tokens, int) and max_total_tokens > 0
         if out["budget_armed"]:
             out["budget"] = max_total_tokens
@@ -595,6 +701,16 @@ def chat_with_agent(
         raw_history = kwargs.get("msg_history")
         raw_msg = kwargs.get("msg")
         n_viewed = 0
+        # F3 (docs/19 §12.42): "the seam was APPLIED" and "how many entries
+        # the sent view carried" are two different facts. ``n_viewed`` is
+        # ONLY the offset into the client's rebuilt history (the client
+        # constructs ``hist = sent_history + [user, assistant]``, so
+        # ``hist[n_viewed:]`` is exactly the appended pair for ANY view
+        # length, including 0). ``seam_applied`` is the boolean: an EMPTY
+        # view is legitimate (a named assembly may return []) and must still
+        # rebuild the canonical history, or the whole prior conversation is
+        # silently replaced.
+        seam_applied = False
         if cm is not None:
             try:
                 send_history, send_msg = cm.assemble_turn(
@@ -606,6 +722,7 @@ def chat_with_agent(
                 n_viewed = len(send_history)
                 kwargs["msg_history"] = send_history
                 kwargs["msg"] = send_msg
+                seam_applied = True
             except Exception as e:  # noqa: BLE001 -- fail-open
                 logging(f"[cm] seam degraded to raw view: {e}")
         response, hist, info = get_response_fn(**kwargs)
@@ -613,18 +730,47 @@ def chat_with_agent(
         total = usage.get("total_tokens")
         if isinstance(total, (int, float)):
             tokens_used += int(total)
-        if cm is not None and n_viewed and isinstance(hist, list):
+        for field, key in (("input_tokens", "prompt_tokens"),
+                           ("output_tokens", "completion_tokens"),
+                           ("reasoning_tokens", "reasoning_tokens")):
+            v = usage.get(key)
+            if isinstance(v, (int, float)):
+                _usage_parts[field] = (_usage_parts[field] or 0) + int(v)
+        if cm is not None and seam_applied and isinstance(info, dict) \
+                and isinstance(info.get("sent"), dict):
+            # SEND FACT (docs/19 §12.54-C): what the client ACTUALLY put on the
+            # wire, compared by the session against what its render claimed.
+            # Audit only -- a comparison failure must never break the call.
+            try:
+                cm.note_send_fact(info["sent"])
+            except Exception as e:  # noqa: BLE001
+                logging(f"[cm] send fact not recorded: {e}")
+        if cm is not None and seam_applied and isinstance(hist, list):
             # keep the CANONICAL (raw) history: the seam's copies were only
             # for sending; the user turn is rebuilt RAW, the assistant reply
-            # is raw by construction (LLM output). Text-key form — the
-            # canonical convention (agent/llm.py returns text-form entries;
-            # get_response's entry conversion text->content handles the send).
+            # is raw by construction (LLM output). ``content``-keyed — the
+            # single carrier (docs/19 §12.54-B); ``_cm_sent`` is the send
+            # projection and must never survive into the canonical, so it is
+            # stripped here as well (defence in depth: the client already
+            # consumed it).
+            # ``seam_applied`` (NEVER ``n_viewed``) gates this: a legal empty
+            # view has offset 0, so ``hist[0:]`` is the appended pair and
+            # ``raw_history + that`` preserves the prior conversation.
+            # ``raw_msg`` is the AS-SENT user turn (it includes the per-turn
+            # tool-use header by design; canonical never stores view
+            # artifacts such as the dedup marker).
             try:
                 new_entries = list(hist[n_viewed:])
                 if new_entries and isinstance(new_entries[0], dict) \
                         and new_entries[0].get("role") == "user":
-                    new_entries[0] = {"role": "user", "text": raw_msg}
-                hist = list(raw_history or []) + new_entries
+                    new_entries[0] = {"role": "user", "content": raw_msg}
+                rebuild = []
+                for entry in (list(raw_history or []) + new_entries):
+                    if isinstance(entry, dict) and "_cm_sent" in entry:
+                        entry = {k: v for k, v in entry.items()
+                                 if k != "_cm_sent"}
+                    rebuild.append(entry)
+                hist = rebuild
             except Exception:  # noqa: BLE001 -- history shapes vary
                 pass
         return response, hist, info
@@ -646,12 +792,12 @@ def chat_with_agent(
             # The seam learns the per-turn header (dedup target) and binds
             # itself for ctx_* tools (contextvar; process_tool_call copies it
             # into the dispatch threads). The live meter reader rides the same
-            # wiring: ctx_budget reads THIS chat run's authoritative totals
+            # wiring: ctx_usage reads THIS chat run's authoritative totals
             # instead of an empty snapshot (docs/10 §11.5).
             try:
                 cm.set_system_prefix(system_msg)
-                if hasattr(cm, "budget_reader"):
-                    cm.budget_reader = _cm_usage_reader
+                if hasattr(cm, "usage_reader"):
+                    cm.usage_reader = _cm_usage_reader
                 cm_token = cm.activate()
             except Exception as e:  # noqa: BLE001 -- advisory wiring
                 logging(f"[cm] session wiring degraded: {e}")
@@ -776,6 +922,11 @@ def chat_with_agent(
                     tool_output, tool_audit = process_tool_call(
                         tools_dict, tool_name, tool_input, timeout_s=tool_timeout_s)
                     num_tool_calls += 1
+                    # A dispatched call resets the output-incomplete retry
+                    # counter (docs/17 §16.7): "consecutive" is literal -- a
+                    # recovered session between failures must not inherit the
+                    # earlier strikes toward the 5-strike forced summary.
+                    _ctx_retry_count = 0
                     if tool_audit.get("wedged"):
                         _emit(logging, trajectory_file, "tool_wedged", tool=tool_name,
                               wedged=tool_audit["wedged"], wedge_limit=tool_audit["wedge_limit"])
@@ -850,16 +1001,18 @@ def chat_with_agent(
                     # the session ends cleanly either way.
                     logging(f"Error: Output context exceeded {_ctx_retry_count}x "
                             f"in a row; forcing final summary.")
+                    _info = info or {}
+                    _usage = _info.get("usage") or {}
                     _emit(logging, trajectory_file, "no_answer",
-                          consecutive_truncations=_ctx_retry_count)
+                          consecutive_truncations=_ctx_retry_count,
+                          finish_reason=_info.get("finish_reason"),
+                          completion_tokens=_usage.get("completion_tokens"))
                     try:
                         response, new_msg_history, info = _counting_llm(
-                            msg=(system_msg
-                                 + "\n\n# Output context exceeded repeatedly\n"
-                                 "Your last attempts were each cut off mid-JSON: "
-                                 "the response was too long. Do NOT call any tool "
-                                 "and do NOT paste file contents. Reply with a "
-                                 "short final answer only."),
+                            msg=(system_msg + "\n\n"
+                                 "# Output context exceeded repeatedly\n"
+                                 + _truncation_feedback(info, response,
+                                                        terminal=True)),
                             model=model,
                             msg_history=new_msg_history,
                         )
@@ -869,8 +1022,9 @@ def chat_with_agent(
                         logging(f"Error during final summary turn: {e}")
                     truncated = True
                     break
-                logging("Error: Output context exceeded. Please try again.")
-                tool_msgs.append("Error: Output context exceeded. Please try again.")
+                retry_msg = _truncation_feedback(info, response)
+                logging(retry_msg)
+                tool_msgs.append(retry_msg)
 
             # Get tool response
             response, new_msg_history, info = _counting_llm(

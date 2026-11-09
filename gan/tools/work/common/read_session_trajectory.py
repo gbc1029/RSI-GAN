@@ -29,7 +29,9 @@ import glob
 import os
 
 from gan.framework.context import get_access_context
-from gan.framework.trajectory import outer_session_index, read_session, session_label
+from gan.framework.trajectory import (outer_session_index, read_session,
+                                      session_label, session_universe)
+from agent.tools.clip import clip_head
 
 
 def tool_info():
@@ -65,6 +67,18 @@ def tool_info():
                                         "(traceback|budget_stop|repeat_break|truncated)."},
                 "offset": {"type": "integer",
                            "description": "Index pagination: skip this many matching segments."},
+                "tail": {"type": "integer",
+                         "description": "Serve the LAST N segments' content as "
+                                        "one page (any mode; the forensic common "
+                                        "case)."},
+                "head": {"type": "integer",
+                         "description": "Serve the FIRST N segments' content as "
+                                        "one page (any mode)."},
+                "grep": {"description": "Regex search over the session files' "
+                                        "segment texts (server-side): returns "
+                                        "matching seg_ids + the first matching "
+                                        "line, so grep -> fetch composes. Bad "
+                                        "regex is a loud error."},
             },
         },
     }
@@ -153,37 +167,35 @@ def _quarantine_note(labels):
             "events.jsonl session_redaction_failed): " + ", ".join(labels))
 
 
-def _session_entries(output_dir, current_outer, outers, role, genid):
+def _session_entries(output_dir, current_outer, outers, role, genid,
+                     *, seat=None):
     """The visible session files as ``(label, path)`` pairs.
 
-    Labels come from ``trajectory.session_label`` — the ONE label rule shared
-    with trajectory materialization (genid-qualified for the current outer,
-    outer-prefixed for other declared outers) so this fallback and the
-    session's materialized index address the same files identically.
-    ``genid`` may carry an ``outer_<O>/`` prefix; a bare genid narrows to the
-    CURRENT outer only. Canonical + attempt siblings per genid, newest first
-    (mirrors trajectory.read_session)."""
-    try:
-        req_outer, req_genid = _parse_genid_ref(genid, current_outer)
-    except ValueError:
-        raise
-    scan_outers = [str(req_outer)] if req_genid is not None \
-        else [str(o) for o in outers]
-    out = []
-    for o in scan_outers:
-        d = os.path.join(output_dir, "trajectory", f"outer_{o}")
-        if req_genid is not None:
-            genids = [req_genid]
-        else:
-            genids = [str(e["genid"])
-                      for e in outer_session_index(output_dir, o, role)]
-        for g in genids:
-            for p in sorted(glob.glob(os.path.join(d, g, f"{role}*.jsonl")),
-                            reverse=True):
-                if os.path.isfile(p):
-                    out.append((session_label(current_outer, o, g,
-                                              os.path.basename(p)), p))
-    return out
+    Built from ``trajectory.session_universe`` — the ONE resolver shared with
+    trajectory materialization, so this fallback and the session's
+    materialized index address the same files identically (the hand-rolled
+    legacy glob that used to live here rebuilt paths that a seat-keyed run
+    never writes: docs/19 §12.12 F1). ``genid`` may carry an ``outer_<O>/``
+    prefix; a bare genid narrows to the CURRENT outer only."""
+    req_outer, req_genid = _parse_genid_ref(genid, current_outer)
+    extras = [o for o in ([req_outer] if req_genid is not None
+                          else list(outers))
+              if str(o) != str(current_outer)]
+    pairs = session_universe(output_dir, role, current_outer,
+                             extra_outers=extras, seat=seat)
+    if req_genid is None:
+        return pairs
+    # genid narrowing: a label is ``<genid>/<file>`` (or
+    # ``outer_<O>/<genid>/<file>``) for per-generation seats and a bare file
+    # name for the self seat, whose files are outer-level.
+    want = str(req_genid)
+    keep = []
+    for label, path in pairs:
+        head = label.split("/")[0]
+        if head == want or (head.startswith("outer_") and
+                            label.split("/")[1:2] == [want]):
+            keep.append((label, path))
+    return keep
 
 
 def _active_traj_session():
@@ -233,7 +245,8 @@ def _norm_filters(kind, tool, flag, offset):
 
 
 def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
-                  flag=None, offset=0, **kwargs):
+                  flag=None, offset=0, tail=None, head=None, grep=None,
+                  **kwargs):
     actx = get_access_context()
     if actx is None:
         return "Error: no access context"
@@ -268,42 +281,119 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
     if hasattr(broker, "session_trajectory_index"):
         # Sandboxed seat worker: every byte crosses the parent-side RPC
         # (redaction stays parent-side; this seat cannot see other outers'
-        # files). The CM slice index / seg-fetch faces are in-process faces
-        # and do not apply here; filters are noted, never silently ignored.
-        extra = ("# note: kind=/tool=/flag=/offset=/fetch= are in-process "
-                 "slice-mode faces; a sandboxed seat worker reads the full "
-                 "redacted blob\n") if (slice_mode or has_filter) else ""
-        if genid is not None:
-            try:
-                req_outer, req_genid = _parse_genid_ref(genid, outer)
-            except ValueError as e:
-                return f"Error: {e}"
-            blob = broker.read_session_trajectory(role, actx.node_id, req_outer,
-                                                  req_genid, cap, seat=actx.seat)
-            if not blob:
-                return f"No session trajectory for genid {genid}."
+        # files). §12.24 (CM-08): the slice faces cross as a structured
+        # ``query`` — the root-side broker serves index/fetch/tail/head/grep
+        # over the SAME declared files (visibility unchanged; the
+        # materialized payload stays reachable via ctx_index/ctx_fetch).
+        # Old root-side brokers refuse the unknown kwarg with TypeError and
+        # the branch degrades to the legacy blob path LOUDLY, never silently.
+        cap = int(max_chars or 6000)
+        query = None
+        if fetch or tail or head or grep:
+            query = {"fetch": fetch, "tail": tail, "head": head, "grep": grep,
+                     "mode": mode}
+        elif slice_mode:
+            query = {"kind": filt["kind"], "tool": filt["tool"],
+                     "flag": filt["flag"], "offset": filt["offset"],
+                     "mode": mode}
+
+        def _render(req_outer, req_genid, result):
             where = "" if str(req_outer) == str(outer) else f" (outer_{req_outer})"
-            return extra + note + f"# your session genid={req_genid}{where}\n{blob}"
-        pairs = []
-        for o in outers:
-            idx = broker.session_trajectory_index(role, actx.node_id, o,
-                                                  seat=actx.seat)
-            for e in (idx or []):
-                pairs.append((session_label(outer, o, e["genid"], f"{role}.jsonl"),
-                              o, e["genid"]))
-        if not pairs:
+            if isinstance(result, dict):
+                serve = result.get("serve")
+                if serve == "error":
+                    return str(result.get("text") or "Error:")
+                if serve == "segment":
+                    entry = result.get("entry") or {}
+                    meta = (f"# segment {result.get('seg_id')} "
+                            f"kind={entry.get('kind')}"
+                            + (f" tool={entry.get('tool')}" if entry.get("tool") else "")
+                            + f" chars={entry.get('chars')}")
+                    return f"{meta}\n{clip_head(str(entry.get('text') or ''), cap)}"
+                if serve == "page":
+                    return str(result.get("text") or "")
+                if serve == "index":
+                    from gan.framework.cm.traj_index import render_index_text
+                    header = (f"# your session index genid={req_genid}{where} "
+                              f"(mode={mode}, redacted; fetch=<seg_id> for content)")
+                    return header + "\n" + render_index_text(
+                        result.get("index") or {}, max_chars=cap,
+                        kinds=filt["kind"], tools=filt["tool"],
+                        flags=filt["flag"], offset=filt["offset"])
+                return f"Error: unknown serve envelope {serve!r}"
+            blob = str(result or "")
+            if not blob:
+                return ""
+            return f"# your session genid={req_genid}{where}\n{blob}"
+
+        try:
+            if genid is not None:
+                try:
+                    req_outer, req_genid = _parse_genid_ref(genid, outer)
+                except ValueError as e:
+                    return f"Error: {e}"
+                parts = [_render(req_outer, req_genid,
+                                 broker.read_session_trajectory(
+                                     role, actx.node_id, req_outer, req_genid,
+                                     cap, seat=actx.seat, query=query))]
+            else:
+                parts = [_render(o, None,
+                                 broker.read_session_trajectory(
+                                     role, actx.node_id, o, None, cap,
+                                     seat=actx.seat, query=query))
+                         for o in outers]
+        except PermissionError as e:
+            # A refusal is DATA, not an exception the agent has to decode
+            # (docs/19 §12.11: every out-of-set request is refused and the
+            # refusal is reported).
+            return (f"Error: {e}\n"
+                    f"(your session may read outers: {outers})")
+        except TypeError:
+            # Old root-side broker (pre-§12.24): no query face. Retry the
+            # legacy blob path and say so — degradation is never silent.
+            if genid is not None:
+                try:
+                    req_outer, req_genid = _parse_genid_ref(genid, outer)
+                except ValueError as e:
+                    return f"Error: {e}"
+                blob = broker.read_session_trajectory(
+                    role, actx.node_id, req_outer, req_genid, cap,
+                    seat=actx.seat)
+                parts = [f"# your session genid={req_genid}\n{blob}"]
+            else:
+                pairs = []
+                for o in outers:
+                    idx = broker.session_trajectory_index(role, actx.node_id, o,
+                                                          seat=actx.seat)
+                    for e in (idx or []):
+                        if e.get("quarantined"):
+                            continue
+                        if e.get("name") and e.get("genid") is None:
+                            pairs.append((session_label(outer, o, None, e["name"]),
+                                          o, None))
+                        else:
+                            pairs.append((session_label(outer, o, e["genid"],
+                                                        f"{role}.jsonl"),
+                                          o, e["genid"]))
+                blob = "\n\n".join(
+                    broker.read_session_trajectory(role, actx.node_id, o, g, cap,
+                                                   seat=actx.seat)
+                    for _l, o, g in pairs)
+                parts = [(f"# your sessions (outers={outers}): "
+                          f"{[p[0] for p in pairs]}\n{clip_head(blob, cap)}")]
+            return ("# note: the parent-side broker predates the segment query "
+                    "face (docs/19 §12.24); the full redacted blob is served "
+                    "instead\n" + "\n\n".join(parts))
+        parts = [p for p in parts if p and p.strip()]
+        if not parts:
             return "No session trajectories in your visible outers yet."
-        blob = "\n\n".join(
-            broker.read_session_trajectory(role, actx.node_id, o, g, cap,
-                                           seat=actx.seat) for _l, o, g in pairs
-        )
-        return extra + note + (f"# your sessions (outers={outers}): "
-                               f"{[p[0] for p in pairs]}\n{blob[:cap]}")
+        return note + "\n\n".join(parts)
 
     if not output_dir:
         return "Error: parent trajectory root is unavailable"
     try:
-        entries = _session_entries(output_dir, outer, outers, role, genid)
+        entries = _session_entries(output_dir, outer, outers, role, genid,
+                                   seat=getattr(actx, "seat", None))
     except ValueError as e:
         return f"Error: {e}"
     labels = {label for label, _p in entries}
@@ -376,7 +466,7 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
                     meta = (f"# segment {seg_id} kind={seg['kind']}"
                             + (f" tool={seg['tool']}" if seg.get("tool") else "")
                             + f" chars={seg['chars']}")
-                    return f"{meta}\n{block.text[:cap]}"
+                    return f"{meta}\n{clip_head(block.text, cap)}"
         src = dict(entries).get(addr)
         if src is None:
             return f"Error: segment '{fetch}' not in the visible sessions."
@@ -386,7 +476,47 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         meta = (f"# segment {seg_id} kind={entry['kind']}"
                 + (f" tool={entry['tool']}" if entry.get("tool") else "")
                 + f" chars={entry['chars']}")
-        return f"{meta}\n{entry['text'][:cap]}"
+        return f"{meta}\n{clip_head(entry['text'], cap)}"
+
+    if tail or head or grep:
+        # §12.36 (R2): content ops serve in ANY mode on BOTH arms — the
+        # in-process ladder previously dropped these three parameters into
+        # the index/blob path with no note. One scan over the visible
+        # sessions, payload first, archived-file fallback (the seat arm's
+        # Tier 1/Tier 2 sources and caps).
+        sess = _active_traj_session()
+        segs = _payload_segments(sess, entries) if sess is not None else None
+        if segs is not None:
+            def _lookup(seg):
+                bid = sess.traj_segments.get(seg["seg_id"])
+                blk = sess.universe.get(bid) if bid else None
+                return blk.text if blk is not None else None
+        else:
+            paths = [p for _l, p in entries if os.path.isfile(p)]
+            if not paths:
+                qnote = _quarantine_note(
+                    _quarantined_labels(output_dir, outer, outers, role))
+                msg = "No session trajectories in your visible outers yet."
+                return msg + ("\n" + qnote if qnote else "")
+            from gan.framework.cm.traj_index import (build_traj_index,
+                                                     segment_entry)
+            segs = (build_traj_index(paths, labels=sorted(labels))
+                    .get("segments") or [])
+            by_label = dict(entries)
+
+            def _lookup(seg):
+                src = by_label.get(seg.get("file"))
+                entry = (segment_entry(src, seg.get("line_no"))
+                         if src else None)
+                return entry["text"] if entry else None
+        from gan.framework.cm.traj_index import grep_page, tail_head_page
+        if grep:
+            try:
+                return grep_page(segs, _lookup, grep)
+            except ValueError as e:
+                return f"Error: {e}"
+        return tail_head_page(segs, _lookup, n=int(tail or head or 1),
+                              tail=bool(tail), max_chars=cap)
 
     if genid is not None:
         try:
@@ -413,7 +543,7 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         read_session(output_dir, o, g, role, cap) for _l, o, g in pairs
     )
     return note + (f"# your sessions (outers={outers}): "
-                   f"{[p[0] for p in pairs]}\n{blob[:cap]}")
+                   f"{[p[0] for p in pairs]}\n{clip_head(blob, cap)}")
 
 
 op_info = tool_info

@@ -39,6 +39,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import shutil
 import statistics
 import threading
@@ -81,6 +82,91 @@ _EVALUATOR_META_KEYS = (
 )
 
 
+def _report_view_for_evaluator(report_summary):
+    """The BLIND-phase projection of the task's ``report_summary``.
+
+    Exclusion set = the trajectory redaction vocabulary (``trajectory
+    ._SENSITIVE``) — ONE sensitive-key source governing BOTH evaluator-visible
+    channels (rendered trajectory views and this meta projection), so they
+    cannot drift again. The B1 lesson (issue ``harness.infra``, g0/i-2): the
+    old inline strip list named two scalars while ``label_distribution`` rode
+    through with the ground-truth distribution, compromising the blind
+    protocol from the framework side. Process facts (coverage / sample_n /
+    contract_ok / patch counts) survive; the objective outcome family is
+    revealed only through the reveal mechanism, never through this payload.
+    """
+    from gan.framework.trajectory import _SENSITIVE
+    banned = frozenset(_SENSITIVE)
+    if not isinstance(report_summary, dict):
+        return {}
+    return {k: v for k, v in report_summary.items() if k not in banned}
+
+
+# The cost record's ``cm`` CONTRACT (docs/19 §12.43/§12.44): a field absent
+# from this tuple is LOST from cost_sessions.jsonl even though the session
+# reported it (assembly_* / traj_segments / thread_leaks used to be dropped).
+# These are the SUMMARY counters of a role seat; the task child's event-shape
+# node lives in runs/<genid>/cost.json ``task_cm`` (two shapes, one mapping
+# table in docs/19 §12.44).
+_CM_COST_KEYS = (
+    "mode", "turns", "blocks", "ops_total", "ops_applied", "ops_refused",
+    "policy_failures", "policy_disabled", "violations", "est_chars_saved",
+    # N4 (docs/19 §12.46): the AGENT-source half of the flow, so the cost row
+    # can attribute (seam half = est_chars_saved - est_saved_agent; the
+    # conditional field stays absent when there is no agent-source flow).
+    "est_saved_agent",
+    # F7: the seam's health facts that used to be summary-only.
+    "substituted",
+    "emit_failures",
+    "assembly_active", "assembly_failures", "assembly_disabled",
+    "assembly_violations", "policy_violations",
+    "assembly_overruns", "policy_overruns",
+    "traj_segments",
+    # CM-03 leak observability: a leaked worker thread must not vanish from
+    # the cost record (absence = clean). ``thread_leaks_live`` is the MEASURED
+    # restart signal; the other two are its prediction / census sibling.
+    "thread_leaks", "thread_leaks_live", "thread_leak_delta",
+    # WHO leaked (docs/19 §12.67): the COUNT alone was unattributable, two real
+    # rounds reported the same "delta=1" on the same seat with no name.
+    "thread_leak_names",
+    # SEND FACT (docs/19 §12.54-C): turns whose SENT widths disagreed with the
+    # render's claim. Conditional in ``summary()`` (absence = clean), so a
+    # "rendered but never shipped" session can never read as healthy here.
+    "send_mismatches", "send_drift_chars",
+    # C (docs/19 §12.55): turns whose send was not the canonical list, so the
+    # view was refused rendering. Conditional too (absence = the view shipped).
+    "send_unrendered_turns",
+)
+
+
+# U (docs/19 §12.64): the summary keys that are deliberately NOT in the cost
+# record. Both are actionable "fix this module" REPORTS for the next
+# self-improve session (they ride ``policy_report``/``assembly_report`` into the
+# prompt, docs/19 §12.17) — a cost row carries counters, not remedies.
+_CM_SUMMARY_ONLY = ("assembly_report", "policy_report")
+
+
+def _cm_cost_node(cm_sum: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The ``cm`` node of a ``cost_sessions.jsonl`` row: the whitelist transform.
+
+    Extracted from the (very long) cost writer so the CONTRACT is testable in
+    one line: which ``summary()`` keys reach the record, and that a session
+    with **zero turns** still speaks (U, docs/19 §12.64).
+
+    * ``None`` in -> ``None`` out: no session means no node (absence = "CM was
+      never wired" — the meaning ``rec["cm"]`` is missing must keep).
+    * A 0-turn session still yields a node. It used to be gated on
+      ``summary()["turns"]``, so a seat built with a disabled/latched module
+      that died before its first LLM call reported ``policy_disabled: true`` to
+      the receipt while the cost row said nothing at all.
+    * Unknown keys are DROPPED (default-deny): the whitelist is the record's
+      contract, and a field the whitelist does not name is invisible on disk.
+    """
+    if cm_sum is None:
+        return None
+    return {k: cm_sum[k] for k in _CM_COST_KEYS if k in cm_sum}
+
+
 def _receipt_for_evaluator(receipt):
     """The evaluator's projection of the plan receipt — outcomes only.
 
@@ -90,9 +176,17 @@ def _receipt_for_evaluator(receipt):
     errors), ``grants`` carry agent free text, and ``design.ops`` duplicate the
     diff_summary channel. The evaluator calibrates on patch OUTCOMES
     (applied/rejected/budget), not on the planner's paperwork.
+
+    ``budget`` is a NAMED projection (docs/19 §12.44): explicit allowlists in
+    ``receipt.project_budget_for_evaluator``, so a future budget/summary field
+    is invisible here until added on purpose. ``budget.cm`` is the REDUCED
+    summary (health counters + ``cm_degraded``), never the planner's module
+    report (its ``last_error``/``where`` text stays on the planner's own
+    ``cm_policy`` channel).
     """
     if not isinstance(receipt, dict):
         return {}
+    from gan.framework.receipt import project_budget_for_evaluator
     cp = receipt.get("code_patch") or {}
     # Cost projection: TASK-ONLY (docs/10 §4). The planner's plan-session
     # cost is the planner's own business; the evaluator never sees it here
@@ -103,7 +197,7 @@ def _receipt_for_evaluator(receipt):
         # current-round events. ``toolset`` stays: it is inherited-baseline
         # context, not a current-round event.
         "round": receipt.get("genid"),
-        "budget": receipt.get("budget") or {},
+        "budget": project_budget_for_evaluator(receipt.get("budget") or {}),
         "cost": {"task": (receipt.get("cost") or {}).get("task")},
         "design_stripped": receipt.get("design_stripped") or [],
         "toolset": receipt.get("toolset") or {},
@@ -114,6 +208,13 @@ from utils.soft_fail import soft_fail
 from utils import prune
 
 _MEASURED = ("ok", "partial")
+
+# A task-child trajectory label as the materialization sees it: the numeric genid
+# dir (main chain) or the fixed-root evaluation round's own dir. Every one of
+# these is EXPECTED to be outside a p/e seat's sandbox bind (docs/19 §12.48 has
+# no task-trajectory mount), which is why the seat-bind demotion is only noisy
+# rather than alarming for exactly this shape (docs/19 §12.70).
+_TASK_TRAJ_LABEL_RE = re.compile(r"^(?:\d+|eval_outer\d+_s\d+)/task\.jsonl$")
 
 
 def stagnation_metric(anchor_child: Optional[float], anchor_parent: Optional[float],
@@ -216,6 +317,38 @@ class GanLoop:
         self.cfg = cfg
         self.planner = planner
         self.evaluator = evaluator
+        # P1/P2 trust hardening (docs/19 §12.14): a module that failed once is
+        # NOT re-attempted until its CONFIGURATION actually changes. The latch
+        # stores the fingerprint of (effective cm_* keys, module bytes): a
+        # change releases it, which is exactly "p/e keeps the latch for the
+        # whole outer" (their writer is the once-per-outer self_improve)
+        # without any outer-boundary plumbing.
+        # The TASK seat is session-scoped inside ``CMSession`` (one failed
+        # attempt per generation): its session is built by the task runner,
+        # whose config path the loop does not own. (p/e latch table moved to
+        # the kind-keyed `_cm_agent_latch`, docs/19 §12.17.)
+        # The tables below are keyed by ``(role, seat, SCOPE)`` — scope is
+        # "main" for the outer's seats and "eval" for the fixed-root
+        # evaluation's own throwaway seat (docs/19 §12.45): those two seats
+        # resolve DIFFERENT workspaces (``outer_<N>__<seat>`` vs
+        # ``outer_<N>_eval__<seat>``), so a shared entry would let either seat
+        # release the other's latch and overwrite its failure report. Scope is
+        # part of the KEY only: a scope entry still persists across outers,
+        # exactly like the main one.
+        # Last settled "your CM module failed" facts per (role, seat, scope)
+        # (docs/19 §12.14 feedback; seat keyed in §12.60-O): the next
+        # self-improve session reads the MAIN/self_improve seat's entry
+        # (``_cm_report_for``), falling back to any other seat of the role.
+        # Before O the key was (role, scope) only, so the plan seat and the
+        # self_improve seat of the same role overwrote each other's failure
+        # report — the self-improve session could read a report written by a
+        # seat it never repairs against.
+        self._cm_assembly_report: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._cm_policy_report: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        # kind-keyed fingerprint latch (docs/19 §12.17): one table for BOTH
+        # agent-owned CM modules; entry shape {kind: {fp, stem, reason, ...}}.
+        self._cm_agent_latch: Dict[Tuple[str, str, str],
+                                   Dict[str, Dict[str, Any]]] = {}
         self.task_runner = task_runner
         # Separate runner for the fixed-root evaluation (docs/14 §5.5). It is
         # pinned to the run-persistent EVALUATION question set (held-out val
@@ -461,6 +594,27 @@ class GanLoop:
         # centrally by gan/framework/models.py and injected by the runner.
         # Generation-0 prompt comes from gan/design/seeds/task.md, through the
         # SAME helper the planner/evaluator self-designs use.
+        #
+        # docs/19 §12.69: a PRE-SEEDED root design is AUTHORITATIVE. The
+        # planner/evaluator seeds already obey that rule (their store file is
+        # the authority and is never re-seeded), but the TASK root did not:
+        # generation 0 always ran the code seed, so nobody could pre-set the
+        # reserved ``cost`` slot — the only way to a non-default task CM mode
+        # was to wait for a planner session to ``set_config`` it. Reading
+        # ``design/task/initial/config.json`` when present gives the task root
+        # the same contract (and makes a task-side CM round reproducible
+        # instead of dependent on a planner's whim).
+        try:
+            from gan.design.store import DesignStore
+            from gan.design.schema import normalize_config
+            _store = DesignStore(paths.design_root(self.output_dir))
+            _root = _store.path("task", "initial")
+            if os.path.isfile(_root):
+                return normalize_config(_store.load("task", "initial"))
+        except Exception as exc:  # noqa: BLE001 -- a pre-seed must never fail silent
+            soft_fail(f"pre-seeded task root design ignored "
+                      f"({type(exc).__name__}: {exc})",
+                      event_path=paths.events_path(self.output_dir))
         return initial_config("task")
 
     def _parent_config(self, parent: Optional[Node]) -> Dict[str, Any]:
@@ -835,7 +989,9 @@ class GanLoop:
     # -- cost ledger (phases A/B, docs/10 §9) -------------------------------
     def _record_session_cost(self, role: str, seat: str, outer: Any,
                              genid: Any = None,
-                             cm_session: Any = None) -> Optional[Dict[str, Any]]:
+                             cm_session: Any = None,
+                             cm_summary: Optional[Dict[str, Any]] = None
+                             ) -> Optional[Dict[str, Any]]:
         """Settled-session cost record (A5): append to
         ``logs/cost_sessions.jsonl`` + a ``cost_session`` event.
 
@@ -863,17 +1019,32 @@ class GanLoop:
                 rec = recs[0] if recs else None
             if rec is None:
                 return None
-            if cm_session is not None:
+            # The summary arrives EITHER as a live session object (in-process)
+            # OR as the dict a cross-process seat published on the event
+            # channel -- one shape, two transports (``cm_wiring.summary_of``).
+            cm_sum = cm_summary
+            if cm_sum is None and cm_session is not None:
                 try:
                     cm_sum = cm_session.summary()
-                    if cm_sum and cm_sum.get("turns"):
-                        rec["cm"] = {k: cm_sum[k] for k in
-                                     ("mode", "turns", "blocks", "ops_total",
-                                      "ops_applied", "ops_refused",
-                                      "policy_failures", "policy_disabled",
-                                      "violations", "est_chars_saved",
-                                      "emit_failures")
-                                     if k in cm_sum}
+                except Exception:  # noqa: BLE001 -- audit-only enrichment
+                    cm_sum = None
+            if cm_sum is not None:
+                try:
+                    # The whitelist is the cost record's CONTRACT: a field
+                    # absent from it is lost from cost_sessions.jsonl even
+                    # though the session reported it. assembly_* /
+                    # traj_segments used to be dropped, so a run with a
+                    # configured named assembly read exactly like one without
+                    # it (both had no assembly fields at all).
+                    #
+                    # U (docs/19 §12.64): gated on "a session EXISTS", never on
+                    # ``turns``. A 0-turn session is legal and can carry
+                    # decision-grade state (a latched/disabled module, a
+                    # degraded build); gating on turns made those rows read as
+                    # "CM was never wired".
+                    node = _cm_cost_node(cm_sum)
+                    if node is not None:
+                        rec["cm"] = node
                 except Exception:  # noqa: BLE001 -- audit-only enrichment
                     pass
             # 幂等：同 key 记录已存在时不重复写入文件（防止 reconcile 重复
@@ -904,6 +1075,19 @@ class GanLoop:
                       event_type="cost_session_record_failed")
             return None
 
+    def _task_cm_degraded(self, genid: Any) -> bool:
+        """The task child's seam degradation for this generation
+        (docs/19 §12.44 D3) — a PROCESS fact for the evaluator's run_summary
+        and for the plan receipt's ``budget.task_cm_degraded``. Missing /
+        ``{"absent": …}`` evidence is NOT degradation (None ≠ False, but the
+        consumer here needs a 3-way-safe bool: only positive evidence turns
+        it True)."""
+        try:
+            return cost_ledger.task_cm_degraded(
+                cost_ledger.task_cm_summary(self.output_dir, genid))
+        except Exception:  # noqa: BLE001 -- advisory diagnostic fact
+            return False
+
     def _write_gen_cost(self, genid: Any, outer: Any) -> None:
         """``runs/<genid>/cost.json`` (A5): the generation's settled sessions —
         task child from the proxy audit, plan/evaluate from trajectories, plus
@@ -915,6 +1099,21 @@ class GanLoop:
         try:
             task = cost_ledger.task_cost_for_gen(self.output_dir, genid)
             sess = cost_ledger.gen_session_costs(self.output_dir, outer, genid)
+            # Prefer the SETTLED records the loop already wrote over a
+            # trajectory re-derivation: the trajectory only carries CM events
+            # for the paths that sink them there, while the settled record
+            # carries ``session.summary()`` from EITHER transport (in-process
+            # object or the seat child's published event). Re-deriving here
+            # dropped the ``cm`` node, so cost.json read exactly like a run
+            # with no seam at all.
+            for key, role, seat in (("planner_plan", "planner", "plan"),
+                                    ("evaluator_evaluate", "evaluator", "evaluate")):
+                settled = next(
+                    (r for r in self._session_costs
+                     if r.get("role") == role and r.get("seat") == seat
+                     and str(r.get("genid")) == str(genid)), None)
+                if settled is not None:
+                    sess[key] = settled
             task_traj = cost_ledger.task_trajectory_cost(self.output_dir, outer, genid)
             task_cm = cost_ledger.task_cm_summary(self.output_dir, genid)
             payload: Dict[str, Any] = {
@@ -1070,39 +1269,75 @@ class GanLoop:
                         "genid": str(genid), "keys": dict(keys or {}),
                         "clamped": list(clamps or [])})
 
-    def _resolve_cm_module(self, role: str, stem: Any,
+    def _cm_workspace_root(self, role: str, seat: Optional[str] = None,
+                           instance: Optional[str] = None,
                            outer: Any = None) -> Optional[str]:
+        """The role's live workspace ``src`` root for ONE seat (or None).
+
+        SEAT-KEYED (CM-07): the granted workspace directory is
+        ``workspaces/<role>/<instance>__<seat>`` — ``role_process._prepare_paths``
+        creates it and ``role_broker.launch`` grants it. The pre-fix resolver
+        probed ``workspaces/<role>/outer_<O>``, which no seat ever writes, so
+        workspace-first resolution could NEVER hit and every named module
+        silently came from the committed tree.
+
+        ``seat is None`` keeps the LEGACY node shape (``outer_<O>``) for
+        direct-construction callers and unit tests that build a loop without a
+        seat; every production call site passes a seat. The evaluate seat has
+        no workspace at all (``frozen.SEAT_WRITE`` is empty and
+        ``role_broker`` binds no workspace for it), so probing would only
+        create an ungranted directory.
+        """
+        from gan.framework import cm_wiring
+        if self.broker is None:
+            return None
+        node = None
+        if seat is not None and instance:
+            if (role, seat) in cm_wiring.NO_WORKSPACE_SEATS:
+                return None
+            node = cm_wiring.workspace_node(instance, seat)
+        elif seat is None and outer is not None:
+            node = f"outer_{outer}"
+        if not node:
+            return None
+        try:
+            return self.broker.src_dir(role, node)
+        except Exception:  # noqa: BLE001 -- advisory; committed fallback applies
+            return None
+
+    def _resolve_cm_module(self, role: str, stem: Any, outer: Any = None,
+                           *, seat: Optional[str] = None,
+                           instance: Optional[str] = None) -> Optional[str]:
         """Resolve a design-named CM module
         (``cost.cm_policy`` / ``cost.cm_assembly``) to a loadable path —
-        WORKSPACE-FIRST (the role's live self-edit surface for this outer),
+        WORKSPACE-FIRST (the role's live self-edit surface for this seat),
         committed tree second, the same rule ``list_components`` and the deep
         tools scan with. Resolved ONCE at session build; the session runs
         that version all session long (no mid-session hot reload). No
         sort-order discovery: the named slot is the only form for in-process
         roles — an unnamed or unresolvable claim degrades LOUDLY (the caller
-        emits ``cm_module_unresolved``)."""
-        if not isinstance(stem, str) or not stem.strip():
+        emits ``cm_module_unresolved``).
+
+        The stem is VALIDATED before it is joined into a path
+        (``cm_wiring.stem_problem``): a design value such as ``../x`` must not
+        become a filesystem probe. Shared implementation with the seat child
+        (``cm_wiring.resolve_stem``) so the parent's resolution and the child's
+        can never disagree about the ORDER, only about the namespace."""
+        from gan.framework import cm_wiring
+        if cm_wiring.stem_problem(stem) is not None:
             return None
-        stem = stem.strip()
-        rel = os.path.join("gan", "components", role, "cm", stem + ".py")
-        if outer is not None and self.broker is not None:
-            try:
-                cand = os.path.join(self.broker.src_dir(role, f"outer_{outer}"),
-                                    rel)
-                if os.path.isfile(cand):
-                    return cand
-            except Exception:  # noqa: BLE001 -- advisory resolution; the
-                # committed-tree fallback below still applies
-                pass
-        cm_root = self._roles_root()
-        if cm_root:
-            cand = os.path.join(cm_root, rel)
-            if os.path.isfile(cand):
-                return cand
-        return None
+        inst = instance if instance is not None else (
+            f"outer_{outer}" if outer is not None else None)
+        workspace_root = self._cm_workspace_root(role, seat, inst, outer)
+        path, _tried = cm_wiring.resolve_stem(
+            role, stem, committed_root=self._roles_root(),
+            workspace_root=workspace_root)
+        return path
 
     def _build_cm_session(self, role: str, keys: Optional[Dict[str, Any]],
-                          outer: Any = None) -> Any:
+                          outer: Any = None, *, seat: Optional[str] = None,
+                          instance: Optional[str] = None,
+                          genid: Any = None) -> Any:
         """Per-session context-management session (docs/10 §11 D11): built from
         this role's ALREADY-CLAMPED effective ``cm_*`` keys; events ride the
         framework event stream (role-attributed). Advisory: any failure
@@ -1118,61 +1353,67 @@ class GanLoop:
         degrades to the slice preset — the keys' ``cm_mode`` is rewritten
         too, so the degrade says what it actually runs (rewriting only a
         local variable would leave the session building ``custom`` and
-        failing on the missing policy every turn)."""
+        failing on the missing policy every turn).
+
+        Resolution/normalization live in ``cm_wiring.resolve_named`` — the
+        SAME function the seat child runs (``build_from_descriptor``), so the
+        parent's in-process session and the child's session can never disagree
+        about order or degrade semantics, only about the namespace they probe.
+        ``seat``/``instance`` are optional for direct-construction callers
+        (``seat=None`` = legacy ``outer_<O>`` workspace node)."""
         if keys is None:
             return None
         try:
             from gan.framework.cm import build_session
+            from gan.framework import cm_wiring
             cm_keys = {k: v for k, v in keys.items()
                        if isinstance(k, str) and k.startswith("cm_")}
-            # Named slots: resolve claims against the role's OWN tree.
-            assembly_path = None
-            named_asm = cm_keys.get("cm_assembly")
-            if isinstance(named_asm, str) and named_asm.strip():
-                assembly_path = self._resolve_cm_module(role, named_asm, outer)
-                if assembly_path is None:
-                    soft_fail(
-                        f"cm_assembly={named_asm.strip()!r} unresolved for "
-                        f"{role} (no workspace/committed module); the "
-                        "baseline preset runs instead",
-                        event_path=paths.events_path(self.output_dir),
-                        event_type="cm_module_unresolved", role=role,
-                        kind="assembly", stem=named_asm.strip())
-            policy_path = None
-            if cm_keys.get("cm_mode") == "custom":
-                named_pol = cm_keys.get("cm_policy")
-                if isinstance(named_pol, str) and named_pol.strip():
-                    policy_path = self._resolve_cm_module(role, named_pol, outer)
-                if policy_path is None:
-                    stem = (named_pol.strip()
-                            if isinstance(named_pol, str) and named_pol.strip()
-                            else None)
-                    soft_fail(
-                        f"cm_mode=custom without a resolvable policy for "
-                        f"{role} (stem={stem!r}); degrading to the slice "
-                        "preset for this session",
-                        event_path=paths.events_path(self.output_dir),
-                        event_type="cm_module_unresolved", role=role,
-                        kind="policy", stem=stem)
-                    # The degrade CLAIMS the slice preset — the keys must say
-                    # it too, or apply_keys would still build a custom
-                    # session whose every turn fails on the missing policy.
-                    cm_keys = dict(cm_keys)
-                    cm_keys["cm_mode"] = "slice"
-            session = build_session(cm_keys, policy_path=policy_path,
-                                    assembly_path=assembly_path)
+            inst = instance if instance is not None else (
+                f"outer_{outer}" if outer is not None else None)
+            resolved = cm_wiring.resolve_named(
+                role, cm_keys, committed_root=self._roles_root(),
+                workspace_root=self._cm_workspace_root(role, seat, inst, outer))
+            for prob in resolved["problems"]:
+                kind = prob.get("kind")
+                if kind == "assembly":
+                    msg = (f"cm_assembly={prob.get('stem')!r} unresolved for "
+                           f"{role} ({prob.get('reason')}); the baseline "
+                           "preset runs instead")
+                else:
+                    msg = (f"cm_mode=custom without a resolvable policy for "
+                           f"{role} (stem={prob.get('stem')!r}, "
+                           f"{prob.get('reason')}); degrading to the slice "
+                           "preset for this session")
+                soft_fail(msg, event_path=paths.events_path(self.output_dir),
+                          event_type="cm_module_unresolved", role=role,
+                          kind=kind, stem=prob.get("stem"),
+                          reason=prob.get("reason"),
+                          tried=list(prob.get("tried") or []))
+            if any(p.get("kind") == "policy" for p in resolved["problems"]):
+                # The degrade CLAIMS the slice preset — the keys must say it
+                # too, or apply_keys would still build a custom session whose
+                # every turn fails on the missing policy.
+                cm_keys = dict(cm_keys)
+                cm_keys["cm_mode"] = "slice"
+            session = build_session(cm_keys,
+                                    policy_path=resolved["policy_path"],
+                                    assembly_path=resolved["assembly_path"])
             session.emit = (lambda r: (lambda e: self.log_event(
                 {**e, "role": r})))(role)
             return session
         except Exception as e:  # noqa: BLE001 -- advisory
             soft_fail(f"cm session build failed ({role}): {e}",
                       event_path=paths.events_path(self.output_dir),
-                      event_type="cm_session_failed", role=role)
+                      event_type="cm_session_failed", role=role,
+                      # §12.47.7: this type covers THREE distinct build
+                      # sub-cases; without `where` they were one shape.
+                      where="session_build")
             return None
 
     def _traj_materialization_files(self, genids: Any, outer: Any = None,
                                     session_role: Optional[str] = None,
-                                    session_outers: Any = None
+                                    session_outers: Any = None,
+                                    seat: Optional[str] = None
                                     ) -> List[Tuple[str, str]]:
         """The seat's visible trajectory files as ``(label, path)`` pairs —
         the SAME set the read tools serve. Task generations ride the seat's
@@ -1198,9 +1439,12 @@ class GanLoop:
         for g in (genids or []):
             _add(trajectory._session_file(self.output_dir, g, "task"), g)
         if session_role and outer is not None:
+            # SEAT-AWARE (docs/19 §12.11): the self seat reads its own
+            # OUTER-level files, plan/evaluate read their per-generation ones;
+            # the resolver owns both shapes, so no path is rebuilt here.
             for label, path in trajectory.session_universe(
                     self.output_dir, session_role, outer,
-                    extra_outers=session_outers):
+                    extra_outers=session_outers, seat=seat):
                 if label not in seen:
                     seen.add(label)
                     out.append((label, path))
@@ -1208,7 +1452,8 @@ class GanLoop:
 
     def _materialize_traj(self, cm_session: Any, genids: Any, outer: Any = None,
                           session_role: Optional[str] = None,
-                          session_outers: Any = None) -> None:
+                          session_outers: Any = None,
+                          seat: Optional[str] = None) -> None:
         """Snapshot the seat's visible trajectories into its CM session (one
         scan; the read tools' index face and the ctx faces then share the
         same address space). Advisory: a failure leaves the session without
@@ -1219,7 +1464,8 @@ class GanLoop:
         try:
             files = self._traj_materialization_files(genids, outer=outer,
                                                      session_role=session_role,
-                                                     session_outers=session_outers)
+                                                     session_outers=session_outers,
+                                                     seat=seat)
             if files:
                 cm_session.materialize_traj(files)
         except Exception as e:  # noqa: BLE001 -- advisory, must speak
@@ -1231,6 +1477,491 @@ class GanLoop:
                           event_type="cm_traj_materialize_failed")
             except Exception:  # noqa: BLE001 -- audit sink unavailable
                 pass
+
+    # -- seat CM session: object (in-process) or descriptor (cross-process) --
+    def _seat_cm_install(self, role_obj: Any, role: str,
+                         keys: Optional[Dict[str, Any]], *, seat: str,
+                         outer: Any = None, genid: Any = None,
+                         traj_genids: Any = None,
+                         session_role: Optional[str] = None,
+                         session_outers: Any = None) -> None:
+        """Put THIS seat's context-management session in place.
+
+        Two shapes, one decision (``role_obj.cm_crossing``):
+
+        * in-process — build the ``CMSession`` object and materialize the seat's
+          trajectories into it (the pre-wiring behaviour, unchanged);
+        * cross-process (``RoleProcess``) — a ``CMSession`` cannot cross the IPC
+          boundary (the seam is consumed mid-conversation in the child), so the
+          parent stamps a JSON DESCRIPTOR (clamped keys + named stems + the
+          trajectory files the child can actually open) and the child builds the
+          session in its own namespace. Before this existed the loop assigned
+          ``role_obj.cm_session`` onto the PROXY, where no child could see it:
+          every planner/evaluator seat ran without a seam (CM-01).
+
+        ``keys is None`` (no design keys) keeps today's "no seam" semantics in
+        both shapes. Advisory end to end: a failure leaves the seat seam-free
+        and SPEAKS — it never fails the generation.
+        """
+        from gan.framework import cm_wiring
+        instance = getattr(role_obj, "instance", None)
+        try:
+            role_obj.session_cm_mode = (keys or {}).get("cm_mode")
+        except Exception:  # noqa: BLE001 -- advisory stamp
+            pass
+        try:
+            latched = self._cm_latch_consume(role, seat, keys, outer,
+                                             kind="assembly",
+                                             instance=instance)
+            latched_pol = self._cm_latch_consume(role, seat, keys, outer,
+                                                 kind="policy",
+                                                 instance=instance)
+        except Exception:  # noqa: BLE001 -- advisory: never fail the seat
+            latched = False
+            latched_pol = False
+        if getattr(role_obj, "cm_crossing", False):
+            try:
+                files = self._traj_materialization_files(
+                    traj_genids, outer=outer, session_role=session_role,
+                    session_outers=session_outers, seat=seat)
+                kept, skipped = cm_wiring.child_visible_traj(
+                    files, output_dir=self.output_dir, role=role,
+                    instance=instance, seat=seat, outer=outer)
+                if skipped:
+                    # Visibility is the PARENT's decision: a trajectory this
+                    # seat may read in the loop is not necessarily one its
+                    # sandbox can open (the seat binds only its own tree).
+                    # Dropping it silently would make "not visible" and "not
+                    # readable" indistinguishable in the audit.
+                    #
+                    # docs/19 §12.70: ONE of those shapes is expected by
+                    # construction — a p/e seat has no task-trajectory mount at
+                    # all (§12.48), so every ``<genid>/task.jsonl`` is skipped
+                    # in EVERY session of EVERY run and the console line became
+                    # constant noise that dilutes real warnings. The event is
+                    # still written either way (nothing hidden); only the
+                    # console line is spared, and ONLY when every label matches
+                    # that known shape. Any other label keeps the warning, so an
+                    # unexpected path can never be masked by this gate.
+                    _expected_only = all(
+                        _TASK_TRAJ_LABEL_RE.match(str(lbl)) for lbl in skipped)
+                    soft_fail(
+                        f"{len(skipped)} trajectory file(s) outside the "
+                        f"{role}/{seat} seat bind are not materialized: "
+                        f"{skipped[:4]}",
+                        event_path=paths.events_path(self.output_dir),
+                        event_type="cm_traj_skipped", role=role, seat=seat,
+                        labels=list(skipped)[:20],
+                        reason=("no_task_trajectory_mount" if _expected_only
+                                else "unexpected_path"),
+                        console=not _expected_only)
+                role_obj.cm_descriptor = cm_wiring.descriptor(
+                    role, keys, seat=seat, instance=instance, genid=genid,
+                    session_cm_mode=(keys or {}).get("cm_mode"),
+                    traj_files=kept, assembly_disabled=latched,
+                    policy_disabled=latched_pol)
+            except Exception as e:  # noqa: BLE001 -- advisory, must SPEAK
+                try:
+                    role_obj.cm_descriptor = None
+                except Exception:  # noqa: BLE001 -- proxy attribute refused
+                    pass
+                soft_fail(f"cm descriptor build failed ({role}/{seat}): {e}",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="cm_session_failed", role=role, seat=seat,
+                          where="descriptor_build")
+            return
+        role_obj.cm_session = self._build_cm_session(
+            role, keys, outer=outer, seat=seat, instance=instance, genid=genid)
+        if latched and role_obj.cm_session is not None:
+            try:
+                role_obj.cm_session.assembly_disabled = True
+            except Exception:  # noqa: BLE001 -- advisory stamp
+                pass
+        if latched_pol and role_obj.cm_session is not None:
+            try:
+                role_obj.cm_session.policy_disabled = True
+            except Exception:  # noqa: BLE001 -- advisory stamp
+                pass
+        self._materialize_traj(role_obj.cm_session, traj_genids, outer=outer,
+                               session_role=session_role,
+                               session_outers=session_outers, seat=seat)
+
+    # -- seat scopes: the fixed-root evaluation is its OWN seat ----------------
+    @staticmethod
+    def _cm_seat_scope(instance: Any) -> str:
+        """Latch/report scope for ONE seat instance.
+
+        The outer's seats are "main"; the fixed-root evaluation's throwaway
+        planner is an INSTANCE-SUFFIXED seat (``outer_<N>_eval``) with its own
+        workspace and trajectory tree (docs/19 §12.45), so it gets "eval".
+        Anything else (direct construction, no instance) is "main"."""
+        return "eval" if str(instance or "").endswith("_eval") else "main"
+
+    def _cm_report_for(self, store: Dict[Tuple[str, str, str], Dict[str, Any]],
+                       role: str) -> Optional[Dict[str, Any]]:
+        """The failure report a role's self-improve should read.
+
+        Keyed by (role, seat, scope) — docs/19 §12.60-O. An entry is stamped
+        with the seat that WROTE it, and the self-improve session repairs
+        against the module configuration that seat ran, so the self_improve
+        seat's own failure (when there is one) wins; the plan seat is the next
+        preference (it is what actually runs the module every outer), then any
+        other seat of the role (deterministic: sorted by seat name).
+
+        Before O the key was (role, scope), so the plan seat and the
+        self_improve seat of the same role overwrote each other and the reader
+        could not tell which seat the failure came from."""
+        for seat in ("self_improve", "plan", "evaluate"):
+            rep = store.get((role, seat, "main"))
+            if rep:
+                return rep
+        for (r, _seat, _scope), rep in sorted(store.items()):
+            if r == role:
+                return rep
+        return None
+
+    def _fill_self_improve_payloads(self, outer: Any,
+                                    recent_eval: Dict[str, Any],
+                                    recent_plan: Dict[str, Any]) -> None:
+        """Fill both self-improve payloads for THIS outer.
+
+        Two fact classes, two gates (docs/19 §12.51, F6):
+
+        * the cost material (``costs`` + ``cost_statement`` + its injection
+          event) is a USAGE record and stays behind ``cost.record_usage``;
+        * the CM module FAILURE reports (``cm_assembly``/``cm_policy``) are
+          DIAGNOSTIC facts — the agent's own module is latched/disabled and
+          this payload is the ONLY surface that can explain why (events.jsonl
+          is not an agent surface). They therefore ride REGARDLESS of that
+          switch.
+
+        Before this split both sat inside one ``if self.record_usage:`` block,
+        so turning usage recording off silently removed the failure report
+        too — the module stayed disabled with no readable explanation. The
+        cost block still runs FIRST so the default (usage on) prompt keeps its
+        historical key order byte-identical.
+        """
+        if self.record_usage:
+            for role, payload in (("evaluator", recent_eval),
+                                  ("planner", recent_plan)):
+                try:
+                    own = [cost_ledger.compact(r)
+                           for r in cost_ledger.self_session_costs(
+                               self.output_dir, outer, role)]
+                    payload["costs"] = {"own_sessions": [r for r in own if r]}
+                    payload["cost_statement"] = self._cost_statement_self(
+                        role, outer)
+                    # Injection fact (B2, self seat): same bytes audit the
+                    # plan/evaluate statements get (docs/10 §11.5 gap fix).
+                    if payload["cost_statement"]:
+                        self.log_event({"type": "cost_statement",
+                                        "seat": "self_improve", "role": role,
+                                        "bytes": len(payload["cost_statement"])})
+                except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+                    soft_fail(f"self cost payload failed ({role}): {e}",
+                              event_path=paths.events_path(self.output_dir),
+                              event_type="cost_statement_build_failed",
+                              seat="self_improve")
+        for role, payload in (("evaluator", recent_eval),
+                              ("planner", recent_plan)):
+            try:
+                # Docs/19 §12.45 + §12.60-O: reports are (role, seat, scope)
+                # keyed — the self_improve/plan seat's MAIN-scope failure is
+                # what self-improve repairs; the eval round's report is only a
+                # fallback.
+                cm_assembly_rep = self._cm_report_for(self._cm_assembly_report,
+                                                      role)
+                if cm_assembly_rep:
+                    payload["cm_assembly"] = cm_assembly_rep
+                cm_policy_rep = self._cm_report_for(self._cm_policy_report,
+                                                    role)
+                if cm_policy_rep:
+                    payload["cm_policy"] = cm_policy_rep
+            except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+                soft_fail(f"self cm report payload failed ({role}): {e}",
+                          event_path=paths.events_path(self.output_dir),
+                          event_type="cm_report_payload_failed",
+                          seat="self_improve")
+
+    def _cm_latch_fingerprint(self, role: str, seat: str,
+                              keys: Optional[Dict[str, Any]],
+                              outer: Any = None,
+                              kind: str = "assembly",
+                              *, instance: Optional[str] = None) -> str:
+        """Fingerprint of what an agent-owned CM module CONFIGURATION would
+        deliver (kind = "assembly" | "policy").
+
+        Effective ``cm_*`` keys + the bytes of the module that would be
+        resolved (seat-suffixed workspace first, then committed). Both the
+        design keys and the module are agent-editable; a change in either
+        means "a different attempt is worth one try", so the latch releases.
+
+        The ``instance`` decides WHICH live workspace is watched (docs/19
+        §12.45): a seat resolves ``workspaces/<role>/<instance>__<seat>/src``
+        (``cm_wiring.workspace_node``), so the fixed-root evaluation's
+        ``outer_<N>_eval`` seat has a workspace the main seat never touches.
+        Fingerprinting the main path for it made an eval-workspace fix
+        invisible to the eval latch (the F4 blind spot, docs/19 §12.45.2).
+        ``instance=None`` keeps the legacy ``outer_<O>__<seat>`` +
+        ``outer_<O>`` candidates for direct-construction callers."""
+        import hashlib
+        import json as _json
+        from gan.framework import cm_wiring
+        try:
+            cm_keys = {k: v for k, v in (keys or {}).items()
+                       if isinstance(k, str) and k.startswith("cm_")}
+            settings = _json.dumps(cm_keys, sort_keys=True, default=str)
+            stem = cm_keys.get("cm_assembly" if kind == "assembly"
+                               else "cm_policy")
+            blobs = []
+            workspace_roots: List[str] = []
+            try:
+                if self.output_dir and role and seat and (instance or outer is not None):
+                    if instance:
+                        # The tree the session ACTUALLY resolves from: the
+                        # seat-keyed workspace of THIS instance (the same node
+                        # _prepare_paths / role_broker create).
+                        workspace_roots.append(os.path.join(
+                            self.output_dir, "workspaces", role,
+                            f"{instance}__{seat}", "src"))
+                    else:
+                        # workspace-first then committed: BOTH are
+                        # agent-editable, so a change in either must release
+                        # the latch. The live workspace is SEAT-SUFFIXED
+                        # (``outer_<O>__<seat>/src``); the legacy unsuffixed
+                        # layout stays as a fallback so an old run's latch
+                        # still releases.
+                        workspace_roots.append(os.path.join(
+                            self.output_dir, "workspaces", role,
+                            "outer_%s__%s" % (outer, seat), "src"))
+                        workspace_roots.append(os.path.join(
+                            self.output_dir, "workspaces", role,
+                            "outer_%s" % outer, "src"))
+            except Exception:  # noqa: BLE001 -- advisory
+                workspace_roots = []
+            paths: List[str] = []
+            seen: set = set()
+            for ws_root in workspace_roots:
+                for path in cm_wiring.candidate_paths(
+                        role,
+                        stem if isinstance(stem, str) and stem.strip() else None,
+                        # N5e: watch the tree the session ACTUALLY resolves
+                        # from (_roles_root — the roles repo in split
+                        # layout), not the task tree: in split layout the
+                        # role modules do not exist under code_root, so the
+                        # committed candidate silently vanished and
+                        # committed edits could never release the latch.
+                        committed_root=self._roles_root(),
+                        workspace_root=ws_root) or []:
+                    if path not in seen:
+                        seen.add(path)
+                        paths.append(path)
+            for path in paths or []:
+                try:
+                    with open(path, "rb") as fh:
+                        blobs.append(hashlib.sha256(fh.read()).hexdigest())
+                except OSError:
+                    continue
+            return hashlib.sha256(
+                (settings + "|" + "|".join(blobs)).encode("utf-8")).hexdigest()[:32]
+        except Exception:  # noqa: BLE001 -- advisory: no latch on doubt
+            return ""
+
+    def _cm_latch_consume(self, role: str, seat: str,
+                          keys: Optional[Dict[str, Any]],
+                          outer: Any = None,
+                          kind: str = "assembly",
+                          *, instance: Optional[str] = None) -> bool:
+        """True when this seat must start with the named module DISABLED
+        (kind = "assembly" | "policy"; docs/19 §12.17).
+
+        ``instance`` selects the (role, seat, scope) latch slot AND the live
+        workspace the fingerprint watches, so the main seat and the fixed-root
+        evaluation's ``outer_<N>_eval`` seat never release each other."""
+        stem_key = "cm_assembly" if kind == "assembly" else "cm_policy"
+        scope = self._cm_seat_scope(instance)
+        slot = self._cm_agent_latch.get((role, seat, scope), {})
+        latch = slot.get(kind)
+        if not latch:
+            return False
+        if not (keys or {}).get(stem_key):
+            return False
+        fingerprint = self._cm_latch_fingerprint(role, seat, keys, outer, kind,
+                                                 instance=instance)
+        if fingerprint and fingerprint == latch.get("fp"):
+            return True
+        # the configuration changed -> the module deserves one fresh try
+        slot.pop(kind, None)
+        if not slot:
+            self._cm_agent_latch.pop((role, seat, scope), None)
+        soft_fail(f"cm {kind} latch released ({role}/{seat}/{scope}): the "
+                  f"configuration changed",
+                  event_path=paths.events_path(self.output_dir),
+                  event_type=f"cm_{kind}_released", role=role, seat=seat,
+                  scope=scope, stem=latch.get("stem"))
+        return False
+
+    def _cm_latch_record(self, role: str, seat: str,
+                         keys: Optional[Dict[str, Any]],
+                         summary: Optional[Dict[str, Any]],
+                         outer: Any = None,
+                         kind: str = "assembly",
+                         *, instance: Optional[str] = None) -> None:
+        """Latch a seat whose agent-owned module (kind) failed at least once
+        this call, and keep the actionable report for the next self-improve
+        session.
+
+        The report/latch are scoped by ``instance`` (docs/19 §12.45): the eval
+        round's failure is stored under its OWN scope, so the MAIN seat's
+        report is not overwritten by a seat it never ran on."""
+        report_key = "assembly_report" if kind == "assembly" else "policy_report"
+        stem_key = "cm_assembly" if kind == "assembly" else "cm_policy"
+        fail_key = "assembly_failures" if kind == "assembly" else "policy_failures"
+        report_store = (self._cm_assembly_report if kind == "assembly"
+                        else self._cm_policy_report)
+        scope = self._cm_seat_scope(instance)
+        report = (summary or {}).get(report_key)
+        if report:
+            # O (§12.60): seat is part of the KEY, not just a stamped field —
+            # the plan seat and the self_improve seat of one role each run a
+            # DIFFERENT session (different design keys are possible) and must
+            # not overwrite each other's failure report.
+            report_store[(role, seat, scope)] = {
+                **report, "seat": seat, "scope": scope,
+                "latched": kind in self._cm_agent_latch.get(
+                    (role, seat, scope), {}),
+            }
+        if not summary or not summary.get(fail_key):
+            return
+        if not (keys or {}).get(stem_key):
+            return
+        slot = self._cm_agent_latch.setdefault((role, seat, scope), {})
+        if kind in slot:
+            return
+        entry = {"fp": self._cm_latch_fingerprint(role, seat, keys, outer, kind,
+                                                  instance=instance),
+                 "stem": keys.get(stem_key),
+                 "reason": str(report.get("last_error") or "")[:160],
+                 "phase": report.get("phase"), "where": report.get("where")}
+        if not entry["fp"]:
+            return
+        slot[kind] = entry
+        soft_fail(f"cm {kind} latched for {role}/{seat}/{scope} "
+                  f"({entry['stem']}: {entry['reason']}) — it will not be "
+                  f"re-attempted until its configuration changes",
+                  event_path=paths.events_path(self.output_dir),
+                  event_type=f"cm_{kind}_latched", role=role, seat=seat,
+                  scope=scope,
+                  **{k: entry[k] for k in ("stem", "reason", "phase", "where")})
+
+    def _seat_cm_summary(self, role_obj: Any, *,
+                         role: Optional[str] = None, seat: Optional[str] = None,
+                         keys: Optional[Dict[str, Any]] = None,
+                         outer: Any = None
+                         ) -> Optional[Dict[str, Any]]:
+        """The settled CM summary for ONE seat call, transport-agnostic.
+
+        in-process reads the session object; a cross-process seat published
+        ``cm_session_summary`` on the event channel and the proxy stashed it.
+        ONE summary shape either way (``CMSession.summary``) — the cost record
+        and the receipt must not depend on which transport ran.
+
+        When ``role``/``seat``/``keys`` are supplied it ALSO maintains the
+        failure LATCH (docs/19 §12.14): one failed attempt keeps the module
+        off until its configuration changes. The latch/report slot is keyed by
+        the role object's ``instance`` (main vs the eval round's own seat)."""
+        from gan.framework import cm_wiring
+        summary = cm_wiring.summary_of(role_obj)
+        if role and seat:
+            instance = getattr(role_obj, "instance", None)
+            try:
+                self._cm_latch_record(role, seat, keys, summary, outer,
+                                      kind="assembly", instance=instance)
+                self._cm_latch_record(role, seat, keys, summary, outer,
+                                      kind="policy", instance=instance)
+            except Exception:  # noqa: BLE001 -- advisory bookkeeping
+                pass
+        return summary
+
+    def _seat_cm_clear(self, role_obj: Any) -> None:
+        """Drop BOTH shapes after the call (no stamp leak across seats).
+
+        ``last_cm_summary`` goes too: a settled summary must never be
+        re-attributed to the NEXT seat call (the proxy also clears it before
+        every call, this is the second lock on the same door)."""
+        for attr in ("cm_session", "cm_descriptor", "last_cm_summary"):
+            try:
+                setattr(role_obj, attr, None)
+            except Exception:  # noqa: BLE001 -- advisory
+                pass
+
+    def _plan_seat_cm_open(self, role_obj: Any, *, outer: Any, genid: Any,
+                           traj_genids: Any) -> Dict[str, Any]:
+        """The ONE seat wiring for a planner ``plan()`` session — MAIN and the
+        fixed-root evaluation's throwaway planner alike (docs/19 §12.45).
+
+        Clamps the planner's OWN design cost keys (single authority), stamps
+        the per-session token soft stop + ``session_cm_mode``, installs the CM
+        session/descriptor, and records ``cost_keys_applied``. Every step is
+        advisory: a wiring failure degrades to "no seam" and SPEAKS — it never
+        fails the seat call. Returns the effective keys (the caller threads
+        ``patch_retry_k`` / ``max_tool_calls`` from them, so the eval seat
+        honours the same design keys the main seat does).
+        """
+        plan_ck: Dict[str, Any] = {}
+        plan_clamps: List[Dict[str, Any]] = []
+        try:
+            plan_ck, plan_clamps = self._effective_cost_keys("planner", {
+                "plan_max_tool_calls": self.plan_max_tool_calls,
+                "patch_retry_k": self.patch_retry_k,
+                "plan_token_budget": None,
+            })
+        except Exception as e:  # noqa: BLE001 -- advisory: no seam on doubt
+            soft_fail(f"cost-key clamp failed (planner/plan): {e}")
+        try:
+            role_obj.session_token_budget = plan_ck.get("plan_token_budget")
+            # slice 前端档位归座 (docs/10 §11.5): the PLAN session's
+            # read_trajectory presentation follows the planner's own design
+            # cm_mode (stamped onto the AccessContext by the role) — visible
+            # sets are untouched. The eval seat runs the SAME design, so it
+            # must not silently present as passthrough.
+            role_obj.session_cm_mode = plan_ck.get("cm_mode")
+        except Exception as e:  # noqa: BLE001 -- advisory stamp
+            soft_fail(f"session cost stamp failed (planner/eval: token "
+                      f"budget / cm_mode): {e}")
+        self._seat_cm_install(role_obj, "planner", plan_ck, seat="plan",
+                              outer=outer, genid=genid,
+                              traj_genids=traj_genids)
+        try:
+            self._emit_cost_keys_applied("planner", "plan", genid,
+                                         plan_ck, plan_clamps)
+        except Exception as e:  # noqa: BLE001 -- audit emit is advisory
+            soft_fail(f"cost_keys_applied emit failed (planner/plan): {e}")
+        return plan_ck
+
+    def _plan_seat_cm_close(self, role_obj: Any, *, outer: Any,
+                            keys: Optional[Dict[str, Any]]
+                            ) -> Optional[Dict[str, Any]]:
+        """Settled summary + stamp clear for a planner ``plan()`` session.
+
+        MUST run on success AND failure (N5d): a failed session's
+        proxy-stashed summary is dropped by the clear otherwise, so its CM
+        failure would never reach the latch/report. Returns the summary.
+        """
+        summary = None
+        try:
+            if keys is not None:
+                summary = self._seat_cm_summary(role_obj, role="planner",
+                                                seat="plan", keys=keys,
+                                                outer=outer)
+        finally:
+            self._seat_cm_clear(role_obj)
+            for attr in ("session_token_budget", "session_cm_mode"):
+                try:
+                    setattr(role_obj, attr, None)
+                except Exception:  # noqa: BLE001 -- advisory
+                    pass
+        return summary
 
     def _task_budget_keys(self, parent: Any) -> Optional[Dict[str, Any]]:
         """Effective TASK-side reserved keys of the design the child will
@@ -2523,25 +3254,51 @@ class GanLoop:
                     # outer_select meaningless. Same empty plan as the main line.
                     plan_result = self._empty_plan_result(eval_cfg)
                 else:
-                    plan_result = eval_planner.plan(
-                        parent_summary=(self._parent_summary(initial) if initial else {}),
-                        parents=[],
-                        parent_feedback=None,
-                        evaluator_issues=None,
-                        config=eval_cfg,
-                        node_id=genid,
-                        broker=self.broker,
-                        task_brief=self.task_brief,
-                        response_contract=(self.task_runner.response_contract
-                                           if self.task_runner else None),
-                        trajectory_genids=[],
-                        receipt=None,
-                        parent_predicted_score=None,
-                        parent_benchmark_score=None,
-                        patch_retry_k=self.patch_retry_k,
-                        max_tool_calls=self.plan_max_tool_calls,
-                        tool_repeat_limit=self.tool_repeat_limit,
-                    ) or {}
+                    # F5 (docs/19 §12.45): the fixed-root evaluation's planner
+                    # seat is a REAL planner seat, so it runs the SAME wiring
+                    # the main plan seat runs (design-clamped cost keys, the
+                    # session cm_mode stamp, the CM session/descriptor, the
+                    # latch, `cost_keys_applied`). It used to call `.plan()`
+                    # directly, which silently ran that seat without any seam
+                    # and without the design's own budget/tool caps.
+                    plan_ck: Optional[Dict[str, Any]] = None
+                    plan_ck = self._plan_seat_cm_open(
+                        eval_planner, outer=outer, genid=genid,
+                        # The eval planner plans from `initial`; it never reads
+                        # task trajectories (same [] the plan CALL passes).
+                        traj_genids=[])
+                    try:
+                        plan_result = eval_planner.plan(
+                            parent_summary=(self._parent_summary(initial) if initial else {}),
+                            parents=[],
+                            parent_feedback=None,
+                            evaluator_issues=None,
+                            config=eval_cfg,
+                            node_id=genid,
+                            broker=self.broker,
+                            task_brief=self.task_brief,
+                            response_contract=(self.task_runner.response_contract
+                                               if self.task_runner else None),
+                            trajectory_genids=[],
+                            receipt=None,
+                            parent_predicted_score=None,
+                            parent_benchmark_score=None,
+                            # the DESIGN's clamped values (main-seat parity),
+                            # not the loop's global fallbacks.
+                            patch_retry_k=plan_ck.get("patch_retry_k",
+                                                      self.patch_retry_k),
+                            max_tool_calls=plan_ck.get("plan_max_tool_calls",
+                                                       self.plan_max_tool_calls),
+                            tool_repeat_limit=self.tool_repeat_limit,
+                        ) or {}
+                    finally:
+                        # N5d parity: a FAILED eval plan session still feeds
+                        # its latch/report (the main seat closes on both
+                        # paths). No cost_sessions row: evaluation rounds are
+                        # cost-isolated by design (docs/14 §5.5) — the CM
+                        # summary is only settled onto the latch/report.
+                        self._plan_seat_cm_close(eval_planner, outer=outer,
+                                                 keys=plan_ck)
                 try:
                     child = self.eval_runner(plan=plan_result, parent=initial,
                                              genid=genid, base=eval_base)
@@ -3233,6 +3990,16 @@ class GanLoop:
         }
         if cm_summary:
             budget["cm"] = cm_summary
+        # Task-side CM degradation (docs/19 §12.44 D3): the PLANNER owns the
+        # task agent's cm code/prompt, so the receipt is the channel where it
+        # becomes visible. Conditional (absence = not degraded) keeps a
+        # healthy round's receipt bytes unchanged.
+        try:
+            if cost_ledger.task_cm_degraded(
+                    cost_ledger.task_cm_summary(self.output_dir, genid)):
+                budget["task_cm_degraded"] = True
+        except Exception:  # noqa: BLE001 -- advisory diagnostic fact
+            pass
         # Cost facts of THIS round (B6): the task child (proxy audit) and the
         # planner's OWN plan session. The evaluator's session cost is
         # deliberately NOT here — the receipt feeds the PLANNER's next prompt,
@@ -3823,32 +4590,11 @@ class GanLoop:
                 # effective values from the planner's OWN design (fallbacks =
                 # the loop.yaml values), passed into the session + stamped on
                 # the instance; the applied/clamped record rides the ledger.
-                plan_ck, plan_clamps = self._effective_cost_keys("planner", {
-                    "plan_max_tool_calls": self.plan_max_tool_calls,
-                    "patch_retry_k": self.patch_retry_k,
-                    "plan_token_budget": None,
-                })
-                # Stamp the token soft stop for THIS session only; _self_session
-                # clears it before self-improve (the stamp is otherwise inherited
-                # by a session that has no design key of its own).
-                try:
-                    self.planner.session_token_budget = plan_ck.get("plan_token_budget")
-                    # slice 前端档位归座 (docs/10 §11.5): the PLAN session's
-                    # read_trajectory presentation follows the PLANNER's own
-                    # design cm_mode (stamped onto the AccessContext by the
-                    # role) — visible sets are untouched.
-                    self.planner.session_cm_mode = plan_ck.get("cm_mode")
-                except Exception as e:  # noqa: BLE001 -- advisory stamp
-                    soft_fail(f"session cost stamp failed (planner: token "
-                              f"budget / cm_mode): {e}")
-                # Context-management session for THIS plan call (docs/10 §11
-                # D11); cleared right after the call (no stamp leak into
-                # self-improve), like ``session_token_budget``.
-                self.planner.cm_session = self._build_cm_session("planner", plan_ck,
-                                                                 outer=outer)
-                self._materialize_traj(self.planner.cm_session, parent_ref)
-                self._emit_cost_keys_applied("planner", "plan", genid,
-                                             plan_ck, plan_clamps)
+                # ONE wiring helper (docs/19 §12.45): the fixed-root evaluation's
+                # plan seat calls the SAME one, so the two can never drift.
+                plan_ck = self._plan_seat_cm_open(
+                    self.planner, outer=outer, genid=genid,
+                    traj_genids=parent_ref)
 
                 # Cost statement for the plan session (B2): framework-rendered
                 # facts only; the role injects the text verbatim. Resume-safe:
@@ -3933,7 +4679,14 @@ class GanLoop:
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to planner_failed
                 except Exception as e:
-                    self.planner.cm_session = None  # no stamp leak
+                    # N5d: a FAILED session must feed the latch the same way
+                    # a successful one does — a recoverable failure has the
+                    # proxy-stashed summary, and it is dropped by the clear
+                    # unless read first (the ONE close helper does it). Best-
+                    # effort: a hard child crash has no summary and the latch
+                    # learns nothing (advisory). Cost record stays success-only.
+                    self._plan_seat_cm_close(self.planner, outer=outer,
+                                             keys=plan_ck)
                     self._archive_invalid("planner_failed", parent, parents, genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
@@ -3942,14 +4695,13 @@ class GanLoop:
                 # and the ledger instead of becoming a silent "unjudged".
                 self._normalize_plan_issue_refs(plan_result, parent_feedback)
                 # Settled plan session -> cost ledger (A5). Success-only: a
-                # planner_failed round has no settled session to record.
-                _plan_cm = getattr(self.planner, "cm_session", None)
-                plan_cm_summary = (_plan_cm.summary()
-                                   if _plan_cm is not None else None)
+                # planner_failed round has no settled session to record. The
+                # close settles the summary AND clears the stamps in one place.
+                plan_cm_summary = self._plan_seat_cm_close(
+                    self.planner, outer=outer, keys=plan_ck)
                 plan_cost_rec = self._record_session_cost(
                     "planner", "plan", outer, genid,
-                    cm_session=_plan_cm)
-                self.planner.cm_session = None  # no stamp leak (§11 D11)
+                    cm_summary=plan_cm_summary)
 
                 task_challenge_kwargs: Dict[str, Any] = {}
                 if parent_challenges:
@@ -4089,8 +4841,8 @@ class GanLoop:
                 # mirroring the per-role access allowlist.
                 meta_view = {k: child.meta[k] for k in _EVALUATOR_META_KEYS
                              if k in (child.meta or {})}
-                report_view = {k: v for k, v in (child.meta.get("report_summary") or {}).items()
-                               if k not in ("overall_accuracy", "random_guess_accuracy")}
+                report_view = _report_view_for_evaluator(
+                    (child.meta or {}).get("report_summary"))
                 # Cost statement for the evaluate session (B2): THIS round's
                 # task cost as a process fact (no scores — blind discipline).
                 task_cost_pair = ((child.value.cost_tokens, child.value.cost_wallclock_s)
@@ -4117,9 +4869,10 @@ class GanLoop:
                 self._emit_cost_keys_applied("evaluator", "evaluate", genid,
                                              eval_ck, eval_clamps)
                 # Context-management session for THIS evaluate call (§11 D11).
-                self.evaluator.cm_session = self._build_cm_session("evaluator", eval_ck,
-                                                                   outer=outer)
-                self._materialize_traj(self.evaluator.cm_session, [genid] + parent_ref)
+                self._seat_cm_install(self.evaluator, "evaluator", eval_ck,
+                                      seat="evaluate", outer=outer,
+                                      genid=genid,
+                                      traj_genids=[genid] + parent_ref)
                 cost_stmt_eval = self._cost_statement_eval(genid, task_cost_pair,
                                                            own_budget=eval_ck.get("evaluate_token_budget"))
                 eval_cost_kwargs: Dict[str, Any] = {}
@@ -4172,6 +4925,12 @@ class GanLoop:
                                 "report_summary": report_view,
                                 "score_status": child.value.score_status,
                                 "imputed": bool(child.meta.get("imputed")),
+                                # Task-side CM health (docs/19 §12.44 D3):
+                                # a process fact for attribution (the agent
+                                # ran on the fail-open preset this round). The
+                                # receipt's budget projection deliberately
+                                # does NOT carry this key (no duplicate).
+                                "task_cm_degraded": self._task_cm_degraded(genid),
                                 # Projection, not the whole receipt —
                                 # `code_patch.rejected_reason` quotes the planner's own
                                 # artifacts, `grants` carries agent free text, and
@@ -4197,7 +4956,12 @@ class GanLoop:
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to evaluator_failed
                 except Exception as e:
-                    self.evaluator.cm_session = None  # no stamp leak
+                    # N5d: same latch feed as the plan failure path (read
+                    # the stashed summary BEFORE the clear drops it).
+                    self._seat_cm_summary(self.evaluator, role="evaluator",
+                                          seat="evaluate", keys=eval_ck,
+                                          outer=outer)
+                    self._seat_cm_clear(self.evaluator)  # no stamp leak
                     child.valid_parent = False
                     child.meta["invalid"] = True
                     child.meta["invalid_reason"] = "evaluator_failed"
@@ -4210,13 +4974,13 @@ class GanLoop:
                     self._save_checkpoint("inner", outer, inner)
                     continue
                 # Settled evaluate session -> cost ledger (A5).
-                _eval_cm = getattr(self.evaluator, "cm_session", None)
-                eval_cm_summary = (_eval_cm.summary()
-                                   if _eval_cm is not None else None)
-                eval_cost_rec = self._record_session_cost(
+                eval_cm_summary = self._seat_cm_summary(
+                    self.evaluator, role="evaluator", seat="evaluate",
+                    keys=eval_ck, outer=outer)
+                self._record_session_cost(
                     "evaluator", "evaluate", outer, genid,
-                    cm_session=_eval_cm)
-                self.evaluator.cm_session = None  # no stamp leak (§11 D11)
+                    cm_summary=eval_cm_summary)
+                self._seat_cm_clear(self.evaluator)
 
                 # Issue identity (framework-owned): namespace this round's ids by
                 # generation so a later round/outer can never collide with them,
@@ -4419,27 +5183,11 @@ class GanLoop:
                            "task_tree_size": len(self.task_tree),
                            "challenge_results": public_challenge_results,
                            "toolset_report": getattr(self.planner, "assembly_report", None)}
-            # Self-improve cost statements (B2): each role's OWN sessions this
-            # outer (cost × quality alignment material) + the role's compact
-            # ledger records; the OTHER role's costs are deliberately absent.
-            if self.record_usage:
-                for role, payload in (("evaluator", recent_eval), ("planner", recent_plan)):
-                    try:
-                        own = [cost_ledger.compact(r)
-                               for r in cost_ledger.self_session_costs(self.output_dir, outer, role)]
-                        payload["costs"] = {"own_sessions": [r for r in own if r]}
-                        payload["cost_statement"] = self._cost_statement_self(role, outer)
-                        # Injection fact (B2, self seat): same bytes audit the
-                        # plan/evaluate statements get (docs/10 §11.5 gap fix).
-                        if payload["cost_statement"]:
-                            self.log_event({"type": "cost_statement",
-                                            "seat": "self_improve", "role": role,
-                                            "bytes": len(payload["cost_statement"])})
-                    except Exception as e:  # noqa: BLE001 -- advisory, never fatal
-                        soft_fail(f"self cost payload failed ({role}): {e}",
-                                  event_path=paths.events_path(self.output_dir),
-                                  event_type="cost_statement_build_failed",
-                                  seat="self_improve")
+            # Self-improve payload facts: CM failure reports ride ALWAYS
+            # (diagnostics), the cost material only under cost.record_usage
+            # (docs/19 §12.51 — they used to share one gate, which silently
+            # removed the failure report when usage recording was off).
+            self._fill_self_improve_payloads(outer, recent_eval, recent_plan)
             # visible task trajectories for self-improvement: this outer's gens
             # + the direct parent of the last generation (read-only).
             si_own = list(outer_genids)
@@ -4509,18 +5257,28 @@ class GanLoop:
                         # slice 前端档位归座 (docs/10 §11.5): the self seat
                         # follows the role's OWN self-design (no leak from the
                         # plan/evaluate stamps above).
-                        role_obj.session_cm_mode = ck_si.get("cm_mode")
-                        role_obj.cm_session = self._build_cm_session(role, ck_si, outer=outer)
-                        # self seat additionally materializes its OWN session
-                        # files (the read_session_trajectory face) over the
-                        # declared universe: this outer + the previous outer
+                        # The self seat additionally materializes its OWN
+                        # session files (the read_session_trajectory face) over
+                        # the declared universe: this outer + the previous outer
                         # (L65 ruling — "self improve should read the previous
-                        # outer's trajectory").
-                        self._materialize_traj(role_obj.cm_session, si_refs,
-                                               outer=outer, session_role=role,
-                                               session_outers=([outer - 1]
-                                                               if isinstance(outer, int)
-                                                               and outer > 1 else []))
+                        # outer's trajectory"). Bind reality (docs/19 §12.13 +
+                        # §12.28 F5): the PREVIOUS outer's own-session dir is
+                        # bound READ-ONLY for the self seat, so those files
+                        # ship and materialize; the CURRENT outer's trajectory
+                        # dir is mounted NOT AT ALL since F5 (rows are
+                        # protocol-forwarded to the parent now), so a
+                        # current-outer own-session file (which only exists on
+                        # a resumed/re-run outer) is kept by this parent-side
+                        # filter and demoted CHILD-side to
+                        # cm_session_built.traj_skipped — the loss is loud
+                        # there, not here.
+                        self._seat_cm_install(
+                            role_obj, role, ck_si, seat="self_improve",
+                            outer=outer, traj_genids=si_refs,
+                            session_role=role,
+                            session_outers=([outer - 1]
+                                            if isinstance(outer, int)
+                                            and outer > 1 else []))
                     except Exception as e:  # noqa: BLE001 -- advisory stamp
                         # A swallowed degradation must SPEAK (no-silent-fail
                         # rule, AGENTS.md): without this event the session's
@@ -4528,8 +5286,9 @@ class GanLoop:
                         soft_fail(f"self-seat cm session build failed ({role}): {e}",
                                   event_path=paths.events_path(self.output_dir),
                                   event_type="cm_session_failed", role=role,
-                                  seat="self_improve")
-                        role_obj.cm_session = None
+                                  seat="self_improve",
+                                  where="seat_install")
+                        self._seat_cm_clear(role_obj)
                     _si_res = role_obj.self_improve(
                         recent={**recent_payload, "receipt": prev_receipt},
                         broker=self.broker,
@@ -4537,11 +5296,11 @@ class GanLoop:
                         tool_repeat_limit=self.tool_repeat_limit,
                         trajectory_genids=si_refs,
                         patch_retry_k=self.patch_retry_k)
-                    if isinstance(_si_res, dict)                             and getattr(role_obj, "cm_session", None) is not None:
-                        try:
-                            _si_res["cm_summary"] = role_obj.cm_session.summary()
-                        except Exception:  # noqa: BLE001 -- audit-only
-                            pass
+                    _si_cm_summary = self._seat_cm_summary(
+                        role_obj, role=role, seat="self_improve",
+                        keys=ck_si, outer=outer)
+                    if isinstance(_si_res, dict) and _si_cm_summary is not None:
+                        _si_res["cm_summary"] = _si_cm_summary
                     session_results[role] = _si_res
                     # Settled self-improve session -> cost ledger (A5). Thread
                     # safety: trajectory_log.append is locked and list.append
@@ -4549,14 +5308,20 @@ class GanLoop:
                     # trajectory files (seat-disjoint by SEAT_WRITE).
                     self._record_session_cost(
                         role, "self_improve", outer, None,
-                        cm_session=getattr(role_obj, "cm_session", None))
+                        cm_summary=_si_cm_summary)
                 except Exception as e:  # noqa: BLE001 -- classified after join
+                    # N5d: feed the latch from a failed self-improve session
+                    # before the finally's clear drops the summary (the
+                    # success path feeds via _seat_cm_summary below the call).
+                    try:
+                        self._seat_cm_summary(
+                            role_obj, role=role, seat="self_improve",
+                            keys=ck_si, outer=outer)
+                    except Exception:  # noqa: BLE001 -- advisory feed
+                        pass
                     session_errors[role] = e
                 finally:
-                    try:
-                        role_obj.cm_session = None
-                    except Exception:  # noqa: BLE001 -- advisory stamp
-                        pass
+                    self._seat_cm_clear(role_obj)
 
             # A3/A4/A5 + E freeze_evaluator: filter the self-improve workers.
             skip_planner_si = (self._ab("disable_self_improve")

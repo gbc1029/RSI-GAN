@@ -18,7 +18,7 @@ live in the PRIMITIVES below, each of which validates before it mutates
         (validate via the ``cm.ops`` vocabulary; pre-check pinned / floor /
         sticky so a stage's predictable refusal never becomes violation noise)
     run_policy                             the custom policy hook (fail-open,
-        execution budget, 2-strike wedge breaker)
+        execution budget, one-strike wedge breaker — docs/19 §12.17)
     finalize_turn                          the post segment: count_ops +
         emit_view (audit completeness) + render (no-fabrication) + the
         outgoing dedup contract
@@ -43,29 +43,176 @@ type-guards (the harness pass-through posture).
 """
 from __future__ import annotations
 
+import copy
 import os
+import threading
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import assembly
 from . import ops
-from .blocks import (Block, Universe, View, cut, placeholder, estimate_tokens,
-                       excerpt_saving, EXCERPT_KEEP, HEAD_TAIL_KEEP,
-                       MIN_COMPACT_SAVE)
+from .blocks import (Block, Universe, View, bake, form_saving,
+                       HEAD_TAIL_KEEP, HEAD_TAIL_KEEP_MAX, MIN_COMPACT_SAVE)
 
 # Framework floor (docs/10 §5.2.3: K 是带框架下限的键) — the clamping
 # authority owns the ranges; this is the hard invariant this layer adds.
 WINDOW_K_FLOOR = 1
 _NOTE_PREFIX = "[gan:note]"
 _WARN_RATIO = 0.8      # budget_checkpoint warns at 80% of an active budget
-_POLICY_STRIKES = 2    # C1-class wedge breaker: 2 failures -> disabled
+# Agent-owned CM modules (assembly / policy) share ONE strike rule (docs/19
+# §12.17): the module is load-once per session, so a retry of the same bytes
+# is deterministic waste — and a timed-out retry leaks ANOTHER worker thread.
+# One failure (load crash, load timeout, or a run-phase failure) latches the
+# module for the session; the CROSS-session fingerprint latch owns the
+# "a fixed module deserves one fresh try" decision. The success-resets-
+# strikes rule died with the per-turn policy reload.
+_AGENT_MODULE_STRIKES = 1
 _KIND_FOR_ROLE = {"tool": "tool_output"}
-# view artifacts carry this marker prefix (placeholder/template/excerpt
-# suffix) — history entries showing it are re-bound to their block, never
+# view artifacts carry this marker prefix ("[block <id> " — the match is
+# form-agnostic; legacy excerpt lines from pre-§12.21 histories still
+# re-bind) — history entries showing it are re-bound to their block, never
 # re-registered as new content (the LLM client rebuilds the history list on
 # every call, so object identity does not survive a turn).
 _VIEW_MARKER_PREFIX = "[block "
 _DEDUP_MARKER = "[gan:system prompt deduplicated]"
+
+# Framework-owned thread names in a seat child: the tool executor keeps the
+# stdlib default (``ThreadPoolExecutor-*``) and the CM exec pools are
+# explicitly named ``cm_exec`` (assembly/failopen runners). Anything else
+# alive is either a module-SPAWNED thread (agent code) or another framework
+# subsystem — the session-build-baselined census of this set is the leak
+# signal for self-spawned threads; exact exec-pool leaks are counted
+# separately (``thread_leaks``, timeout-driven). Advisory in in-process
+# mode (parallel sessions share one process census), authoritative in the
+# seat child (one session's census per worker process).
+#
+# G (docs/19 §12.59): FRAMEWORK PLUMBING threads are excluded by name prefix.
+# The relay/proxy pumps, the broker and the telemetry client are started by the
+# framework around (or after) the session baseline, so they used to be counted
+# as leaks — every seat session reported ``thread_leak_delta``>=1 and the
+# post-session hygiene restart fired on EVERY call (probed: delta=3), i.e. the
+# signal was constant noise. The exclusion is prefix-based only: anything an
+# agent module spawns keeps its own name and still counts, so the leak
+# detection itself is not weakened.
+#
+# §12.67: the name is what lets this tuple stay SMALL and true. The remaining
+# constant was ``litellm-logging_0`` — litellm's own logging worker, spawned
+# lazily on the first provider call, i.e. ALWAYS after a session baseline taken
+# at build. It made every plan/evaluate seat look like it leaked one thread and
+# paid a full worker restart for it (measured 2026-11-09, §12.67.6: the census
+# named it, and the two rounds before that had only "+1" to argue about).
+_FOREIGN_THREAD_EXCLUDE = (
+    "ThreadPoolExecutor",   # concurrent.futures pools (framework + libs)
+    "cm_exec",              # the CM per-turn exec worker (counted as thread_leaks)
+    "rsi-gan-",             # every framework thread: llm-relay, llm-proxy, *-broker
+    "f5-telemetry",         # telemetry client pump
+    "role-inactivity-watchdog",
+    "litellm-logging",      # litellm's own logging worker (lazy, first call)
+)
+
+
+def _foreign_threads() -> List[str]:
+    """NAMES of the live threads the census counts (one entry per thread).
+
+    The NAME is the whole point of the census: a bare ``thread_leak_delta=1``
+    is unattributable — it cannot say whether the extra thread belongs to the
+    agent's module, to a library, or to framework plumbing the exclusion tuple
+    has not learned yet (measured 2026-11-09: two independent real rounds each
+    reported exactly ``+1`` on the planner's plan seat with no name, so the
+    only possible diagnosis was "something, somewhere"). Duplicate names are
+    kept: a module that spawns two workers must read as 2.
+    """
+    out: List[str] = []
+    for t in threading.enumerate():
+        if not t.is_alive() or t is threading.main_thread():
+            continue
+        if t.name.startswith(_FOREIGN_THREAD_EXCLUDE):
+            continue
+        out.append(str(t.name))
+    return out
+
+
+def _foreign_thread_count() -> int:
+    return len(_foreign_threads())
+
+
+def _new_thread_names(baseline: List[str], now: List[str]) -> List[str]:
+    """Names alive NOW that the BASELINE did not already account for.
+
+    Multiset difference (``Counter``), so a framework thread that was already
+    running at session build is never reported as this session's leak, and two
+    same-named new threads report twice. A missing baseline (an old snapshot
+    restore) falls back to "everything counted" — which can only over-report
+    on a session that was ALREADY reporting a delta, never invent one.
+    """
+    if not baseline:
+        return sorted(now)
+    remaining = Counter(baseline)
+    new: List[str] = []
+    for name in now:
+        if remaining.get(name, 0) > 0:
+            remaining[name] -= 1
+        else:
+            new.append(name)
+    return sorted(new)
+
+
+class _ModuleLoad:
+    """Load-once state for ONE agent-owned CM module (assembly / policy).
+
+    Shared machinery (docs/19 §12.17): the module is loaded ONCE per
+    session, under the SAME exec budget as its execution — module-level
+    code is agent code, so a top-level hang is a load-phase timeout and a
+    top-level crash is a load-phase failure; BOTH are strike-counted
+    (byte-identical retries are deterministic waste). The cache holds
+    FAILURE too: a mid-session edit must not change the seam. The cache
+    holds the MODULE, never a run result — apply/assemble still execute
+    every turn.
+
+    ``loader(path, exec_ms)`` is the side's timed loader; it raises the
+    side's ``timeout_exc`` on budget overrun and lets load crashes
+    propagate — the classification (crash vs timeout) is what the session
+    strikes on, uniformly for both kinds."""
+
+    __slots__ = ("kind", "path", "loader", "timeout_exc",
+                 "result", "failed", "error", "timed_out", "exc")
+
+    def __init__(self, kind: str, path: Optional[str], loader: Callable,
+                 timeout_exc: type) -> None:
+        self.kind = kind
+        self.path = path
+        self.loader = loader
+        self.timeout_exc = timeout_exc
+        self.result: Optional[Tuple[Any, Dict[str, Callable], List[str]]] = None
+        self.failed = False
+        self.error = ""
+        self.timed_out = False
+        self.exc: Optional[BaseException] = None
+
+    @property
+    def armed(self) -> bool:
+        return self.path is not None
+
+    def ensure(self, exec_ms: int
+               ) -> Optional[Tuple[Any, Dict[str, Callable], List[str]]]:
+        """Load once (timed). Returns the loader result, or None with
+        ``failed``/``error``/``timed_out`` set (the failure is cached)."""
+        if self.failed:
+            return None
+        if self.result is not None:
+            return self.result
+        try:
+            self.result = self.loader(self.path, exec_ms)
+        except self.timeout_exc as e:
+            self.failed = True
+            self.timed_out = True
+            self.error = ops.clip_diag(str(e), 160)
+            self.exc = e   # carries candidate_thread (docs/19 §12.31)
+        except Exception as e:  # noqa: BLE001 -- classified by the caller
+            self.failed = True
+            self.error = ops.clip_diag(str(e), 160)
+        return self.result
 
 
 def _parse_view_marker(content: str) -> Optional[str]:
@@ -86,24 +233,292 @@ def _fingerprint(content: str) -> str:
     return hashlib.sha1(content.encode("utf-8", "replace")).hexdigest()
 
 
-def _msg_text(m: Any) -> Optional[str]:
-    """The text of one history entry, in EITHER key convention.
+# The SINGLE raw text carrier of a history entry (docs/19 §12.54-B). ``text``
+# is a retired spelling: two spellings of one value with OPPOSITE precedence in
+# the two layers (this session read ``content`` first, the client's conversion
+# let ``text`` win) meant a rendered view written under one of them was
+# silently discarded by the other.
+_RAW_KEY = "content"
+# The framework-owned SEND PROJECTION: written ONLY by ``render``, on the
+# throw-away copies a turn sends, and consumed ONLY by the payload builder
+# (``agent/llm.py:_payload_messages``, which strips it). It never exists in a
+# canonical history, so "raw" and "rendered" are two keys with two meanings
+# instead of one key with two.
+_SENT_KEY = "_cm_sent"
 
-    This repo's canonical history is ``text``-keyed (``agent/llm.py`` converts
-    content->text on return; ``task_agent`` reads ``['text']``) while the
-    seam's user-turn rebuild in the chat loop writes ``content`` — the binding
-    must not depend on which form a given entry happens to carry (docs/10
-    §11.5 erratum: the seam previously read ``content`` only and silently
-    failed to bind the canonical history)."""
+
+def _msg_text(m: Any) -> Optional[str]:
+    """The RAW text of one history entry — one carrier: ``content``.
+
+    ``_cm_sent`` is deliberately NOT read here: it is the send projection, not
+    the entry's text, and reading it would put the rendered form back into the
+    layer that must stay raw (that confusion is exactly docs/19 §12.54-B).
+
+    A legacy ``text``-only entry is still understood (``_entry_text`` — the
+    normalizer rewrites it once at the turn boundary), but nothing in this
+    module ever WRITES ``text``."""
+    return _entry_text(m)
+
+
+def _entry_text(m: Any) -> Optional[str]:
+    """Raw text of an entry, tolerating the retired ``text`` spelling."""
     if not isinstance(m, dict):
         return None
-    v = m.get("content")
-    if isinstance(v, str) and v:
-        return v
-    v = m.get("text")
-    if isinstance(v, str) and v:
-        return v
+    for key in (_RAW_KEY, "text"):
+        v = m.get(key)
+        if isinstance(v, str) and v:
+            return v
     return None
+
+
+def _shipped_text(m: Any) -> Optional[str]:
+    """The text a SEND COPY actually ships: the CM projection, else the raw.
+
+    Used by the send fact's CLAIM side only (docs/19 §12.54-C). Reading the
+    projection here is the whole point: a claim measured on ``content`` would
+    describe the raw history, not what the turn promised to send — and the
+    difference between the two IS the saving the fact exists to verify."""
+    if isinstance(m, dict):
+        proj = m.get(_SENT_KEY)
+        if isinstance(proj, str):
+            return proj
+    return _entry_text(m)
+
+
+def _canon_seq(msgs: Any) -> List[Tuple[str, Optional[str]]]:
+    """The CANONICAL IDENTITY sequence: ``(role, text)`` per entry.
+
+    docs/19 §12.55 (finding C): ``msg_index`` is a render ADDRESS, so the only
+    list an address may point into is the turn's canonical history. Identity is
+    compared BY VALUE — the client rebuilds the list every call, so object
+    identity never survives a turn — and ROLE is part of it: an entry that
+    keeps its text but changes role is a different message, and letting it
+    through would address it from a block that belongs to the old one.
+    """
+    return [(str(m.get("role") or ""), _entry_text(m))
+            for m in (msgs or []) if isinstance(m, dict)]
+
+
+def _canon_diff(canon: List[Tuple[str, Optional[str]]],
+                got: List[Tuple[str, Optional[str]]]) -> int:
+    """Index of the first disagreement (or ``min(len)`` — a length mismatch)."""
+    return next((i for i, (a, b) in enumerate(zip(canon, got)) if a != b),
+                min(len(canon), len(got)))
+
+
+def _normalize_entry(entry: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """One carrier, one spelling (docs/19 §12.54-B, I1/I2/I5/I6).
+
+    Returns ``(entry, note)`` where ``note`` is ``""`` (nothing to say),
+    ``"legacy"`` (a ``text``-only entry was rewritten to ``content``) or
+    ``"projection"`` (a ``_cm_sent`` was stripped: a fed-back send list is
+    legal, the projection is recomputed from the raw bytes).
+
+    A dual-carrier entry is NOT normalized here — it is the ambiguous state
+    this change exists to remove; ``_entries_conflict`` detects it and the
+    turn refuses loudly.
+    """
+    note = ""
+    if _SENT_KEY in entry:
+        entry.pop(_SENT_KEY, None)
+        note = "projection"
+    if "text" in entry:
+        value = entry["text"]
+        if not isinstance(entry.get(_RAW_KEY), str) \
+                and isinstance(value, str) and value:
+            entry[_RAW_KEY] = value
+        entry.pop("text", None)
+        note = note or "legacy"
+    return entry, note
+
+
+def _entries_conflict(entry: Dict[str, Any]) -> bool:
+    """Both carriers present with DIFFERENT text: refuse (I5)."""
+    content, text = entry.get(_RAW_KEY), entry.get("text")
+    return (isinstance(content, str) and isinstance(text, str)
+            and content and text and content != text)
+
+
+def _is_step_head(block: Any) -> bool:
+    """One STEP = one LLM call; its head is the assistant reply (docs/19 §12.56).
+
+    The chat protocol appends exactly TWO entries per call: the user message
+    carrying that call's tool outputs, then the assistant reply. Counting
+    ENTRIES therefore made ``cm_window_k`` mean "blocks" (≈ half a step per
+    unit, and ``k=1`` kept only the *current* message — an unusable floor).
+    The window now counts CALLS: a step starts at its assistant block and owns
+    every block back to the previous assistant (its tool-output input).
+    """
+    return block.kind == "turn_output" and block.source == "assistant"
+
+
+_LEGAL_ROLES = ("system", "user", "assistant", "tool")
+
+
+def _validate_sent_history(history: Any) -> Optional[str]:
+    """P0 (docs/19 §12.14): the SENT history must be a list of message dicts.
+
+    The shape check alone (list) let ``[None]`` reach the LLM payload while
+    ``assembly_failures`` stayed 0 — a silent contract break that surfaces as
+    a confusing "model/task quality" failure. Element-level validation turns
+    it into the same loud fallback a crash gets."""
+    if not isinstance(history, list):
+        return f"sent history is {type(history).__name__}, not a list"
+    for i, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            return f"history[{i}] is {type(entry).__name__}, not a message dict"
+        role = entry.get("role")
+        if not isinstance(role, str) or not role:
+            return f"history[{i}] carries no role"
+        if role not in _LEGAL_ROLES:
+            return f"history[{i}] role {role!r} is not a chat role"
+        # ONE text carrier (docs/19 §12.54-B). A non-str ``content`` is legal
+        # (``None``/multimodal); the CM layer reads it as "no text".
+        if _RAW_KEY in entry and entry[_RAW_KEY] is not None \
+                and not isinstance(entry[_RAW_KEY], str):
+            return (f"history[{i}][{_RAW_KEY!r}] is "
+                    f"{type(entry[_RAW_KEY]).__name__}, not text")
+        if "text" in entry and entry["text"] is not None \
+                and not isinstance(entry["text"], str):
+            return (f"history[{i}]['text'] is "
+                    f"{type(entry['text']).__name__}, not text "
+                    f"(allowed entry keys: ['role', {_RAW_KEY!r}])")
+    return None
+
+
+class _ViewRead:
+    """READ-ONLY projection of the persistent view (P2 portal surface).
+
+    Authors may inspect the view; they may not write it. ``set`` simply does
+    not exist here (the presets keep the real object)."""
+
+    __slots__ = ("_v",)
+
+    def __init__(self, view: Any):
+        object.__setattr__(self, "_v", view)
+
+    def form_of(self, block_id: str) -> str:
+        return self._v.form_of(block_id)
+
+    @property
+    def forms(self) -> Dict[str, str]:
+        return dict(self._v.forms)
+
+    @property
+    def rules(self) -> Dict[str, str]:
+        return dict(self._v.rules)
+
+    def __getattr__(self, name: str) -> Any:
+        from .assembly import AssemblyError
+        raise AssemblyError(
+            f"view.{name} is not available on the assembly surface: view is a "
+            f"READ-ONLY projection (use the primitives to change it)")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        from .assembly import AssemblyError
+        raise AssemblyError("the view is READ-ONLY for assemblies")
+
+
+class _UniverseRead:
+    """READ-ONLY projection of the block universe (P2 portal surface).
+
+    ``get``/``ordered``/iteration return DEEP copies: a block object carries
+    mutable fields (``pinned``, ``msg_index``) AND a mutable container
+    (``sources`` — derived lineage); a shallow copy shares that list, so
+    ``get(...).sources.append(...)`` would write straight through the
+    read-only facade (N5c, docs/19 §12.32)."""
+
+    __slots__ = ("_u",)
+
+    def __init__(self, universe: Any):
+        object.__setattr__(self, "_u", universe)
+
+    def get(self, block_id: str) -> Any:
+        block = self._u.blocks.get(str(block_id))
+        return copy.deepcopy(block) if block is not None else None
+
+    def ordered(self) -> List[Any]:
+        return [copy.deepcopy(b) for b in self._u.ordered()]
+
+    def __iter__(self):
+        return iter(self.ordered())
+
+    def __len__(self) -> int:
+        return len(self._u.blocks)
+
+    def __getattr__(self, name: str) -> Any:
+        from .assembly import AssemblyError
+        raise AssemblyError(
+            f"universe.{name} is not available on the assembly surface: "
+            f"universe is a READ-ONLY projection (blocks are framework-owned)")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        from .assembly import AssemblyError
+        raise AssemblyError("the block universe is READ-ONLY for assemblies")
+
+
+class SessionPortal:
+    """P2 (docs/19 §12.14): the object an AGENT-OWNED assembly receives.
+
+    The published authoring surface is the session's PRIMITIVE METHODS
+    (``cm/assembly.py`` composes exactly those) plus the refs fold
+    (``record_refs`` — N2 batch, docs/19 §12.33: the baseline pipeline
+    performs the same early fold before ``run_policy``, so the authoring
+    surface must be able to express it too) plus clamped parameters as
+    READ-ONLY values. Everything else — the mutable ``view``/``universe``,
+    the audit post segment (``emit_view``/``count_ops``), the internal
+    bookkeeping — is refused here, so "it cannot bypass the rules" becomes
+    true by construction instead of by convention. The parameter NAME stays
+    ``session`` (signature unchanged); only the object narrows.
+
+    Escape (``type(portal)``, a captured closure) is still possible — that is
+    the malicious tier, and the P1 turn reconciliation backstops it.
+    """
+
+    __slots__ = ("_s",)
+
+    _METHODS = frozenset({
+        "register_history", "register_outgoing", "budget_checkpoint",
+        "window_defaults", "conservative_compaction", "dedup_prefix",
+        "run_policy", "call_method", "finalize_turn", "render",
+        "record_refs",
+        # DELIBERATELY ABSENT (docs/19 §12.54-C): ``claim_send`` and
+        # ``note_send_fact`` are the two halves of the SEND FACT. An assembly
+        # that could write either would be able to make the audit agree with
+        # itself — the claim is set by the post segment / the passthrough
+        # preset, and the fact is folded by the chat-loop seam.
+    })
+    _PARAMS = frozenset({
+        "mode", "system_prefix", "window_k", "head_tail_keep",
+        "drop_floor_chars",
+        "min_compact_save", "note_cap_chars", "max_ops_per_turn",
+        "assembly_exec_ms", "policy_exec_ms", "turn",
+    })
+
+    def __init__(self, session: Any):
+        object.__setattr__(self, "_s", session)
+
+    def __getattr__(self, name: str) -> Any:
+        from .assembly import AssemblyError
+        if name in self._METHODS:
+            return getattr(self._s, name)
+        if name in self._PARAMS:
+            return getattr(self._s, name)
+        if name == "view":
+            return _ViewRead(self._s.view)
+        if name == "universe":
+            return _UniverseRead(self._s.universe)
+        raise AssemblyError(
+            f"{name!r} is not part of the assembly surface "
+            f"(allowed methods: {sorted(self._METHODS)}; "
+            f"read-only parameters: {sorted(self._PARAMS)}; "
+            f"view/universe are read-only projections)")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        from .assembly import AssemblyError
+        raise AssemblyError(
+            f"{name!r} is read-only on the assembly surface (clamping is "
+            f"framework-owned)")
 
 
 class ViewHandle:
@@ -112,7 +527,16 @@ class ViewHandle:
     (ops.AGENT_FACES / ops.POLICY_FACES); the policy face carries the
     per-turn op budget (``cm_max_ops_per_turn``). Every op returns a
     structured record that never carries block content (peek/note reads are
-    the explicit content requests)."""
+    the explicit content requests).
+
+    The policy budget is an ATTEMPTS quota (ruled, docs/19 §12.39.4 R7b):
+    READ ops draw from the same pool as writes; a refused attempt counts
+    and is NOT refunded (the decrement precedes the primitive's
+    validation); exhaustion and parameter errors record as violation
+    events — DISPLAY-ONLY (the session counter and the cost line's
+    aggregate): no strike, latch or disable reads them (those consume the
+    reconcile's return and the ``cm_*_failed`` counters). The agent face
+    carries no budget."""
 
     def __init__(self, session: "CMSession", face: str):
         self._s = session
@@ -122,9 +546,73 @@ class ViewHandle:
 
     def _audit(self, rec: Dict[str, Any]) -> Dict[str, Any]:
         """Policy-face refusals are violations wherever they happen (the
-        wedge breaker counts them via the session, not only in the seam)."""
-        if self.face == "policy" and not rec.get("ok"):
+        wedge breaker counts them via the session, not only in the seam).
+
+        Event vocabulary (docs/19 §12.39.4 R7b + §12.47 F3): the OP-REFUSAL
+        family (an attempt that did NOT take effect) is split by SOURCE, so a
+        reader can always tell where the refusal came from:
+
+        * ``cm_violation`` with ``source="policy_face"`` — a policy-face
+          handle refusal (this path, counted);
+        * ``cm_violation`` with ``source="seam_record"`` — a refusal record
+          produced by the seam pipeline (``count_ops``, counted);
+        * ``cm_face_violation`` with ``face="agent"`` — an AGENT tool-face
+          refusal (``note_face_violation``, NOT counted: agent ops never flow
+          through ``count_ops``, so folding them into ``violations`` /
+          ``ops_refused`` would break the documented alias and the
+          ``ops_total == applied + refused + ...`` invariant).
+
+        The reconcile's detections are a DIFFERENT family — contract breaches
+        by an effect that DID happen — emitted per-subsystem as
+        ``cm_assembly_violation``/``cm_policy_violation`` (§12.17.1, N5a) by
+        ``_note_violations``. A scanner counting a session's refusals must
+        subscribe to both families; the cost line's ``cm_violations``
+        aggregate counts ONLY the counted half of the op-refusal family
+        (declared half-count; widening it is a recorded pending option).
+
+        Successful MUTATING ops also publish their refs to the session's
+        recorded-refs set: the P1 turn reconciliation must be able to explain
+        a non-full form even when the caller forgot to thread the record
+        through ``finalize_turn`` (or when the op happened inside a custom
+        METHOD, whose own record carries no refs).
+
+        Agent-face ok records ALSO land their ``saved`` delta in the
+        session's net accounting (docs/19 §12.37, R4): agent-face records
+        never flow through ``finalize_turn``/``count_ops`` (the only other
+        accumulator), so the handle is where an agent trim credits and a
+        full restore refunds. Policy/assembly records are counted by
+        ``count_ops`` — accumulating here too would double-count.
+
+        N4 (docs/19 §12.46) SOURCE SPLIT: the agent-face delta is a different
+        SOURCE than the seam's, so it lands in TWO extra places besides the
+        total: ``est_saved_agent`` (the session-level attribution export) and
+        ``_agent_saved_pending`` (per-turn, folded into the NEXT cm_view's
+        ``agent_saved_chars``). The total ``est_chars_saved`` keeps its
+        historical meaning (a flow, never billing).
+
+        ``saved`` is a TRANSITION number (docs/19 §12.40, F2): the handle
+        snapshots the block's previous form BEFORE calling the primitive and
+        fills the record through the session's single accounting funnel
+        (``_book``); primitives no longer carry a block-local "vs full"
+        number, so a repeated / no-op / cross-form op can never double-book.
+        """
+        if rec.get("ok"):
+            refs = rec.get("refs") or []
+            if refs:
+                self._s._recorded_refs.update(str(r) for r in refs)
+            if self.face == "agent" and "saved" in rec:
+                saved = int(rec.get("saved") or 0)
+                self._s.est_chars_saved += saved
+                self._s.est_saved_agent += saved
+                self._s._agent_saved_pending += saved
+            return rec
+        if self.face == "policy":
             self._s.note_violation(rec)
+        elif self.face == "agent":
+            # F3 (docs/19 §12.47): a CM-semantic refusal on the AGENT tool
+            # face is a real CM decision -- it must be auditable, but it is
+            # NOT part of the seam's counted universe (see note_face_violation).
+            self._s.note_face_violation(rec, face=self.face)
         return rec
 
     def _gate(self, op: str) -> Optional[Dict[str, Any]]:
@@ -139,10 +627,13 @@ class ViewHandle:
         return None
 
     # -- read-only ---------------------------------------------------------
-    def index(self, kinds: Optional[List[str]] = None) -> Dict[str, Any]:
+    def index(self, kinds: Optional[List[str]] = None,
+              offset: int = 0, cap: Optional[int] = None) -> Dict[str, Any]:
         if err := self._gate("index"):
             return err
-        return ops.index_blocks(self._s.universe, kinds)
+        return ops.index_blocks(self._s.universe, kinds,
+                                cap=ops.INDEX_CAP_DEFAULT if cap is None else cap,
+                                offset=offset)
 
     def peek(self, block_id: str) -> Dict[str, Any]:
         if err := self._gate("peek"):
@@ -152,24 +643,80 @@ class ViewHandle:
     def view_state(self) -> Dict[str, Any]:
         if err := self._gate("view_state"):
             return err
-        return ops.view_state(self._s.universe, self._s.view)
+        return ops.view_state(self._s.universe, self._s.view,
+                              head_tail_keep=self._s.head_tail_keep)
 
-    def budget_query(self, tokens_used: Optional[int] = None,
+    def usage_query(self, tokens_used: Optional[int] = None,
                      budget: Optional[int] = None) -> Dict[str, Any]:
-        if err := self._gate("budget_query"):
+        if err := self._gate("usage_query"):
             return err
-        return self._s.budget_snapshot(tokens_used, budget)
+        return self._s.usage_snapshot(tokens_used, budget)
 
     # -- mutations (ops validate first; view mutates only on success) ---------
     def fetch(self, block_id: str, form: str = "full") -> Dict[str, Any]:
         if err := self._gate("fetch"):
             return err
-        return self._audit(ops.fetch(self._s.universe, self._s.view, block_id, form))
+        # Agent-face fetch verb contract (ops.AGENT_FETCH_FORMS — the same
+        # constant the ctx_fetch schema enum is built from): materialize
+        # (full) or trim (head_tail). The eviction forms are the
+        # assembly/policy layer's, and the agent tool face has NO turn-end
+        # reconcile — an out-of-contract form is refused HERE rather than
+        # left to a backstop. The policy face's fetch(non-full) shrink verb
+        # is deliberately untouched.
+        if self.face == "agent" and form not in ops.AGENT_FETCH_FORMS:
+            return self._audit({
+                "op": "fetch", "refs": [block_id], "ok": False,
+                "error": (f"invalid form {form!r} on the agent face "
+                          f"(allowed: {', '.join(ops.AGENT_FETCH_FORMS)})")})
+        prev = self._s._pre_state(block_id)
+        rec = ops.fetch(self._s.universe, self._s.view, block_id,
+                        form, keep=self._s.head_tail_keep)
+        # saved is the session's transition delta — the SAME funnel every
+        # mutation uses (docs/19 §12.40, F2). The former dedup-only fixup
+        # (C.3, §12.39.5) is subsumed: ``_book`` knows every anchored form.
+        self._s._book(rec, block_id, prev)
+        return self._audit(rec)
 
     def pin(self, block_id: str, note: str = "") -> Dict[str, Any]:
+        """Pin/unpin. PINNING A NOT-YET-FULL BLOCK RESTORES ITS CONTENT.
+
+        pinned's declared meaning is "content must not be lost" — the ONE
+        exemption is ``dedup`` (it only elides the repeated system header;
+        docs/10 "pin 的唯一豁免是 dedup"). A pin on an already-elided block
+        used to set the flag and buy nothing: the block kept shipping as a
+        placeholder AND the state violated the P1 ``pinned_form`` contract,
+        which struck the NEXT healthy policy/assembly turn as a false
+        contract break (docs/19 §12.40, F1). The pin now converges the
+        block: a form outside {full, dedup} is restored to full (the
+        transition's refund books through the accounting funnel, and the
+        record self-reports it: ``restored`` / ``restored_from`` / ``chars``
+        / ``saved``). ``dedup`` and ``full`` are left untouched.
+        """
         if err := self._gate("pin"):
             return err
-        return self._audit(ops.pin(self._s.universe, self._s.view, block_id, True, note))
+        prev = self._s._pre_state(block_id)
+        rec = ops.pin(self._s.universe, self._s.view, block_id, True, note)
+        blk = self._s.universe.get(block_id)
+        if (rec.get("ok") and blk is not None
+                and prev[0] not in ("full", "dedup")):
+            saving = self._s._transition_saving(
+                blk, prev[0], prev[1], "full", prev[1])
+            ops.fetch(self._s.universe, self._s.view, block_id, "full",
+                      keep=self._s.head_tail_keep)
+            if rec.get("note_stored"):
+                # the restore wrote its own rule tag; the pin annotation is
+                # the durable read-back, so it wins on a restored block
+                self._s.view.rules[block_id] = "pin:" + str(rec["note_stored"])
+            else:
+                # no annotation: a FULL block needs no rule tag (the eviction
+                # reason that applied before the restore lives in the earlier
+                # cm_view event; leaving "fetch" on a full block is noise)
+                self._s.view.rules.pop(block_id, None)
+            rec["restored"] = True
+            rec["restored_from"] = prev[0]
+            rec["chars"] = blk.chars
+            rec["saved"] = saving
+        return self._audit(rec)
 
     def unpin(self, block_id: str) -> Dict[str, Any]:
         if err := self._gate("unpin"):
@@ -179,21 +726,40 @@ class ViewHandle:
     def drop(self, block_id: str, rule: str = "policy") -> Dict[str, Any]:
         if err := self._gate("drop"):
             return err
-        return self._audit(ops.drop(self._s.universe, self._s.view, block_id, rule,
-                        self._s.drop_floor_chars))
+        prev = self._s._pre_state(block_id)
+        rec = ops.drop(self._s.universe, self._s.view, block_id, rule,
+                       self._s.drop_floor_chars)
+        self._s._book(rec, block_id, prev)
+        return self._audit(rec)
 
     def compact(self, block_ids: List[str],
                 strategy: str = "first_last") -> Dict[str, Any]:
         if err := self._gate("compact"):
             return err
-        return self._audit(ops.compact(self._s.universe, self._s.view, list(block_ids),
-                           strategy, self._s.drop_floor_chars, self._s.turn))
+        # snapshot EVERY block's (form, rule): the materializing strategies
+        # change host/other sources AND re-point stale references, so the
+        # exact delta is computed over all changed blocks after the call.
+        prev_all = self._s._pre_state_all()
+        rec = ops.compact(self._s.universe, self._s.view, list(block_ids),
+                          strategy, self._s.drop_floor_chars, self._s.turn,
+                          keep=self._s.head_tail_keep)
+        if rec.get("ok"):
+            rec["saved"] = self._s._delta_since(prev_all)
+            # N1: the primitive reports WHICH derived sources it pinned on
+            # consumption; that is the evidence the reconcile's fourth
+            # question needs (docs/19 §12.52).
+            self._s._op_pinned.update(str(b) for b in (rec.get("pinned") or []))
+        return self._audit(rec)
 
     def substitute(self, block_id: str, form: str) -> Dict[str, Any]:
         if err := self._gate("substitute"):
             return err
-        return self._audit(ops.substitute(self._s.universe, self._s.view, block_id, form,
-                              "policy", self._s.drop_floor_chars))
+        prev = self._s._pre_state(block_id)
+        rec = ops.substitute(self._s.universe, self._s.view, block_id, form,
+                             "policy", self._s.drop_floor_chars,
+                             keep=self._s.head_tail_keep)
+        self._s._book(rec, block_id, prev)
+        return self._audit(rec)
 
     def order(self, block_ids: List[str]) -> Dict[str, Any]:
         if err := self._gate("order"):
@@ -204,12 +770,22 @@ class ViewHandle:
     def note_write(self, text: str) -> Dict[str, Any]:
         if err := self._gate("note"):
             return err
-        return ops.note_write(self._s, text, self._s.note_cap_chars)
+        # F3 / B1 (docs/19 §12.47): the note verb used to bypass the audit
+        # hook, so its refusals (text over ``note_cap_chars``) were the ONE
+        # agent-face CM decision with no event at all. It now goes through
+        # ``_audit`` like every other mutating verb; ok records are unchanged
+        # (a note record carries no ``saved`` and no ``refs``).
+        return self._audit(ops.note_write(self._s, text,
+                                          self._s.note_cap_chars))
 
     def note_read(self, note_id: str) -> Dict[str, Any]:
         if err := self._gate("note"):
             return err
-        return ops.note_read(self._s.notes, note_id)
+        # F3 / B1 (docs/19 §12.47): same reason — an unknown note is a CM
+        # semantic refusal and must be auditable. The ok record's ``refs``
+        # only joins the reconciliation's recorded-refs set (note blocks are
+        # pinned + FULL, so the P1 questions are unaffected).
+        return self._audit(ops.note_read(self._s.notes, note_id))
 
     def note_list(self) -> Dict[str, Any]:
         if err := self._gate("note"):
@@ -243,12 +819,14 @@ class CMSession:
     preset with a loud ``cm_assembly_fallback`` event, never silently)."""
     mode: str = "passthrough"
     window_k: int = 4
+    head_tail_keep: int = HEAD_TAIL_KEEP  # session-wide head_tail notch
+    # (cost key cm_head_tail_keep; excerpt form retired — docs/19 §12.21)
     drop_floor_chars: int = 400
     max_ops_per_turn: int = 32
     policy_exec_ms: int = 200
     note_cap_chars: int = 8_000
     emit: Optional[Callable[[Dict[str, Any]], None]] = None
-    budget_reader: Optional[Callable[[], Dict[str, Any]]] = None
+    usage_reader: Optional[Callable[[], Dict[str, Any]]] = None
     policy_path: Optional[str] = None  # custom mode: agent policy module path
     assembly_path: Optional[str] = None  # named agent-owned assembly module
     assembly_exec_ms: int = 200          # per-turn budget for that assembly
@@ -265,8 +843,48 @@ class CMSession:
     policy_failures: int = 0
     policy_disabled: bool = False
     violations: int = 0
+    # Cumulative SIGNED flow of booked management-op deltas: every mutation
+    # books the TRANSITION width (prev rendered form → new rendered form,
+    # docs/19 §12.40 F2), render-visible blocks only (⑤). It can decrease
+    # (refunds: a restore widens the view again) and it CAN be negative
+    # transiently — a shrink that widens a tiny block (C.1) or a cross-form
+    # move books the true signed delta instead of a clamped 0. The STATE
+    # quantity (current view net saving) remains independently observable
+    # from the per-turn render deltas; consumers treat this as a flow, never
+    # as billing.
+    #
+    # N4 (docs/19 §12.46) SOURCE SPLIT: this total mixes the SEAM source
+    # (``count_ops`` records) with the AGENT-tool source (the handle audit,
+    # which never flows through ``finalize_turn``/``count_ops``). The agent
+    # half is exported separately as ``est_saved_agent`` (conditional in
+    # ``summary()``) so a reader can attribute the flow; the seam half is
+    # ``est_chars_saved - est_saved_agent`` (derived, no third field).
     est_chars_saved: int = 0
+    est_saved_agent: int = 0
     emit_failures: int = 0
+    # CM-03 leak observability: an exec-budget timeout leaks its worker
+    # thread (Python cannot kill threads). ``thread_leaks`` counts the
+    # timed-out load/apply/assemble jobs this session produced; the
+    # ``_thread_baseline`` census catches module-SPAWNED threads, which
+    # never pass through an exec budget at all. Both surface in
+    # ``summary()`` as CONDITIONAL fields (absence = clean) and drive the
+    # seat proxy's post-session hygiene restart (docs/19 CM-03 residual).
+    thread_leaks: int = 0
+    # Band-① advisory counters (docs/19 §12.30.3/N1): a run that completed
+    # INSIDE the wait deadline but over the wall budget. Advisory only —
+    # the result is honored, never struck.
+    assembly_overruns: int = 0
+    policy_overruns: int = 0
+    # the workers abandoned at T (candidate threads attached to the raised
+    # timeout exceptions) — ``thread_leaks_live`` measures how many are
+    # STILL alive at summary time (docs/19 §12.31)
+    _timeout_workers: List[Any] = field(default_factory=list, repr=False,
+                                        compare=False)
+    _thread_baseline: int = field(default=0, repr=False, compare=False)
+    # NAMES of the counted threads alive at build (docs/19 §12.67) — the
+    # multiset the summary's ``thread_leak_names`` is diffed against.
+    _thread_baseline_names: List[str] = field(default_factory=list, repr=False,
+                                              compare=False)
     _policy_strikes: int = 0
     _seen_user: bool = False   # first-user-turn default pin (docs/10 §5.2.3)
     # Named-assembly bookkeeping (audit fields materialize WITH the
@@ -275,16 +893,67 @@ class CMSession:
     assembly_active: bool = False    # the named assembly produced >= 1 turn
     assembly_failures: int = 0
     assembly_disabled: bool = False  # wedge-broken for the session
+    assembly_violations: int = 0     # seam-contract violations this session
+    policy_violations: int = 0       # policy-tail reconcile violations (N5a)
     _assembly_strikes: int = 0
-    _named_fn: Optional[Callable] = field(default=None, repr=False,
-                                          compare=False)
-    _named_failed: bool = field(default=False, repr=False, compare=False)
+    # P1 turn reconciliation (docs/19 §12.14): turn-start snapshot + the op
+    # refs the post segment recorded. Named-assembly turns only (presets never
+    # populate them: they cannot touch these surfaces).
+    _turn_snapshot: Optional[Dict[str, Any]] = field(default=None, repr=False,
+                                                     compare=False)
+    # Forms are STICKY across turns, so a block substituted on turn 2 is still
+    # non-full on turn 3 without a new record. The reconciliation therefore
+    # needs the CUMULATIVE set of recorded refs, not just this turn's.
+    _recorded_refs: set = field(default_factory=set, repr=False, compare=False)
+    # N1 (docs/19 §12.52): blocks a RECORDED op pinned this turn — the
+    # evidence the reconcile's fourth question consults. ``compact`` pins a
+    # consumed derived source (one consumer per node -> a tree); that pin is
+    # a framework fact, not a policy escape. Written only by
+    # ``ViewHandle.compact`` from the primitive's own record, never by a
+    # face, so an escape cannot forge it.
+    _op_pinned: set = field(default_factory=set, repr=False, compare=False)
+    # A/N2 (docs/19 §12.53): the canonical text sequence of THIS turn. Every
+    # ``msg_index`` must address it; ``register_history`` refuses a list that
+    # is not a prefix-compatible view of it. ``None`` = no turn entry was
+    # seen (direct construction / tests) -> the check is skipped.
+    _turn_canonical: Optional[List[str]] = field(default=None, repr=False,
+                                                 compare=False)
+    _assembly_last_error: Dict[str, Any] = field(default_factory=dict,
+                                                 repr=False, compare=False)
+    _portal_cache: Any = field(default=None, repr=False, compare=False)
+    # load-once state, one instance per agent-owned CM module kind (docs/19
+    # §12.17): caches the MODULE (success AND failure) — apply/assemble still
+    # run every turn.
+    _assembly_load: Optional["_ModuleLoad"] = field(default=None, repr=False,
+                                                    compare=False)
+    _policy_load: Optional["_ModuleLoad"] = field(default=None, repr=False,
+                                                  compare=False)
+    _policy_last_error: Dict[str, Any] = field(default_factory=dict,
+                                               repr=False, compare=False)
     _assembly_ignored: bool = field(default=False, repr=False, compare=False)
     _turn_degraded: bool = field(default=False, repr=False, compare=False)
     _view_emitted_turn: Optional[int] = field(default=None, repr=False,
                                               compare=False)
+    # N4 (docs/19 §12.46): the turn whose POST SEGMENT (count_ops + emit_view +
+    # render) ran. Basis of the per-turn ``send_source`` fact: a turn that is
+    # not finalized did not send a framework-rendered view (it is either the
+    # passthrough identity or an assembly-authored send). Not the same thing
+    # as ``_view_emitted_turn``: passthrough emits a cm_view WITHOUT running
+    # the post segment, so only ``finalize_turn`` sets this.
+    _finalized_turn: Optional[int] = field(default=None, repr=False,
+                                           compare=False)
+    # N4 source split: agent tool-face deltas accumulate here BETWEEN turns
+    # (the handle audit books them; ``count_ops`` never sees them). The next
+    # cm_view folds the pending delta into its ``agent_saved_chars`` field and
+    # resets it — the session-level export stays in ``est_saved_agent``.
+    _agent_saved_pending: int = field(default=0, repr=False, compare=False)
     # identity-keyed bookkeeping: rewritten shallow copies are not re-registered
     _by_fp: Dict[str, str] = field(default_factory=dict)  # content fp -> bid
+    # R5 backstop (docs/19 §12.38): each turn_output block's REGISTRATION
+    # fingerprint, keyed by block_id — the reconcile's identity question
+    # compares it against the block's CURRENT text (a live-object leak that
+    # mutates block.text in place desynchronizes the two and is caught).
+    _reg_fp: Dict[str, str] = field(default_factory=dict)
     # Custom methods: registered per session from the
     # named modules' METHODS export — same-level, same-callee surface. The
     # assembly's harvest registers first; the policy's merges at its first
@@ -304,8 +973,67 @@ class CMSession:
     # resolved assembly (cache: mode is clamped upstream and never mutates)
     _assembly_fn: Optional[Callable] = field(default=None, repr=False,
                                              compare=False)
+    # SEND FACT (docs/19 §12.54-C): the width vector the framework CLAIMED to
+    # send this turn (post segment / passthrough identity), compared against
+    # the widths the client reports having put on the wire. ``None`` = this
+    # turn's send was not produced by the framework (an assembly authored its
+    # own history, or the seam failed open) -> nothing to compare.
+    _send_expect: Optional[List[int]] = field(default=None, repr=False,
+                                              compare=False)
+    # session-lifetime audit counters (conditional in ``summary()``)
+    send_mismatches: int = 0
+    send_drift_chars: int = 0
+    # one-shot "the entries carried a retired/forged spelling" announcements
+    _entry_legacy_seen: bool = field(default=False, repr=False, compare=False)
+    _entry_projection_seen: bool = field(default=False, repr=False,
+                                         compare=False)
+    # C (docs/19 §12.55): this turn's send was NOT the canonical list, so the
+    # view was not rendered (a capability refusal, never a strike). The
+    # one-shot flag keeps the event to once per session; the counter is the
+    # session-level audit fact.
+    _turn_unrendered: bool = field(default=False, repr=False, compare=False)
+    _turn_unrendered_seen: bool = field(default=False, repr=False, compare=False)
+    unrendered_turns: int = 0
+    # F (docs/19 §12.58): a dedup form that cannot apply any more is demoted
+    # to FULL (with a refund); the one-shot flag keeps the explanation to one
+    # event per session.
+    _dedup_lapsed_seen: bool = field(default=False, repr=False, compare=False)
+    # F (§12.58): the EXACT credit each dedup form booked when it was applied.
+    # ``view_text`` already models "a dedup that cannot apply = full width", so
+    # a lapse cannot recompute the credit from the CURRENT prefix — the amount
+    # to refund is the one the op actually booked. Popped by ``_book`` whenever
+    # the block leaves the dedup form (so a fetch-then-lapse cannot refund
+    # twice). A P1 snapshot/restore does not carry it, which is harmless: the
+    # only writer of the dedup form is ``dedup_prefix`` (the policy face
+    # refuses it), and it overwrites the entry, while ``_lapse_forms`` only
+    # acts on blocks whose CURRENT form still is dedup.
+    _dedup_credit: Dict[str, int] = field(default_factory=dict, repr=False,
+                                          compare=False)
+    # K (docs/19 §12.62): every cm_view is ADDRESSABLE. A turn can emit more
+    # than one view — a named assembly may call finalize_turn (which books ops
+    # and emits) and then raise, so the fail-open preset replays the turn and
+    # emits a SECOND view for the same turn. Summing ``saved_chars`` over the
+    # events then double-counts, and "the last view" is only the authoritative
+    # one by accident of stream order. ``view_seq`` is session-monotonic,
+    # ``view_in_turn`` is 1-based within the turn, and a rolled-back view is
+    # RETRACTED by its own event (never rewritten).
+    view_seq: int = 0
+    _turn_view_seq: int = field(default=0, repr=False, compare=False)
+    _last_view: Optional[Tuple[int, int, int]] = field(
+        default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------- config
+    def __post_init__(self) -> None:
+        """Anchor the foreign-thread census at session build (CM-03 leak
+        observability; see ``_foreign_thread_count``).
+
+        The baseline is captured as NAMES (docs/19 §12.67), not just a count:
+        a count can say "+1 appeared" and nothing else, while the name says
+        which subsystem to look at. The count stays derived, so the two can
+        never disagree."""
+        self._thread_baseline_names = _foreign_threads()
+        self._thread_baseline = len(self._thread_baseline_names)
+
     def apply_keys(self, keys: Dict[str, Any]) -> None:
         """Type-guarded application of ALREADY-CLAMPED effective values."""
         mode = keys.get("cm_mode")
@@ -315,6 +1043,9 @@ class CMSession:
         k = keys.get("cm_window_k")
         if type(k) is int and k >= WINDOW_K_FLOOR:
             self.window_k = k
+        v = keys.get("cm_head_tail_keep")
+        if type(v) is int and 1 <= v <= HEAD_TAIL_KEEP_MAX:
+            self.head_tail_keep = v
         v = keys.get("cm_drop_floor_chars")
         if type(v) is int and v >= 0:
             self.drop_floor_chars = v
@@ -331,28 +1062,257 @@ class CMSession:
         if type(v) is int and v >= 1:
             self.note_cap_chars = v
 
+    # ------------------------------------------------ sent-text + accounting
+    # ONE source for a block's sent text (all forms, incl. the session-
+    # anchored dedup / derived_host), and ONE source for an op's saving
+    # (the TRANSITION from the block's previous rendered form). Render, the
+    # marker re-bind and the audit funnel all consume these (docs/19 §12.40):
+    # the pre-§12.40 split (bake() + block-local form_saving() + a dedup-only
+    # session fixup) booked wrong deltas for repeated/no-op/cross-form ops
+    # and for the derived_host restore.
+    @staticmethod
+    def _renders(block: "Block") -> bool:
+        """⑤ RENDER-VISIBILITY caliber, single-sourced: a block books saving
+        when it renders NOW (bound to the canonical history) or necessarily
+        NEXT turn (the unbound outgoing turn_output — the fingerprint bind is
+        guaranteed by the chat protocol). Notes / derived / traj_seg never
+        render → never book."""
+        return block.msg_index is not None or block.kind == "turn_output"
+
+    def view_text(self, block: "Block", form: str, rule: str = "") -> str:
+        """The text this block contributes to the SENT history in ``form``.
+
+        context-free forms delegate to ``bake`` (the frozen formula source);
+        the two SESSION-ANCHORED forms are resolved here:
+        ``dedup`` — exactly the render's rewrite (head prefix → marker;
+        a non-matching prefix is a no-effect, i.e. the full text);
+        ``derived_host`` — the resolved derived text + the host suffix
+        (the rule carries ``derived=<id>``; a missing host stays raw, the
+        same defensive behavior render has).
+        """
+        rule = str(rule or "")
+        if form == "full":
+            return block.text
+        if form == "dedup":
+            if self.system_prefix and block.text.startswith(self.system_prefix):
+                return _DEDUP_MARKER + block.text[len(self.system_prefix):]
+            return block.text
+        if form == "derived_host":
+            bid = rule[len("derived="):] if rule.startswith("derived=") else None
+            dblock = self.universe.get(bid) if bid else None
+            if dblock is None:
+                return block.text
+            return bake(block, "derived_host", rule, host_text=dblock.text)
+        return bake(block, form, rule, keep=self.head_tail_keep)
+
+    def _transition_saving(self, block: "Block", prev_form: str, prev_rule: str,
+                           new_form: str, new_rule: str) -> int:
+        """Signed sent-width delta of one form transition (SIGNED: a move to
+        a wider form refunds; small-block evictions may legitimately widen —
+        the C.1 phenomenon is now visible instead of clamped, docs/19
+        §12.40). 0 for never-rendering blocks (⑤)."""
+        if not self._renders(block):
+            return 0
+        prev_form = str(prev_form or "full")
+        new_form = str(new_form or "full")
+        if prev_form == new_form and str(prev_rule or "") == str(new_rule or ""):
+            return 0
+        return (len(self.view_text(block, prev_form, prev_rule))
+                - len(self.view_text(block, new_form, new_rule)))
+
+    def _pre_state(self, block_id: str) -> Tuple[str, str]:
+        """The (form, rule) snapshot taken BEFORE a mutation."""
+        return (self.view.form_of(block_id),
+                str(self.view.rules.get(block_id, "") or ""))
+
+    def _pre_state_all(self) -> Dict[str, Tuple[str, str]]:
+        return {b.block_id: self._pre_state(b.block_id)
+                for b in self.universe.ordered()}
+
+    def _book(self, rec: Dict[str, Any], block_id: str,
+              prev: Tuple[str, str]) -> Dict[str, Any]:
+        """THE accounting funnel: fill ``rec["saved"]`` from the transition.
+
+        Only ok mutation records are booked (refusals carry no saving);
+        the record keeps its other fields untouched. Every caller that
+        mutates the view goes through this (ViewHandle + the stage methods),
+        so there is exactly ONE place a saving number is produced.
+
+        [勘误 2026-11-08, T] "exactly ONE place" is wrong, and deliberately
+        so. ``_book`` is the funnel for the PRIMITIVE/handle path. Two stage
+        paths compute the SAME number from the SAME formula
+        (``_transition_saving``) without calling it: ``dedup_prefix`` writes
+        ``saved`` itself because its value is needed BEFORE the view is
+        mutated, and ``_lapse_forms`` writes ``-credit`` because the formula
+        returns 0 exactly in the lapse case (``view_text`` already models
+        "cannot apply = full width", docs/19 §12.58). The honest invariant is
+        therefore: ONE FORMULA (``_transition_saving``), one funnel per
+        caller SHAPE — never a second formula.
+        """
+        if rec.get("ok"):
+            block = self.universe.get(block_id)
+            if block is not None:
+                new_state = self._pre_state(block_id)
+                rec["saved"] = self._transition_saving(
+                    block, prev[0], prev[1], *new_state)
+                # F (§12.58): the dedup credit belongs to the dedup FORM. Any
+                # transition out of it (fetch/restore/drop/compact/substitute)
+                # already booked its own signed delta through this funnel, so
+                # the ledger entry must not survive to be refunded again.
+                if new_state[0] != "dedup":
+                    self._dedup_credit.pop(block_id, None)
+        return rec
+
+    def _delta_since(self, prev_all: Dict[str, Tuple[str, str]]) -> int:
+        """Exact summed delta for a multi-block mutation (``compact``): every
+        block whose (form, rule) changed since the snapshot contributes its
+        transition width difference — this includes the stale-reference
+        re-points the materializing strategies perform."""
+        total = 0
+        for block in self.universe.ordered():
+            before = prev_all.get(block.block_id)
+            if before is None:
+                continue   # blocks the op registered have no prior view state
+            now = self._pre_state(block.block_id)
+            if before[0] == now[0] and before[1] == now[1]:
+                continue
+            total += self._transition_saving(block, before[0], before[1],
+                                             now[0], now[1])
+        return total
+
+    def _substituted_blocks(self) -> int:
+        """Blocks currently carrying a NON-FULL view form (docs/19 §12.44 D5).
+
+        ``len(view.forms)`` counted FULL entries too: ``fetch(full)``/unpin/
+        a restore writes an explicit ``"full"`` form, so the old number mixed
+        "blocks addressed by the view" with "blocks compacted". One name, one
+        caliber: the count of forms that actually differ from ``full``."""
+        return sum(1 for form in self.view.forms.values() if form != "full")
+
     def summary(self) -> Dict[str, Any]:
         """Session-level CM summary (cost record / receipt ``cm`` node).
 
         The assembly fields materialize only when an assembly was CONFIGURED
         (the design claim creates the observability duty: a configured-but-
-        never-active assembly must read as exactly that, None ≠ 0 style)."""
+        never-active assembly must read as exactly that, None ≠ 0 style).
+        Conditional audit fields keep the same rule: ``policy_violations`` /
+        ``*_overruns`` / ``thread_leaks`` / ``thread_leaks_live`` /
+        ``thread_leak_delta`` / ``thread_leak_names`` / ``est_saved_agent``
+        appear only when non-zero (absence = zero/clean), while
+        ``assembly_*`` appear whenever an assembly was configured (they may
+        legitimately read 0). ``thread_leak_names`` always rides WITH
+        ``thread_leak_delta`` (docs/19 §12.67): the count alone is
+        unattributable, and the two can never disagree because both derive
+        from the same ``_foreign_threads()`` reading.
+
+        N4 (docs/19 §12.46): ``est_chars_saved`` is the TOTAL flow (seam +
+        agent tool face); ``est_saved_agent`` exports the agent-source half so
+        a reader can attribute (seam half = total - agent). The per-turn
+        split rides ``cm_view.stats.agent_saved_chars``."""
         out = {"mode": self.mode, "turns": self.turn,
                "blocks": len(self.universe.blocks),
                "ops_total": self.ops_total, "ops_applied": self.ops_applied,
                "ops_refused": self.ops_refused,
                "policy_failures": self.policy_failures,
                "policy_disabled": self.policy_disabled,
+               # ``violations`` is the OP-REFUSAL export of the SAME counter
+               # as ``ops_refused`` (both are incremented together at exactly
+               # two sites: count_ops' unaudited branch and note_violation;
+               # docs/19 §12.44 D4). Kept as an alias -- no third writer.
                "violations": self.violations,
+               "substituted": self._substituted_blocks(),
                "est_chars_saved": self.est_chars_saved}
+        if self.est_saved_agent:
+            out["est_saved_agent"] = self.est_saved_agent
+        if self.policy_violations:
+            out["policy_violations"] = self.policy_violations
         if self.emit_failures:
             # Conditional audit field (absence = a healthy sink): a session
             # whose event sink dropped lines must not read as fully audited.
             out["emit_failures"] = self.emit_failures
+        # CM-03 leak observability: conditional audit fields (absence =
+        # clean). ``thread_leaks`` counts exec-budget timeouts whose worker
+        # thread leaked (load/apply/assemble); ``thread_leak_delta`` catches
+        # module-SPAWNED threads via the foreign-thread census (never passes
+        # through an exec budget). Advisory in in-process mode, authoritative
+        # in the seat child; both drive the seat proxy's post-session hygiene
+        # restart.
+        if self.thread_leaks:
+            out["thread_leaks"] = self.thread_leaks
+        now_names = _foreign_threads()
+        delta = len(now_names) - self._thread_baseline
+        if delta > 0:
+            out["thread_leak_delta"] = delta
+            # WHO (docs/19 §12.67): the census's number alone was a dead end —
+            # a seat that leaked exactly one thread twice in a row produced
+            # "delta=1" and the hygiene restart, with no way to tell an agent
+            # module from unlearned framework plumbing. The NAMES are the
+            # fact that makes the next action obvious; they are diffed against
+            # the build-time multiset so a thread that was already running
+            # when the session opened is never blamed on this session.
+            out["thread_leak_names"] = _new_thread_names(
+                self._thread_baseline_names, now_names)
+        if self.assembly_overruns:
+            out["assembly_overruns"] = self.assembly_overruns
+        if self.policy_overruns:
+            out["policy_overruns"] = self.policy_overruns
+        # SEND FACT (docs/19 §12.54-C): conditional audit fields (absence =
+        # "every turn's rendered view reached the wire"). ``send_mismatches``
+        # counts the turns whose SENT widths disagreed with the render's
+        # claim; ``send_drift_chars`` is their signed total. A non-zero value
+        # is a FRAMEWORK bug (the seam rendered, the client shipped something
+        # else) — never a policy/module failure, so it is deliberately NOT
+        # part of ``cm_degraded``.
+        if self.send_mismatches:
+            out["send_mismatches"] = self.send_mismatches
+        if self.send_drift_chars:
+            out["send_drift_chars"] = self.send_drift_chars
+        # C (docs/19 §12.55): turns whose send was refused rendering (the list
+        # was not the canonical). A framework observation, never degradation.
+        if self.unrendered_turns:
+            out["send_unrendered_turns"] = self.unrendered_turns
+        # The MEASURED leak signal (docs/19 §12.31): how many of the
+        # workers abandoned at T are STILL alive. A timed-out worker may
+        # finish normally after the wait was abandoned (band ② — the wait
+        # deadline and the work's completion are different clocks); only
+        # the candidates' liveness distinguishes that from a real hang.
+        # ``thread_leaks`` above stays the historical prediction count and
+        # drives nothing.
+        live = sum(1 for t in self._timeout_workers
+                   if t is not None and t.is_alive())
+        if live:
+            out["thread_leaks_live"] = live
         if self.assembly_path:
             out["assembly_active"] = self.assembly_active
             out["assembly_failures"] = self.assembly_failures
             out["assembly_disabled"] = self.assembly_disabled
+            out["assembly_violations"] = self.assembly_violations
+            # Actionable "fix this module" facts for the NEXT session (rl:
+            # stem + where + reason). Absence is meaningful: the module has
+            # never failed, so there is nothing to act on.
+            if self._assembly_last_error or self.assembly_violations:
+                out["assembly_report"] = {
+                    "stem": os.path.basename(str(self.assembly_path)).split(".")[0],
+                    "failures": self.assembly_failures,
+                    "violations": self.assembly_violations,
+                    "disabled": self.assembly_disabled,
+                    "last_error": ops.clip_diag(str(self._assembly_last_error.get("error") or ""), 160),
+                    "phase": self._assembly_last_error.get("phase"),
+                    "where": str(self._assembly_last_error.get("where") or ""),
+                }
+        # policy_report (docs/19 §12.17): same contract as assembly_report —
+        # actionable "fix this module" facts for the NEXT self-improve
+        # session; absence = the policy has never failed.
+        if self.policy_path and self._policy_last_error:
+            out["policy_report"] = {
+                "stem": os.path.basename(str(self.policy_path)).split(".")[0],
+                "failures": self.policy_failures,
+                "violations": self.policy_violations,
+                "disabled": self.policy_disabled,
+                "last_error": ops.clip_diag(str(self._policy_last_error.get("error") or ""), 160),
+                "phase": self._policy_last_error.get("phase"),
+                "where": str(self._policy_last_error.get("where") or ""),
+            }
         if self.traj_index is not None:
             out["traj_segments"] = len(self.traj_segments)
         return out
@@ -373,6 +1333,39 @@ class CMSession:
             self.emit_failures += 1
 
     # ---------------------------------------------------- block registration
+    def _require_msg_dicts(self, msgs: Any, where: str) -> None:
+        """The msgs contract (docs/19 §12.32.4): every canonical-history
+        entry is a framework-constructed dict — agent/llm.py wraps strings
+        into dicts at the boundary (user + assistant entries), tool rounds
+        ride user-turn text, and no producer ships a bare entry. The old
+        tolerance (skip unknown shapes silently) was a booby trap: the P1
+        snapshot's texts layer is dict-only COMPRESSED while the restore
+        indexed it by list position, so ONE non-dict entry would shift
+        every later restoration (silent canonical corruption). A violation
+        is now LOUD: the offenders are emitted on the CM event stream and
+        a TypeError aborts the call BEFORE any mutation — no blocks, no
+        view changes, no counters, and deliberately NO strike/latch: a
+        harness-side contract break is not a module failure. (A violation
+        raised from ``finalize_turn`` inside an agent-owned ``assemble`` IS
+        attributed to the module by the P1 catch — the module tampered
+        the list it was given.)"""
+        if not isinstance(msgs, list):
+            self._emit({"type": "cm_msg_contract_violation",
+                        "turn": self.turn, "where": where, "offenders": [],
+                        "detail": f"expected a list, got {type(msgs).__name__}"})
+            raise TypeError(f"cm msgs contract violated at {where}: "
+                            "expected a list, got "
+                            f"{type(msgs).__name__}")
+        bad = [(i, type(m).__name__) for i, m in enumerate(msgs)
+               if not isinstance(m, dict)]
+        if not bad:
+            return
+        detail = ", ".join(f"msgs[{i}] is {t}" for i, t in bad[:5])
+        self._emit({"type": "cm_msg_contract_violation", "turn": self.turn,
+                    "where": where, "offenders": bad[:10],
+                    "detail": ops.clip_diag(detail, 160)})
+        raise TypeError(f"cm msgs contract violated at {where}: {detail}")
+
     def register_history(self, msgs: List[Dict[str, Any]]) -> None:
         """Register NEW message-history entries as blocks (universe add-only).
 
@@ -382,15 +1375,60 @@ class CMSession:
         to one block). An entry showing a baked view artifact (``[block bN
         ...`` marker) is RE-BOUND to its block instead of re-registered: the
         rendered copy must not grow a second block or the view would fight
-        its own output. Blocks carry their latest msg_index for rendering."""
+        its own output. Blocks carry their latest msg_index for rendering.
+
+        A/N2 + C (docs/19 §12.53, §12.55): ``msg_index`` is a render ADDRESS,
+        so the ONLY list that may be registered is the turn's CANONICAL
+        history — exactly (same length, same ``(role, text)`` at every index).
+        The earlier "canonical PREFIX plus appended entries" allowance is GONE
+        (finding C): an appended entry never enters the next turn's canonical
+        (the client rebuilds ``raw_history + [user, assistant]``), so an
+        address into the appended region is a misaddress one turn later — and
+        §12.53's own sixth reconcile question treats it as an escape, i.e. the
+        documented-legal case became a strike. Appended content may still be
+        SENT (that is the author path's business); it is simply not MANAGED.
+
+        Registration is now FRAMEWORK-OWNED for the canonical: ``_open_turn``
+        registers it before any preset/assembly runs, so a mismatching list
+        from agent code costs nothing but this refusal. Direct construction
+        without a turn entry keeps the historical behaviour (no check).
+        """
+        self._require_msg_dicts(msgs, "register_history")
+        canon = self._turn_canonical
+        if canon is not None:
+            got = _canon_seq(msgs)
+            if got != canon:
+                self._emit({"type": "cm_register_history_refused",
+                            "reason": "not_canonical",
+                            "got": len(got), "want": len(canon),
+                            "first_diff": _canon_diff(canon, got),
+                            "detail": "the address space is the CANONICAL "
+                                      "history; an appended/reordered list is "
+                                      "sent but never registered"})
+                return
         for i, m in enumerate(msgs):
             content = _msg_text(m)
             if not content:
                 continue  # tool-call carriers etc. — no text to manage
             bid = _parse_view_marker(content)
             if bid is not None and bid in self.universe.blocks:
-                self.universe.get(bid).msg_index = i  # re-bind, not re-register
-                continue
+                block = self.universe.get(bid)
+                # Re-bind only a GENUINE rendered copy: an entry whose whole
+                # text is the block's current baked form (render replaces the
+                # block's span with the bake output; when that span WAS the
+                # whole entry, the copy is byte-identical — the case this
+                # branch exists for: the rendered copy must not grow a second
+                # block). A marker QUOTED inside agent/tool text — discussing
+                # one's own context, or a fetch trim's returned line riding
+                # inside the tool-result json wrapper — must NOT steal the
+                # binding: that silently un-applied the block's form on its
+                # real entry (the eviction/trim shipped raw again) and left
+                # the quoting entry unmanaged (docs/19 batch record).
+                # Non-matching entries fall through to the fingerprint path
+                # and register as the fresh content they are.
+                if content.strip() == self._baked_entry_text(block).strip():
+                    block.msg_index = i  # re-bind, not re-register
+                    continue
             fp = _fingerprint(content)
             known = self._by_fp.get(fp)
             if known is not None and known in self.universe.blocks:
@@ -408,6 +1446,31 @@ class CMSession:
                 self._seen_user = True
             block.msg_index = i
             self._by_fp[fp] = block.block_id
+            self._reg_fp[block.block_id] = fp
+
+    def _baked_entry_text(self, block: Block) -> str:
+        """What a WHOLE-ENTRY rendered copy of this block looks like right
+        now — the marker re-bind guard's expectation. Mirrors render's bake
+        switch (span replacement makes an echoed copy byte-identical only
+        when the baked span WAS the whole entry); ``full``/``dedup`` have no
+        baked whole-entry form to match (identical text re-binds via the
+        fingerprint path anyway; the dedup rewrite carries no ``[block``
+        marker)."""
+        form = self.view.form_of(block.block_id)
+        rule = str(self.view.rules.get(block.block_id) or "")
+        if form == "head_tail":
+            return self.view_text(block, "head_tail", rule)
+        if form == "placeholder":
+            return self.view_text(block, "placeholder", rule)
+        if form == "template":
+            return self.view_text(block, "template", rule)
+        if form == "derived_host":
+            dblock = (self.universe.get(rule[len("derived="):])
+                      if rule.startswith("derived=") else None)
+            if dblock is None:
+                return ""  # unreachable (universe add-only): nothing to match
+            return self.view_text(block, "derived_host", rule)
+        return ""
 
     def register_note(self, text: str) -> Tuple[Optional[str], str]:
         """Scratchpad note write: the note block is auto-pinned (never dropped)."""
@@ -437,8 +1500,19 @@ class CMSession:
         block = self.universe.register("turn_output", outgoing, self.turn,
                                        source="user", pinned=first_user)
         self._seen_user = True
-        self._by_fp[_fingerprint(outgoing)] = block.block_id
-        return block
+        fp_out = _fingerprint(outgoing)
+        self._by_fp[fp_out] = block.block_id
+        self._reg_fp[block.block_id] = fp_out
+        # R5 (docs/19 §12.38): return a SNAPSHOT, never the live Block — the
+        # universe object anchors render span-matching, drop floors and the
+        # reconcile's identity question, and a live hand-out let an
+        # assembly's in-place field write corrupt all of that invisibly
+        # (none of the reconcile questions covered block fields). The copy
+        # makes the live object unreachable BY CONSTRUCTION (the P2 posture,
+        # same as the msgs boundary copy and the ctx faces' to_meta reads):
+        # every legitimate read (block_id/chars/pinned/text) sees identical
+        # values, and a write lands on the assembly's own scratch copy.
+        return copy.deepcopy(block)
 
     def materialize_traj(self, files: List[Tuple[str, str]]) -> int:
         """Snapshot the seat's visible trajectory files into the universe.
@@ -459,6 +1533,14 @@ class CMSession:
         materializes, nothing emits). Per-file scan failures skip that file
         and SPEAK (``cm_traj_materialize_failed``); the read tools then fall
         back to building their own index for uncovered genids. Returns the
+
+        [勘误 2026-11-08, T] The "per-file … skip that file" sentence above is
+        WRONG: ``build_traj_materialization`` is called ONCE for the whole
+        list inside a single try/except, so a scan failure is ALL-OR-NOTHING —
+        nothing materializes and one event carries the error. What is per-file
+        is only the PRE-FILTER above (missing labels/paths, duplicates). The
+        read tools' own-index fallback therefore covers the whole seat, not
+        just the failed file. Returns the
         number of segments registered."""
         if self.mode == "passthrough" or not files:
             return 0
@@ -478,7 +1560,7 @@ class CMSession:
             payload, texts = build_traj_materialization(clean)
         except Exception as e:  # noqa: BLE001 -- degrade, but speak
             self._emit({"type": "cm_traj_materialize_failed",
-                        "error": str(e)[:200]})
+                        "error": ops.clip_diag(str(e), 200)})
             return 0
         registered = 0
         for seg in payload.get("segments", []):
@@ -497,6 +1579,36 @@ class CMSession:
         return registered
 
     # -------------------------------------------------------------- the seam
+    def _boundary_copy(self, msgs):
+        """The per-turn defensive copy handed to the agent-owned assembly
+        (docs/19 §12.36, R1): the seam's ``msgs`` is a list-local shell whose
+        ENTRY DICTS are shared with the loop's ``raw_history`` — handing the
+        live objects to agent code would let an in-place field write corrupt
+        the cross-turn canonical (the P1 restore covers the text carriers
+        only), and a list grow/shrink survives the restore into the preset
+        replay. The copy makes the canonical unreachable BY CONSTRUCTION;
+        the P1 texts layer stays as the escape-tier tripwire (§12.27
+        pattern: backstop, never the primary guard), and the fallback
+        preset replay at the end of :meth:`assemble_turn` runs on the
+        PRISTINE real list.
+
+        deepcopy (not ``dict(m)``): under the flat str-valued msgs contract
+        the two are equivalent (strings are atomic — deepcopy returns them
+        unchanged, so long texts are never copied), and deepcopy also
+        isolates a future nested-mutable value instead of reopening the
+        write-through channel (N5c posture). A non-copyable entry is OUT of
+        contract: loud ``cm_msg_contract_violation`` envelope + TypeError,
+        raised OUTSIDE the P1 catch (a framework/contract break is never a
+        module strike)."""
+        try:
+            return [copy.deepcopy(m) for m in msgs]
+        except Exception as e:  # noqa: BLE001 -- out-of-contract shape: loud, no strike
+            self._emit({"type": "cm_msg_contract_violation", "turn": self.turn,
+                        "where": "boundary_copy",
+                        "detail": ops.clip_diag(str(e), 160)})
+            raise TypeError(
+                f"cm msgs contract violated at boundary_copy: {e}") from e
+
     def assemble_turn(self, msgs: List[Dict[str, Any]],
                       outgoing: str,
                       tokens_used: int = 0,
@@ -516,23 +1628,40 @@ class CMSession:
         When the design names an assembly (``assembly_path``), it
         REPLACES the preset composition for every non-passthrough turn —
         loaded once per session, executed under ``cm_assembly_exec_ms``,
-        wedge-broken after 2 failures. ``passthrough`` is the ABSOLUTE
+        wedge-broken after ONE failure (docs/19 §12.17: load-once makes
+        byte-identical retries deterministic waste). ``passthrough`` is the ABSOLUTE
         identity posture: a named assembly is never executed under it (the
         kill switch must stay absolute; the mismatch is spoken once). ANY
         assembly failure re-runs the baseline preset on the current state
-        for that turn (sticky forms make the replay safe) and leaves a
-        durable trace: ``cm_assembly_failed`` per failing turn,
+        for that turn (sticky forms make the replay safe) — the preset is
+        the SESSION'S OWN mode preset: the fail-open removes exactly the
+        failed module and keeps the rest (docs/19 §12.30 rule 1) — and
+        leaves a durable trace: ``cm_assembly_failed`` per failing turn,
         ``degraded`` on that turn's ``cm_view``, ``assembly_disabled`` in
-        every subsequent ``cm_view`` — a fallback is never silent."""
-        self.turn += 1
-        self._turn_degraded = False
-        self._method_face = None  # per-turn method-face budget reset
+        every subsequent ``cm_view`` — a fallback is never silent.
+
+        The assembly never sees the live ``msgs``: it receives a per-turn
+        BOUNDARY COPY (``_boundary_copy``, docs/19 §12.36) whose entries
+        share nothing with the loop's ``raw_history``, so the cross-turn
+        canonical is unreachable by construction and the fallback replay
+        always runs on the pristine real list. The P1 snapshot/reconcile
+        stays as the escape-tier tripwire (view forms, pins, counters,
+        refs — and the canonical texts layer, which can now only fire for
+        direct callers)."""
+        self._require_msg_dicts(msgs, "assemble_turn")
+        self._open_turn(msgs)
         fn = self._assembly_fn
         if fn is None:
             fn, fallback = assembly.resolve(self.mode)
             self._assembly_fn = fn
             if fallback is not None:
+                # O7 (docs/19 §12.49): `where` separates the two meanings of
+                # this event type — RESOLVE degradation (unknown/claim-less
+                # mode -> slice preset, no module involved) vs LOAD failure
+                # (a named module that could not be loaded). Same shape,
+                # different causes; a reader had only `reason`/`turn` to tell.
                 self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                            "where": "resolve",
                             "mode": self.mode, "to": fallback})
         if self.assembly_path and self.mode == "passthrough":
             if not self._assembly_ignored:
@@ -548,16 +1677,53 @@ class CMSession:
         named = None if self.assembly_disabled else self._load_named()
         if named is not None:
             self._view_emitted_turn = None
+            # P1: the LAST LEGAL STATE (end of the previous turn) is the
+            # rollback target — never a blank view (that would silently undo
+            # earlier turns' compaction, changing the pin window and the
+            # dedup accounting). Everything the failed attempt does is undone
+            # except the block universe, which is add-only by contract (its
+            # extra blocks are unreferenced and never sent).
+            snap = self._snapshot_turn(msgs)
+            # R1 (docs/19 §12.36): the agent-owned assembly receives a
+            # BOUNDARY COPY, never the live list — the canonical is
+            # unreachable by construction, and the fallback preset replay at
+            # the end of this method runs on the PRISTINE real list. The
+            # copy failure raises OUTSIDE the P1 try on purpose (a contract
+            # break is never a module strike).
+            assembly_msgs = self._boundary_copy(msgs)
             try:
-                result = assembly.run_assembly(named, self, msgs, outgoing,
-                                               tokens_used, budget,
-                                               self.assembly_exec_ms)
+                # P2: the agent-owned assembly gets the PORTAL, not the live
+                # session (the published primitive surface + read-only
+                # parameters; ``emit_view``/``count_ops``/state fields are
+                # refused). The parameter name stays ``session``.
+                result, over_ms = assembly.run_assembly(
+                    named, self._portal(), assembly_msgs, outgoing,
+                    tokens_used, budget, self.assembly_exec_ms)
                 if not (isinstance(result, tuple) and len(result) == 2
                         and isinstance(result[0], list)
                         and isinstance(result[1], str)):
                     raise assembly.AssemblyError(
                         "assembly returned a non-(history, msg) result")
+                problem = _validate_sent_history(result[0])
+                if problem:
+                    raise assembly.AssemblyError(problem)
+                if over_ms:
+                    # Band-① advisory, owned by the LIVE session: the emit
+                    # used to fire inside run_assembly through the portal,
+                    # whose _emit raises — a completed-over-budget run died
+                    # as a false contract failure (docs/19 §12.30.3/N1).
+                    self.assembly_overruns += 1
+                    self._emit({"type": "cm_assembly_overrun",
+                                "turn": self.turn, "over_ms": over_ms})
+                violations = self._reconcile_turn(msgs, snap)
+                if violations:
+                    self._note_violations(violations)
+                    self._restore_turn(snap, msgs, outgoing_text=outgoing)
+                    raise assembly.AssemblyError(
+                        "assembly violated the seam contract: "
+                        + ",".join(kind for kind, _refs in violations))
                 self.assembly_active = True
+                self._turn_snapshot = None
                 if self._view_emitted_turn != self.turn:
                     # audit completeness is framework-owned: an assembly
                     # that skips the finalize_turn post segment still gets
@@ -567,35 +1733,59 @@ class CMSession:
             except Exception as e:  # noqa: BLE001 -- fail-open, never break the seam
                 phase = ("contract" if isinstance(e, assembly.AssemblyError)
                          else "run")
-                self._note_assembly_failure(str(e)[:160], phase=phase)
-                self._turn_degraded = True
-                # fall through: the preset re-runs on the current state
-                # (sticky forms make the replay safe); this turn's cm_view
-                # carries degraded=true
+                # A crashed or violating attempt may have mutated state before
+                # it raised: go back to the turn-start state BEFORE the preset
+                # replays (idempotent — the violation path already restored).
+                self._restore_turn(snap, msgs, outgoing_text=outgoing)
+                self._note_assembly_failure(ops.clip_diag(str(e), 160), phase=phase,
+                                            exc=e,
+                                            timed_out=isinstance(
+                                                e, assembly.AssemblyTimeout))
+                # K (§12.62): if the failed attempt already CLOSED the turn
+                # (its own finalize_turn emitted a view and booked ops), that
+                # view is undone by the restore above — so it must be
+                # WITHDRAWN, or a consumer summing ``saved_chars`` counts the
+                # same turn twice (probed: 2 views x 319 vs a session delta of
+                # 319). Events are streamed, so the rollback is expressed by a
+                # retraction event, never by rewriting the earlier one.
+                self._retract_last_view(phase=phase)
+                # fall through: the preset re-runs on the CLEAN state (sticky
+                # forms make the replay safe); this turn's cm_view carries
+                # degraded=true
         return fn(self, msgs, outgoing, tokens_used, budget)
 
     def _load_named(self) -> Optional[Callable]:
-        """Load the named assembly ONCE per session; the result is cached
-        INCLUDING failure (no mid-session hot reload — a self_improve
-        session editing its own assembly must not change its own seam
-        mid-flight). A load failure speaks exactly once
-        (``cm_assembly_fallback``) and the baseline preset runs for the
-        whole session; ``summary()`` shows ``assembly_active: false``."""
+        """Load the named assembly ONCE per session (docs/19 §12.17): the
+        load runs under the SAME exec budget as the execution, the cache
+        holds success AND failure, and a mid-session edit must not change
+        the seam. A load failure — CRASH or timeout, both strike-counted
+        (byte-identical retries are deterministic waste; a crash used to
+        speak once and never strike, so the feedback loop could not tell
+        the author) — fails the session open to the baseline preset;
+        ``summary()`` shows ``assembly_active: false`` and the failure
+        facts ride ``assembly_report``."""
         if self.assembly_path is None:
             return None
-        if self._named_fn is None and not self._named_failed:
-            try:
-                fn, methods, method_problems = \
-                    assembly.load_assembly(self.assembly_path)
-                self._named_fn = fn
-                self._merge_methods(methods, method_problems,
-                                    source="assembly")
-            except Exception as e:  # noqa: BLE001 -- fail-open, loudly, once
-                self._named_failed = True
-                self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
-                            "mode": self.mode, "to": self.mode,
-                            "reason": str(e)[:160]})
-        return self._named_fn
+        if self._assembly_load is None:
+            self._assembly_load = _ModuleLoad(
+                "assembly", self.assembly_path,
+                assembly.timed_load_assembly, assembly.AssemblyTimeout)
+        st = self._assembly_load
+        first = st.result is None and not st.failed
+        result = st.ensure(self.assembly_exec_ms)
+        if st.failed and result is None:
+            # one strike, one event pair — crash and timeout alike
+            self._note_assembly_failure(st.error, phase="load",
+                                        timed_out=st.timed_out, exc=st.exc)
+            self._emit({"type": "cm_assembly_fallback", "turn": self.turn,
+                        "where": "load",
+                        "mode": self.mode, "to": self.mode,
+                        "reason": st.error})
+            return None
+        fn, methods, method_problems = result
+        if first:
+            self._merge_methods(methods, method_problems, source="assembly")
+        return fn
 
     def _merge_methods(self, methods: Dict[str, Callable],
                        problems: List[str], source: str) -> None:
@@ -629,7 +1819,7 @@ class CMSession:
         try:
             rec = fn(callee, **kwargs)
         except Exception as e:  # noqa: BLE001 -- refusal, never a seam crash
-            return {"op": str(name), "ok": False, "error": str(e)[:160]}
+            return {"op": str(name), "ok": False, "error": ops.clip_diag(str(e), 160)}
         if not isinstance(rec, dict) or "ok" not in rec:
             return {"op": str(name), "ok": False,
                     "error": "method returned a non-record"}
@@ -650,47 +1840,483 @@ class CMSession:
             return err
         return self._invoke_method(name, kwargs, callee=self._method_face)
 
-    def _note_assembly_failure(self, error: str, phase: str = "run") -> None:
-        """One assembly turn failure: count + emit + strike; 2 strikes
-        disable the named assembly for the session (C1-class wedge breaker)
-        — the preset then runs directly and every subsequent ``cm_view``
-        carries ``assembly_disabled: true`` until the session ends."""
+    # -- P1: turn snapshots, reconciliation, rollback ---------------------
+    def _portal(self) -> "SessionPortal":
+        """The P2 façade handed to the named assembly (cached per session)."""
+        if self._portal_cache is None:
+            self._portal_cache = SessionPortal(self)
+        return self._portal_cache
+
+    def record_refs(self, records: List[Dict[str, Any]]) -> None:
+        """Fold the refs of already-produced stage records into the
+        recorded-refs set (docs/19 §12.18; portal surface since the N2
+        batch, docs/19 §12.33).
+
+        The policy-path P1 reconcile runs BEFORE ``finalize_turn``
+        (``count_ops``), so form changes made by the baseline stages
+        (``window_defaults`` drop placeholders, ``dedup_prefix``) would read
+        as unrecorded at snapshot time — count_ops only records their refs
+        at closure. Mirrors count_ops's condition exactly (ok + not already
+        handle-audited); the later re-recording is an idempotent set
+        update.
+
+        SEMANTICS — explanation, NOT counting (docs/19 §12.33): this only
+        widens the recorded-refs set, the P1 reconcile's explanation
+        channel. The audit counters (``ops_total``/``ops_applied``/
+        ``est_chars_saved``) move ONLY through ``finalize_turn``; an op
+        whose record is folded here but never threaded is explained yet
+        uncounted — exactly the mirror of the handle audit hook, which
+        auto-publishes refs for the same reason. On the SessionPortal
+        because the authoring surface must express the composition the
+        baseline pipeline performs (a shrink stage before ``run_policy``
+        was unexpressible and struck the POLICY with ``unrecorded_view``
+        for the assembly's missing fold — measured repro in §12.33).
+        Residual, accepted and documented: a caller may fold refs it
+        fabricated, lowering the cost of faking a question-1 explanation;
+        the malicious tier's backstop is the reconcile's other three
+        questions (and T3/F5, both user-deferred)."""
+        for rec in records:
+            if (isinstance(rec, dict) and rec.get("ok")
+                    and not rec.get("_audited")):
+                refs = rec.get("refs") or []
+                if refs:
+                    self._recorded_refs.update(str(r) for r in refs)
+
+    def _snapshot_turn(self, msgs: Optional[List[Dict[str, Any]]] = None
+                       ) -> Dict[str, Any]:
+        """Snapshot the turn-mutable state (rollback target for P1).
+
+        ``msgs=None`` (the policy path without a canonical reference) skips
+        the canonical-texts layer: the view/counters/refs protection still
+        applies — only the msgs-rewrite question is unanswerable without the
+        list."""
+        return {
+            "forms": dict(self.view.forms),
+            "rules": dict(self.view.rules),
+            # (value, had_content): the canonical text of every entry plus
+            # whether it CARRIED the carrier at all, so a restore can also
+            # undo a ``content`` the attempt grafted onto a text-less entry.
+            # One carrier now (docs/19 §12.54-B): the old 4-tuple tracked two
+            # spellings, and a tamper of the non-dominant one was invisible to
+            # BOTH the snapshot and the reconcile.
+            "texts": None if msgs is None else [
+                (_msg_text(m), isinstance(m.get(_RAW_KEY), str))
+                for m in (msgs or [])],
+            # R7a (docs/19 §12.38): the overrun counters ride the snapshot —
+            # their band-① increment happens AFTER this snapshot and BEFORE
+            # the reconcile, so a contract-rejected turn must roll them back
+            # too (they used to survive the restore: a rejected turn kept
+            # its +1).
+            "counters": (self.ops_total, self.ops_applied, self.ops_refused,
+                         self.violations, self.est_chars_saved,
+                         self.assembly_overruns, self.policy_overruns),
+            "refs": set(self._recorded_refs),
+            # the op-pin evidence rides the snapshot: a restored turn must
+            # not leave evidence behind (a later escape pin of the same
+            # block would otherwise be exempted for the rest of the session)
+            "op_pinned": set(self._op_pinned),
+            # pinned FLAG of every block existing at snapshot time (docs/19
+            # §12.18: the restore surface covers the pre-existing pins — a
+            # crashed attempt's pin/unpin of an EXISTING block is undone).
+            # Blocks the attempt REGISTERED (note blocks are auto-pinned)
+            # stay as-is: the universe is add-only, and a note's block and
+            # its ``notes`` entry must stay consistent (notes persist by
+            # design — scratchpad semantics). The op-pin EVIDENCE rides the
+            # same snapshot (``op_pinned``): a restored turn must not leave
+            # evidence that could exempt a later escape pin (docs/19 §12.52).
+            "pinned_state": {bid: block.pinned
+                             for bid, block in self.universe.blocks.items()},
+            # B/N2 (docs/19 §12.53): the block->entry ADDRESS is turn-mutable
+            # too (``register_history`` re-binds it), so a rollback must put
+            # it back — otherwise a rejected attempt keeps rendering at the
+            # retargeted position.
+            "msg_index": {bid: block.msg_index
+                          for bid, block in self.universe.blocks.items()},
+        }
+
+    def _restore_turn(self, snap: Optional[Dict[str, Any]],
+                      msgs: List[Dict[str, Any]],
+                      outgoing_text: Optional[str] = None) -> None:
+        """Undo everything the failed attempt did, back to the last legal state.
+
+        ``outgoing_text`` (docs/19 §12.38, R5 backstop) is the seam's
+        outgoing payload — the pristine source for restoring an UNBOUND
+        turn_output block whose fields were mutated in place; bound blocks
+        restore from their canonical msg carrier."""
+        if not snap:
+            return
+        self.view.forms.clear()
+        self.view.forms.update(snap.get("forms") or {})
+        # legacy normalization (docs/19 §12.21): the excerpt form retired —
+        # an old snapshot may still carry it; head_tail at the session keep
+        # is the closest surviving semantic.
+        for _bid, _f in list(self.view.forms.items()):
+            if _f == "excerpt":
+                self.view.forms[_bid] = "head_tail"
+        self.view.rules.clear()
+        self.view.rules.update(snap.get("rules") or {})
+        cnt = list(snap.get("counters") or ())
+        defaults = (self.ops_total, self.ops_applied, self.ops_refused,
+                    self.violations, self.est_chars_saved,
+                    self.assembly_overruns, self.policy_overruns)
+        cnt += defaults[len(cnt):]   # tolerate an older 5-field snapshot
+        (self.ops_total, self.ops_applied, self.ops_refused, self.violations,
+         self.est_chars_saved, self.assembly_overruns,
+         self.policy_overruns) = cnt
+        self._recorded_refs.clear()
+        self._recorded_refs.update(snap.get("refs") or ())
+        self._op_pinned.clear()
+        self._op_pinned.update(snap.get("op_pinned") or ())
+        # pinned flags of blocks that EXISTED at snapshot time (docs/19
+        # §12.18): the attempt's pin/unpin of a pre-existing block is undone;
+        # blocks it registered (note blocks) stay as-is — the universe is
+        # add-only and note blocks must keep their auto-pin. A RECORDED
+        # primitive's consumption pin (``compact``) is undone here too; the
+        # evidence set is restored alongside so the reconcile stays exact
+        # (docs/19 §12.52).
+        pinned_state = snap.get("pinned_state") or {}
+        for bid, was_pinned in pinned_state.items():
+            block = self.universe.blocks.get(bid)
+            if block is not None:
+                block.pinned = bool(was_pinned)
+        # B/N2: the address map too (only blocks that existed at snapshot
+        # time; blocks the attempt registered are not in it).
+        for bid, was_index in (snap.get("msg_index") or {}).items():
+            block = self.universe.blocks.get(bid)
+            if block is not None:
+                block.msg_index = was_index
+        # R5 backstop (docs/19 §12.38): a turn_output block whose text no
+        # longer fingerprints to its registration value (or whose chars
+        # desynced) was mutated in place — restore from the pristine
+        # source: the canonical msg carrier for bound blocks, the seam's
+        # outgoing payload for the unbound one. Pure backstop: the portal
+        # hands out snapshots, so agent code cannot reach here.
+        for block in self.universe.blocks.values():
+            if block.kind != "turn_output":
+                continue
+            intact = (self._reg_fp.get(block.block_id)
+                      == _fingerprint(block.text))
+            if intact:
+                continue
+            if block.msg_index is not None and block.msg_index < len(msgs or []):
+                entry = (msgs or [])[block.msg_index]
+                if isinstance(entry, dict):
+                    restored = _msg_text(entry)
+                    if restored:
+                        block.text = restored   # chars derives from text
+            elif outgoing_text and block.block_id == self._by_fp.get(
+                    _fingerprint(outgoing_text)):
+                block.text = outgoing_text  # chars derives from text
+        # canonical: put the original text back where the attempt rewrote it
+        # (``texts is None`` = the snapshot carried no canonical reference —
+        # the policy path without ``msgs``; the layer is simply skipped)
+        texts = snap.get("texts")
+        if texts is None:
+            return
+        for i, entry in enumerate(msgs or []):
+            # entries are contract-validated upstream (§12.32.4): texts is
+            # POSITION-ALIGNED with msgs by construction, and a non-dict
+            # here is a bypass that must crash loudly, never skip silently.
+            if i >= len(texts):
+                continue
+            value, had_content = texts[i]
+            # the retired spelling and a forged projection are never legal in
+            # the canonical: the restore removes them rather than leaving a
+            # second text source behind (docs/19 §12.54-B)
+            entry.pop("text", None)
+            entry.pop(_SENT_KEY, None)
+            if not had_content and _RAW_KEY in entry:
+                entry.pop(_RAW_KEY, None)   # the attempt ADDED the carrier
+            if value is not None and entry.get(_RAW_KEY) != value:
+                entry[_RAW_KEY] = value
+
+    def _reconcile_turn(self, msgs: List[Dict[str, Any]],
+                        snap: Optional[Dict[str, Any]],
+                        check_closure: bool = True
+                        ) -> List[Tuple[str, List[str]]]:
+        """The six seam-contract questions (docs/19 §12.14, §12.27, §12.38,
+        §12.53).
+
+        [勘误 2026-11-08, T] The list below numbers the questions 1, 2, 3, 4,
+        6 — the original text never wrote down number 5. The code DOES ask it
+        (it is the escape-tier backstop for the portal's snapshot return):
+
+        **5.** the REGISTRATION IDENTITY of every block must be the object the
+        session owns — a block whose identity the attempt swapped (a copied /
+        re-created ``Block`` that renders the same text but is not in
+        ``universe.blocks``) is a contract breach, restoring the snapshot and
+        strike-counting the attempt (docs/19 §12.38).
+
+        1. every non-full form must be explained by a recorded op;
+        2. a pinned block may only be ``full`` (or ``dedup``: the prefix-elision
+           form, which loses only the repeated header);
+        3. the canonical history must be untouched;
+        4. the pinned set of PRE-EXISTING blocks is policy-immutable (D8
+           direction (b): the policy face has no pin/unpin), with TWO
+           exemptions (docs/19 §12.52, N1):
+
+           * blocks the attempt REGISTERED keep their add-only auto-pin (the
+             universe is never rolled back);
+           * blocks a RECORDED PRIMITIVE pinned this turn — ``compact`` pins
+             a consumed derived source so that each derived node has at most
+             one consumer (tree, not DAG). That pin is the framework's own
+             fact, not an escape: the evidence set (``_op_pinned``) is filled
+             only from the primitive's record and rides the snapshot/restore.
+
+           Every OTHER pinned delta on a block that existed at snapshot time
+           (either direction) is a ``_s``-escape: detected here, restored by
+           the caller, strike-counted.
+        6. a block's ``msg_index`` (the entry its form renders into) may only
+           move to an entry carrying the SAME text (duplicate re-bind) or the
+           block's own baked form (rendered-copy re-bind), and an UNBOUND
+           block (``None``) may bind only to an entry carrying its own text
+           (the normal ``register_outgoing`` transition); any other move is
+           an escape (docs/19 §12.53, N2) — the snapshot's ``msg_index`` map
+           lets the caller restore it.
+
+        ``check_closure=False`` (the POLICY path) skips the turn-closure
+        question: a policy's ops are closed by ``assemble_custom``'s
+        ``finalize_turn`` AFTER ``run_policy`` returns, so asking "did this
+        turn close through the post segment" inside the policy would
+        false-positive on every legitimate op (docs/19 §12.18).
+        """
+        out: List[Tuple[str, List[str]]] = []
+        recorded = set(self._recorded_refs)
+        unexplained = sorted(
+            bid for bid, form in self.view.forms.items()
+            if form != "full" and bid not in recorded)
+        if unexplained:
+            out.append(("unrecorded_view", unexplained))
+        # Turn closure: a turn that CHANGED the view must have closed through
+        # the post segment (``finalize_turn``) — otherwise the ops happened and
+        # the audit never counted them (docs/19 §12.14, S2: the documented
+        # handle API invites this). SKIPPED for the policy path (see above).
+        if check_closure:
+            before_forms = (snap or {}).get("forms") or {}
+            changed_now = {bid for bid, form in self.view.forms.items()
+                           if before_forms.get(bid, "full") != form}
+            if changed_now and self._view_emitted_turn != self.turn:
+                out.append(("unclosed_turn", sorted(changed_now)))
+        pinned_broken = sorted(
+            block.block_id for block in self.universe.blocks.values()
+            if block.pinned
+            and self.view.form_of(block.block_id) not in ("full", "dedup"))
+        if pinned_broken:
+            out.append(("pinned_form", pinned_broken))
+        # 4. pinned delta on pre-existing blocks (docs/19 §12.27): BOTH
+        # directions — an escape pin (protection the policy must not grant)
+        # and an escape unpin (protection the policy must not remove).
+        # EXEMPT (docs/19 §12.52, N1): a pin a RECORDED PRIMITIVE applied
+        # this turn — ``compact`` pins a consumed derived source so each
+        # derived node has at most one consumer (tree, not DAG). That is a
+        # framework fact, not an escape; the evidence set is written only
+        # from the primitive's own record and rides the snapshot/restore.
+        pinned_before = (snap or {}).get("pinned_state") or {}
+        pinned_delta = sorted(
+            bid for bid, block in self.universe.blocks.items()
+            if bid in pinned_before
+            and bool(pinned_before[bid]) != bool(block.pinned)
+            and bid not in self._op_pinned)
+        if pinned_delta:
+            out.append(("unrecorded_pin", pinned_delta))
+        snap_texts = (snap or {}).get("texts")
+        if snap_texts is not None:
+            before = [t[0] for t in snap_texts]
+            after = [_msg_text(m) for m in (msgs or []) if isinstance(m, dict)]
+            if before != after:
+                moved = [f"msgs[{i}]" for i, (a, b) in enumerate(zip(before, after))
+                         if a != b]
+                out.append(("canonical_mutated", moved[:8]))
+        # 5. registration identity (docs/19 §12.38, R5 backstop): a
+        # turn_output block's text must still fingerprint to its
+        # registration value — the portal hands
+        # out SNAPSHOT copies, so this can only fire through a future
+        # live-object leak (a new portal method handing out state) or a
+        # direct caller. Restored by _restore_turn from the pristine
+        # source (canonical msg carrier / the seam's outgoing payload).
+        tampered = sorted(
+            block.block_id for block in self.universe.blocks.values()
+            if block.kind == "turn_output"
+            and self._reg_fp.get(block.block_id) != _fingerprint(block.text))
+        if tampered:
+            out.append(("block_tampered", tampered))
+        # 6. msg_index binding (docs/19 §12.53, N2): the block->entry ADDRESS
+        # is what ``render`` writes a form into, so a retargeted address
+        # silently elides the WRONG message (or, out of range, none at all
+        # while the view still counts it as substituted). TWO legal moves:
+        #   * the new entry carries the SAME text as the old one (duplicate
+        #     re-bind — the fingerprint-uniqueness behaviour);
+        #   * the new entry carries the block's own baked form (a rendered
+        #     copy re-bound at a new position — the marker behaviour).
+        # Anything else is a violation (restored by the caller; the snapshot
+        # carries the address map).
+        mi_before = (snap or {}).get("msg_index")
+        if mi_before is not None and msgs is not None:
+            moved = []
+            for bid, old_i in mi_before.items():
+                block = self.universe.blocks.get(bid)
+                if block is None or block.msg_index == old_i:
+                    continue
+                new_i = block.msg_index
+                ok_move = False
+                if isinstance(new_i, int) and 0 <= new_i < len(msgs):
+                    new_text = _msg_text(msgs[new_i])
+                    baked = self._baked_entry_text(block)
+                    if old_i is None:
+                        # an UNBOUND block (``register_outgoing``) becomes
+                        # bound when its own text enters the canonical
+                        # history — the normal outgoing transition
+                        ok_move = new_text == block.text or new_text == baked
+                    else:
+                        old_text = (_msg_text(msgs[old_i])
+                                    if 0 <= old_i < len(msgs) else None)
+                        ok_move = ((old_text is not None
+                                    and new_text == old_text)
+                                   or new_text == baked)
+                if not ok_move:
+                    moved.append(bid)
+            if moved:
+                out.append(("msg_index_moved", sorted(moved)[:20]))
+        return out
+
+    def _note_violations(self, violations: List[Tuple[str, List[str]]],
+                         source: str = "assembly") -> None:
+        """Count + emit each seam-contract violation (never silent). The
+        event vocabulary is per-subsystem (docs/19 §12.17.1): the named
+        assembly's reconcile reports ``cm_assembly_violation``, the custom
+        policy tail's reports ``cm_policy_violation`` — a policy escape
+        used to be filed against the assembly (N5a)."""
+        for kind, refs in violations:
+            if source == "policy":
+                self.policy_violations += 1
+            else:
+                self.assembly_violations += 1
+            self._emit({"type": f"cm_{source}_violation", "turn": self.turn,
+                        "kind": kind, "refs": list(refs)[:20]})
+
+    def _note_assembly_failure(self, error: str, phase: str = "run",
+                               exc: Any = None,
+                               timed_out: bool = False) -> None:
+        """One assembly turn failure: count + emit + latch.
+
+        ONE failure is enough to stop re-attempting IN THIS SESSION (the
+        module is deterministic; a retry can leak a worker thread). The
+        preset then runs directly and every subsequent ``cm_view`` carries
+        ``assembly_disabled: true`` until the session ends. The framework's
+        loop-level LATCH (fingerprint-keyed, docs/19 §12.14) additionally
+        stops the NEXT sessions from re-attempting a module that has not
+        changed. ``phase`` distinguishes load-stage (module top level) from
+        run-stage (``assemble``) from contract refusals; ``timed_out``
+        marks the leaked worker thread in the session's leak counters
+        (CM-03).
+
+        [勘误 2026-11-08, Q] docs/19 §12.19-C1 claims
+        ``cm_assembly_failed.phase`` takes FOUR values (load/run/contract/
+        TIMEOUT). It takes THREE: a budget expiry is reported as the phase it
+        happened in (``load`` for a top-level hang, ``run`` for an
+        ``assemble`` hang), and the emitted event carries no ``timed_out``
+        field either — the hang is only visible indirectly, as the
+        ``thread_leaks`` / ``thread_leaks_live`` counters (a timeout leaks the
+        abandoned worker, a crash does not). Telling "hung" from "raised"
+        therefore takes a SECOND channel, exactly the lesson in AGENTS.md
+        ("an unexpected tool result is a hypothesis, not a verdict")."""
         self.assembly_failures += 1
         self._assembly_strikes += 1
+        # A strike turn IS a degraded turn — its governance came from the
+        # fail-open preset (docs/19 §12.30 rule 1; this also covers the
+        # load-failure turn, which has no other degraded marker).
+        self._turn_degraded = True
+        if timed_out:
+            self.thread_leaks += 1
+            cand = getattr(exc, "candidate_thread", None)
+            if cand is not None:
+                self._timeout_workers.append(cand)
+        where = ""
+        if exc is not None and phase == "run":
+            try:
+                import traceback
+                frames = traceback.extract_tb(exc.__traceback__)
+                if frames:
+                    where = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+            except Exception:  # noqa: BLE001 -- diagnostics only
+                where = ""
+        self._assembly_last_error = {"error": str(error), "phase": phase,
+                                     "where": where}
         self._emit({"type": "cm_assembly_failed", "turn": self.turn,
                     "phase": phase, "error": error,
                     "struck": self._assembly_strikes,
+                    "where": where,
                     "fallback": self.mode})
-        if self._assembly_strikes >= _POLICY_STRIKES:
+        if self._assembly_strikes >= _AGENT_MODULE_STRIKES:
             self.assembly_disabled = True
             self._emit({"type": "cm_assembly_disabled", "turn": self.turn,
                         "strikes": self._assembly_strikes})
+
+    def _retract_last_view(self, *, phase: str) -> None:
+        """K (docs/19 §12.62): withdraw the view this turn already emitted.
+
+        Fires ONLY when the failed attempt closed the turn itself (a view was
+        emitted for THIS turn by the attempt that is now being rolled back).
+        The event carries the retracted ordinals and the amount that view
+        booked, so ``sum(saved_chars) - sum(retracted.saved_chars)`` is the
+        authoritative turn delta and ``view_seq``/``view_in_turn`` survive the
+        gap (the next view of the turn is ``view_in_turn=2``).
+        """
+        last = self._last_view
+        if last is None or last[2] != self.turn:
+            return                        # nothing of THIS turn to withdraw
+        seq, saved, turn = last
+        self._emit({"type": "cm_view_retracted", "turn": turn,
+                    "view_seq": seq, "saved_chars": saved, "phase": phase,
+                    "detail": "the attempt closed the turn and then failed; "
+                              "the view was rolled back with the turn state"})
+        self._last_view = None            # one retraction per view
 
     def _emit_synthetic_view(self) -> None:
         """Per-turn audit completion for an assembly that returned without
         closing through ``finalize_turn``: one ``cm_view`` brief per
         assembled turn is the framework's contract, so the seam emits the
-        minimal honest brief itself (ops empty; stats marked)."""
+        minimal honest brief itself (ops empty; stats marked).
+
+        This fires ONLY on the LEGAL skip shape — a turn that changed the
+        view without finalizing is already a contract violation
+        (``unclosed_turn`` -> restore + strike + fail-open preset), so it
+        never reaches this method. The stats therefore share the session's
+        single caliber (``_turn_stats``) instead of a hand-built dict
+        (docs/19 §12.46: the old ``len(view.forms)`` counted explicit
+        ``"full"`` entries and made this brief disagree with every other
+        ``cm_view`` about ``substituted``)."""
+        stats = self._turn_stats(0)
+        stats["assembled_by"] = "agent_assembly"
         self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
-                    "ops": [],
-                    "stats": {"blocks": len(self.universe.blocks),
-                              "substituted": len(self.view.forms),
-                              "saved_chars": 0,
-                              "est_saved_session": self.est_chars_saved,
-                              "policy_disabled": self.policy_disabled,
-                              "assembled_by": "agent_assembly"}})
+                    "ops": [], "stats": stats})
         self._view_emitted_turn = self.turn
 
     def assemble(self, msgs: List[Dict[str, Any]],
                  tokens_used: int = 0,
                  budget: Optional[int] = None) -> List[Dict[str, Any]]:
         """Direct-form seam (tests / non-chat callers): render the history
-        only; passthrough returns ``msgs`` unchanged."""
+        only; passthrough returns ``msgs`` unchanged.
+
+        It shares the SAME turn boundary as ``assemble_turn`` (``_open_turn``):
+        the canonical identity is captured and the framework registers it, so
+        the passthrough direct form can no longer validate against a STALE
+        canonical captured by an earlier call (finding C: it used to refuse
+        every later list with ``not_canonical`` while still returning it,
+        leaving the new entries unregistered and silent).
+
+        No send claim is set here: the direct form has no outgoing message and
+        no client call following it, so a ``cm_send_fact`` from a LATER call
+        must not be compared against a stale vector — ``_send_expect`` is
+        cleared (``compare:false`` on an unrelated fact beats a false drift)."""
+        self._require_msg_dicts(msgs, "assemble")
         if self.mode == "passthrough":
-            self.turn += 1
-            self.register_history(msgs)
+            self._open_turn(msgs)
             self.emit_view(0)
+            self.claim_send(msgs, "")
             return msgs
+        # non-passthrough: ``assemble_turn`` opens the turn itself (never open
+        # it twice — the turn counter and the per-turn resets must advance once)
         send_history, _msg = self.assemble_turn(msgs, "", tokens_used=tokens_used,
                                                 budget=budget)
         return send_history
@@ -716,8 +2342,8 @@ class CMSession:
         """Advisory warning at >=80% of an active token budget (the C8 soft
         stop stays the enforcement point; this only informs)."""
         used = tokens_used
-        if not used and self.budget_reader is not None:
-            used = self.budget_snapshot().get("tokens_used") or 0
+        if not used and self.usage_reader is not None:
+            used = self.usage_snapshot().get("tokens_used") or 0
         if not isinstance(budget, int) or budget <= 0 \
                 or not isinstance(used, int) or used <= 0:
             return None
@@ -727,19 +2353,51 @@ class CMSession:
                     "used": used, "budget": budget})
         return {"op": "budget_checkpoint", "ok": True, "source": "pre"}
 
+    def _window_kept_ids(self) -> set:
+        """Block ids the pin window keeps FULL (docs/19 §12.56).
+
+        ONE unit for every window-relative stage (window / compaction /
+        dedup): a STEP is one LLM call, anchored on its assistant block, and
+        it owns the blocks back to the previous assistant — i.e. its own
+        tool-output input. The newest ``window_k`` steps stay verbatim.
+
+        Counting ENTRIES instead (the pre-§12.56 rule) made ``k`` mean
+        "blocks": half a step per unit, and ``k=1`` kept only the current
+        message while dropping every tool result. It also let the three
+        window-relative stages drift apart, because each carried its own copy
+        of the counter.
+        """
+        blocks = [b for b in self.universe.ordered()
+                  if b.kind in ("turn_output", "tool_output")]
+        steps = 0
+        limit = max(self.window_k, WINDOW_K_FLOOR)
+        kept = set()
+        for block in reversed(blocks):
+            if _is_step_head(block):
+                steps += 1
+            if steps <= limit:
+                kept.add(block.block_id)
+        return kept
+
     def window_defaults(self) -> List[Dict[str, Any]]:
-        """slice/compact/custom modes: keep the newest ``window_k`` assistant
-        turns FULL (plus pinned blocks + notes — pin/note protection lives in
-        the primitives), older turn/tool blocks -> placeholder. Drop-floor
-        guarded: small blocks stay (a placeholder would cost more)."""
+        """slice/compact/custom modes: keep the newest ``window_k`` LLM CALLS
+        FULL (plus pinned blocks + notes — pin/note protection lives in the
+        primitives), older turn/tool blocks -> placeholder. Drop-floor
+        guarded: small blocks stay (a placeholder would cost more).
+
+        The unit is a CALL, not an entry (docs/19 §12.56): one call appends
+        two entries (assistant reply + the user message carrying its tool
+        outputs), so counting entries made ``k`` mean "blocks" — half a step
+        per unit, and ``k=1`` kept only the current message while dropping
+        every tool result. A step is anchored on its assistant block and owns
+        the blocks back to the previous assistant, so a kept step keeps its
+        own tool-output input (never a tool call without its result)."""
         out: List[Dict[str, Any]] = []
         blocks = [b for b in self.universe.ordered()
                   if b.kind in ("turn_output", "tool_output")]
-        rounds = 0
+        kept = self._window_kept_ids()
         for block in reversed(blocks):
-            if block.kind == "turn_output":
-                rounds += 1
-            if rounds <= max(self.window_k, WINDOW_K_FLOOR):
+            if block.block_id in kept:
                 continue
             if self.view.form_of(block.block_id) != "full":
                 continue  # already substituted in an earlier turn (sticky)
@@ -748,66 +2406,135 @@ class CMSession:
                 # block must never drop) does not become violation noise
             if block.chars < self.drop_floor_chars:
                 continue
-            out.append(ops.drop(self.universe, self.view, block.block_id,
-                                f"window_k={self.window_k}",
-                                self.drop_floor_chars))
+            prev = self._pre_state(block.block_id)
+            rec = ops.drop(self.universe, self.view, block.block_id,
+                           f"window_k={self.window_k}",
+                           self.drop_floor_chars)
+            out.append(self._book(rec, block.block_id, prev))
         return out
 
     def conservative_compaction(self) -> List[Dict[str, Any]]:
         """compact_conservative adds: history turns older than the pin window
-        whose mechanical excerpt actually saves >= MIN_COMPACT_SAVE chars
-        become EXCERPTS (head+tail kept) instead of the slice mode's
-        whole-turn placeholder.
+        whose mechanical head_tail trim actually saves >= MIN_COMPACT_SAVE
+        chars become head_tail-trimmed (head+tail kept at the session
+        ``cm_head_tail_keep``) instead of the slice mode's whole-turn
+        placeholder.
 
         Erratum (docs/10 §11.5): the compaction target is the old USER turn —
         this chat protocol embeds tool outputs in the next user message, so a
         separate ``tool_output`` kind never materializes and the original
         tool_output-only targeting made this tier identical to ``slice``."""
         out: List[Dict[str, Any]] = []
-        rounds = 0
+        kept = self._window_kept_ids()
         for block in reversed([b for b in self.universe.ordered()
-                               if b.kind in ("turn_output", "tool_output")]):
-            if block.kind == "turn_output":
-                rounds += 1
-            if rounds <= max(self.window_k, WINDOW_K_FLOOR):
+                               if b.kind == "turn_output"]):
+            if block.block_id in kept:
                 continue
             if block.pinned:
                 continue
             if self.view.form_of(block.block_id) != "full":
                 continue  # already substituted in an earlier turn (sticky)
-            if excerpt_saving(block) < MIN_COMPACT_SAVE:
-                continue  # the excerpt would save nothing: leave to the window
-            out.append(ops.compact(self.universe, self.view,
-                                   [block.block_id], "first_last",
-                                   self.drop_floor_chars, self.turn))
+            if form_saving(block, "head_tail", rule="compacted:first_last",
+                           keep=self.head_tail_keep) < MIN_COMPACT_SAVE:
+                continue  # the trim would save nothing: leave to the window
+            prev = self._pre_state(block.block_id)
+            rec = ops.compact(self.universe, self.view,
+                              [block.block_id], "first_last",
+                              self.drop_floor_chars, self.turn,
+                              keep=self.head_tail_keep)
+            out.append(self._book(rec, block.block_id, prev))
         return out
 
-    def budget_snapshot(self, tokens_used: Optional[int] = None,
-                        budget: Optional[int] = None) -> Dict[str, Any]:
-        return ops.budget_query(self.budget_reader, tokens_used, budget)
+    def usage_snapshot(self, tokens_used: Optional[int] = None,
+                       budget: Optional[int] = None) -> Dict[str, Any]:
+        return ops.usage_query(self.usage_reader, tokens_used, budget)
 
     # -- policy segment -----------------------------------------------------------
-    def run_policy(self) -> List[Dict[str, Any]]:
-        """Run the custom policy module (fail-open; wedge breaker)."""
+    def run_policy(self, msgs: Optional[List[Dict[str, Any]]] = None
+                   ) -> List[Dict[str, Any]]:
+        """Run the custom policy module (fail-open; ONE-strike latch; P1
+        snapshot/reconcile/restore — docs/19 §12.17/§12.18).
+
+        The module is loaded ONCE per session (``_ModuleLoad``; cached with
+        its failure — a mid-session edit must not change the seam) and
+        ``apply`` executes EVERY turn under the per-turn budget: load-once
+        caches the MODULE, never the run result. One failure — load crash,
+        load timeout, or a run-phase failure — disables the policy for the
+        session; the failure facts ride ``policy_report`` for the next
+        self-improve session.
+
+        P1 parity with the named-assembly branch: the turn-mutable state is
+        snapshotted BEFORE ``apply`` and RESTORED when the attempt fails or
+        violates the seam contract (a crashed policy's half-applied
+        session-level ops must not persist; a ``_s``-escape must be caught).
+        ``msgs`` (the canonical history, passed by ``assemble_custom``)
+        enables the canonical-texts layer; without it the snapshot covers
+        view/counters/refs only. The closure question is structurally
+        delegated to ``finalize_turn`` (the caller invokes it right after
+        this returns) — see ``_reconcile_turn(check_closure=False)``."""
+        if msgs is not None:
+            self._require_msg_dicts(msgs, "run_policy")
         if self.policy_disabled:
             return [{"op": "policy", "ok": False,
-                     "error": "policy disabled for this session"}]
-        from .failopen import run_policy as _run_policy_module
+                     "error": "policy disabled for this session",
+                     "_lifecycle": True}]
+        if self.policy_path is None:
+            # configuration signal, NOT a module failure: the build rewrites
+            # custom when nothing is deliverable, so this is only reachable
+            # by direct construction. Nothing struck, nothing latched.
+            return [{"op": "policy", "ok": False,
+                     "error": "no policy configured for this session",
+                     "_lifecycle": True}]
+        from .failopen import (PolicyTimeout, apply_policy as _apply_policy,
+                               timed_load_policy as _timed_load_policy)
+        if self._policy_load is None:
+            self._policy_load = _ModuleLoad(
+                "policy", self.policy_path,
+                _timed_load_policy, PolicyTimeout)
+        st = self._policy_load
+        first = st.result is None and not st.failed
+        result = st.ensure(self.policy_exec_ms)
+        if st.failed and result is None:
+            self._note_policy_failure(st.error, phase="load",
+                                      timed_out=st.timed_out, exc=st.exc)
+            return [{"op": "policy", "ok": False, "error": "policy failed"}]
+        apply_fn, methods, method_problems = result
+        if first and not self._methods_policy_done:
+            # assembly registrations take precedence (shadowed policy names
+            # refuse with a recorded reason)
+            self._methods_policy_done = True
+            self._merge_methods(methods, method_problems, source="policy")
         handle = ViewHandle(self, "policy")
+        # P1: snapshot BEFORE apply; restore on any failure/violation. A
+        # LOCAL variable — the turn-level P1 snapshot of the named branch
+        # must stay untouched (nested portal.run_policy restores to
+        # pre-policy, which is exactly the right granularity there).
+        snap = self._snapshot_turn(msgs)
         try:
-            records, over_ms, methods, method_problems = \
-                _run_policy_module(self.policy_path, handle,
-                                   self.policy_exec_ms)
+            records, over_ms = _apply_policy(apply_fn, handle,
+                                             self.policy_exec_ms)
+        except PolicyTimeout as e:
+            # known shared race: the leaked worker still holds the handle
+            # (T2 hygiene restart owns the residual; T3 closes it)
+            self._restore_turn(snap, msgs)
+            self._note_policy_failure(ops.clip_diag(str(e), 160), phase="timeout",
+                                      timed_out=True, exc=e, restored=True)
+            return [{"op": "policy", "ok": False, "error": "policy failed"}]
         except Exception as e:  # noqa: BLE001 -- fail-open, never break the session
-            self._note_policy_failure(str(e)[:160])
+            self._restore_turn(snap, msgs)
+            self._note_policy_failure(ops.clip_diag(str(e), 160), phase="run", exc=e,
+                                      restored=True)
             return [{"op": "policy", "ok": False, "error": "policy failed"}]
         if over_ms:
+            self.policy_overruns += 1
             self._emit({"type": "cm_policy_overrun", "turn": self.turn,
                         "over_ms": over_ms})
         if not isinstance(records, list):
             # A non-list return is a policy failure like any other (failopen
             # contract): strike-counted, emitted, fail-open.
-            self._note_policy_failure("policy returned a non-list")
+            self._restore_turn(snap, msgs)
+            self._note_policy_failure("policy returned a non-list",
+                                      phase="contract", restored=True)
             return [{"op": "policy", "ok": False,
                      "error": "policy returned a non-list"}]
         for rec in records:
@@ -816,27 +2543,64 @@ class CMSession:
                 # the wedge breaker: one policy failure, strike-counted,
                 # emitted, fail-open — never a seam crash with only a log
                 # line.
-                self._note_policy_failure("policy returned a non-dict record")
+                self._restore_turn(snap, msgs)
+                self._note_policy_failure("policy returned a non-dict record",
+                                          phase="contract", restored=True)
                 return [{"op": "policy", "ok": False,
                          "error": "policy returned a non-dict record"}]
-        self._policy_strikes = 0
-        # Harvest the policy's METHODS once per session (a crashing first
-        # turn leaves the flag unset — the next successful load retries);
-        # assembly registrations take precedence (shadowed policy names
-        # refuse with a recorded reason).
-        if not self._methods_policy_done:
-            self._methods_policy_done = True
-            self._merge_methods(methods, method_problems, source="policy")
+        # P1 reconcile on the SUCCESS route: the three questions answerable
+        # before closure (unrecorded_view / pinned_form / canonical_mutated).
+        # Closure itself is finalize_turn's job (check_closure=False).
+        violations = self._reconcile_turn(msgs, snap, check_closure=False)
+        if violations:
+            # mirror the named branch's order: the violation EVENTS land
+            # first (durable), then the counters roll back with the restore
+            self._note_violations(violations, source="policy")
+            self._restore_turn(snap, msgs)
+            self._note_policy_failure(
+                "policy violated the seam contract: "
+                + ",".join(kind for kind, _refs in violations),
+                phase="contract", restored=True)
+            return [{"op": "policy", "ok": False, "error": "policy failed"}]
         return records
 
-    def _note_policy_failure(self, error: str) -> None:
-        """One policy failure: count + emit, and disable after 2 strikes
-        (C1-class wedge breaker; docs/10 §5.2 分三)."""
+    def _note_policy_failure(self, error: str, phase: str = "run",
+                             exc: Any = None, timed_out: bool = False,
+                             restored: bool = False) -> None:
+        """One policy failure: count + emit + ONE-strike latch (docs/19
+        §12.17 — the module is load-once, so byte-identical retries are
+        deterministic waste; the success-resets-strikes rule died with the
+        per-turn reload). ``phase`` distinguishes load/run/timeout/contract;
+        ``timed_out`` marks the leaked worker thread; ``restored`` marks a
+        P1 rollback (docs/19 §12.18). The failure facts ride
+        ``policy_report`` for the next self-improve session."""
         self.policy_failures += 1
         self._policy_strikes += 1
+        # A strike turn IS a degraded turn (docs/19 §12.30 rule 1 — same
+        # rule as the assembly side): the failing turn's governance came
+        # from the pre-segment fail-open.
+        self._turn_degraded = True
+        if timed_out:
+            self.thread_leaks += 1
+            cand = getattr(exc, "candidate_thread", None)
+            if cand is not None:
+                self._timeout_workers.append(cand)
+        where = ""
+        if exc is not None and phase == "run":
+            try:
+                import traceback
+                frames = traceback.extract_tb(exc.__traceback__)
+                if frames:
+                    where = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+            except Exception:  # noqa: BLE001 -- diagnostics only
+                where = ""
+        self._policy_last_error = {"error": str(error), "phase": phase,
+                                   "where": where}
         self._emit({"type": "cm_policy_failed", "turn": self.turn,
-                    "error": error})
-        if self._policy_strikes >= _POLICY_STRIKES:
+                    "phase": phase, "error": error, "where": where,
+                    "struck": self._policy_strikes,
+                    "state_restored": bool(restored)})
+        if self._policy_strikes >= _AGENT_MODULE_STRIKES:
             self.policy_disabled = True
             self._emit({"type": "cm_policy_disabled", "turn": self.turn,
                         "strikes": self._policy_strikes})
@@ -845,19 +2609,46 @@ class CMSession:
     def count_ops(self, records: List[Dict[str, Any]]) -> int:
         """The primitives already validated + mutated the view; this counts,
         emits violations, and sums the estimated savings (audit only — the
-        ledger keeps 实付; savings are a derived indicator, never billing)."""
+        ledger keeps 实付; savings are a derived indicator, never billing).
+
+        N2 (docs/19 §12.33): FULL-fidelity accounting — every record is
+        classified exactly once, wherever it sits. The old
+        ``max_ops_per_turn`` slice + overflow blanket re-labeled tail
+        records as refused AFTER they had already happened at exec time
+        (the cap's exec authority is the handle gate, not the audit): the
+        counters' identity broke (``ops_total`` missed the tail), overflow
+        ``ok`` records lost their saved/refs (P1 false-positive risk for
+        baseline-overflow refs), and the blanket silently absorbed real
+        refusals. Now ``ops_total == ops_applied + ops_refused +
+        lifecycle + audited`` holds for every turn, saved/refs recording
+        is position-independent, and the cap survives ONLY where it can
+        actually enforce (the policy-face handle gate) or present (the
+        ``emit_view`` brief)."""
         saved_total = 0
-        capped = records[:max(1, self.max_ops_per_turn)]
-        for rec in capped:
+        for rec in records or []:
             self.ops_total += 1
             if rec.get("op") == "budget_checkpoint":
                 self.ops_applied += 1
                 continue
             if not rec.get("ok"):
+                if rec.get("_lifecycle"):
+                    # A lifecycle marker (the module is retired/absent) is
+                    # not a misbehavior: the standing degradation is spoken
+                    # ONCE by cm_policy_disabled + the stats; re-filing it
+                    # per turn is the N7 phantom (the assembly side's
+                    # standing degradation is already silent — docs/19
+                    # §12.30 rule 1 visibility symmetry). The strike
+                    # turn's REAL failure record still counts below.
+                    continue
                 if not rec.get("_audited"):
                     self.ops_refused += 1
                     self.violations += 1
+                    # F3 (docs/19 §12.47): the op-refusal family is split by
+                    # SOURCE so a reader can tell a seam-record refusal from
+                    # a policy-face one (both counted; the agent face has its
+                    # own UNCOUNTED cm_face_violation).
                     self._emit({"type": "cm_violation", "turn": self.turn,
+                                "source": "seam_record",
                                 "op": rec.get("op"), "refs": rec.get("refs"),
                                 "error": rec.get("error")})
                 # already counted + emitted by the handle audit hook
@@ -866,8 +2657,151 @@ class CMSession:
             self.ops_applied += 1
             self.est_chars_saved += saved
             saved_total += saved
-        self.ops_refused += max(0, len(records) - len(capped))
+            # P1: the reconciliation compares the view against EXACTLY what the
+            # post segment recorded (cumulative: forms are sticky).
+            self._recorded_refs.update(str(r) for r in (rec.get("refs") or []))
         return saved_total
+
+    # ------------------------------------------------------ turn boundary
+    def _open_turn(self, msgs: List[Dict[str, Any]]) -> None:
+        """The ONE turn boundary, shared by ``assemble_turn`` and ``assemble``.
+
+        Owns four facts, in this order (docs/19 §12.54-B, §12.55):
+
+        1. the per-turn resets (degraded flag, send claim, unrendered flag,
+           method-face budget);
+        2. entry normalization — in place and position-preserving, because
+           every address computed below indexes this list (a retired ``text``
+           spelling becomes ``content``; a fed-back send projection is
+           dropped; both are spoken ONCE per session, since a silent rewrite
+           is how the two-spelling era stayed invisible, and two carriers that
+           DISAGREE are refused loudly);
+        3. the CANONICAL IDENTITY of the turn — ``(role, text)`` per entry,
+           captured BEFORE any preset/assembly runs;
+        4. **the framework registers the canonical itself** (finding C): the
+           address space belongs to the framework, so a module that appends,
+           reorders or rebuilds the list cannot cost the turn its
+           registration — its list is simply not registered, loudly.
+        """
+        self.turn += 1
+        # K (§12.62): the per-turn view ordinal restarts here.
+        self._turn_view_seq = 0
+        self._turn_degraded = False
+        self._send_expect = None   # set by whoever produces THIS turn's send
+        self._turn_unrendered = False
+        self._method_face = None  # per-turn method-face budget reset
+        for i, entry in enumerate(msgs or []):
+            if not isinstance(entry, dict):
+                continue
+            if _entries_conflict(entry):
+                self._emit({"type": "cm_entry_carrier_conflict", "turn": self.turn,
+                            "refs": [f"msgs[{i}]"],
+                            "allowed": ["role", _RAW_KEY]})
+                raise ValueError(
+                    f"history[{i}] carries BOTH {_RAW_KEY!r} and 'text' with "
+                    f"different text; allowed entry keys: "
+                    f"['role', {_RAW_KEY!r}] (+ the framework-private "
+                    f"{_SENT_KEY!r}, which is never read from the canonical)")
+            _, note = _normalize_entry(entry)
+            if note == "legacy" and not self._entry_legacy_seen:
+                self._entry_legacy_seen = True
+                self._emit({"type": "cm_entry_legacy_key", "turn": self.turn,
+                            "refs": [f"msgs[{i}]"],
+                            "detail": "entry carried the retired 'text' "
+                                      "spelling; normalized to 'content'"})
+            elif note == "projection" and not self._entry_projection_seen:
+                self._entry_projection_seen = True
+                self._emit({"type": "cm_entry_projection_stripped",
+                            "turn": self.turn, "refs": [f"msgs[{i}]"],
+                            "detail": f"{_SENT_KEY!r} is the framework-owned "
+                                      "SEND projection; recomputed per send, "
+                                      "never read from a history"})
+        self._turn_canonical = _canon_seq(msgs)
+        # the framework's own registration (idempotent by fingerprint): the
+        # preset/assembly calls become no-ops for the same list, and a
+        # mismatching list is refused without costing the turn anything.
+        self.register_history(msgs)
+
+    def _note_off_canonical(self, msgs: Any, where: str) -> bool:
+        """``True`` when ``msgs`` is NOT this turn's canonical (docs/19 §12.55).
+
+        The address space is the canonical, so a list that is not IDENTICAL to
+        it cannot be rendered into: doing so replaces whichever message
+        happens to sit at a block's index (``render``'s span-drift branch then
+        writes a placeholder over an innocent entry — probed: a reordered list
+        through ``finalize_turn`` elided a message the block never owned, with
+        zero violations before this guard).
+
+        Sets the per-turn flag (so the turn's ``cm_view`` can say it) and
+        speaks ONCE per session; no strike — this is a capability refusal, not
+        an escape.
+        """
+        canon = self._turn_canonical
+        if canon is None:
+            return False
+        got = _canon_seq(msgs)
+        if got == canon:
+            return False
+        if not self._turn_unrendered:
+            self._turn_unrendered = True
+            self.unrendered_turns += 1
+        if not self._turn_unrendered_seen:
+            self._turn_unrendered_seen = True
+            self._emit({"type": "cm_render_off_canonical", "turn": self.turn,
+                        "where": where, "got": len(got), "want": len(canon),
+                        "first_diff": _canon_diff(canon, got)})
+        return True
+
+    # ------------------------------------------------------ send fact (audit)
+    def claim_send(self, send_history: List[Dict[str, Any]],
+                   send_msg: str) -> None:
+        """Record what THIS turn CLAIMS to send (docs/19 §12.54-C).
+
+        Called by the post segment and by the passthrough preset — the two
+        places where the framework produces the sent list. The widths become
+        the left-hand side of the send fact: the client reports the widths it
+        actually built, and a difference means the rendered view did not reach
+        the wire (the silent no-op that used to be invisible). One place
+        computes it, so the claim can never drift from the render.
+
+        The widths are measured on what each send copy SHIPS (``_cm_sent``
+        when one is attached, else the raw text): a claim measured on the raw
+        carrier would describe the history, not the promise — and the gap
+        between the two is precisely the saving this fact verifies."""
+        self._send_expect = (
+            [len(_shipped_text(m) or "") for m in (send_history or [])]
+            + [len(str(send_msg or ""))])
+
+    def note_send_fact(self, sent: Dict[str, Any]) -> None:
+        """Compare the claim with the FACT the client measured on the wire.
+
+        Content-free by construction (docs/19 §12.54-C): counts and widths,
+        never text. Emitted once per LLM call; the per-entry detail
+        materialises ONLY on drift, so the steady-state record stays tiny.
+        ``compare: false`` marks the turns where there is nothing to compare
+        (an assembly authored its own history, or the seam failed open) — the
+        fact is still recorded there, because "sent N chars with no framework
+        claim" is itself auditable.
+        """
+        exp = self._send_expect
+        chars = int(sent.get("chars") or 0)
+        row: Dict[str, Any] = {"turn": self.turn, "sent_chars": chars,
+                               "sent_entries": sent.get("entries")}
+        if isinstance(sent.get("nonstr"), int) and sent["nonstr"]:
+            row["sent_nonstr"] = sent["nonstr"]
+        if exp is not None and sent.get("entries") == len(exp):
+            row["expect_chars"] = sum(exp)
+            row["drift"] = chars - sum(exp)
+            if row["drift"]:
+                widths = sent.get("widths") or []
+                row["mismatch"] = [
+                    {"i": i, "expect": e, "sent": w}
+                    for i, (e, w) in enumerate(zip(exp, widths)) if e != w][:20]
+                self.send_mismatches += 1
+                self.send_drift_chars += row["drift"]
+        else:
+            row["compare"] = False
+        self._emit({"type": "cm_send_fact", **row})
 
     def finalize_turn(self, msgs: List[Dict[str, Any]],
                       outgoing: str,
@@ -881,7 +2815,20 @@ class CMSession:
         (``cm_view`` brief, no content); the sent history is materialized
         from the persistent view by the no-fabrication render (copies only
         — 双记); the outgoing instruction is never substituted except the
-        dedup prefix-elision (same frozen form, anchored at the head)."""
+        dedup prefix-elision (same frozen form, anchored at the head).
+
+        N4 (docs/19 §12.46): this call IS the per-turn "framework post
+        segment ran" fact. ``_finalized_turn`` lets the audit distinguish
+        three shapers of the sent history — the framework (this method),
+        the passthrough identity, and an assembly-authored return — WITHOUT
+        conflating them with "did ``render`` get invoked" (an assembly may
+        call ``render`` itself and still return its own list)."""
+        self._require_msg_dicts(msgs, "finalize_turn")
+        self._finalized_turn = self.turn
+        # C (docs/19 §12.55): decide BEFORE ``emit_view`` whether this turn's
+        # send can be rendered, so the turn's own cm_view can say so (the
+        # ``send_unrendered`` stat has to be part of the same brief).
+        self._note_off_canonical(msgs, "finalize_turn")
         saved = self.count_ops(records)
         self.emit_view(saved, records)
         send_history = self.render(msgs)
@@ -892,24 +2839,47 @@ class CMSession:
             # like an old turn (same frozen form, anchored at the head)
             if self.system_prefix and outgoing.startswith(self.system_prefix):
                 send_msg = _DEDUP_MARKER + outgoing[len(self.system_prefix):]
+        # the claim side of the send fact (docs/19 §12.54-C): what THIS turn
+        # says it is sending, measured on the rendered view it just produced
+        self.claim_send(send_history, send_msg)
         return send_history, send_msg
 
     def dedup_prefix(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fixed pre-segment: fixed-overhead governance. The tool-use header
-        is re-sent in EVERY user message; for messages older than the pin
-        window it is elided (one in-band marker replaces it) — the newest
-        window keeps the full header so tool behavior is unaffected. This is
-        a form, not a drop: no content is lost except the repeated prefix."""
+        is re-sent in EVERY user message; one in-band marker replaces it on
+        an OLD block, keeping the newest window's full header so tool
+        behavior is unaffected. A form, not a drop: no content is lost
+        except the repeated prefix.
+
+        Population in the PRESET pipelines is narrow by construction
+        (docs/19 §12.32.3): ``window_defaults`` runs FIRST and placeholder's
+        every un-pinned old block (the ``form != "full"`` skip below), so
+        this stage's live surface is the PINNED old blocks — in practice
+        the auto-pinned first user turn (one dedup op per session; probed
+        in §12.32.3). The order is value-correct: the placeholder saves
+        the whole body where dedup saves only the header. As a POLICY-
+        composable primitive the stage is fully alive (a custom policy may
+        run dedup without the window)."""
         if not self.system_prefix:
             return []
+        # R4/F2 (docs/19 §12.37, §12.40): the ACTUAL sent delta is the
+        # transition width (prefix minus marker), measured by the session
+        # accounting funnel — never the bare prefix length, and never a
+        # second copy of the formula. A prefix shorter than the marker would
+        # GROW the old turn: skip the block (the "saves nothing" semantics
+        # of compact's MIN_COMPACT_SAVE gate; realistic tool-use headers are
+        # far longer than the marker).
         out: List[Dict[str, Any]] = []
         blocks = [b for b in self.universe.ordered()
                   if b.kind == "turn_output"]
-        rounds = 0
+        # ONE unit for every window-relative stage (docs/19 §12.56): the set
+        # this stage may touch is exactly the set the window does NOT keep.
+        # A private counter here would let dedup rewrite a block the window
+        # deliberately keeps FULL (and vice versa) — the two stages would
+        # disagree about what "old" means.
+        kept = self._window_kept_ids()
         for block in reversed(blocks):
-            if block.kind == "turn_output":
-                rounds += 1
-            if rounds <= max(self.window_k, WINDOW_K_FLOOR):
+            if block.block_id in kept:
                 continue
             if self.view.form_of(block.block_id) != "full":
                 continue
@@ -917,19 +2887,91 @@ class CMSession:
                 continue
             if len(block.text) - len(self.system_prefix) < self.drop_floor_chars:
                 continue
+            prev = self._pre_state(block.block_id)
+            saving = self._transition_saving(block, prev[0], prev[1],
+                                             "dedup", "system_prefix")
+            if saving <= 0:
+                continue
             self.view.set(block.block_id, "dedup", "system_prefix")
+            self._dedup_credit[block.block_id] = int(saving)
             out.append({"op": "dedup", "refs": [block.block_id], "ok": True,
-                        "rule": "system_prefix",
-                        "saved": len(self.system_prefix)})
+                        "rule": "system_prefix", "saved": saving})
         return out
+
+    def _lapse_forms(self, msgs: List[Dict[str, Any]]) -> None:
+        """F (docs/19 §12.58): DEMOTE a dedup form that can no longer apply.
+
+        ``render``'s dedup branch rewrites an entry only when its text starts
+        with the SESSION prefix. When it does not — the prefix was set again
+        with a different header, or the entry text was rewritten — the branch
+        ``continue``d: the entry shipped RAW while the view still said
+        ``dedup``, so ``substituted`` counted a block that was not
+        substituted and the credit booked at op time never materialized (a
+        phantom saving; probed: est 800 with no marker anywhere).
+
+        Eliding a header that is NOT the current prefix is not an option —
+        the model was never told that text is redundant, so dropping it would
+        delete information (invariant 1). The FORM is what is wrong, so it is
+        demoted to FULL and the signed transition books the refund
+        (``_book``), with ONE event per session.
+        """
+        for bid in list(self.view.forms.keys()):
+            if self.view.form_of(bid) != "dedup":
+                continue
+            block = self.universe.blocks.get(bid)
+            if block is None or getattr(block, "note", False):
+                continue
+            idx = block.msg_index
+            text = (_msg_text(msgs[idx])
+                    if idx is not None and 0 <= idx < len(msgs) else None)
+            if text is None:
+                text = block.text
+            if self.system_prefix and text.startswith(self.system_prefix):
+                continue                      # still applicable: nothing to do
+            credit = int(self._dedup_credit.get(bid) or 0)
+            prev = self._pre_state(bid)
+            self.view.set(bid, "full", "")
+            rec = self._book({"op": "dedup_lapsed", "refs": [bid], "ok": True},
+                             bid, prev)
+            # ``view_text`` already models "cannot apply = full width", so the
+            # recomputed transition is 0 here; the honest refund is the credit
+            # the op BOOKED (see ``_dedup_credit``).
+            rec["saved"] = -credit
+            rec["refunded"] = -credit
+            # The refund lands on the CUMULATIVE flow (``est_saved_session``),
+            # not on this turn's stage sum: the credit it cancels was booked by
+            # an EARLIER turn, and ``saved_chars`` is documented as the seam
+            # stage sum of the turn that ran the stages (§12.56-B calibers).
+            self.est_chars_saved -= credit
+            if not self._dedup_lapsed_seen:
+                self._dedup_lapsed_seen = True
+                self._emit({"type": "cm_dedup_lapsed", "turn": self.turn,
+                            "refs": [bid], "refunded": -credit,
+                            "detail": "the dedup form no longer applies (the "
+                                      "entry does not start with the current "
+                                      "session prefix); demoted to FULL and "
+                                      "the credit refunded"})
 
     def render(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Materialize the CURRENT persistent view into shallow copies.
 
-        A block's text is only ever replaced by its own excerpt/head_tail cut
-        or the frozen placeholder (or the metadata template) — the view
-        cannot fabricate content (§5.2 不变量 1). Idempotent: an entry whose
-        content already carries the block's baked artifact is left alone."""
+        A block's text is only ever replaced by its own head_tail cut (at
+        the session keep), the frozen placeholder line, or the catalog-card
+        line — the view cannot fabricate content (§5.2 不变量 1). Idempotent:
+        an entry whose content already carries the block's baked artifact is
+        left alone.
+
+        C (docs/19 §12.55): rendering is only legal on the turn's CANONICAL
+        list. A block's ``msg_index`` is an index into that list, so rendering
+        any other list would write the form over whichever message now sits at
+        that index. A non-canonical list is returned as untouched copies and
+        the refusal is spoken once (``cm_render_off_canonical``)."""
+        self._require_msg_dicts(msgs, "render")
+        if self._note_off_canonical(msgs, "render"):
+            return [dict(m) if isinstance(m, dict) else m for m in msgs]
+        # F (§12.58): a form that cannot apply must not keep claiming a
+        # substitution. Runs on the CANONICAL list only (the gate above).
+        self._lapse_forms(msgs)
         by_msg: Dict[int, List[Block]] = {}
         for block in self.universe.ordered():
             form = self.view.form_of(block.block_id)
@@ -952,36 +2994,33 @@ class CMSession:
             for block in blocks:
                 form = self.view.form_of(block.block_id)
                 rule = self.view.rules.get(block.block_id, "")
-                if f"[block {block.block_id} " in content:
+                # idempotency looks at what would ACTUALLY be sent: the
+                # projection when one is already attached, else the raw text
+                if f"[block {block.block_id} " in (m.get(_SENT_KEY) or content):
                     continue  # already baked in an earlier turn (idempotent)
                 if form == "placeholder":
-                    new_text = placeholder(block, rule or "view")
-                elif form in ("excerpt", "head_tail"):
-                    keep = EXCERPT_KEEP if form == "excerpt" else HEAD_TAIL_KEEP
-                    new_text = (cut(block.text, keep)
-                                + f"\n[block {block.block_id} {form}: {rule or 'view'}]")
+                    new_text = self.view_text(block, "placeholder",
+                                              rule or "view")
+                elif form == "head_tail":
+                    new_text = self.view_text(block, "head_tail",
+                                              rule or "view")
                 elif form == "derived_host":
                     # the host span renders the DERIVED text IN FULL (the
                     # merge/template already did the compressing). The baked
                     # marker carries the HOST id, so the idempotency check
                     # and the view-marker re-bind above keep working on the
                     # next turn (docs/10 §15).
-                    dblock = (self.universe.get(rule[len("derived="):])
-                              if rule.startswith("derived=") else None)
-                    if dblock is None:
-                        continue  # unreachable (universe add-only): stay raw
-                    new_text = (dblock.text
-                                + f"\n[block {block.block_id} derived_host: {rule}]")
+                    new_text = self.view_text(block, "derived_host", rule)
                 elif form == "dedup":
                     if self.system_prefix and new_content.startswith(self.system_prefix):
                         new_text = _DEDUP_MARKER + new_content[len(self.system_prefix):]
                     else:
                         continue
-                else:  # template
-                    meta = block.to_meta()
-                    new_text = (f"[block {block.block_id} template: "
-                                f"kind={meta['kind']}, chars={meta['chars']}, "
-                                f"source={meta['source']}]")
+                else:  # template — catalog CARD, not an eviction event (the
+                    # line never claims a loss); restorable via fetch(full)
+                    # like every non-full form (docs/10 form 语义声明,
+                    # docs/19 §12.20/§12.21)
+                    new_text = self.view_text(block, "template", rule or "view")
                 if form == "dedup":
                     new_content = new_text  # prefix elision (anchored at head)
                 elif block.text and block.text in new_content:
@@ -990,30 +3029,65 @@ class CMSession:
                     # the span drifted (result embedded with decorations): a
                     # whole-message placeholder keeps the view honest without
                     # fabricating anything
-                    new_content = placeholder(block, f"span-drift:{rule or form}")
+                    new_content = bake(block, "placeholder",
+                                       f"span-drift:{rule or form}")
                     break
             if new_content != content:
                 shallow = dict(m)
-                # write back under the entry's OWN key: the canonical history
-                # mixes ``text``-form and ``content``-form entries, and the
-                # client's text->content conversion keys off exactly these
-                shallow["content" if isinstance(m.get("content"), str)
-                        else "text"] = new_content
+                # THE PROJECTION, never a carrier (docs/19 §12.54-B, I3):
+                # ``content`` keeps the canonical bytes; ``_cm_sent`` carries
+                # what this call ships. The payload builder consumes and
+                # strips it, so the two meanings live in two keys instead of
+                # fighting over one.
+                shallow[_SENT_KEY] = new_content
                 out[idx] = shallow
         return out
 
     def note_violation(self, rec: Dict[str, Any]) -> None:
-        """Count + emit one op refusal (idempotent with the seam path: the
-        seam's ``count_ops`` only emits for records that did NOT come from a
-        handle audit — tracked via the record marker below)."""
+        """Count + emit one POLICY-FACE op refusal (idempotent with the seam
+        path: the seam's ``count_ops`` only emits for records that did NOT
+        come from a handle audit — tracked via the record marker below).
+
+        This is the COUNTED half of the OP-REFUSAL family (``cm_violation``
+        with ``source="policy_face"``, docs/19 §12.47): an attempt that did
+        not take effect, counted in ``violations``/``ops_refused``. The
+        agent tool face has its own UNCOUNTED event
+        (``note_face_violation``); the reconcile's contract-breach family is
+        ``_note_violations`` (per-subsystem event types, §12.17.1) — see the
+        vocabulary map on :meth:`_audit`."""
         if rec.get("_audited"):
             return
         rec["_audited"] = True
         self.violations += 1
         self.ops_refused += 1
         self._emit({"type": "cm_violation", "turn": self.turn,
+                    "source": "policy_face",
                     "op": rec.get("op"), "refs": rec.get("refs"),
                     "error": rec.get("error")})
+
+    def note_face_violation(self, rec: Dict[str, Any], *,
+                            face: str = "agent") -> None:
+        """Emit one AGENT-TOOL-FACE op refusal (docs/19 §12.47, F3).
+
+        Semantically the same OP-REFUSAL fact as ``cm_violation`` (CM refused
+        an attempt on its own semantic grounds — pinned/note form guards,
+        unknown block, note cap, ...), but a SEPARATE event type and NO
+        counter increment on purpose: agent tool-face records never flow
+        through ``finalize_turn``/``count_ops``, so folding them into
+        ``violations``/``ops_refused`` would break the documented alias and
+        the ``ops_total == applied + refused + ...`` invariant (§12.44 D5).
+        Scanners counting a session's refusals must subscribe to both event
+        types (the two-family pattern of §12.39.4).
+
+        Not deduped via the record's ``_audited`` marker: agent records never
+        reach ``count_ops``, so there is no second writer to collide with.
+
+        Call refusals by the tool-dispatch layer (unknown/missing parameters)
+        and the no-session refusal are NOT this fact — they never reach CM
+        (L1/L3 layers)."""
+        self._emit({"type": "cm_face_violation", "turn": self.turn,
+                    "face": face, "op": rec.get("op"),
+                    "refs": rec.get("refs"), "error": rec.get("error")})
 
     def emit_view(self, saved: int,
                   records: Optional[List[Dict[str, Any]]] = None) -> None:
@@ -1022,9 +3096,15 @@ class CMSession:
         audit: what was kept/dropped, by which rule, addressable by block id
         (docs/10 §5.2.3; the aggregate ``stats`` stay alongside)."""
         ops_brief: List[Dict[str, Any]] = []
-        for rec in (records or [])[:max(1, self.max_ops_per_turn)]:
-            if not rec.get("ok") or rec.get("op") == "policy":
-                continue  # refusals ride cm_violation; the run itself is not a view op
+        # N2 (docs/19 §12.33): filter BEFORE the cap. Refusals ride
+        # cm_violation and the policy run itself is not a view op, but the
+        # old slice-first order let them waste brief slots and pushed real
+        # applied mutations out of the 对账 half. The brief is the first
+        # ``max_ops_per_turn`` APPLIED mutations; the accounting (count_ops)
+        # stays full-fidelity regardless of this presentation cap.
+        applied = [rec for rec in (records or [])
+                   if rec.get("ok") and rec.get("op") != "policy"]
+        for rec in applied[:max(1, self.max_ops_per_turn)]:
             brief = {"op": rec.get("op"),
                      "refs": list(rec.get("refs") or []),
                      "rule": str(rec.get("rule")
@@ -1035,9 +3115,57 @@ class CMSession:
                 # byte-identical — same pattern as degraded/assembly_disabled)
                 brief["derived"] = str(rec.get("derived"))
             ops_brief.append(brief)
+        stats: Dict[str, Any] = self._turn_stats(saved)
+        self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
+                    "ops": ops_brief, "stats": stats})
+        self._view_emitted_turn = self.turn
+
+    def _take_agent_delta(self) -> int:
+        """Read-and-reset the agent tool-face flow booked since the last
+        ``cm_view`` (docs/19 §12.46). The delta is already in the session
+        total; this only moves it into the per-turn export."""
+        delta = self._agent_saved_pending
+        self._agent_saved_pending = 0
+        return delta
+
+    def _turn_stats(self, saved: int) -> Dict[str, Any]:
+        """THE one per-turn ``stats`` shape for BOTH ``cm_view`` paths.
+
+        ``emit_view`` (the post segment closed) and ``_emit_synthetic_view``
+        (an assembly that legally skipped the post segment) used to build
+        their dicts separately — exactly how the synthetic brief's
+        ``substituted`` caliber drifted from the session's (NON-FULL forms vs
+        ``len(view.forms)``; docs/19 §12.46). One builder, one caliber.
+
+        N4 additions (both CONDITIONAL — absence is meaningful, so the
+        default passthrough shape stays byte-identical):
+        * ``agent_saved_chars`` — the agent tool-face source delta folded
+          into this turn (signed; never mixed into the seam-scope
+          ``saved_chars``);
+        * ``send_source`` — who produced this turn's SENT history. ABSENCE =
+          the framework post segment (``finalize_turn`` -> ``render``);
+          ``"identity"`` = passthrough sent the input as-is; ``"author"`` =
+          a named assembly returned its own history.
+
+        The QUANTITATIVE half of that same question is NOT here: the
+        claim-vs-wire comparison rides its own ``cm_send_fact`` event (per LLM call,
+        docs/19 §12.54-C), because ``cm_view`` is emitted during assembly —
+        before the payload exists. Keeping them apart avoids an event that
+        describes one turn's promise with another turn's fact.
+        """
+        # K (§12.62): one builder, one place the ordinals advance — every
+        # emitted view (normal OR synthetic) is addressable, and a consumer can
+        # name "the last view of turn T" without relying on stream order.
+        self.view_seq += 1
+        self._turn_view_seq += 1
+        self._last_view = (self.view_seq, int(saved), self.turn)
         stats: Dict[str, Any] = {"blocks": len(self.universe.blocks),
-                                 "substituted": len(self.view.forms),
+                                 # docs/19 §12.44 D5: NON-FULL forms only —
+                                 # same caliber as summary()'s substituted.
+                                 "substituted": self._substituted_blocks(),
                                  "saved_chars": saved,
+                                 "view_seq": self.view_seq,
+                                 "view_in_turn": self._turn_view_seq,
                                  "est_saved_session": self.est_chars_saved,
                                  "policy_disabled": self.policy_disabled}
         # conditional audit fields: they materialize only in the states they
@@ -1047,13 +3175,24 @@ class CMSession:
             stats["degraded"] = True
         if self.assembly_disabled:
             stats["assembly_disabled"] = True
-        self._emit({"type": "cm_view", "turn": self.turn, "mode": self.mode,
-                    "ops": ops_brief, "stats": stats})
-        self._view_emitted_turn = self.turn
+        agent_delta = self._take_agent_delta()
+        if agent_delta:
+            stats["agent_saved_chars"] = agent_delta
+        if self._finalized_turn != self.turn:
+            stats["send_source"] = ("identity" if self.mode == "passthrough"
+                                    else "author")
+        # C (docs/19 §12.55): the send could not be rendered because the list
+        # was not the canonical one. Conditional (absence = the view shipped),
+        # and it is the ONLY trace when an assembly feeds a reordered list:
+        # the send fact agrees with itself there (claim and payload are both
+        # the unrendered list), so drift cannot see it.
+        if self._turn_unrendered:
+            stats["send_unrendered"] = True
+        return stats
 
 
 def build_session(keys: Dict[str, Any], *, emit: Optional[Callable] = None,
-                  budget_reader: Optional[Callable] = None,
+                  usage_reader: Optional[Callable] = None,
                   policy_path: Optional[str] = None,
                   assembly_path: Optional[str] = None) -> CMSession:
     """Factory: already-clamped effective keys -> a ready session. Unknown or
@@ -1061,7 +3200,7 @@ def build_session(keys: Dict[str, Any], *, emit: Optional[Callable] = None,
     parent-side); the safe defaults are the passthrough posture. The named
     assembly path is FRAMEWORK-RESOLVED (the snapshot/component tree), never
     a design value: keys carry only the name."""
-    session = CMSession(emit=emit, budget_reader=budget_reader,
+    session = CMSession(emit=emit, usage_reader=usage_reader,
                         policy_path=policy_path, assembly_path=assembly_path)
     session.apply_keys(keys or {})
     return session

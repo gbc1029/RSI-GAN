@@ -132,7 +132,14 @@ class LocalLLMRelay:
             upstream.settimeout(None)
             threads = []
             for source, target in ((client, upstream), (upstream, client)):
+                # ③ (docs/19 §12.65): NAMED so the CM leak census (§12.59)
+                # excludes framework plumbing by prefix. Unnamed they were
+                # `Thread-N`, i.e. counted as a module-spawned leak — measured
+                # 2026-11-09 R1: cm_thread_leak_delta=1 on a healthy
+                # planner/plan seat (86 frames later, still alive: exactly the
+                # relay's two pump halves).
                 t = threading.Thread(target=self._copy, args=(source, target),
+                                     name="rsi-gan-llm-relay-pump",
                                      daemon=True)
                 t.start()
                 threads.append(t)

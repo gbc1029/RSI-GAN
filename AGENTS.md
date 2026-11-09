@@ -41,26 +41,128 @@ live under `scripts/dgmh/`.
   block model, primitives, the per-turn seam (``assemble_turn`` DISPATCHES
   only; the pipeline itself is the baseline assembly ``assembly.py`` — one
   named preset per ``cm_mode``, composed over the session's frozen primitive
-  methods; invariants live in the primitives, never in the pipeline source,
+  methods; invariants live in the primitives, never in the pipeline source;
+  the SENT TEXT of every form and the saving number are single-sourced in
+  the session: ``view_text`` (context-free forms delegate to ``bake``; dedup /
+  derived_host are session-anchored) and the accounting funnel books `saved`
+  as a SIGNED TRANSITION delta from the previous rendered form (`cm_window_k`
+  counts LLM CALLS — one call = assistant reply + its tool-output entry, so
+  `k` = 2k entries; the window, the compaction tier and dedup all share ONE
+  membership rule, `_window_kept_ids`, docs/19 §12.56; a dedup form that can
+  no longer apply is DEMOTED to full with an exact refund rather than left
+  claiming a substitution, docs/19 §12.58; every `cm_view` carries `view_seq`
+  / `view_in_turn`, and a view rolled back by the fail-open replay is
+  RETRACTED by its own `cm_view_retracted` event rather than rewritten, so
+  `sum(saved_chars) - sum(retracted)` is the authoritative turn delta and "the
+  last view" is decided by the ordinals, never by stream order, docs/19 §12.62) — primitives
+  carry no ``saved``, a repeated/no-op op books 0, a restore refunds, and
+  ``pin`` on an already-elided block restores it to FULL (dedup the only
+  exempt non-full pinned form; docs/19 §12.40 — the P1 ``pinned_form``
+  invariant is therefore enforced at the entry, never left for the
+  reconcile to misattribute to an innocent module); a DERIVED node may be
+  consumed ONCE (depth-N derivation is legal) and the consumption pin —
+  which keeps the lineage a tree, ≤1 consumer per node — is EXEMPT from
+  the reconcile's fourth question via the primitive's own `pinned`
+  evidence set (docs/19 §12.52, N1); a block's ``msg_index`` is its RENDER
+  ADDRESS whose ONLY legal domain is the turn's CANONICAL history — exactly
+  (same length, same ``(role, text)`` per index): the framework registers the
+  canonical itself at the turn boundary (``_open_turn``), a mismatching list
+  from agent code is sent but never registered
+  (``cm_register_history_refused``), and ``render``/``finalize_turn`` refuse to
+  render a non-canonical list at all (``cm_render_off_canonical`` +
+  ``cm_view.stats.send_unrendered`` + ``summary().send_unrendered_turns`` ⇒
+  cost key ``cm_send_unrendered``); the address map rides the
+  snapshot/restore, and the sixth reconcile question (``msg_index_moved``)
+  allows only same-text / own-baked-form / unbound-binds-to-own-text moves
+  (docs/19 §12.53, §12.55 — the old "canonical prefix + appended entries"
+  allowance was removed because an appended entry never enters the next turn's
+  canonical, so its address was a misaddress one turn later, finding C),
   and ``resolve()`` also loads the P2 NAMED agent-owned assembly (``cost.cm_assembly``
   design key → ``gan/components/<role>/cm/<stem>.py``, delivered as
   ``cm_assembly.py`` / policy as ``cm_policy.py`` under FIXED names so the
-  child env pins are static; load-once per session, per-turn exec budget,
-  2-strike wedge breaker, fail-open to the preset — every fallback leaves
-  durable events + ``degraded``/``assembly_disabled`` cm_view stats; the P3
-  in-process p/e seats resolve the SAME named slots workspace-first at
-  session build (``loop._resolve_cm_module``, no sort-order discovery — an
-  unresolved claim is a loud ``cm_module_unresolved`` and custom degrades to
-  the slice preset with its keys rewritten), with per-path sys.modules keys
+  child env pins are static; load-once per session, and the per-turn exec
+  budget covers LOAD+execute — module-level code is agent code, so a
+  top-level hang is a load-phase timeout, never a session hung outside
+  every budget; failure semantics (docs/19 §12.17, UNIFORM for both
+  agent-owned module kinds): load-once per session with the failure cached
+  (a mid-session edit must not change the seam; load-once caches the
+  MODULE — apply/assemble still run every turn), ONE strike disables the
+  module for the session (load crash, load timeout, or run failure — a
+  crash on byte-identical retries is deterministic), plus a loop-level
+  kind-keyed fingerprint latch (clamped keys + module bytes, released when
+  either changes; descriptor flags ``assembly_disabled``/``policy_disabled``,
+  both ADDITIVE), fail-open to the preset — every fallback leaves durable
+  events (with ``phase``) + ``degraded``/``assembly_disabled`` cm_view
+  stats; policy failures ride ``policy_report`` → ``recent["cm_policy"]``
+  into both self-improve prompts (mirror of the assembly report channel);
+  the agent-owned assembly receives the P2 ``SessionPortal``
+  (narrowed facade) and a per-turn BOUNDARY COPY of msgs (deepcopy; the
+  canonical list is unreachable by construction and the fallback preset
+  replay always runs on the pristine real list — docs/19 §12.36; the P1
+  texts layer survives as the escape-tier tripwire, so
+  ``canonical_mutated`` can no longer fire for named turns), and the
+  portal's ``register_outgoing`` returns a SNAPSHOT copy of the block —
+  the live universe object is unreachable by construction too, with the
+  reconcile's fifth question (registration identity) as the escape-tier
+  backstop and the overrun counters riding the P1 counters tuple
+  (docs/19 §12.38) — and agent-owned turns are reconciled at turn end
+  (P1 snapshot/reconcile/restore on BOTH the named-assembly branch and the
+  custom policy tail — also the backstop for attribute-level escapes: a
+  ``_s``-escape on the policy path is caught, restored, contract-struck;
+  the baseline stages' refs are folded before the policy snapshot so the
+  reconcile does not false-positive on their form changes — docs/19 §12.18);
+  in-process p/e seats resolve the SAME named slots
+  workspace-first at session build (``cm_wiring.resolve_named`` reached from
+  ``loop._build_cm_session``, no sort-order discovery — an unresolved claim
+  is a loud ``cm_module_unresolved`` and custom degrades to the slice preset
+  with its keys rewritten), while DRIVER-mode p/e seats build the session in
+  the CHILD from the parent-computed descriptor (``role_state.cm``,
+  protocol 2 → ``cm_wiring.build_from_descriptor``; stems resolve
+  child-side, workspace ``<instance>__<seat>`` first then committed), with
+  per-path sys.modules keys
   for the parallel self-improve threads and a preflight pool gate; named
   modules may export a ``METHODS`` dict of custom methods (harvested
   all-or-nothing with ``cm_methods_refused``, assembly > policy shadowing,
   invoked same-level/same-callee via ``handle.call``/``session.call_method``
   — the caller's own privilege, never an escalation), fail-open policy
-  runner, trajectory index (``materialize_traj`` snapshots the seat's visible
-  trajectories as pinned ``traj_seg`` blocks — one scan per session; the
-  read tools and the ``ctx_`` faces share that single genid-qualified
-  address space); STDLIB-ONLY import contract because it is
+  runner, and ONE shared plan-seat wiring (``loop._plan_seat_cm_open/_close``)
+  for BOTH the main plan seat AND the fixed-root evaluation's throwaway
+  planner (``outer_<N>_eval``): design-clamped cost keys, the cm_mode stamp,
+  the CM session/descriptor, the latch, and ``cost_keys_applied`` all apply
+  there too — while evaluation stays cost-isolated (no ``cost_sessions``
+  row); the latch/report tables are keyed ``(role, seat, scope)`` (main vs
+  eval) and the fingerprint watches the EVAL seat's own workspace bytes,
+  so the two seats can never release each other's latch (docs/19 §12.45),
+  trajectory index (``materialize_traj`` snapshots the seat's visible
+  trajectories as pinned ``traj_seg`` blocks — one scan per session WHEN
+  the seat's sandbox can open the files; the read tools and the ``ctx_``
+  faces share the same genid-qualified ADDRESS space, but the single-scan
+  SERVING tier exists only where a materialization happened (a DRIVER-mode
+  p/e seat has no task-trajectory mount — docs/19 §12.48: decision = no
+  mount — so its ctx faces stay empty and ``read_trajectory`` serves Tier 2
+  from the same visible files); the seat layer bounds what the budgets
+  cannot (CM-03
+  residual): an INACTIVITY watchdog (``loop.role_inactivity_timeout_s``,
+  no-frame based — its duration is DERIVED as
+  ``max(llm_client_timeout_s, tool_call_timeout_s) + 300s`` and an explicit
+  value below that bound REFUSES the build, because the longest legitimate
+  frame-free stretch is ONE LLM call or tool call, never the sum of two
+  (docs/19 §12.57); the kill event names ``last_frame`` and converges as
+  ``planner_failed``/``evaluator_failed`` and is deliberately NOT a CM latch
+  signal) plus a post-session hygiene restart when the session summary reports
+  leaked worker threads (``thread_leaks``/``thread_leak_delta`` — conditional
+  fields, absence = clean; framework plumbing threads are excluded by NAME
+  prefix ``rsi-gan-``/``f5-telemetry``/``role-inactivity-watchdog``/
+  ``litellm-logging``, so the
+  census only sees what an agent module actually spawned, docs/19 §12.59; the
+  census also reports WHICH threads: ``thread_leak_names`` is the multiset
+  difference against the build-time name baseline, so a thread already alive
+  when the session opened is never blamed on it — a bare ``delta`` was
+  unattributable and cost two rounds of "something leaked, unknown",
+  docs/19 §12.67); the task seat latches a failed named assembly OR POLICY for the
+  REST of the generation (harness-injected ``GAN_CM_ASSEMBLY_DISABLED`` /
+  ``GAN_CM_POLICY_DISABLED`` — the agent child is per-question);
+  STDLIB-ONLY import contract because it is
   snapshot-delivered into the task sandbox as top-level ``cm``).
 - `gan/tools/` — **always-on** callables: `work/<role>/` (role behavior tools),
   `work/common/` (frozen plumbing: `edit_source`, `read_file`, `list_dir`, `grep`,
@@ -77,8 +179,8 @@ live under `scripts/dgmh/`.
   `task/` (tools + the curated `task/knowledge/*.md` base), `evaluator/`,
   `planner/` (self-authored knowledge/tools); each tree may carry a `cm/`
   pool of THIN context-management wrappers (``ctx_index``/`ctx_fetch`/
-  `ctx_budget`/`ctx_pin`/`ctx_note`/`ctx_view` — task selects only
-  `ctx_budget`/`ctx_note`; its trajectory access rides the
+  `ctx_usage`/`ctx_pin`/`ctx_note`/`ctx_view` — task selects only
+  `ctx_usage`/`ctx_note`; its trajectory access rides the
   `read_trajectory` slice front-end instead).
 - `gan/registries/` — per-role tool catalog: **one single-writer `json` per role**
   (`task.json` / `planner.json` / `evaluator.json`; no shared file) + `loader.py`.
@@ -339,7 +441,7 @@ with a GAN-native data layer.
 ### Data flow and boundaries
 
 - **Permissions = capability by existence (batch 4 axiom)**: reads are physical absence without a grant; writes are not applied without capability. Enforced by what the framework MOVES (`AccessContext` role+seat; REQUIRED no-default on `set_access_context` / `frozen.write_roots` / `frozen.is_allowed` / `AccessBroker.grant` / `code_repo.check_patch|apply_*`; no `legacy` seat; `frozen.any_seat_allows` is the only deliberate union query — classification, never authorization; `AccessBroker` refuses repo-root / self-containing / oversized grants; local check: `scripts/local/test_frozen.py`).
-- **Reserved cost keys & context-management seam (docs/10 phases C/D)**: authority is `gan/framework/cost_keys.py` (`validate_cost_config` shared by schema/set, `effective_all` the ONLY clamp, `cost_keys_applied` events); task budget keys ride the harness stdin payload (never env). Phase-D seam: `agent/llm_withouts._counting_llm` is the single per-turn assembly point — `CMSession` (per-seat, snapshot-loaded) rewrites only what is SENT; per-entry copies keep canonical history + raw trajectory rows untouched; modes `passthrough` (kill switch) / `slice` / `compact_conservative` / `custom`; audit via `cm_violation` / `cm_*` events and the `cm_events.jsonl` sidecar; runtime `cm` savings are DERIVED, never billing.
+- **Reserved cost keys & context-management seam (docs/10 phases C/D)**: authority is `gan/framework/cost_keys.py` (`validate_cost_config` shared by schema/set, `effective_all` the ONLY clamp, `cost_keys_applied` events); task budget keys ride the harness stdin payload (never env). Phase-D seam: `agent/llm_withtools._counting_llm` is the single per-turn assembly point — `CMSession` (per-seat, snapshot-loaded) rewrites only what is SENT; per-entry copies keep canonical history + raw trajectory rows untouched; the canonical rebuild is gated by `seam_applied` (never the sent-view length), so a legally EMPTY sent view still preserves the prior canonical history (docs/19 §12.42); modes `passthrough` (kill switch) / `slice` / `compact_conservative` / `custom`; audit via `cm_violation` / `cm_*` events and the `cm_events.jsonl` sidecar; runtime `cm` savings are DERIVED, never billing. The runtime CM numbers are FOUR separate calibers (docs/19 §12.46, §12.54): the view STATE (`substituted`), the view-transition FLOW split by SOURCE (`saved_chars` per turn is seam-only; `est_chars_saved` is the total, with the agent tool-face half exported as the conditional `agent_saved_chars` / `est_saved_agent` — the two never mix), the SHAPER of the send (conditional `send_source`: `identity` = passthrough sent the raw history, `author` = a named assembly returned its own history, ABSENCE = the framework post segment rendered the send), and the SEND FACT — claim vs wire (`cm_send_fact`, one per LLM call: the widths the render PROMISED against the widths the client actually built, with a conditional signed `drift` + per-entry `mismatch` only on disagreement and `compare:false` where the framework produced no claim). It exists because a rendered view could be dropped between the seam and the provider while every other number stayed healthy — the silent no-op of docs/19 §12.54-C. History entries carry ONE text carrier, `content`; the rendered form of a send copy is the framework-private projection `_cm_sent` (written only by `render`, consumed and stripped only by the payload builder in `agent/llm.py`, deliberately absent from the assembly portal surface) — so "raw" and "rendered" are two keys with two meanings instead of one key with two. The OP-REFUSAL family is split by `cm_violation.source` (`policy_face` | `seam_record`), and the AGENT tool face rides its own UNCOUNTED `cm_face_violation` (`face="agent"`, docs/19 §12.47) — it is outside the `count_ops` universe, so it never moves `violations`/`ops_refused`; scanners must subscribe to both event types. One `_turn_stats` builder feeds both the normal and the synthetic `cm_view`, so their calibers cannot drift. The cost-record `cm` node keeps three facts distinct by construction (docs/19 §12.43): a failure is a STRIKE event, a disabled flag is a STATE (bool), an overrun is ADVISORY — never summed together; the refusal/breach families stay separate keys too (`cm_violations` = the counted op-refusal half, `cm_face_violations` = the agent-face half — audit-only, never degradation, docs/19 §12.50 — and `cm_*_violations` = contract breaches). The cost row's `cm` node is ONE pure transform (`loop._cm_cost_node`) gated on "a session exists" — never on `turns`, so a 0-turn session's `policy_disabled`/`assembly_disabled` facts are not mistaken for "CM was never wired", and the whitelist's two-way coverage (no dropped field, no dead entry) is tested against a session that can report everything (docs/19 §12.64). The evaluator's receipt `budget` (and its reduced `cm`) is a NAMED projection with explicit allowlists (docs/19 §12.44), and the task child's CM degradation reaches both roles once each (planner `budget.task_cm_degraded`, evaluator `run_summary.task_cm_degraded`) — covering RUNTIME strikes/disabled AND the BUILD-time `cm_session_degraded` fact (docs/19 §12.47.7).
 - **Planner→evaluator isolation**: every evaluator-facing channel is a NAMED PROJECTION (explicit allowlist transform) — summary is ops-only (files exited; changed files are an outcome fact owned by `meta_view.task_patch_files`, grant facts ride `ops[].paths`), receipt exposes only outcomes (`receipt.design.ops`), run summary exposes only `run_summary.meta`/`run_summary.receipt` (no `rejected_reason` full text, which quotes the planner's artifacts), feedback digest exposes only `issue_id`/`accepted`/`stance`. A NEW meta key or receipt field is invisible to the evaluator until its projection is extended on purpose (default-deny, mirroring the role access allowlist). The planner responds to issues with a REQUIRED structured stance (`response_kind`: acted / acted_differently / out_of_scope / disputed / deferred) — the evaluator calibrates on decisions, never on persuasion.
 - **Artifact vs rationale (B29, batch 16)**: the ARTIFACT under evolution gets structural facts; the planner's RATIONALE gets nothing. `set_prompt` / `set_config(key="prompt")` record `prompt_change_facts` (chars/lines/prev_*/added_lines/removed_lines/similarity/char_similarity/char_survival/changed_from_to/sha256_12/empty/equals_seed — numbers and hashes only, never text), and `DesignContext.record` stamps `target_role` for every design record (framework-owned, written after the caller's fields so it cannot be shadowed). Those facts are whitelisted into `build_diff_summary` and `receipt.design.ops`. The prompt TEXT is deliberately not projected: it is audit evidence the evaluator may fetch from the task trajectory (`read_trajectory` archives the child's input message verbatim, redacted only for benchmark/score strings), never an assertion pushed into its decision surface — the isolation is on the PROMPT surface, not on the read surface; the AUTHOR side reads its own draft via `get_config` (same object the R2 gate compares against). This does NOT relax the `respond_issue.feedback` rule: its derived statistics stay banned.
 - Evaluator feedback is **text** (a digest), not a numeric reward; the evaluator must not fit the benchmark score (blind score first, then reveal).
@@ -432,7 +534,61 @@ non-repeatable:
 - Active design docs outside that consolidation: `docs/9_多域评测设计.md`,
   `docs/10_成本反馈闭环设计.md`, `docs/11_消融实验设计.md` (ablation matrix +
   switch→consumer authority, incl. §3.1 new-sandbox execution-position map)
-  (and `docs/cost_tem.md`).
+  (and `docs/cost_tem.md`); `docs/19_CM问题与解决.md` (CM audit ledger +
+  §12 batch records — the authority for CM done/open status; the `outer=2`
+  real-round acceptance is PASSED (§12.22); still open there:
+  T3 process isolation deferred (F5 — audit-stream write authority +
+  parent-side hash chain — has since landed in §12.28, see below);
+  CM-08 trajectory seat reads CLOSED in §12.24 (segment index/query RPC,
+  offset/fetch/tail/head/grep, per-request 120k cap); CM-06 CLOSED in
+  §12.25 — usage face renamed ctx_budget→ctx_usage (budget = runtime cap,
+  usage = meter) + tokens split input/output/reasoning (absent when
+  unreported), ⑥ ctx_view stats ruled won't-fix); the CM permission-surface
+  batch CLOSED in §12.27 — make_face_tool param boundary (spec params
+  enforced, keyword-only, no internal-name leaks), load_policy runs the
+  guarded-cm import gate, POLICY_FACES narrowed to read+shrink (D8 ruled
+  direction (b) thorough: no pin/unpin/note on the policy face; protection
+  = agent ctx_pin/presets, creation = ctx_note; policy-turn pinned delta
+  caught by the reconcile's fourth question); F5 audit-stream write
+  authority moved to the parent (§12.28 — seat trajectory rows arrive as
+  protocol messages, task child forwards over the telemetry socket,
+  role_broker no longer grants the trajectory dir, parent-side hash chain
+  in gan/framework/traj_chain.py, offline verifier verify_stream); the
+  §12.40 F1+F2 batch (2026-11-05 deep-audit follow-up) closed the
+  pin-semantics hole and the saving caliber: ctx_pin on an elided block
+  restores FULL (dedup the only exempt form; entry-level convergence, so
+  `pinned_form` no longer misattributes an innocent module), and
+  `saved` is the SIGNED TRANSITION width delta from the single
+  `CMSession.view_text` source (primitives carry no `saved`; dedup /
+  derived_host anchored forms + stale-reference re-points are included;
+  C.1's small-block widening is recorded honestly instead of clamped).
+  The F4/F5 description-face items (agent-facing registry descriptions /
+  params_schema, the `_cm_latch_scan` docstring) and the doc/comment
+  errata are closed by the TEXT-ONLY batch (§12.41 — zero behavior change);
+  the §12.42 F3 batch closed the seam empty-history hole: the canonical
+  rebuild is gated by `seam_applied` (never by the sent-view LENGTH), so a
+  named assembly that legally returns `[]` no longer replaces the prior
+  conversation; `n_viewed` is only the offset into the client's rebuilt
+  history, and canonical stays AS-SENT (user turns keep the per-turn
+  tool-use header; no dedup marker ever enters it). F6 (cost aggregation
+  caliber) is closed by §12.43: `cm_*_failures` counts STRIKE events only,
+  `cm_*_disabled` is a BOOL state (disabled/latched/cm_view stats merged),
+  `cm_*_overruns` is the ADVISORY counter (never a failure),
+  `cm_*_violations` is its own family, and both transports share ONE
+  mapping helper (`_cm_node`). F7 is closed by §12.44: the evaluator's
+  receipt `budget` is now a NAMED projection (explicit allowlist +
+  reduced cm node with `cm_degraded`, never the planner's module report /
+  `last_error` / `where`), both roles get the task child's CM degradation
+  once each (plan receipt `budget.task_cm_degraded` / evaluator
+  `run_summary.task_cm_degraded`), the cost record's `cm` whitelist
+  carries the violation/overrun families + `thread_leaks_live` +
+  `substituted`, and `substituted` is the NON-FULL form count in BOTH
+  `summary()` and `cm_view.stats` (`violations` is documented as the
+  `ops_refused` alias). F5 (the fixed-root evaluation's plan seat ran without
+  any CM/cost-key wiring) is closed by §12.45: the main plan seat's wiring was
+  extracted into one helper used by BOTH seats, and the latch/report tables
+  became `(role, seat, scope)`-keyed (closing the F4 instance blind spot) —
+  evaluation still writes no `cost_sessions` row.
 - Environment/deployment record: `docs/archive/1_DGMH部署记录.md` and `README.md`
 
 ## Base license

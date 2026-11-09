@@ -33,14 +33,21 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from gan.framework import paths
 from utils import trajectory_log
 
 _STATEMENT_MAX_CHARS = 1500
 _RECONCILE_MISMATCH_CAP = 20
+# Outer-tree labels are ``outer_<N>`` for the main chain and ``outer_<N>_eval``
+# for the fixed-root evaluation instance (docs/19 §12.68). The reconcile used
+# to hard-cast the label with ``int()``, so an ``_eval`` tree raised ValueError
+# and the whole tree was SKIPPED — the eval seat's tokens then appeared on the
+# audit side only and produced a permanent false mismatch.
+_OUTER_LABEL_RE = re.compile(r"^(\d+)(_eval)?$")
 
 
 # -- row helpers -------------------------------------------------------------
@@ -113,54 +120,135 @@ def _llm_sidecar_metrics(path: str) -> Optional[Dict[str, Any]]:
             "llm_time_s": round(total_s, 3)}
 
 
+def _last_cumulative_est(rows: List[Dict[str, Any]], key: str = "kind") -> int:
+    """R-C2 (docs/19 §12.39.6): the LAST cm_view's cumulative
+    ``est_saved_session`` — not the sum of per-turn ``saved_chars``, which
+    systematically misses between-turn handle ops (agent-face ctx_* ops
+    book into the session cumulative without a cm_view row). Residual
+    (declared): ops in the final tool phase after the last cm_view.
+
+    M (docs/19 §12.62): "last" is decided by the view's OWN ordinals
+    (``(turn, view_seq)``) instead of by stream position, because one turn can
+    emit MORE than one ``cm_view`` (a named assembly that closes the turn and
+    then fails — the fail-open preset replays it; K). Stream order was only
+    right by accident there, and a merged/echoed event stream could invert it.
+
+    Backward compatible: rows written before the ordinals existed carry
+    neither key, so they tie at ``(turn, 0)`` and the file position decides —
+    byte-identical to the old behavior on old logs."""
+    est = 0
+    best: Optional[Tuple[int, int, int]] = None
+    for i, r in enumerate(rows):
+        if r.get(key) != "cm_view":
+            continue
+        stats = r.get("stats") or {}
+        cur = (int(r.get("turn") or 0), int(stats.get("view_seq") or 0), i)
+        if best is None or cur >= best:
+            best = cur
+            est = int(stats.get("est_saved_session") or 0)
+    return est
+
+
+def _cm_node(items: List[Dict[str, Any]], *,
+              type_of: Callable[[Dict[str, Any]], str],
+              stats_of: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]
+                                 ]) -> Dict[str, Any]:
+    """ONE CM event→field mapping for BOTH transports (F6, docs/19 §12.43).
+
+    ``failures`` counts STRIKE events only (``cm_*_failed``); ``overruns`` is
+    the ADVISORY counter (a completed-over-budget run is honored, never a
+    failure); ``disabled`` is a BOOL merging the disabled event, the latch
+    event and the per-turn ``cm_view`` stat (a latched session emits no
+    failed/disabled event, and a role seat may only carry the stat).
+    ``*_violations`` count the contract-breach family (``cm_*_violation``),
+    which is NOT the op-refusal ``cm_violations`` family (docs/19 §12.39.4).
+    ``cm_face_violations`` counts the AGENT tool-face refusals
+    (``cm_face_violation``, docs/19 §12.47/§12.50) — the op-refusal family's
+    UNCOUNTED half. It is deliberately a THIRD key rather than a widening of
+    ``cm_violations``: that key keeps its meaning (the counted half: policy
+    face + seam records), so a reader can never mistake the two, and the
+    refusal is not a strike/disabled fact either (``task_cm_degraded`` must
+    stay False for it).
+    ``cm_session_degraded`` is the BUILD-time fact (the child never built a
+    seam at all — ``cm_session_degraded`` event, docs/19 §12.47.7); it is a
+    BOOL, not a counter, and it is the one key here that is NOT a strike or a
+    per-turn stat: a build failure has no module and no turn to strike.
+    """
+    types = [type_of(it) for it in items]
+
+    def n(kind: str) -> int:
+        return types.count(kind)
+
+    view_stats = [stats_of(it) or {} for it in items
+                  if type_of(it) == "cm_view"]
+
+    def disabled(prefix: str) -> bool:
+        return bool(n(f"cm_{prefix}_disabled") or n(f"cm_{prefix}_latched")
+                    or any(bool(s.get(f"{prefix}_disabled"))
+                           for s in view_stats))
+
+    facts = [it for it in items if type_of(it) == "cm_send_fact"]
+
+    return {
+        "cm_view_turns": n("cm_view"),
+        "cm_send_facts": len(facts),
+        # SEND FACT (docs/19 §12.54-C): turns where the client's measured
+        # payload disagreed with the render's claim. A framework bug, not a
+        # module failure — deliberately NOT part of ``cm_degraded``.
+        "cm_send_mismatches": sum(1 for f in facts if f.get("drift")),
+        # C (docs/19 §12.55): sends refused rendering because the list was not
+        # the canonical one. A capability refusal, never a module failure —
+        # deliberately NOT part of ``cm_degraded``.
+        "cm_send_unrendered": n("cm_render_off_canonical"),
+        "cm_violations": n("cm_violation"),
+        "cm_face_violations": n("cm_face_violation"),
+        "cm_policy_failures": n("cm_policy_failed"),
+        "cm_policy_disabled": disabled("policy"),
+        "cm_policy_overruns": n("cm_policy_overrun"),
+        "cm_policy_violations": n("cm_policy_violation"),
+        "cm_assembly_failures": n("cm_assembly_failed"),
+        "cm_assembly_disabled": disabled("assembly"),
+        "cm_assembly_overruns": n("cm_assembly_overrun"),
+        "cm_assembly_violations": n("cm_assembly_violation"),
+        "cm_session_degraded": bool(n("cm_session_degraded")),
+        "cm_budget_warnings": n("cm_budget_checkpoint"),
+    }
+
+
 def _cm_summary(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Aggregate the session's ``cm_*`` trajectory rows (docs/10 §11 D12).
 
     Returns None when the session had no CM rows (None ≠ 0 — a seam-free
     session must not read as a zero-ops one). Content-free: the rows already
-    are; this only counts."""
-    if not any(str(r.get("kind", "")).startswith("cm_") for r in rows):
+    are; this only counts. ``kind`` is the trajectory convention, ``type`` is
+    what a CM event sink appends verbatim (direct ``Role`` construction / old
+    runs) — BOTH are accepted so the fallback aggregation is not dead
+    (docs/19 §12.43). Seat sessions built by the loop sink CM events into
+    ``events.jsonl`` instead, so their authoritative numbers come from
+    ``CMSession.summary`` (docs/19:1272/1630)."""
+    if not any(str(r.get("kind") or r.get("type") or "").startswith("cm_")
+               for r in rows):
         return None
-    return {
-        "cm_view_turns": _count(rows, "cm_view"),
-        "cm_violations": _count(rows, "cm_violation"),
-        "cm_policy_failures": (_count(rows, "cm_policy_failed")
-                               + _count(rows, "cm_policy_disabled")
-                               + _count(rows, "cm_policy_overrun")),
-        "cm_assembly_failures": (_count(rows, "cm_assembly_failed")
-                                 + _count(rows, "cm_assembly_disabled")
-                                 + _count(rows, "cm_assembly_overrun")),
-        "cm_budget_warnings": _count(rows, "cm_budget_checkpoint"),
-        "est_chars_saved": sum(int(r.get("stats", {}).get("saved_chars") or 0)
-                               for r in rows if r.get("kind") == "cm_view"),
-    }
+    out = _cm_node(rows,
+                   type_of=lambda r: str(r.get("kind") or r.get("type") or ""),
+                   stats_of=lambda r: r.get("stats"))
+    out["est_chars_saved"] = _last_cumulative_est(rows)
+    return out
 
 
 def cm_summary_from_events(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Aggregate CM events (the sidecar/ingested form) into a cost-record
-    ``cm`` summary — same shape as :func:`_cm_summary` but keyed on the event
+    ``cm`` summary — same shape as :func:`_cm_summary`, keyed on the event
     ``type`` field: the task child's seam events arrive via events.jsonl
     (role-attributed by task_runner's ingest), not the trajectory. Returns
     None when there are no cm events (None ≠ 0)."""
     if not events:
         return None
-
-    def _count(kind: str) -> int:
-        return sum(1 for e in events if e.get("type") == kind)
-
-    return {
-        "cm_view_turns": _count("cm_view"),
-        "cm_violations": _count("cm_violation"),
-        "cm_policy_failures": (_count("cm_policy_failed")
-                               + _count("cm_policy_disabled")
-                               + _count("cm_policy_overrun")),
-        "cm_assembly_failures": (_count("cm_assembly_failed")
-                                 + _count("cm_assembly_disabled")
-                                 + _count("cm_assembly_overrun")),
-        "cm_budget_warnings": _count("cm_budget_checkpoint"),
-        "est_chars_saved": sum(int((e.get("stats") or {}).get("saved_chars") or 0)
-                               for e in events if e.get("type") == "cm_view"),
-    }
+    out = _cm_node(events,
+                   type_of=lambda e: str(e.get("type") or ""),
+                   stats_of=lambda e: e.get("stats"))
+    out["est_chars_saved"] = _last_cumulative_est(events, key="type")
+    return out
 
 
 def task_cm_summary(output_dir: str, genid: Any) -> Optional[Dict[str, Any]]:
@@ -185,6 +273,28 @@ def task_cm_summary(output_dir: str, genid: Any) -> Optional[Dict[str, Any]]:
             continue
         events.append(e)
     return cm_summary_from_events(events)
+
+
+def task_cm_degraded(node: Optional[Dict[str, Any]]) -> bool:
+    """The task child's seam was DEGRADED in this generation (docs/19 §12.44).
+
+    Reads the event-shape ``task_cm`` node (``_cm_node`` keys, docs/19 §12.43):
+    any strike/disabled fact OR the BUILD-time degradation (the child ran with
+    no seam at all — ``cm_session_degraded``, docs/19 §12.47.7; before that
+    key existed such a generation read as a HEALTHY zero-turn session and the
+    "both roles learn about task CM degradation" promise silently covered only
+    the RUNTIME half). ``cm_face_violations`` is an op-refusal COUNT and is
+    deliberately NOT read here: a refused attempt is a behavior fact, not a
+    broken seam (docs/19 §12.50). ``None`` / ``{"absent": …}`` is NOT
+    degradation —
+    missing evidence is a different fact (cost.json always explains it), and
+    a health flag must never be inferred from an absence."""
+    if not isinstance(node, dict) or node.get("absent"):
+        return False
+    return bool(node.get("cm_policy_failures") or node.get("cm_policy_disabled")
+                or node.get("cm_assembly_failures")
+                or node.get("cm_assembly_disabled")
+                or node.get("cm_session_degraded"))
 
 
 def _wallclock(rows: List[Dict[str, Any]]) -> Optional[float]:
@@ -382,7 +492,12 @@ def compact(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     keys = ("role", "seat", "outer", "genid", "attempt", "llm_calls",
             "tool_calls", "tool_outputs", "prompt_tokens", "completion_tokens",
             "reasoning_tokens", "total_tokens", "wallclock_s",
-            "llm_calls_failed", "llm_retry_total", "llm_time_s")
+            "llm_calls_failed", "llm_retry_total", "llm_time_s",
+            # The session's CM node (mode/turns/ops/violations/assembly).
+            # Dropping it here made cost.json's planner_plan /
+            # evaluator_evaluate read exactly like a run with no seam at all,
+            # even though cost_sessions.jsonl carried it.
+            "cm")
     out = {k: record.get(k) for k in keys if record.get(k) is not None}
     return out or None
 
@@ -474,55 +589,78 @@ def reconcile(output_dir: str) -> Dict[str, Any]:
 
     fine: Dict[str, List[int]] = {}
     unattributed = 0
+
+    def _add(key: str, rec: Optional[Dict[str, Any]]) -> None:
+        # A session with no usage counters is UNATTRIBUTED (reported, never a
+        # mismatch) — and its key must not be created: an empty list would
+        # coerce sum() to 0 and fabricate a trajectory side of zero (the
+        # false-drift mode this function shipped with under the F5 layout).
+        nonlocal unattributed
+        if not rec:
+            return
+        if rec.get("total_tokens") is not None:
+            fine.setdefault(key, []).append(int(rec["total_tokens"]))
+        else:
+            unattributed += 1
+
     traj_root = paths.trajectory_root(output_dir)
     if os.path.isdir(traj_root):
         for outer_name in sorted(os.listdir(traj_root)):
             outer_dir = os.path.join(traj_root, outer_name)
             if not os.path.isdir(outer_dir) or not outer_name.startswith("outer_"):
                 continue
-            try:
-                outer = int(outer_name[len("outer_"):])
-            except ValueError:
+            label = outer_name[len("outer_"):]
+            m = _OUTER_LABEL_RE.match(label)
+            if not m:
                 continue
+            outer = int(m.group(1))
+            # BOTH labels are real trees with their own sessions: the main chain
+            # (``outer_1``) and the fixed-root evaluation instance
+            # (``outer_1_eval``). Keys are built from the LABEL, so the audit
+            # side (proxy ``scope_id``) and this side can finally agree — the
+            # proxy issues the eval plan seat its own ``<N>_eval`` scope.
+            # Role sessions: the F5 seat-keyed trees are the ONLY shape a role
+            # process writes — the genid set is derived from those trees, not
+            # from the legacy numeric genid dirs (a genid whose only session
+            # file is seat-keyed — e.g. an old-format no-usage session — has no
+            # numeric dir and must still be visited; unattributed is a real
+            # state, not an address).
+            genids = set()
+            for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
+                seat_dir = paths.role_traj_dir(output_dir, label, role, seat)
+                if not os.path.isdir(seat_dir):
+                    continue
+                for f in os.listdir(seat_dir):
+                    stem = f[:-len(".jsonl")] if f.endswith(".jsonl") else ""
+                    if stem.startswith("gen_") and not stem.endswith(".llm_calls"):
+                        genids.add(stem[len("gen_"):])
+            for gid in sorted(genids):
+                # Through the F5 readers (gen_session_costs): re-walking raw
+                # paths here re-created the exact drift those readers fixed.
+                per_gen = gen_session_costs(output_dir, label, gid)
+                for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
+                    _add(f"role:{role}:{outer_name}", per_gen.get(f"{role}_{seat}"))
+            # The task child stays in its own genid dir (task has no seat): the
+            # main chain uses the numeric genid, the fixed-root evaluation
+            # instance uses ``eval_outer<N>_s<M>`` — and the proxy audit keys
+            # that child ``task:gen_<scope_id>`` with the SAME string, so both
+            # shapes must be collected or the eval child reads as unattributed
+            # while its tokens sit on the audit side.
             for name in sorted(os.listdir(outer_dir)):
                 sub = os.path.join(outer_dir, name)
-                if os.path.isdir(sub):
-                    for role in ("planner", "evaluator"):
-                        rec = session_cost_from_file(
-                            os.path.join(sub, f"{role}.jsonl"),
-                            role=role, seat="plan", outer=outer, genid=name)
-                        if rec:
-                            key = f"role:{role}:{outer_name}"
-                            fine.setdefault(key, [])
-                            if rec.get("total_tokens") is not None:
-                                fine[key].append(int(rec["total_tokens"]))
-                            else:
-                                unattributed += 1
-                    rec = session_cost_from_file(
-                        os.path.join(sub, "task.jsonl"),
-                        role="task", seat="task", outer=outer, genid=name)
-                    if rec:
-                        key = f"task:gen_{name}"
-                        fine.setdefault(key, [])
-                        if rec.get("total_tokens") is not None:
-                            fine[key].append(int(rec["total_tokens"]))
-                        else:
-                            unattributed += 1
-                elif name.endswith(".jsonl"):
-                    stem = name[: -len(".jsonl")]
-                    role = stem.split("__", 1)[0]
-                    if role not in ("planner", "evaluator"):
-                        continue
-                    rec = session_cost_from_file(
-                        os.path.join(outer_dir, name),
-                        role=role, seat="self_improve", outer=outer)
-                    if rec:
-                        key = f"role:{role}:{outer_name}"
-                        fine.setdefault(key, [])
-                        if rec.get("total_tokens") is not None:
-                            fine[key].append(int(rec["total_tokens"]))
-                        else:
-                            unattributed += 1
+                if not os.path.isdir(sub):
+                    continue
+                if not (name.isdigit() or name.startswith("eval_outer")):
+                    continue
+                rec = session_cost_from_file(
+                    os.path.join(sub, "task.jsonl"),
+                    role="task", seat="task", outer=outer, genid=name)
+                _add(f"task:gen_{name}", rec)
+            # Outer-level self-improve sessions (canonical + attempt siblings),
+            # collected by the F5 self reader.
+            for role in ("planner", "evaluator"):
+                for rec in self_session_costs(output_dir, label, role):
+                    _add(f"role:{role}:{outer_name}", rec)
 
     mismatches: List[Dict[str, Any]] = []
     checked = 0

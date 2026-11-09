@@ -1191,10 +1191,18 @@ def run_gan_driver(
             # instance per outer: the loop builds ``outer_<N>_eval``. Give the
             # planner's plan seat a second proxy token; the role broker registers
             # it as a separate launchable scope (outer_<N>_eval).
+            #
+            # Its AUDIT scope must carry the instance too (docs/19 §12.68): the
+            # eval seat writes its trajectory under ``trajectory/outer_<N>_eval``
+            # while a plain ``str(outer)`` scope filed every one of its
+            # ``llm_call`` rows under the MAIN outer's key — so
+            # ``cost_ledger.reconcile`` saw audit-only tokens and reported a
+            # permanent mismatch of exactly the eval seat's usage (measured
+            # 2026-11-09 R2: delta 100,743 = the eval plan seat's 6 calls).
             role_proxy_tokens["planner"]["plan"] = [
                 role_proxy_tokens["planner"]["plan"],
                 proxy.issue_scope(
-                    "planner", str(outer), models["planner"], seat="plan",
+                    "planner", f"{outer}_eval", models["planner"], seat="plan",
                     peer_uid=int(role_accounts["planner"]["uid"])),
             ]
             role_broker.register_outer(outer, role_proxy_tokens)
@@ -1305,11 +1313,23 @@ def run_gan_driver(
         _cost_rollup(output_dir, label="run", since_ts=0.0)  # full-run cumulative
         return code_root
     finally:
+        # docs/19 §12.70: the BROKERS must shut down BEFORE the LLM proxy.
+        # Closing the proxy first left `role_broker`/`task_broker` shutting down
+        # their seats against a dead control socket, so every scoped-token
+        # revocation raced the close and surfaced as
+        # "[ERROR] role sandbox ACL reclaim failed: role proxy revoke failed:
+        #  [Errno 104] Connection reset by peer" — a misleading message (the
+        # ACLs HAD been reclaimed) that also marked the seat scope `failed`
+        # (which refuses later launches). Shutdown order is now
+        # brokers → proxy; each step is still independently attempted so a
+        # failure in one can never skip the others.
         try:
-            proxy.close()
+            task_broker.close()
         finally:
             try:
-                task_broker.close()
-            finally:
                 role_broker.close()
-                shutil.rmtree(proxy_dir, ignore_errors=True)
+            finally:
+                try:
+                    proxy.close()
+                finally:
+                    shutil.rmtree(proxy_dir, ignore_errors=True)

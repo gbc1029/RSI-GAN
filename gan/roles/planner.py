@@ -417,10 +417,19 @@ class Planner(Role):
                      max_tool_calls: int = 30, trajectory_genids: Optional[List[Any]] = None,
                      patch_retry_k: int = 2, tool_repeat_limit: Optional[int] = None):
         from gan.framework.trajectory import outer_session_index
-        sessions = outer_session_index(self.output_dir, self.outer, "planner")
+        # seat="self_improve": the self seat writes OUTER-level files, so the
+        # prompt must list ITS OWN sessions (not the plan/evaluate ones).
+        sessions = outer_session_index(self.output_dir,
+                                       getattr(self, "traj_outer", None) or self.outer,
+                                       "planner", seat="self_improve")
         sess_line = json.dumps(sessions, ensure_ascii=False) if sessions else "[]"
         rr = render_receipt((recent or {}).get("receipt"))
         cost_stmt = str((recent or {}).get("cost_statement") or "")
+        # docs/19 §12.14/§12.17 feedback: a failed CM module (assembly OR
+        # policy) is a to-do for THIS session (stem + where + reason);
+        # measured facts, never text dumps.
+        cm_rep = (recent or {}).get("cm_assembly") or {}
+        cm_pol = (recent or {}).get("cm_policy") or {}
         instruction = (
             "Improve YOURSELF (the planner's own design) using only design operators "
             "(`set_prompt`/`set_config`/`select_component`/`deselect_component`/`set_param`; "
@@ -432,6 +441,12 @@ class Planner(Role):
             "the long run. "
             "Do not repeat the same tool call; when done, stop.\n"
             f"\n## Your session trajectories this outer (use read_session_trajectory)\n{sess_line}\n"
+            + ((f"\n## Your context-manager assembly (framework-measured; fix it with "
+                f"`request_source_access` + `edit_source`)\n"
+                f"{json.dumps(cm_rep, ensure_ascii=False)}\n") if cm_rep else "")
+            + ((f"\n## Your context-manager policy (framework-measured; fix it with "
+                f"`request_source_access` + `edit_source`)\n"
+                f"{json.dumps(cm_pol, ensure_ascii=False)}\n") if cm_pol else "")
             + (("\n" + rr + "\n") if rr else "")
             + ((f"\n{cost_stmt}\n") if cost_stmt else "")
             + f"\nRecent outcomes: {json.dumps({k: v for k, v in (recent or {}).items() if k not in ('receipt', 'cost_statement')}, ensure_ascii=False)[:2000]}"

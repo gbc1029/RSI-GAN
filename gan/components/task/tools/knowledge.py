@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 
+from agent.tools.clip import clip_head
+
 _MAX_CHARS_PER_READ = 20_000
 
 
@@ -26,8 +28,9 @@ def tool_info():
         "description": (
             "Read your curated knowledge base (markdown notes the planner wrote for "
             "you). Call with name='' to LIST the available notes; call with a name to "
-            "READ that note's full text. Use it when a note looks relevant to the "
-            "current task."
+            "READ that note's full text. A read returns up to 20000 chars — longer "
+            "notes are clipped and marked with shown/total counts. Use it when a "
+            "note looks relevant to the current task."
         ),
         "input_schema": {
             "type": "object",
@@ -56,13 +59,17 @@ def tool_function(name="", **kwargs):
     if not os.path.isfile(path):
         return f"Error: no knowledge note named '{fname}' (call with name='' to list)"
     try:
+        # Full read (not the old cap+1 probe): the marker's total must be the
+        # NOTE's real size, not the probe's -- notes are materialized under
+        # the cost key knowledge_max_file_chars, so a full read is bounded.
         with open(path, "r", encoding="utf-8") as f:
-            text = f.read(_MAX_CHARS_PER_READ + 1)
+            text = f.read()
     except OSError as e:
         return f"Error: cannot read knowledge note '{fname}': {e}"
-    if len(text) > _MAX_CHARS_PER_READ:
-        text = text[:_MAX_CHARS_PER_READ] + "\n<response clipped>"
-    return text
+    # Counted clip (docs/17 §17): cap == the cost key knowledge_max_file_chars
+    # default == the chat loop's per-tool outer entry for this tool, so the
+    # inner marker (with counts) always fires before any outer cut.
+    return clip_head(text, _MAX_CHARS_PER_READ)
 
 
 op_info = tool_info

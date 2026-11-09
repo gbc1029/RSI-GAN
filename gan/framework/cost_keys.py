@@ -118,7 +118,15 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
     },
     "cm_window_k": {
         "type": "int", "min": 1, "max": 50, "default": 4,
-        "consumer": "cm seam (default pin window; framework floor is the min)",
+        "consumer": ("cm seam pin window: keep the newest K LLM CALLS verbatim "
+                     "(one call = the assistant reply + the user message "
+                     "carrying its tool outputs, so K calls = 2K entries; the "
+                     "framework floor is 1 call — docs/19 §12.56)"),
+    },
+    "cm_head_tail_keep": {
+        "type": "int", "min": 1, "max": 2000, "default": 600,
+        "consumer": ("cm render (head_tail form per-side keep, session-wide; "
+                     "excerpt form retired — docs/19 §12.21)"),
     },
     "cm_drop_floor_chars": {
         "type": "int", "min": 0, "max": 100_000, "default": 400,
@@ -126,22 +134,37 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
     },
     "cm_max_ops_per_turn": {
         "type": "int", "min": 1, "max": 200, "default": 32,
-        "consumer": "cm seam (policy op budget per turn; excess ops are refused)",
+        "consumer": ("cm seam (POLICY-face exec op budget per turn — the "
+                     "ViewHandle gate refuses excess policy ops at exec "
+                     "time — plus the cm_view brief presentation cap; the "
+                     "audit accounting is full-fidelity and does NOT "
+                     "consume this key — N2, docs/19 §12.33)"),
     },
     "cm_policy_exec_ms": {
         "type": "int", "min": 10, "max": 10_000, "default": 200,
-        "consumer": "cm seam (policy execution budget; overruns count toward the wedge breaker)",
+        "consumer": ("cm seam (policy execution budget per stage — load and "
+                     "run each get one window; a timeout strikes; a "
+                     "completed-over-budget run is honored with a "
+                     "cm_policy_overrun advisory)"),
     },
     "cm_assembly_exec_ms": {
         "type": "int", "min": 10, "max": 10_000, "default": 200,
-        "consumer": "cm seam (agent assembly execution budget per turn; overruns count toward its wedge breaker)",
+        "consumer": ("cm seam (agent assembly execution budget per turn; a "
+                     "timeout strikes; a completed-over-budget run is "
+                     "honored with a cm_assembly_overrun advisory)"),
     },
     "cm_policy": {
         "type": "str", "max_len": 64, "default": None,
         "consumer": ("cm seam (custom mode: stems the policy module in "
-                     "gan/components/<role>/cm/; named slot, delivered as "
-                     "cm_policy.py — the sort-first legacy scan is only the "
-                     "unnamed fallback)"),
+                     "gan/components/<role>/cm/; NAMED SLOT ONLY — an unnamed "
+                     "or unresolvable stem is a loud cm_module_unresolved and "
+                     "the custom->slice keys rewrite, never a scan fallback "
+                     "(role side: loop._build_cm_session / "
+                     "cm_wiring.resolve_named). The sort-first legacy scan "
+                     "survives ONLY on the TASK-side snapshot delivery for "
+                     "UNNAMED designs (task_execution.materialize_cm_snapshot, "
+                     "reported as policy_selection=legacy_sort_first); a named "
+                     "module ships there under the fixed name cm_policy.py)"),
     },
     "cm_assembly": {
         "type": "str", "max_len": 64, "default": None,

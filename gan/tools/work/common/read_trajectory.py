@@ -27,6 +27,7 @@ from gan.framework.trajectory import read  # passthrough full-read path
                                            # (import lost in the 2d0a19a
                                            # dispatch rewrite — fixed in the
                                            # docs/10 §15 batch, pre-existing)
+from agent.tools.clip import clip_head
 
 
 def tool_info():
@@ -60,6 +61,20 @@ def tool_info():
                                         "(traceback|budget_stop|repeat_break|truncated)."},
                 "offset": {"type": "integer",
                            "description": "Index pagination: skip this many matching segments."},
+                "tail": {"type": "integer",
+                         "description": "Serve the LAST N segments' content as "
+                                        "one page (any mode; the forensic common "
+                                        "case — the failure lives in the latest "
+                                        "turns)."},
+                "head": {"type": "integer",
+                         "description": "Serve the FIRST N segments' content as "
+                                        "one page (any mode)."},
+                "grep": {"description": "Regex search over the trajectory's "
+                                        "segment texts (server-side — the "
+                                        "archive lives outside your sandbox): "
+                                        "returns matching seg_ids + the first "
+                                        "matching line, so grep -> fetch "
+                                        "composes. Bad regex is a loud error."},
             },
         },
     }
@@ -208,7 +223,10 @@ def _serve_fetch(output_dir, fetch, allowed, genid_param, cap, sess):
                 meta = (f"# segment {seg_id} kind={seg['kind']}"
                         + (f" tool={seg['tool']}" if seg.get("tool") else "")
                         + f" chars={seg['chars']}")
-                return f"{meta}\n{block.text[:cap]}"
+                # Counted clip (docs/17 §17): the meta line already carries the
+                # segment's total chars; the marker adds the shown count so a
+                # capped fetch is distinguishable from a short segment.
+                return f"{meta}\n{clip_head(block.text, cap)}"
     path = _traj_path(output_dir, genid)
     if fname and os.path.basename(path or "") != fname:
         return f"Error: segment '{seg_id}' not in the visible files."
@@ -218,11 +236,38 @@ def _serve_fetch(output_dir, fetch, allowed, genid_param, cap, sess):
     meta = (f"# segment {seg_id} kind={entry['kind']}"
             + (f" tool={entry['tool']}" if entry.get("tool") else "")
             + f" chars={entry['chars']}")
-    return f"{meta}\n{entry['text'][:cap]}"
+    return f"{meta}\n{clip_head(entry['text'], cap)}"
+
+
+def _inproc_segments(output_dir, genid, sess):
+    """``(segments, text_lookup)`` for ONE genid on the in-process arm —
+    payload first (the session's materialized scan), archived-file fallback.
+    Mirrors the seat arm's Tier 1/Tier 2 sources so BOTH arms serve the SAME
+    segments (docs/19 §12.36, R2). ``(None, None)`` = nothing servable."""
+    segs = _payload_segments(sess, genid) if sess is not None else None
+    if segs is not None:
+        def _lookup(seg):
+            bid = sess.traj_segments.get(seg["seg_id"])
+            blk = sess.universe.get(bid) if bid else None
+            return blk.text if blk is not None else None
+        return segs, _lookup
+    path = _traj_path(output_dir, genid)
+    if not path or not os.path.isfile(path):
+        return None, None
+    from gan.framework.cm.traj_index import build_traj_index, segment_entry
+    segs = (build_traj_index([path],
+                             labels=[f"{genid}/{os.path.basename(path)}"])
+            .get("segments") or [])
+
+    def _lookup(seg):
+        entry = segment_entry(path, seg.get("line_no"))
+        return entry["text"] if entry else None
+    return segs, _lookup
 
 
 def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
-                  flag=None, offset=0, **kwargs):
+                  flag=None, offset=0, tail=None, head=None, grep=None,
+                  **kwargs):
     actx = get_access_context()
     if actx is None:
         return "Error: no access context"
@@ -241,17 +286,96 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
         return f"Error: generation '{genid}' is not visible (allowed: {allowed})."
     output_dir = getattr(actx.broker, "output_dir", None) if actx.broker is not None else None
     if hasattr(broker, "session_trajectory_index"):
-        # Sandboxed seat worker: the blob crosses the parent-side RPC and
-        # redaction stays parent-side; kind=/tool=/flag=/offset=/fetch= are
-        # in-process slice-mode faces and degrade here (noted, never ignored).
-        extra = ("# note: kind=/tool=/flag=/offset=/fetch= are in-process "
-                 "slice-mode faces; a sandboxed seat worker reads the full "
-                 "redacted blob\n") if (kind or tool or flag or offset or fetch) else ""
-        blob = broker.read_trajectory(actx.role, actx.node_id, genid,
-                                      int(max_chars or 6000), seat=actx.seat)
+        # Sandboxed seat worker: every byte crosses the parent-side RPC
+        # (redaction stays parent-side). §12.24 (CM-08): the seat branch now
+        # serves the SAME slice faces as in-process. Two tiers:
+        #   Tier 1 — a materialized session payload covers this genid: the
+        #   scan and the segment text live in THIS process (the CM universe),
+        #   so index/fetch/filters/tail/head/grep serve child-side, zero RPC;
+        #   Tier 2 — everything else crosses as a structured ``query``
+        #   envelope (kwarg; old root-side brokers refuse it with TypeError
+        #   and the tool degrades to the full blob LOUDLY, never silently).
+        cap = int(max_chars or 6000)
+        mode = _session_cm_mode(actx)
+        slice_mode = mode in ("slice", "compact_conservative", "custom")
+        sess = _active_traj_session() if slice_mode else None
+        try:
+            filt = _norm_filters(kind, tool, flag, offset)
+        except ValueError as e:
+            return f"Error: {e}"
+        segs = _payload_segments(sess, genid) if sess is not None else None
+        if segs is not None and not (tail or head or grep):
+            # Tier 1 (index/fetch/filters): the payload path IS the serve path.
+            if fetch:
+                return _serve_fetch(output_dir, fetch, allowed, genid, cap, sess)
+            return _serve_index(output_dir, genid, cap, filt, sess, mode)
+        if segs is not None and (tail or head or grep):
+            from gan.framework.cm.traj_index import grep_page, tail_head_page
+
+            def _lookup(seg):
+                bid = sess.traj_segments.get(seg["seg_id"])
+                blk = sess.universe.get(bid) if bid else None
+                return blk.text if blk is not None else None
+
+            if grep:
+                try:
+                    return grep_page(segs, _lookup, grep)
+                except ValueError as e:
+                    return f"Error: {e}"
+            return tail_head_page(segs, _lookup, n=int(tail or head or 1),
+                                  tail=bool(tail), max_chars=cap)
+        # Tier 2: query over RPC. Content ops (fetch/tail/head/grep) apply in
+        # ANY mode; the index faces stay slice-mode-gated (in-process parity).
+        query = None
+        if fetch or tail or head or grep:
+            query = {"fetch": fetch, "tail": tail, "head": head,
+                     "grep": grep, "mode": mode}
+        elif slice_mode:
+            query = {"kind": filt["kind"], "tool": filt["tool"],
+                     "flag": filt["flag"], "offset": filt["offset"],
+                     "mode": mode}
+        try:
+            result = broker.read_trajectory(actx.role, actx.node_id, genid,
+                                            cap, seat=actx.seat, query=query)
+        except TypeError:
+            blob = broker.read_trajectory(actx.role, actx.node_id, genid,
+                                          cap, seat=actx.seat)
+            note = ("# note: the parent-side broker predates the segment query "
+                    "face (docs/19 §12.24); the full redacted blob is served "
+                    "instead — update the parent tree to restore "
+                    "index/fetch/offset/tail/head/grep\n")
+            return note + f"# generation {genid} trajectory\n{blob}"
+        if isinstance(result, dict):
+            serve = result.get("serve")
+            if serve == "error":
+                return str(result.get("text") or "Error:")
+            if serve == "segment":
+                entry = result.get("entry") or {}
+                meta = (f"# segment {result.get('seg_id')} "
+                        f"kind={entry.get('kind')}"
+                        + (f" tool={entry.get('tool')}" if entry.get("tool") else "")
+                        + f" chars={entry.get('chars')}")
+                return f"{meta}\n{clip_head(str(entry.get('text') or ''), cap)}"
+            if serve == "page":
+                return str(result.get("text") or "")
+            if serve == "index":
+                from gan.framework.cm.traj_index import render_index_text
+                header = (f"# trajectory index genid={genid} (mode={mode}, "
+                          "redacted; fetch=<seg_id> for content)")
+                return header + "\n" + render_index_text(
+                    result.get("index") or {}, max_chars=cap,
+                    kinds=filt["kind"], tools=filt["tool"],
+                    flags=filt["flag"], offset=filt["offset"])
+            return f"Error: unknown serve envelope {serve!r}"
+        blob = result if isinstance(result, str) else ""
         if not blob:
             return f"No archived trajectory for generation {genid}."
-        return extra + f"# generation {genid} trajectory\n{blob}"
+        note = ""
+        if not slice_mode and (filt["kind"] or filt["tool"] or filt["flag"]
+                               or filt["offset"]) and not (fetch or tail or head or grep):
+            note = (f"# note: kind=/tool=/flag=/offset= apply in slice mode only "
+                    f"(this session runs {mode or 'passthrough'})\n")
+        return note + f"# generation {genid} trajectory\n{blob}"
 
     if not output_dir:
         return "Error: parent trajectory root is unavailable"
@@ -270,10 +394,29 @@ def tool_function(genid=None, max_chars=6000, fetch=None, kind=None, tool=None,
                 f"(this session runs {mode or 'passthrough'})\n")
     sess = _active_traj_session() if slice_mode else None
 
-    if slice_mode and not fetch:
-        return _serve_index(output_dir, genid, cap, filt, sess, mode)
     if fetch:
         return _serve_fetch(output_dir, fetch, allowed, genid, cap, sess)
+    if tail or head or grep:
+        # §12.36 (R2): content ops serve in ANY mode on BOTH arms — the
+        # in-process ladder previously dropped these three parameters into
+        # the blob/index path with no note (an ignored parameter reads as
+        # taken effect). One scan, payload first, archive fallback — the
+        # SAME sources the seat arm's Tier 1/Tier 2 serve from, with the
+        # seat arm's caps (tail/head page = the tool's max_chars; grep =
+        # its documented 100-result / 16k stop boundary).
+        segs, lookup = _inproc_segments(output_dir, genid, sess)
+        if segs is None:
+            return f"No archived trajectory for generation {genid}."
+        from gan.framework.cm.traj_index import grep_page, tail_head_page
+        if grep:
+            try:
+                return grep_page(segs, lookup, grep)
+            except ValueError as e:
+                return f"Error: {e}"
+        return tail_head_page(segs, lookup, n=int(tail or head or 1),
+                              tail=bool(tail), max_chars=cap)
+    if slice_mode:
+        return _serve_index(output_dir, genid, cap, filt, sess, mode)
 
     blob = read(output_dir, genid, max_chars=cap, role="task")
     if not blob:

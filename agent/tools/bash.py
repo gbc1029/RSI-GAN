@@ -28,9 +28,17 @@ import os
 import signal
 import subprocess
 
+from agent.tools.clip import clip_head_tail
+
 BASH_TIMEOUT_S = 120.0   # tool-level budget; <= dispatch C1 default (600)
 KILL_GRACE_S = 5.0       # SIGTERM -> SIGKILL escalation window
 TAIL_CHARS = 2000        # stdout/stderr tails kept in the timeout error
+# Success-output composite clip (docs/17 §17): head+tail, total == the chat
+# loop's default budget (16k), so the outer layer never double-fires below the
+# tool's own declared cap. TAIL matters: benchmark verdicts / build summaries
+# print LAST — a head-only cut would hide the line the agent needs most.
+BASH_OUT_HEAD = 12_000
+BASH_OUT_TAIL = 4_000
 
 
 def tool_info():
@@ -44,6 +52,9 @@ between calls -- chain dependent commands with && or ; inside one command.
 * A non-zero exit code is reported as a trailing "[exit N]" marker.
 * Long-running commands are killed after 120 seconds; do not start servers
 and do not wait on stdin.
+* Output is capped at 16000 chars: the first 12000 plus the last 4000 are
+kept (the middle is omitted and marked). For huge outputs, narrow the
+command itself (sed -n line ranges, grep, redirect to a file and view it).
 * Please avoid commands that may produce a very large amount of output.
 * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.""",
         "input_schema": {
@@ -102,7 +113,8 @@ def tool_function(command):
     )
     try:
         out, err = proc.communicate(timeout=BASH_TIMEOUT_S)
-        return _format(out, err, proc.returncode)
+        return clip_head_tail(_format(out, err, proc.returncode),
+                              BASH_OUT_HEAD, BASH_OUT_TAIL)
     except subprocess.TimeoutExpired:
         # Escalate on the WHOLE process group: TERM -> grace -> KILL.
         _killpg(proc, signal.SIGTERM)

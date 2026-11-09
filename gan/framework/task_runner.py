@@ -119,6 +119,104 @@ def _task_change_summary(submitted_patch: Any, config: Any,
     }
 
 
+def summarize_question_failures(path: str) -> Optional[Dict[str, Any]]:
+    """Fold the harness's per-question failure sidecar into ONE event payload.
+
+    Why this exists (docs/19 §12.54-A): the harness isolates a failed question
+    into a blank prediction, so a generation in which EVERY question died (e.g.
+    the task child could not be spawned at all) used to reach the loop as
+    "score 0 / worse agent" — an infrastructure break wearing a task-quality
+    costume. These counts are the durable evidence that separates the two:
+    ``all_failed`` plus a single dominant ``error_type`` is a systemic break;
+    the same failures spread over several error types are ordinary noise.
+
+    Reads the sidecar the harness writes (``eval_failures.jsonl``: per-question
+    records + one ``question_failures_summary`` line, docs/19 §12.54-A).
+    Returns None when the file is missing/empty/record-free — absence is "no
+    failures recorded", the only honest reading of a missing sidecar
+    (None is not 0). Never raises."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().splitlines()
+    except OSError:
+        return None
+    records: List[Dict[str, Any]] = []
+    summary_line: Optional[Dict[str, Any]] = None
+    # S (docs/19 §12.61): a torn line is TOLERATED (it must not sink the
+    # summary) but never SILENT — a truncated tail is the trace of a writer
+    # that died mid-append, and the fold is the only reader that can tell.
+    # The count rides the returned payload so the loss is visible downstream.
+    torn = 0
+    non_dict = 0
+    for line in raw:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            torn += 1
+            continue          # a torn last line must not sink the whole summary
+        if not isinstance(row, dict):
+            non_dict += 1
+            continue
+        if row.get("kind") == "question_failures_summary":
+            summary_line = row
+        else:
+            records.append(row)
+    if not records:
+        # The summary line is appended AFTER the per-question records, so an
+        # empty record half means either "no failures" or "the records did not
+        # survive". Trust the harness's own counts in the latter case instead
+        # of reading the absence as health (a missing record is not a healthy
+        # round when the summary says N>0 died).
+        failed = int((summary_line or {}).get("failed") or 0)
+        if summary_line and failed > 0:
+            out: Dict[str, Any] = {
+                "failed": failed,
+                "records_missing": True,
+                "error_types": dict(summary_line.get("error_types") or {}),
+            }
+            if torn or non_dict:
+                out["torn_lines"] = torn + non_dict
+            out["attempted"] = summary_line.get("attempted")
+            out["all_failed"] = bool(summary_line.get("all_failed"))
+            if out["all_failed"] and len(out["error_types"]) == 1:
+                out["systemic"] = True
+                out["error_type"] = next(iter(out["error_types"]))
+            return out
+        return None
+    error_types: Dict[str, int] = {}
+    phases: Dict[str, int] = {}
+    for row in records:
+        kind = str(row.get("error_type") or "unknown")
+        error_types[kind] = error_types.get(kind, 0) + 1
+        phase = str(row.get("phase") or "unknown")
+        phases[phase] = phases.get(phase, 0) + 1
+    out = {
+        "failed": len(records),
+        "error_types": error_types,
+        "phases": phases,
+        "questions": [str(r.get("question_id")) for r in records][:20],
+    }
+    if torn or non_dict:
+        # S (§12.61): conditional, like every other absence-means-clean field
+        # — a truncated sidecar tail is now visible instead of silent.
+        out["torn_lines"] = torn + non_dict
+    if summary_line:
+        # The harness's own denominator: it counts what THIS run attempted, so
+        # "all failed" is exact instead of being inferred from predictions.csv.
+        out["attempted"] = summary_line.get("attempted")
+        out["all_failed"] = bool(summary_line.get("all_failed"))
+    if out.get("all_failed") and len(error_types) == 1:
+        # Every attempted question died the SAME way: no agent behaviour
+        # produces that shape (it is one broken spawn/transport, not a bad
+        # policy). Downstream issue-checkers consume it as an infra fact.
+        out["systemic"] = True
+        out["error_type"] = next(iter(error_types))
+    return out
+
+
 def pool_check(domain: str, domain_cfg: Dict[str, Any], num_samples: int,
                dataset_root: Optional[str] = None, subset: str = "") -> None:
     """Fail fast when a domain's candidate pool cannot satisfy --num_samples.
@@ -314,21 +412,26 @@ class DomainTaskRunner:
         except Exception as e:  # noqa: BLE001 -- audit write failure: stderr covers
             print(f"[WARN] {event_type} event write failed: {e}")
 
-    def _ingest_cm_events(self, run_dir: str, genid: Any) -> None:
-        """Fold the child's CM seam-event sidecar into events.jsonl (docs/10
-        §11.5): each line is re-emitted with role=task attribution so the
-        per-generation cost record and the offline reconcilers see the seam
-        activity in the ONE audit stream. Advisory end to end: never a run
-        failure -- but NEVER silent (no-silent-fail rule, AGENTS.md): a
-        MISSING or EMPTY sidecar is itself a finding (the runner pre-creates
-        the file, so absence/emptiness means the child had no seam at all)
-        and gets its own event. The sidecar dies with the pruned work dir
-        either way."""
-        sidecar = paths.cm_events_path(run_dir)
+    def _ingest_cm_events(self, run_dir: str, run_id: str, genid: Any) -> None:
+        """Fold the CM seam-event sidecar into events.jsonl (docs/10 §11.5,
+        transport reworked by F5 P1 / docs/19 §12.28): each line is
+        re-emitted with role=task attribution so the per-generation cost
+        record and the offline reconcilers see the seam activity in the ONE
+        audit stream. Advisory end to end: never a run failure -- but NEVER
+        silent (no-silent-fail rule, AGENTS.md): a MISSING or EMPTY sidecar
+        is itself a finding and gets its own event. The sidecar dies with
+        the pruned work dir either way.
+
+        F5 WRITER CHANGE: the sidecar is no longer child-written. The
+        trusted harness receives the child's seam events over the run-scoped
+        telemetry socket and appends them here (pre-created, so a
+        zero-event run reads as present-but-empty); the child holds no
+        write path to this file at all."""
+        sidecar = paths.task_cm_events_path(run_dir, run_id)
         if not os.path.isfile(sidecar):
             self._event("cm_events_ingest_empty", genid=str(genid),
-                        reason="sidecar file missing (child never created "
-                               "or never bound it)")
+                        reason="sidecar file missing (harness failed before "
+                               "staging the telemetry run)")
             return
         try:
             with open(sidecar, "r", encoding="utf-8") as f:
@@ -357,12 +460,20 @@ class DomainTaskRunner:
         if emitted:
             self._event("cm_events_ingested", genid=str(genid), events=emitted)
         else:
-            # A zero-event sidecar after a real harness run means the child
-            # had no seam session (or its emit never reached the file):
-            # exactly the failure mode that used to be invisible.
+            # A zero-event sidecar after a real harness run has TWO causes that
+            # look identical from here (docs/19 §12.66): the child genuinely had
+            # no seam session, OR the audit channel itself was down and the
+            # child's events died with its tmpfs. Saying only the first
+            # attribution sent a real investigation to the wrong layer for a
+            # whole round, so the reason names the ambiguity and points at the
+            # harness's own "[WARN] f5 audit channel delivered 0" line, which is
+            # the discriminator.
             self._event("cm_events_ingest_empty", genid=str(genid),
-                        reason="sidecar present but no seam events (child "
-                               "ran without a cm session)")
+                        reason="sidecar present but no seam events — either the "
+                               "child ran without a cm session, or the audit "
+                               "telemetry channel delivered nothing (see the "
+                               "harness '[WARN] f5 audit channel delivered 0' "
+                               "line in logs/task_runner.log)")
 
     def adjudicate_proof_challenges(
         self, parent: Node, child: Node, challenges: List[Dict[str, Any]],
@@ -857,7 +968,7 @@ class DomainTaskRunner:
         # Context-management audit exit (docs/10 §11.5): fold the child's
         # seam events into events.jsonl on EVERY post-harness path (the child
         # may have run a seam session even when scoring later failed).
-        self._ingest_cm_events(run_dir, genid)
+        self._ingest_cm_events(run_dir, run_id, genid)
         # Persist per-question failure diagnostics into runs/<genid>/: the work
         # dir is pruned at generation end, so anything left only under an
         # outputs/<run_id>/agent_evals directory dies before it can be read.
@@ -884,6 +995,26 @@ class DomainTaskRunner:
                                      os.path.join(archive_dir, name))
                     except OSError:
                         pass  # evidence is best-effort; never fail the run
+                    if name == "eval_failures.jsonl" and evals_dir == eval_sources[0][0]:
+                        # Docs/19 §12.54-A: a generation where EVERY question
+                        # was isolated by the same non-domain error is an
+                        # infrastructure break, not a worse agent. ONE durable
+                        # event carries the counts so the loop (and the
+                        # offline reconcilers) can tell the two apart without
+                        # opening the evidence tree.
+                        try:
+                            qf = summarize_question_failures(
+                                os.path.join(evals_dir, name))
+                            if qf:
+                                self._event("question_failures",
+                                            genid=str(genid), **qf)
+                        except Exception as exc:  # noqa: BLE001 -- advisory
+                            from utils.soft_fail import soft_fail
+                            soft_fail(f"question-failure summary failed "
+                                      f"(genid {genid}): {exc}",
+                                      event_path=paths.events_path(self.output_dir),
+                                      event_type="question_failures_fold_failed",
+                                      genid=str(genid))
         # Merge the CHILD-reported load outcome into the toolset report (the
         # assembly stage can only report what it copied). Failures are classified
         # by owner: a component (or a role-owned always-on tool) is an agent-fixable

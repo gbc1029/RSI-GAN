@@ -19,7 +19,11 @@ from typing import Any, Dict, Optional, TextIO
 from gan.framework.access import SourceAccessDisabled
 
 
-_PROTOCOL_VERSION = 1
+# Protocol revision 2: ``role_state`` carries the CM descriptor (``cm``).
+# Both ends are spawned from the SAME code tree, so the bump only turns a
+# stale/mismatched child into a loud protocol error instead of a vague
+# "invalid role state".
+_PROTOCOL_VERSION = 2
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 _ROLE_METHODS = {
     "planner": {"plan", "self_improve"},
@@ -32,6 +36,104 @@ _MISSING = object()
 
 class RoleProcessError(RuntimeError):
     """The role worker failed or violated its IPC contract."""
+
+
+class RoleWorkerTimeout(RoleProcessError):
+    """Seat-call inactivity watchdog fired (CM-03 L2-01): the worker child
+    produced no frame for ``loop.role_inactivity_timeout_s`` and was torn
+    down; the call converges through the seat's failure path
+    (planner_failed/evaluator_failed/self_improve degraded). The NEXT invoke
+    restarts the worker through the existing seat-switch path.
+
+    Deliberately NOT a CM latch signal: after load-in-budget (docs/19
+    §12.16) a CM module cannot hang the call, so a watchdog kill is almost
+    certainly non-CM (tool deadlock, LLM relay stall, child bug) — auto-
+    latching the assembly would mis-attribute and poison the evolution
+    feedback (user-confirmed decision)."""
+
+
+class _InvokeWatchdog:
+    """Inactivity monitor for ONE seat call (CM-03 L2-01).
+
+    No total wall clock: the child sends frames continuously while it works
+    (events, broker replies), so "no frame for N seconds" is the honest
+    no-progress signal — long but legitimate LLM/tool waits keep touching
+    it. On expiry the monitor SHUTS DOWN the channel socket, which unblocks
+    the pending buffered read; ``_invoke`` converts that into
+    :class:`RoleWorkerTimeout` and the existing unhealthy-worker teardown
+    stops the process. Monitor-side only: it never mutates role state."""
+
+    def __init__(self, proxy: "RoleProcess", seat: str, method: str,
+                 call_id: int, timeout_s: Optional[float],
+                 cm_assembly_stem: Optional[str]) -> None:
+        self._proxy = proxy
+        self._seat = seat
+        self._method = method
+        self._call_id = call_id
+        self._timeout = (float(timeout_s)
+                         if timeout_s and float(timeout_s) > 0 else None)
+        self._cm_assembly_stem = cm_assembly_stem
+        # GIL-atomic attribute: the monitor only reads it, the reader thread
+        # only overwrites it — no lock needed for a monotonic timestamp.
+        self._last = time.monotonic()
+        self._stop = threading.Event()
+        self._fired = False
+        self._thread: Optional[threading.Thread] = None
+        # P (docs/19 §12.57): the type of the last frame received. A kill is
+        # otherwise undiagnosable — "900s idle" does not say whether the child
+        # was inside an LLM call, a tool, or nothing at all.
+        self.last_frame: Optional[str] = None
+
+    @property
+    def fired(self) -> bool:
+        return self._fired
+
+    def touch(self, frame: Optional[str] = None) -> None:
+        self._last = time.monotonic()
+        if frame:
+            self.last_frame = frame
+
+    def start(self) -> None:
+        if self._timeout is None or self._proxy._socket is None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="role-inactivity-watchdog", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            idle = time.monotonic() - self._last
+            if idle < self._timeout:
+                continue
+            self._fired = True
+            self._proxy._log_worker_event(
+                "role_session_timeout", seat=self._seat,
+                method=self._method, call_id=self._call_id,
+                idle_s=round(idle, 1), timeout_s=self._timeout,
+                # P (§12.57): which frame type was last seen — the one hint
+                # that separates "stuck in a tool" from "stuck in an LLM call"
+                # from "never got going".
+                last_frame=self.last_frame,
+                # diagnosis only (user decision: NO auto-latch from a kill)
+                cm_assembly_stem=self._cm_assembly_stem,
+                action="channel_closed_worker_stopped")
+            # Unblock the pending buffered read: shutdown() unblocks a
+            # blocked recv even while makefile io_refs are held (plain
+            # close() would not). The process teardown then happens on
+            # _invoke's unhealthy-worker path.
+            sock = self._proxy._socket
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -205,6 +307,15 @@ def _raise_remote(error: Dict[str, Any]) -> None:
 class RoleProcess:
     """API-compatible proxy with one isolated worker per role seat."""
 
+    # The CM session CANNOT cross this boundary as an object (it is consumed
+    # mid-conversation inside the child and is not JSON), so the loop hands
+    # this proxy a JSON DESCRIPTOR instead: clamped ``cm_*`` keys, the named
+    # module STEMS and the seat's materializable trajectory list
+    # (``gan.framework.cm_wiring``). The flag is how the loop tells a
+    # cross-process seat from an in-process one (it must not import
+    # role_process, which imports the roles).
+    cm_crossing = True
+
     def __init__(
         self,
         role: str,
@@ -214,6 +325,7 @@ class RoleProcess:
         code_root: Optional[str] = None,
         attempt_id: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        inactivity_timeout_s: Optional[float] = None,
     ):
         if role not in _ROLE_METHODS:
             raise ValueError(f"unsupported role process: {role}")
@@ -226,12 +338,31 @@ class RoleProcess:
         # Thinking-intensity knob (same models.yaml entry as ``model``);
         # threaded into the child via the init message -- never env.
         self.reasoning_effort = reasoning_effort
+        # CM-03 L2-01: seat-call inactivity watchdog (loop.role_inactivity_
+        # timeout_s; None/<=0 disables — in-process/test proxies never set
+        # it). The ONLY outer bound on a hung seat call.
+        self.inactivity_timeout_s = inactivity_timeout_s
         self.tool_timeout_s: Optional[int] = None
+        # CM descriptor for the NEXT call (set by the loop per seat call) and
+        # the CM summary the last call PUBLISHED (event channel). Both are
+        # per-call state: ``_invoke`` snapshots the descriptor and clears both
+        # before sending, so a stale value can never ride into a later call.
+        self.cm_descriptor: Optional[dict] = None
+        self.last_cm_summary: Optional[dict] = None
         self.assembly_report: Optional[dict] = None
         self.runtime: Optional[dict] = None
         self._call_id = 0
         self._lock = threading.Lock()
         self._closed = False
+        # F5 P1/P2 (docs/19 §12.28): the seat's trajectory write authority is
+        # GONE (role_broker no longer grants the dir); rows arrive as
+        # ``traj_row`` protocol messages and land HERE, stamped with a
+        # parent-owned hash chain. ``_traj_seat`` pins the one seat identity
+        # this child may name (first row wins; the child knows its own seat
+        # at bootstrap, the host learns it before the first call).
+        from gan.framework.traj_chain import TrajChain
+        self._traj_chain: "TrajChain" = TrajChain()
+        self._traj_seat: "Optional[str]" = None
         self._process: Optional[subprocess.Popen[str]] = None
         self._socket: Optional[socket.socket] = None
         self._reader: Optional[TextIO] = None
@@ -260,6 +391,17 @@ class RoleProcess:
 
     def _start_worker(self, seat: str) -> None:
         self._stop_worker()
+        # ② (docs/19 §12.65): the seat pin is a WORKER-lifetime fact, not a
+        # host-lifetime one. One RoleProcess legitimately serves the role's
+        # main seat and its self_improve seat in sequence; leaving the pin on
+        # the first seat refused EVERY row of the second one — measured
+        # 2026-11-09 R1: 36 `traj_row_refused{reason:"seat pin mismatch"}`, and
+        # the two self-improve sessions' trajectory (session + llm_calls
+        # sidecar) never landed at all, while the previous accepted round
+        # (pre-F5, 2026-11-03) had 8 such files. Each seat switch starts a NEW
+        # child, and that child may name exactly ONE seat — the guarantee is
+        # unchanged; only the scope of the pin is corrected.
+        self._traj_seat = None
         broker_socket = os.environ.get("GAN_ROLE_BROKER_UNIX", "").strip()
         if not broker_socket:
             raise RoleProcessError("role broker launch capability is required")
@@ -315,6 +457,9 @@ class RoleProcess:
             reply = _read_message(self._reader)
             if reply.get("type") == "event":
                 self._handle_event(reply)
+                continue
+            if reply.get("type") in ("traj_row", "traj_reset"):
+                self._handle_traj_row(reply)
                 continue
             if reply.get("type") == "error":
                 _exact_keys(reply, {"v", "type", "error"}, "init error")
@@ -423,12 +568,19 @@ class RoleProcess:
                     self._log_worker_event("role_worker_restart", seat=seat)
             if self._reader is None or self._writer is None:
                 raise RoleProcessError("role worker channel is not running")
+            # Snapshot per-call state NOW and clear it: a descriptor left over
+            # from an earlier call would be executed against this call's
+            # session, and a leftover summary would be attributed to it.
+            cm_descriptor = self.cm_descriptor
+            self.cm_descriptor = None
+            self.last_cm_summary = None
             self._call_id += 1
             call_id = self._call_id
             session_node = f"{self.instance}__{seat}"
             session_started = False
             call_succeeded = False
             worker_healthy = False
+            watchdog: Optional[_InvokeWatchdog] = None
             try:
                 if broker is not None and hasattr(broker, "begin_session"):
                     broker.begin_session(self.role, session_node)
@@ -468,17 +620,45 @@ class RoleProcess:
                     "role_state": {
                         "attempt_id": self.attempt_id,
                         "tool_timeout_s": self.tool_timeout_s,
+                        # CM session descriptor (protocol 2): the child builds
+                        # the session in ITS name space from these clamped keys
+                        # + stems. ``None`` = no seam for this call (identical
+                        # to the in-process ``keys is None`` case).
+                        "cm": cm_descriptor,
                     },
                 })
+                watchdog = _InvokeWatchdog(
+                    self, seat, method, call_id, self.inactivity_timeout_s,
+                    (cm_descriptor or {}).get("assembly_stem")
+                    if isinstance(cm_descriptor, dict) else None)
+                watchdog.start()
                 while True:
                     try:
                         reply = _read_message(self._reader)
                     except EOFError as exc:
+                        if watchdog.fired:
+                            raise RoleWorkerTimeout(
+                                f"role seat call {method!r} produced no frame "
+                                f"for {self.inactivity_timeout_s}s; worker "
+                                f"stopped (CM-03 watchdog)") from exc
                         code = self._process.poll() if self._process is not None else None
                         raise RoleProcessError(
                             f"role worker exited during {method} (exit={code})") from exc
+                    except (OSError, ValueError) as exc:
+                        # the watchdog's channel shutdown surfaces here on the
+                        # buffered read; a NON-fired failure keeps the previous
+                        # behavior (raw propagate)
+                        if watchdog.fired:
+                            raise RoleWorkerTimeout(
+                                f"role seat call {method!r} hit the inactivity "
+                                f"watchdog; worker stopped (CM-03)") from exc
+                        raise
+                    watchdog.touch(reply.get("type"))
                     if reply.get("type") == "event":
                         self._handle_event(reply)
+                        continue
+                    if reply.get("type") in ("traj_row", "traj_reset"):
+                        self._handle_traj_row(reply)
                         continue
                     if reply.get("type") == "broker_call":
                         self._handle_broker_call(reply, call_id, method, broker)
@@ -507,12 +687,125 @@ class RoleProcess:
                     self.assembly_report = report
                     result = _validated_result(method, reply["result"])
                     call_succeeded = True
+                    self._maybe_hygiene_restart(seat, method)
+                    self._emit_traj_fingerprint()
                     return result
             finally:
+                if watchdog is not None:
+                    watchdog.stop()
                 if not call_succeeded and not worker_healthy:
                     self._stop_worker()
                 if session_started:
                     broker.end_session(self.role, session_node)
+
+    def _maybe_hygiene_restart(self, seat: str, method: str) -> None:
+        """CM-03 T2 (docs/19 §12.16): a session whose agent CM code hit the
+        exec budget leaks its worker thread until the worker PROCESS dies
+        (Python cannot kill threads), and module-SPAWNED threads never even
+        pass through a budget. The result and summary are already in hand,
+        so the hygiene restart is POST-DELIVERY: stop + start the seat
+        worker, killing every thread it hosts. A restart failure never
+        retro-affects the delivered call — the worker state resets and the
+        NEXT invoke re-runs the restart through the seat-switch path (and
+        fails the seat only if the relaunch itself fails:
+        role_worker_restart_denied). Latch-bounded upstream (assembly and
+        policy each latch on FIRST failure — docs/19 §12.17), so this fires
+        at most a couple of times per seat segment."""
+        summary = self.last_cm_summary
+        if not isinstance(summary, dict):
+            return
+        try:
+            # MEASURED, not predicted (docs/19 §12.30.3/N1): the timed-out
+            # worker may still finish normally (band ② — the wait was
+            # abandoned at T, the work completed after it); the live census
+            # is the only signal that separates that from a real hang.
+            # ``thread_leaks`` stays a reported historical fact (the event
+            # fields below) and never triggers a restart by itself.
+            leaked = (int(summary.get("thread_leaks_live") or 0) > 0
+                      or int(summary.get("thread_leak_delta") or 0) > 0)
+        except (TypeError, ValueError):
+            return
+        if not leaked:
+            return
+        self._log_worker_event(
+            "role_worker_restart", seat=seat, method=method,
+            reason="cm_thread_leak",
+            thread_leaks=summary.get("thread_leaks"),
+            thread_leak_delta=summary.get("thread_leak_delta"),
+            # WHO (docs/19 §12.67): the restart event must carry the names, or
+            # the hygiene restart stays a number nobody can act on.
+            thread_leak_names=summary.get("thread_leak_names"))
+        try:
+            self._stop_worker()
+            self._start_worker(seat)
+        except Exception as exc:  # noqa: BLE001 -- the delivered result stands
+            self._log_worker_event("role_worker_restart_denied", seat=seat,
+                                   reason="cm_thread_leak",
+                                   detail=str(exc)[:300])
+
+    def _handle_traj_row(self, request: Dict[str, Any]) -> None:
+        """Parent-side sink for the seat's trajectory rows (F5 P1/P2,
+        docs/19 §12.28). The child forwards every trajectory-root append
+        (main stream + llm_calls sidecar) and every reset; THIS process is
+        the only writer. Structural validation: rel must be a relative,
+        non-escaping path under ``trajectory/outer_*/roles/<role>/<seat>/``
+        with THIS host's role, a pinned seat, and no ``..``."""
+        from utils import trajectory_log
+        from gan.framework.traj_chain import TrajChain
+        want = {"traj_row": {"v", "type", "rel", "traj_record"},
+                "traj_reset": {"v", "type", "rel"}}.get(request.get("type"))
+        if want is None:
+            self._log_worker_event("traj_row_refused", reason="unknown type")
+            return
+        try:
+            _exact_keys(request, want, "traj message")
+        except Exception:
+            self._log_worker_event("traj_row_refused", reason="bad shape")
+            return
+        rel = request.get("rel")
+        parts = rel.split(os.sep) if isinstance(rel, str) else []
+        seat = parts[4] if len(parts) > 4 else None
+        if (request.get("v") != _PROTOCOL_VERSION or len(parts) < 6 or not parts
+                or os.path.isabs(rel) or ".." in parts
+                or parts[0] != "trajectory" or not parts[1].startswith("outer_")
+                or parts[2] != "roles" or parts[3] != self.role
+                or not seat or seat.startswith("outer_")):
+            self._log_worker_event("traj_row_refused", rel=str(rel)[:120],
+                                   reason="structurally invalid")
+            return
+        if self._traj_seat is None:
+            self._traj_seat = seat
+        elif seat != self._traj_seat:
+            self._log_worker_event("traj_row_refused", rel=rel[:120],
+                                   reason="seat pin mismatch")
+            return
+        if self._seat is not None and self._seat != seat:
+            self._log_worker_event("traj_row_refused", rel=rel[:120],
+                                   reason="call seat mismatch")
+            return
+        base = os.path.join(self.output_dir, rel)
+        if request["type"] == "traj_reset":
+            trajectory_log.reset(base)
+            self._traj_chain = TrajChain()
+            return
+        record = request.get("traj_record")
+        if not isinstance(record, dict):
+            self._log_worker_event("traj_row_refused", rel=rel[:120],
+                                   reason="record must be an object")
+            return
+        trajectory_log.append(base, self._traj_chain.stamp(base, record))
+
+    def _emit_traj_fingerprint(self) -> None:
+        """One chain-head checkpoint event per call (the last one of a
+        launch is the session fingerprint; auditable + replayable without
+        touching the frozen role result contracts)."""
+        for base, (seq, head) in sorted(self._traj_chain.state().items()):
+            if seq <= 0:
+                continue
+            self._log_worker_event(
+                "traj_chain_fingerprint", file=os.path.relpath(
+                    base, self.output_dir), seq=seq, head=head,
+                seat=self._traj_seat)
 
     def _log_worker_event(self, event_type: str, **fields: Any) -> None:
         try:
@@ -533,7 +826,26 @@ class RoleProcess:
             raise RoleProcessError("invalid role event")
         from gan.framework import paths
         from utils import trajectory_log
-        trajectory_log.append(paths.events_path(self.output_dir), request["event"])
+        event = request["event"]
+        trajectory_log.append(paths.events_path(self.output_dir), event)
+        # The seat child's settled CM summary arrives on the EVENT channel (a
+        # return value would have to change three role result contracts and
+        # ``_validated_result`` checks those by exact field set). Stash it so
+        # the caller can record it in the cost ledger without touching the
+        # result payload; a mismatched attribution is DROPPED and reported.
+        if isinstance(event, dict) and event.get("type") == "cm_session_summary":
+            summary = event.get("summary")
+            seat = event.get("seat")
+            if (isinstance(summary, dict)
+                    and event.get("role") in (None, self.role)
+                    and seat in (None, self._seat)):
+                self.last_cm_summary = dict(summary)
+            else:
+                trajectory_log.append(paths.events_path(self.output_dir), {
+                    "type": "cm_session_summary_mismatch", "role": self.role,
+                    "seat": self._seat,
+                    "got": {"role": event.get("role"), "seat": seat},
+                })
 
     def _handle_broker_call(
         self, request: Dict[str, Any], call_id: int, role_method: str, broker: Any
@@ -750,15 +1062,31 @@ class _RemoteBroker:
         return reply["result"]
 
     def read_trajectory(self, role: str, node_id: Any, genid: Any,
-                        max_chars: int, *, seat: str) -> str:
-        return str(self._rpc("read_trajectory",
-                             [role, node_id, genid, int(max_chars)], {"seat": seat}))
+                        max_chars: int, *, seat: str,
+                        query: Optional[Dict[str, Any]] = None) -> Any:
+        # §12.24 (CM-08): ``query`` rides as a KWARG (the protocol already
+        # carries kwargs — "seat" crosses the same way), so the positional
+        # list and broker_info stay untouched. The kwarg is OMITTED when no
+        # query is requested, so a pre-§12.24 root-side broker keeps serving
+        # plain calls; with a query, an old broker refuses it with TypeError
+        # -> the tool's fail-open fallback.
+        call_kwargs: Dict[str, Any] = {"seat": seat}
+        if query is not None:
+            call_kwargs["query"] = query
+        result = self._rpc("read_trajectory",
+                           [role, node_id, genid, int(max_chars)], call_kwargs)
+        return result if isinstance(result, dict) else str(result)
 
     def read_session_trajectory(self, role: str, node_id: Any, outer: Any,
-                                genid: Any, max_chars: int, *, seat: str) -> str:
-        return str(self._rpc("read_session_trajectory",
-                             [role, node_id, outer, genid, int(max_chars)],
-                             {"seat": seat}))
+                                genid: Any, max_chars: int, *, seat: str,
+                                query: Optional[Dict[str, Any]] = None) -> Any:
+        call_kwargs: Dict[str, Any] = {"seat": seat}
+        if query is not None:
+            call_kwargs["query"] = query
+        result = self._rpc("read_session_trajectory",
+                           [role, node_id, outer, genid, int(max_chars)],
+                           call_kwargs)
+        return result if isinstance(result, dict) else str(result)
 
     def session_trajectory_index(self, role: str, node_id: Any, outer: Any,
                                  *, seat: str) -> list[dict[str, Any]]:
@@ -908,7 +1236,22 @@ def _worker_main() -> None:
         from gan.framework import paths as role_paths
         from utils import trajectory_log as role_trajectory_log
         original_append = role_trajectory_log.append
+        original_reset = role_trajectory_log.reset
         event_path = os.path.realpath(role_paths.events_path(init["output_dir"]))
+        # F5 P1 (docs/19 §12.28): the trajectory write authority moves to the
+        # parent — EVERY append under the output trajectory tree (main
+        # stream + llm_calls sidecar) and every reset is FORWARDED; the
+        # child keeps local write only for paths outside both sinks (there
+        # are none under the granted roots once role_broker drops the
+        # trajectory grant).
+        traj_root = os.path.realpath(os.path.join(init["output_dir"], "trajectory"))
+        output_root = os.path.realpath(init["output_dir"])
+
+        def _traj_rel(path: str) -> Optional[str]:
+            rp = os.path.realpath(path)
+            if not rp.startswith(traj_root + os.sep):
+                return None
+            return os.path.relpath(rp, output_root)
 
         def append_with_parent_event(path: str, record: Dict[str, Any],
                                      max_bytes: Optional[int] =
@@ -918,9 +1261,26 @@ def _worker_main() -> None:
                     "v": _PROTOCOL_VERSION, "type": "event", "event": record,
                 })
                 return
+            rel = _traj_rel(path)
+            if rel is not None:
+                _write_message(protocol_writer, {
+                    "v": _PROTOCOL_VERSION, "type": "traj_row",
+                    "rel": rel, "traj_record": record,
+                })
+                return
             original_append(path, record, max_bytes=max_bytes)
 
+        def reset_with_parent_event(path: str) -> None:
+            rel = _traj_rel(path)
+            if rel is not None:
+                _write_message(protocol_writer, {
+                    "v": _PROTOCOL_VERSION, "type": "traj_reset", "rel": rel,
+                })
+                return
+            original_reset(path)
+
         role_trajectory_log.append = append_with_parent_event
+        role_trajectory_log.reset = reset_with_parent_event
         with contextlib.redirect_stdout(sys.stderr):
             if role_name == "planner":
                 from gan.roles.planner import Planner as RoleClass
@@ -980,10 +1340,85 @@ def _worker_main() -> None:
                     or not isinstance(request["kwargs"], dict)):
                 raise RoleProcessError("invalid role call request")
             state = request["role_state"]
-            if not isinstance(state, dict) or set(state) != {"attempt_id", "tool_timeout_s"}:
+            if (not isinstance(state, dict)
+                    or set(state) != {"attempt_id", "tool_timeout_s", "cm"}):
                 raise RoleProcessError("invalid role state")
             role.attempt_id = state["attempt_id"]
             role.tool_timeout_s = state["tool_timeout_s"]
+            # Reserved cost keys / CM seam (docs/10 §11 D10-D11) ACROSS the
+            # process boundary: the parent sent the already-clamped keys and
+            # the named module STEMS; this child resolves them in ITS OWN
+            # namespace and builds the session HERE (the seam is consumed
+            # mid-conversation in this process, so nothing about it can live
+            # in the parent). Every resolution gap / build failure SPEAKS on
+            # the event channel -- a session that silently did not exist is
+            # exactly the failure this transport closes.
+            from gan.framework import cm_wiring
+            cm_value = state["cm"]
+            cm_genid = None
+            cm_problems = cm_wiring.check_descriptor(cm_value)
+            if cm_problems:
+                raise RoleProcessError(
+                    "invalid cm descriptor: " + "; ".join(cm_problems))
+            role.session_cm_mode = ((cm_value or {}).get("session_cm_mode"))
+            role.cm_session = None
+            if cm_value is not None:
+                cm_genid = cm_value.get("genid")
+
+                # Attribution (docs/19 §12.68): role+seat alone cannot tell the
+                # MAIN plan seat from the fixed-root evaluation's plan seat --
+                # both are ``planner/plan`` and both live in one events.jsonl,
+                # while their trajectories sit in different outer trees. The
+                # instance label (``outer_<N>`` / ``outer_<N>_eval``) and the
+                # generation are stamped onto EVERY CM event here, which is the
+                # only place the child knows both.
+                _cm_instance = os.environ.get("GAN_ROLE_INSTANCE") or None
+                _cm_genid = (None if cm_genid is None else str(cm_genid))
+
+                def _cm_sink(event: Dict[str, Any]) -> None:
+                    # Ride the framework event stream: an append onto the
+                    # events path is forwarded to the parent (see the patched
+                    # ``trajectory_log.append`` above) and lands in ITS
+                    # events.jsonl -- the same sink the in-process loop uses
+                    # (``log_event``), so a driver-mode session is audited
+                    # identically. Attribution is added here because no
+                    # ``loop.log_event`` wrapper exists in this process.
+                    role_trajectory_log.append(
+                        role_paths.events_path(init["output_dir"]),
+                        {**event, "role": role_name, "seat": expected_seat,
+                         "genid": _cm_genid, "instance": _cm_instance})
+
+                try:
+                    cm_session, cm_report = cm_wiring.build_from_descriptor(
+                        cm_value, role=role_name,
+                        output_dir=init["output_dir"],
+                        code_root=init["code_root"], emit=_cm_sink)
+                    role.cm_session = cm_session
+                except Exception as exc:  # noqa: BLE001 -- fail-open, must SPEAK
+                    cm_report = {"problems": [{"kind": "build", "stem": None,
+                                               "reason": f"{type(exc).__name__}: {exc}",
+                                               "tried": []}]}
+                for prob in (cm_report.get("problems") or []):
+                    _cm_sink({"type": "cm_module_unresolved",
+                              "kind": prob.get("kind"),
+                              "stem": prob.get("stem"),
+                              "reason": prob.get("reason"),
+                              "tried": list(prob.get("tried") or [])})
+                _cm_sink({"type": "cm_session_built",
+                          "mode": cm_report.get("mode"),
+                          "assembly": bool(cm_report.get("assembly_path")),
+                          "policy": bool(cm_report.get("policy_path")),
+                          "traj_kept": int(cm_report.get("traj_kept") or 0),
+                          "traj_skipped": list(cm_report.get("traj_skipped") or [])})
+                if cm_report.get("traj_skipped"):
+                    # R6 (docs/19 §12.37): the child-side demotion rides its
+                    # OWN event, symmetric with the parent-side
+                    # cm_traj_skipped — a fields-only signal is invisible to
+                    # event scans, and "parent says kept, child says
+                    # skipped" must be loud from BOTH sides.
+                    _cm_sink({"type": "cm_traj_skipped", "side": "child",
+                              "count": len(cm_report["traj_skipped"]),
+                              "labels": list(cm_report["traj_skipped"])[:20]})
             args = list(request["args"])
             kwargs = dict(request["kwargs"])
             if request["has_broker"]:
@@ -1032,9 +1467,34 @@ def _worker_main() -> None:
                                   if k in sig.parameters}
                     result = sink(*args, **kwargs)
             finally:
-                _purge_role_workspace(
-                    init["output_dir"], role_name,
-                    f"{init['instance']}__{expected_seat}")
+                try:
+                    _purge_role_workspace(
+                        init["output_dir"], role_name,
+                        f"{init['instance']}__{expected_seat}")
+                finally:
+                    # Settled CM session -> ONE summary record on the event
+                    # channel (docs/10 §11 D11). Emitted on the failure path
+                    # too: the turns that DID run are a fact worth recording,
+                    # and the parent's cost ledger must not read "no session"
+                    # for a session that existed and then failed.
+                    try:
+                        if role.cm_session is not None:
+                            cm_wiring.emit_summary(
+                                role.cm_session, role=role_name,
+                                seat=expected_seat, genid=cm_genid,
+                                event_path=role_paths.events_path(
+                                    init["output_dir"]))
+                    except Exception as exc:  # noqa: BLE001 -- audit-only
+                        try:
+                            role_trajectory_log.append(
+                                role_paths.events_path(init["output_dir"]),
+                                {"type": "cm_session_summary_failed",
+                                 "role": role_name, "seat": expected_seat,
+                                 "reason": f"{type(exc).__name__}: {exc}"[:200]})
+                        except Exception:  # noqa: BLE001 -- sink is down
+                            pass
+                    finally:
+                        role.cm_session = None
             if dataclasses.is_dataclass(result):
                 result = dataclasses.asdict(result)
             _json_bytes(result)

@@ -518,11 +518,12 @@ class Role(AgentSystem):
         # yet) keeps the tool's legacy current-outer derivation. Labels are
         # the instance-derived trajectory labels (D1): main "N", eval rounds
         # "N_eval"; a suffixed (eval-round) instance reads ONLY its own tree.
-        session_outers = None
-        if self.traj_outer is not None:
-            session_outers = {self.traj_outer}
-            if isinstance(self.outer, int) and self.outer > 1:
-                session_outers.add(str(self.outer - 1))
+        # ONE rule (gan/framework/trajectory.declared_session_outers): the SAME
+        # function the broker validates against, so what is declared and what is
+        # served cannot drift (docs/19 §12.12 F2).
+        from gan.framework.trajectory import declared_session_outers
+        session_outers = declared_session_outers("self_improve", self.traj_outer,
+                                                 self.outer)
         tok_access = (set_access_context(broker, self.role, self.access_key("self"),
                                          trajectory_genids=trajectory_genids,
                                          seat="self_improve",

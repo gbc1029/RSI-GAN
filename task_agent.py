@@ -1,3 +1,26 @@
+"""HyperAgents task agent.
+
+History-entry schema — the ONE place an evolved artifact, or an agent-authored
+context-management module, needs to know this (docs/19 §12.54-B; every writer
+and reader in the framework follows it):
+
+    msg_history: List[dict] where each entry is
+        {"role": "user" | "assistant", "content": <str>, ...}
+
+* ``content`` is the RAW text of that turn and the ONLY text carrier. There is
+  no ``text`` field — reading one yields ``None``.
+* while one turn is being assembled, the framework tags the THROW-AWAY send
+  copies with a private key ``_cm_sent`` (the RENDERED form of that entry).
+  Never read or write it here: those copies are discarded after the call, and
+  a canonical history never carries it.
+* ``ctx_fetch`` / ``ctx_peek`` block records also expose a ``text`` field —
+  that is the BLOCK's content, not the history entry's key. Do not confuse
+  the two.
+
+Runtime use of ``msg_history`` in this file is limited to ``_extract_prediction``
+(reading the final assistant turn); keep it ``content``-keyed.
+"""
+
 import json
 import os
 
@@ -55,9 +78,11 @@ class TaskAgent(AgentSystem):
         self.cm = cm
 
     def _extract_prediction(self, msg_history):
+        # entry schema: see the module docstring. ``content`` is the only text
+        # carrier (the retired ``text`` spelling no longer exists).
         if not msg_history or not isinstance(msg_history[-1], dict):
             return "", "missing final assistant message"
-        text = msg_history[-1].get("text")
+        text = msg_history[-1].get("content")
         if not isinstance(text, str):
             return "", "final assistant message has no text"
         extracted_jsons = extract_jsons(text, logging=self.log)

@@ -15,7 +15,54 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from datetime import datetime
+from utils.telemetry import TelemetryServer
+
+
+def _audit_chain():
+    """The audit hash chain, imported from the STAGED snapshot.
+
+    A″ (docs/19 §12.65): this harness runs INSIDE the sandbox, where ``gan/``
+    does not exist (``task_execution._RUNTIME_DIRS`` copies agent/ + utils/
+    only), so the framework module can never be imported here. The framework
+    therefore COPIES ``gan/framework/traj_chain.py`` into ``.gan_runtime/``
+    (same delivery as the CM core) and this resolves it as a top-level module,
+    exactly like ``domains/task_worker`` resolves ``cm``.
+
+    Loud on failure: the chain is the tamper evidence for the task
+    trajectory, and a silent fail-open would disable it without a trace.
+    """
+    import sys as _sys
+    for cand in (os.environ.get("GAN_AUDIT_SRC") or "",
+                 os.path.join(os.getcwd(), ".gan_runtime")):
+        if cand and os.path.isfile(os.path.join(cand, "traj_chain.py")):
+            if cand not in _sys.path:
+                _sys.path.insert(0, cand)
+            break
+    try:
+        from traj_chain import TrajChain as _Chain  # noqa: F401
+        from traj_chain import stream_fingerprint as _fp  # noqa: F401
+        return _Chain, _fp
+    except ImportError:
+        pass
+    # Root/manual path (the documented `python -m domains.harness` flow, and
+    # every offline test): there is no stage, but the repo IS the tree, so the
+    # framework module is importable. Resolved AFTER the staged copy so a
+    # sandbox never silently uses a different tree than the one it was staged
+    # from.
+    try:
+        from gan.framework.traj_chain import TrajChain as _Chain  # noqa: F401
+        from gan.framework.traj_chain import stream_fingerprint as _fp
+        return _Chain, _fp
+    except ImportError as exc:  # pragma: no cover -- both deliveries broken
+        raise RuntimeError(
+            "audit chain unavailable: neither the staged snapshot "
+            "(.gan_runtime/traj_chain.py, delivered by "
+            "materialize_cm_snapshot) nor gan.framework.traj_chain is "
+            f"importable. A harness that cannot chain the task trajectory is "
+            f"refused loudly, never run unaudited (docs/19 §12.65). ({exc})"
+        ) from exc
 import pandas as pd
 from hydra import compose, initialize_config_dir
 from utils.common import summarize_error
@@ -49,6 +96,13 @@ _TASK_ENV_NAMES = {
     # audit sidecar (§11.5: rw-bound host file, folded back by task_runner)
     "GAN_CM_CORE", "GAN_CM_POLICY", "GAN_CM_ASSEMBLY",
                       "GAN_CM_EVENTS",
+    # CM-03 generation latch (docs/19 §12.16): HARNESS-ORIGINATED, never
+    # parent-supplied — this process sets them after a question's seam
+    # events showed a named-assembly or named-policy failure (the snapshot
+    # is fixed for the whole generation, so re-attempting per question
+    # cannot change the outcome). Listed so the hop-1 audit face shows
+    # everything that crosses it.
+    "GAN_CM_ASSEMBLY_DISABLED", "GAN_CM_POLICY_DISABLED",
     # timeout plumbing (consumers: QUESTION_TIMEOUT above, agent/llm.py
     # per-call client budget). The thinking-intensity knob does NOT ride the
     # env: it is threaded explicitly (CLI --reasoning_effort -> payload).
@@ -338,7 +392,8 @@ def _add_empty_parents(command, path, created):
         created.add(item)
 
 
-def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
+def _sandbox_command(run_root, agent_path, proxy_socket=None,
+                     telemetry_socket=None):
     """Create a fail-closed Bubblewrap command for one TaskAgent question."""
     bwrap = shutil.which("bwrap")
     if not bwrap:
@@ -438,18 +493,29 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
     # agent/ is bound unconditionally for every domain. The context-management
     # snapshot lives under .gan_runtime/cm (GAN_CM_CORE) — delivered by the
     # same ro-bind above, still no gan/ (docs/10 §11.0.1).
-    # Task-child CM audit sidecar (docs/10 §11.5): a rw BIND (the tmpfs
-    # /workspace dies with the sandbox, so the sidecar must be a host file)
-    # so task_runner can ingest the seam events after the child exits. The
-    # host file is pre-created by assemble_task_env (a --bind source must
-    # exist before the namespace is built).
-    cm_events_host = os.path.join(run_root, "cm_events.jsonl")
-    if os.path.isfile(cm_events_host):
-        command.extend(["--bind", cm_events_host, "/workspace/cm_events.jsonl"])
+    # Task-child CM audit sidecar (docs/10 §11.5): a rw BIND, because the
+    # tmpfs /workspace dies with the sandbox and the parent ingests the events
+    # after the child exits.
+    #
+    # The bind source MUST be a file this process owns: the sandbox root here
+    # is the STAGE copy (``stage_root``), while the ingested sidecar lives in
+    # the run dir — and the run dir itself is bound READ-ONLY into the
+    # sandbox. Binding the run-dir file was the CM-02 bug: the source did not
+    # exist under ``stage_root``, the bind was skipped, and the child silently
+    # created /workspace/cm_events.jsonl inside the tmpfs — every append
+    # "succeeded" and the ingested sidecar stayed empty. Staging the file and
+    # copying it back is the same contract the trajectory already uses.
+    # F5 P1 (docs/19 §12.28): NO trajectory/sidecar bind — the child holds
+    # NO write authority over its audit streams; rows arrive over the
+    # telemetry socket and the harness writes them (hash-chained). The
+    # socket is ro-bound like the LLM proxy socket (connect needs file-perm,
+    # not a writable mount).
+    if telemetry_socket:
+        command.extend([
+            "--ro-bind", telemetry_socket, "/workspace/.telemetry.sock",
+            "--setenv", "GAN_TELEMETRY_UNIX", "/workspace/.telemetry.sock",
+        ])
     command.extend([
-        # Expose only this question's trajectory file, never outputs/ or other
-        # questions' trajectories, which may themselves contain benchmark data.
-        "--bind", trajectory_path, "/workspace/trajectory.jsonl",
         "--tmpfs", "/workspace/scratch",
         "--chdir", "/workspace/scratch",
         "--setenv", "HOME", "/tmp",
@@ -465,8 +531,76 @@ def _sandbox_command(run_root, agent_path, trajectory_path, proxy_socket=None):
     return command
 
 
+# CM-03 generation latch (docs/19 §12.16): set when ANY question of this
+# harness process produced a ``cm_assembly_failed`` / ``cm_policy_failed``
+# seam event. The CM snapshot is fixed for the whole generation (module bytes
+# cannot change), so later questions in the same generation must not
+# re-attempt the named module — each attempt would burn the exec budget and
+# leak a worker thread for an outcome that cannot differ. The flags cross to
+# the agent child as ``GAN_CM_*_DISABLED=1``; the child honors them at
+# session build (``task_worker._build_cm_session``).
+#
+# A MUTABLE HOLDER on purpose (docs/19 §12.54-A). Both flags are written from
+# ``_run_sandboxed_agent``, and a module-level REBINDING there needs one
+# ``global`` declaration per name: the missing one turned the read below into
+# ``UnboundLocalError`` on EVERY task question, the per-question isolation
+# swallowed it into a blank prediction, and the whole generation failed
+# silently while reading as a bad agent. Items of a dict cannot hit that class
+# at all — no name is ever rebound, so no declaration can be forgotten.
+_CM_LATCH = {"assembly": False, "policy": False}
+
+# kind -> the child env key that carries it (task_worker whitelists both).
+_CM_LATCH_ENV = {
+    "assembly": "GAN_CM_ASSEMBLY_DISABLED",
+    "policy": "GAN_CM_POLICY_DISABLED",
+}
+
+
+def _apply_cm_latches(env, latch=None):
+    """Project the generation latch onto one child env (docs/19 §12.16 C3).
+
+    ONE place owns the latch->env mapping, so the two kinds can never drift
+    apart and a regression test can assert the contract without spawning a
+    sandbox. Only ``True`` writes the flag: the child compares ``=="1"``, so a
+    cleared latch must write NOTHING rather than a ``"0"`` that would read as
+    set. Mutates and returns ``env`` (the caller owns the dict)."""
+    latch = _CM_LATCH if latch is None else latch
+    for kind, key in _CM_LATCH_ENV.items():
+        if latch.get(kind):
+            env[key] = "1"
+    return env
+
+
+def _cm_latch_scan(staged_lines: str) -> bool:
+    """True when staged seam-event lines show a named-assembly failure.
+
+    The trigger matches the p/e latch (``assembly_failures > 0``): only
+    strike-counted failures latch. EVERY ``cm_assembly_failed`` is
+    strike-counted, the LOAD phase included — ``_note_assembly_failure(
+    phase="load")`` counts it and emits the same event (docs/19
+    §12.17/§12.30: load-once caches the module failure, so a reload of
+    byte-identical module code would just fail again; the one-strike latch
+    is the intended semantics). The presence of the event alone is
+    therefore the trigger, exactly like the policy scan below."""
+    return '"cm_assembly_failed"' in (staged_lines or "")
+
+
+def _cm_policy_latch_scan(staged_lines: str) -> bool:
+    """True when staged seam-event lines show a named-policy failure.
+
+    Mirror of ``_cm_latch_scan`` (docs/19 §12.30 rule 3 — the persistence
+    layer is kind-symmetric): every ``cm_policy_failed`` is strike-counted
+    (``_note_policy_failure``), so the presence of the event alone is the
+    trigger — same one-event-per-strike contract as the assembly scan."""
+    return '"cm_policy_failed"' in (staged_lines or "")
+
+
 def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socket=None, proxy_token=None,
-                         reasoning_effort=None, cost_overrides=None):
+                         reasoning_effort=None, cost_overrides=None,
+                         cm_events_target=None):
+    # (No ``global`` needed: the generation latch lives in the ``_CM_LATCH``
+    # holder, so this function never REBINDS a module-level name — the class
+    # of bug that killed every task question once docs/19 §12.54-A.)
     # Private run ancestors deliberately remain non-traversable to the
     # sandbox uid. Bubblewrap also cannot reliably open bind sources through
     # /proc/self/fd, so stage only the allowlisted inputs in a private /tmp
@@ -500,6 +634,11 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
         if cost_overrides.get("token_budget") is not None:
             payload["token_budget"] = int(cost_overrides["token_budget"])
     child_env = _task_child_env(os.environ)
+    # CM-03 generation latch: an earlier question of THIS generation failed
+    # its named assembly / policy — later questions get the latch flag (the
+    # child keeps the design claim but never loads the module; every cm_view
+    # then reads <kind>_disabled=true, so the latch is loud, not silent).
+    _apply_cm_latches(child_env)
 
     # The result channel is an anonymous temporary file. Only the trusted
     # task_worker receives its fd; the TaskAgent child is spawned later with
@@ -507,6 +646,10 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
     run_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     run_root = f"/proc/self/fd/{run_fd}"
     stage_root = tempfile.mkdtemp(prefix="rsi-gan-task-", dir="/tmp")
+    # F5 P1: initialized before the try so an early-staging failure cannot
+    # make the finally block NameError on the teardown path.
+    _telemetry = None
+    cm_received: list = []
     try:
         run_real = os.path.realpath(run_root)
         trajectory_real = os.path.realpath(trajectory_path)
@@ -543,31 +686,128 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
             shutil.copytree(runtime_source,
                             os.path.join(stage_root, ".gan_runtime"),
                             symlinks=False)
-        staged_trajectory = os.path.join(stage_root, "trajectory.jsonl")
-        shutil.copy2(trajectory_source, staged_trajectory)
+        # F5 P1 (docs/19 §12.28): the telemetry channel REPLACES the staged
+        # trajectory/sidecar copy-back contract. The harness (trusted) owns
+        # both streams now: trajectory rows are hash-chained INTO the real
+        # host file; cm events append straight to the host sidecar that
+        # task_runner ingests. Pre-create the sidecar so a zero-event run
+        # reads as "present but empty", not "missing".
+        if cm_events_target:
+            host_cm_events = os.path.abspath(cm_events_target)
+            os.makedirs(os.path.dirname(host_cm_events), exist_ok=True)
+            with open(host_cm_events, "a", encoding="utf-8"):
+                pass
+        _Chain, _fp = _audit_chain()
+        chain = _Chain()
+        cm_received: list = []
+        telemetry_socket = os.path.join(stage_root, "telemetry.sock")
+
+        def _on_telemetry(msg):
+            mtype = msg.get("type")
+            if mtype == "traj_row" and isinstance(msg.get("record"), dict):
+                from utils import trajectory_log as _tlog
+                _tlog.append(trajectory_source,
+                             chain.stamp(trajectory_source, msg["record"]))
+            elif mtype == "traj_reset":
+                from utils import trajectory_log as _tlog
+                _tlog.reset(trajectory_source)
+            elif mtype == "cm_event" and isinstance(msg.get("event"), dict):
+                cm_received.append(msg["event"])
+                if cm_events_target:
+                    with open(os.path.abspath(cm_events_target), "a",
+                              encoding="utf-8") as handle:
+                        handle.write(json.dumps(
+                            msg["event"], ensure_ascii=False, default=str) + "\n")
+
+        _telemetry = TelemetryServer(telemetry_socket, _on_telemetry)
+        _telemetry.start()
 
         with tempfile.TemporaryFile(mode="w+b") as result_file:
             result_fd = result_file.fileno()
             payload["result_fd"] = result_fd
-            proc = subprocess.run(
-                _sandbox_command(stage_root, "./task_agent.py", staged_trajectory,
-                                 proxy_socket),
-                input=json.dumps(payload, ensure_ascii=False, default=str),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=child_env,
-                timeout=QUESTION_TIMEOUT,
-                pass_fds=(result_fd,),
-            )
+            # S (docs/19 §12.61): a QUESTION TIMEOUT must not skip the latch
+            # feed. `subprocess.run(timeout=...)` used to raise straight past
+            # the scan, so a generation whose first question timed out after
+            # the module had already failed never latched it — every later
+            # question paid the same failure again (the latch's whole point is
+            # "one strike, rest of the generation"). The scan therefore runs
+            # on EVERY exit path, including the timeout one.
+            _run_timeout: Optional[BaseException] = None
+            proc = None
+            try:
+                proc = subprocess.run(
+                    _sandbox_command(stage_root, "./task_agent.py",
+                                     proxy_socket,
+                                     telemetry_socket=telemetry_socket),
+                    input=json.dumps(payload, ensure_ascii=False, default=str),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=child_env,
+                    timeout=QUESTION_TIMEOUT,
+                    pass_fds=(result_fd,),
+                )
+            except subprocess.TimeoutExpired as exc:
+                _run_timeout = exc
+            # F5 P1: no copy-back — the sink appended received cm events to
+            # the host sidecar LIVE (the writer is the trusted harness now).
+            # The CM-03 generation latch feed reads the RECEIVED events
+            # (joined back to lines — the scan's contract is text).
+            _latch_text = "".join(
+                json.dumps(e, ensure_ascii=False, default=str) + "\n"
+                for e in cm_received)
+            # CM-03 generation latch feed: ONE kind-symmetric loop (docs/19
+            # §12.30 rule 3 promises symmetry; two hand-copied blocks are
+            # exactly how the policy half was broken once).
+            for kind, scan in (("assembly", _cm_latch_scan),
+                               ("policy", _cm_policy_latch_scan)):
+                if scan(_latch_text) and not _CM_LATCH[kind]:
+                    _CM_LATCH[kind] = True
+                    print(f"[cm] {kind} latched for the rest of this "
+                          f"generation (cm_{kind}_failed seen)", flush=True)
+            if _run_timeout is not None:
+                # the latch feed has run; keep the pre-S contract (the caller
+                # maps TimeoutExpired to its own per-question failure)
+                raise _run_timeout
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
                 raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")
 
+            # A LIVE socket that delivered NOTHING is the exact shape of a dead
+            # audit channel — the socket path dropped at an env hop, a refused
+            # connect, a client that could not be imported, or an agent that
+            # never logs. It used to be silent whenever rc == 0: the child's own
+            # diagnostic ("[f5] telemetry channel not established / up") lives
+            # in a PIPE the harness throws away on success, and the finally-line
+            # below only speaks when the chain is non-empty. Measured cost of
+            # that silence: docs/19 §12.66 — every generation's trajectory
+            # archive came back empty and its CORRECT answer was nulled to
+            # score=null while nothing in the run said why.
+            if _telemetry is not None and _telemetry.rows == 0:
+                _child_diag = "\n".join(
+                    part for part in ((proc.stdout or "").strip(),
+                                      (proc.stderr or "").strip()) if part)
+                print("[WARN] f5 audit channel delivered 0 trajectory rows and "
+                      f"{_telemetry.cm_events} cm events for this question "
+                      f"(connected={_telemetry.connected}, "
+                      f"socket={telemetry_socket}) — the task trajectory will be "
+                      "empty, so the generation's archive will FAIL and its score "
+                      "will be nulled"
+                      + (f"\n[WARN] child diagnostics:\n{_child_diag[-1200:]}"
+                         if _child_diag else ""), flush=True)
+
             result_file.seek(0)
             raw_result = result_file.read()
-            shutil.copyfile(staged_trajectory, trajectory_source)
+            # F5 P1: no trajectory copy-back — the telemetry sink wrote the
+            # real host file live (hash-chained).
     finally:
+        if _telemetry is not None:
+            _telemetry.stop()
+        _, _fp = _audit_chain()
+        fseq, fhead, freason = _fp(trajectory_source)
+        if fseq > 0 or freason:
+            print(f"[f5] traj rows chained={fseq} head={fhead} "
+                  f"reason={freason} cm_events={len(cm_received)}", flush=True)
         shutil.rmtree(stage_root, ignore_errors=True)
         os.close(run_fd)
 
@@ -591,10 +831,16 @@ def run_agent(TaskAgent, model, row, evals_folder, format_input_dict,
     inputs = format_input_dict(row)
     _t0 = time.time()
     if sandbox_task_agent:
-        prediction = _run_sandboxed_agent(model, inputs, agent_path, chat_history_path,
-                                          proxy_socket, proxy_token,
-                                          reasoning_effort=reasoning_effort,
-                                          cost_overrides=cost_overrides)
+        prediction = _run_sandboxed_agent(
+            model, inputs, agent_path, chat_history_path,
+            proxy_socket, proxy_token,
+            reasoning_effort=reasoning_effort,
+            cost_overrides=cost_overrides,
+            # The OUTPUT tree (parent of agent_evals) is the only tree that
+            # is read-write INSIDE the sandbox namespace, so the seam sidecar
+            # is folded back there, never next to the run-dir inputs.
+            cm_events_target=os.path.join(os.path.dirname(evals_folder),
+                                          "cm_events.jsonl"))
         print(f"[timing] question {question_id}: {time.time() - _t0:.1f}s "
               f"(budget {QUESTION_TIMEOUT}s, {'blank' if not str(prediction).strip() else 'prediction produced'})",
               flush=True)
@@ -647,6 +893,40 @@ def _failure_phase(e):
     if "TaskAgent child" in s or "Trusted TaskAgent worker" in s:
         return "result_channel"
     return "unknown"
+
+
+def _write_failure_summary(failures_path, failures, attempted):
+    """Append ONE generation-level summary line to ``eval_failures.jsonl``.
+
+    Per-question records are diagnostics; this line is the FACT the parent
+    needs to tell an infrastructure break from model noise (docs/19 §12.54-A):
+    a generation in which EVERY attempted question died with the SAME
+    non-domain error (the observed shape: 20/20 ``UnboundLocalError``,
+    per-question isolation turning it into blank predictions, score 0 — i.e.
+    "the agent is bad") must not be indistinguishable from ordinary failures.
+    ``all_failed`` plus a single dominant ``error_type`` is that signal.
+
+    Advisory end to end: a write failure never fails the run, and an absent
+    summary line means "no failures recorded" (absence = healthy, per the
+    no-silent-fail / None-is-not-0 rule)."""
+    error_types = {}
+    for rec in failures or []:
+        kind = str(rec.get("error_type") or "unknown")
+        error_types[kind] = error_types.get(kind, 0) + 1
+    summary = {
+        "kind": "question_failures_summary",
+        "attempted": int(attempted or 0),
+        "failed": len(failures or []),
+        "all_failed": bool(attempted) and len(failures or []) >= int(attempted),
+        "error_types": error_types,
+    }
+    try:
+        with open(failures_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    except OSError as exc:  # audit sidecar only: never fail the run
+        print(f"[WARN] failure summary not written ({failures_path}): {exc}",
+              flush=True)
+    return summary
 
 
 def _dump_failure_log(evals_folder, qid, e):
@@ -906,6 +1186,7 @@ def harness(
 
     if failures:
         append_pending_failures()
+        _write_failure_summary(failures_path, failures, len(futures))
         print(f"{len(failures)} question(s) failed and were isolated (see eval_failures.jsonl)")
 
     return output_folder
