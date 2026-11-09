@@ -70,6 +70,12 @@ def summarize_question_failures(path: str) -> Optional[Dict[str, Any]]:
         return None
     records: List[Dict[str, Any]] = []
     summary_line: Optional[Dict[str, Any]] = None
+    # S (docs/19 §12.61): a torn line is TOLERATED (it must not sink the
+    # summary) but never SILENT — a truncated tail is the trace of a writer
+    # that died mid-append, and the fold is the only reader that can tell.
+    # The count rides the returned payload so the loss is visible downstream.
+    torn = 0
+    non_dict = 0
     for line in raw:
         line = line.strip()
         if not line:
@@ -77,8 +83,10 @@ def summarize_question_failures(path: str) -> Optional[Dict[str, Any]]:
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
+            torn += 1
             continue          # a torn last line must not sink the whole summary
         if not isinstance(row, dict):
+            non_dict += 1
             continue
         if row.get("kind") == "question_failures_summary":
             summary_line = row
@@ -97,6 +105,8 @@ def summarize_question_failures(path: str) -> Optional[Dict[str, Any]]:
                 "records_missing": True,
                 "error_types": dict(summary_line.get("error_types") or {}),
             }
+            if torn or non_dict:
+                out["torn_lines"] = torn + non_dict
             out["attempted"] = summary_line.get("attempted")
             out["all_failed"] = bool(summary_line.get("all_failed"))
             if out["all_failed"] and len(out["error_types"]) == 1:
@@ -117,6 +127,10 @@ def summarize_question_failures(path: str) -> Optional[Dict[str, Any]]:
         "phases": phases,
         "questions": [str(r.get("question_id")) for r in records][:20],
     }
+    if torn or non_dict:
+        # S (§12.61): conditional, like every other absence-means-clean field
+        # — a truncated sidecar tail is now visible instead of silent.
+        out["torn_lines"] = torn + non_dict
     if summary_line:
         # The harness's own denominator: it counts what THIS run attempted, so
         # "all failed" is exact instead of being inferred from predictions.csv.

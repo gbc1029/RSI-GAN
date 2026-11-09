@@ -85,7 +85,22 @@ _DEDUP_MARKER = "[gan:system prompt deduplicated]"
 # separately (``thread_leaks``, timeout-driven). Advisory in in-process
 # mode (parallel sessions share one process census), authoritative in the
 # seat child (one session's census per worker process).
-_FOREIGN_THREAD_EXCLUDE = ("ThreadPoolExecutor", "cm_exec")
+#
+# G (docs/19 §12.59): FRAMEWORK PLUMBING threads are excluded by name prefix.
+# The relay/proxy pumps, the broker and the telemetry client are started by the
+# framework around (or after) the session baseline, so they used to be counted
+# as leaks — every seat session reported ``thread_leak_delta``>=1 and the
+# post-session hygiene restart fired on EVERY call (probed: delta=3), i.e. the
+# signal was constant noise. The exclusion is prefix-based only: anything an
+# agent module spawns keeps its own name and still counts, so the leak
+# detection itself is not weakened.
+_FOREIGN_THREAD_EXCLUDE = (
+    "ThreadPoolExecutor",   # concurrent.futures pools (framework + libs)
+    "cm_exec",              # the CM per-turn exec worker (counted as thread_leaks)
+    "rsi-gan-",             # every framework thread: llm-relay, llm-proxy, *-broker
+    "f5-telemetry",         # telemetry client pump
+    "role-inactivity-watchdog",
+)
 
 
 def _foreign_thread_count() -> int:
@@ -278,6 +293,19 @@ def _entries_conflict(entry: Dict[str, Any]) -> bool:
     content, text = entry.get(_RAW_KEY), entry.get("text")
     return (isinstance(content, str) and isinstance(text, str)
             and content and text and content != text)
+
+
+def _is_step_head(block: Any) -> bool:
+    """One STEP = one LLM call; its head is the assistant reply (docs/19 §12.56).
+
+    The chat protocol appends exactly TWO entries per call: the user message
+    carrying that call's tool outputs, then the assistant reply. Counting
+    ENTRIES therefore made ``cm_window_k`` mean "blocks" (≈ half a step per
+    unit, and ``k=1`` kept only the *current* message — an unusable floor).
+    The window now counts CALLS: a step starts at its assistant block and owns
+    every block back to the previous assistant (its tool-output input).
+    """
+    return block.kind == "turn_output" and block.source == "assistant"
 
 
 _LEGAL_ROLES = ("system", "user", "assistant", "tool")
@@ -918,6 +946,21 @@ class CMSession:
     _turn_unrendered: bool = field(default=False, repr=False, compare=False)
     _turn_unrendered_seen: bool = field(default=False, repr=False, compare=False)
     unrendered_turns: int = 0
+    # F (docs/19 §12.58): a dedup form that cannot apply any more is demoted
+    # to FULL (with a refund); the one-shot flag keeps the explanation to one
+    # event per session.
+    _dedup_lapsed_seen: bool = field(default=False, repr=False, compare=False)
+    # F (§12.58): the EXACT credit each dedup form booked when it was applied.
+    # ``view_text`` already models "a dedup that cannot apply = full width", so
+    # a lapse cannot recompute the credit from the CURRENT prefix — the amount
+    # to refund is the one the op actually booked. Popped by ``_book`` whenever
+    # the block leaves the dedup form (so a fetch-then-lapse cannot refund
+    # twice). A P1 snapshot/restore does not carry it, which is harmless: the
+    # only writer of the dedup form is ``dedup_prefix`` (the policy face
+    # refuses it), and it overwrites the entry, while ``_lapse_forms`` only
+    # acts on blocks whose CURRENT form still is dedup.
+    _dedup_credit: Dict[str, int] = field(default_factory=dict, repr=False,
+                                          compare=False)
 
     # ------------------------------------------------------------------- config
     def __post_init__(self) -> None:
@@ -1032,9 +1075,15 @@ class CMSession:
         if rec.get("ok"):
             block = self.universe.get(block_id)
             if block is not None:
+                new_state = self._pre_state(block_id)
                 rec["saved"] = self._transition_saving(
-                    block, prev[0], prev[1],
-                    *self._pre_state(block_id))
+                    block, prev[0], prev[1], *new_state)
+                # F (§12.58): the dedup credit belongs to the dedup FORM. Any
+                # transition out of it (fetch/restore/drop/compact/substitute)
+                # already booked its own signed delta through this funnel, so
+                # the ledger entry must not survive to be refunded again.
+                if new_state[0] != "dedup":
+                    self._dedup_credit.pop(block_id, None)
         return rec
 
     def _delta_since(self, prev_all: Dict[str, Tuple[str, str]]) -> int:
@@ -2156,19 +2205,51 @@ class CMSession:
                     "used": used, "budget": budget})
         return {"op": "budget_checkpoint", "ok": True, "source": "pre"}
 
+    def _window_kept_ids(self) -> set:
+        """Block ids the pin window keeps FULL (docs/19 §12.56).
+
+        ONE unit for every window-relative stage (window / compaction /
+        dedup): a STEP is one LLM call, anchored on its assistant block, and
+        it owns the blocks back to the previous assistant — i.e. its own
+        tool-output input. The newest ``window_k`` steps stay verbatim.
+
+        Counting ENTRIES instead (the pre-§12.56 rule) made ``k`` mean
+        "blocks": half a step per unit, and ``k=1`` kept only the current
+        message while dropping every tool result. It also let the three
+        window-relative stages drift apart, because each carried its own copy
+        of the counter.
+        """
+        blocks = [b for b in self.universe.ordered()
+                  if b.kind in ("turn_output", "tool_output")]
+        steps = 0
+        limit = max(self.window_k, WINDOW_K_FLOOR)
+        kept = set()
+        for block in reversed(blocks):
+            if _is_step_head(block):
+                steps += 1
+            if steps <= limit:
+                kept.add(block.block_id)
+        return kept
+
     def window_defaults(self) -> List[Dict[str, Any]]:
-        """slice/compact/custom modes: keep the newest ``window_k`` assistant
-        turns FULL (plus pinned blocks + notes — pin/note protection lives in
-        the primitives), older turn/tool blocks -> placeholder. Drop-floor
-        guarded: small blocks stay (a placeholder would cost more)."""
+        """slice/compact/custom modes: keep the newest ``window_k`` LLM CALLS
+        FULL (plus pinned blocks + notes — pin/note protection lives in the
+        primitives), older turn/tool blocks -> placeholder. Drop-floor
+        guarded: small blocks stay (a placeholder would cost more).
+
+        The unit is a CALL, not an entry (docs/19 §12.56): one call appends
+        two entries (assistant reply + the user message carrying its tool
+        outputs), so counting entries made ``k`` mean "blocks" — half a step
+        per unit, and ``k=1`` kept only the current message while dropping
+        every tool result. A step is anchored on its assistant block and owns
+        the blocks back to the previous assistant, so a kept step keeps its
+        own tool-output input (never a tool call without its result)."""
         out: List[Dict[str, Any]] = []
         blocks = [b for b in self.universe.ordered()
                   if b.kind in ("turn_output", "tool_output")]
-        rounds = 0
+        kept = self._window_kept_ids()
         for block in reversed(blocks):
-            if block.kind == "turn_output":
-                rounds += 1
-            if rounds <= max(self.window_k, WINDOW_K_FLOOR):
+            if block.block_id in kept:
                 continue
             if self.view.form_of(block.block_id) != "full":
                 continue  # already substituted in an earlier turn (sticky)
@@ -2196,12 +2277,10 @@ class CMSession:
         separate ``tool_output`` kind never materializes and the original
         tool_output-only targeting made this tier identical to ``slice``."""
         out: List[Dict[str, Any]] = []
-        rounds = 0
+        kept = self._window_kept_ids()
         for block in reversed([b for b in self.universe.ordered()
-                               if b.kind in ("turn_output", "tool_output")]):
-            if block.kind == "turn_output":
-                rounds += 1
-            if rounds <= max(self.window_k, WINDOW_K_FLOOR):
+                               if b.kind == "turn_output"]):
+            if block.block_id in kept:
                 continue
             if block.pinned:
                 continue
@@ -2643,11 +2722,14 @@ class CMSession:
         out: List[Dict[str, Any]] = []
         blocks = [b for b in self.universe.ordered()
                   if b.kind == "turn_output"]
-        rounds = 0
+        # ONE unit for every window-relative stage (docs/19 §12.56): the set
+        # this stage may touch is exactly the set the window does NOT keep.
+        # A private counter here would let dedup rewrite a block the window
+        # deliberately keeps FULL (and vice versa) — the two stages would
+        # disagree about what "old" means.
+        kept = self._window_kept_ids()
         for block in reversed(blocks):
-            if block.kind == "turn_output":
-                rounds += 1
-            if rounds <= max(self.window_k, WINDOW_K_FLOOR):
+            if block.block_id in kept:
                 continue
             if self.view.form_of(block.block_id) != "full":
                 continue
@@ -2661,9 +2743,64 @@ class CMSession:
             if saving <= 0:
                 continue
             self.view.set(block.block_id, "dedup", "system_prefix")
+            self._dedup_credit[block.block_id] = int(saving)
             out.append({"op": "dedup", "refs": [block.block_id], "ok": True,
                         "rule": "system_prefix", "saved": saving})
         return out
+
+    def _lapse_forms(self, msgs: List[Dict[str, Any]]) -> None:
+        """F (docs/19 §12.58): DEMOTE a dedup form that can no longer apply.
+
+        ``render``'s dedup branch rewrites an entry only when its text starts
+        with the SESSION prefix. When it does not — the prefix was set again
+        with a different header, or the entry text was rewritten — the branch
+        ``continue``d: the entry shipped RAW while the view still said
+        ``dedup``, so ``substituted`` counted a block that was not
+        substituted and the credit booked at op time never materialized (a
+        phantom saving; probed: est 800 with no marker anywhere).
+
+        Eliding a header that is NOT the current prefix is not an option —
+        the model was never told that text is redundant, so dropping it would
+        delete information (invariant 1). The FORM is what is wrong, so it is
+        demoted to FULL and the signed transition books the refund
+        (``_book``), with ONE event per session.
+        """
+        for bid in list(self.view.forms.keys()):
+            if self.view.form_of(bid) != "dedup":
+                continue
+            block = self.universe.blocks.get(bid)
+            if block is None or getattr(block, "note", False):
+                continue
+            idx = block.msg_index
+            text = (_msg_text(msgs[idx])
+                    if idx is not None and 0 <= idx < len(msgs) else None)
+            if text is None:
+                text = block.text
+            if self.system_prefix and text.startswith(self.system_prefix):
+                continue                      # still applicable: nothing to do
+            credit = int(self._dedup_credit.get(bid) or 0)
+            prev = self._pre_state(bid)
+            self.view.set(bid, "full", "")
+            rec = self._book({"op": "dedup_lapsed", "refs": [bid], "ok": True},
+                             bid, prev)
+            # ``view_text`` already models "cannot apply = full width", so the
+            # recomputed transition is 0 here; the honest refund is the credit
+            # the op BOOKED (see ``_dedup_credit``).
+            rec["saved"] = -credit
+            rec["refunded"] = -credit
+            # The refund lands on the CUMULATIVE flow (``est_saved_session``),
+            # not on this turn's stage sum: the credit it cancels was booked by
+            # an EARLIER turn, and ``saved_chars`` is documented as the seam
+            # stage sum of the turn that ran the stages (§12.56-B calibers).
+            self.est_chars_saved -= credit
+            if not self._dedup_lapsed_seen:
+                self._dedup_lapsed_seen = True
+                self._emit({"type": "cm_dedup_lapsed", "turn": self.turn,
+                            "refs": [bid], "refunded": -credit,
+                            "detail": "the dedup form no longer applies (the "
+                                      "entry does not start with the current "
+                                      "session prefix); demoted to FULL and "
+                                      "the credit refunded"})
 
     def render(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Materialize the CURRENT persistent view into shallow copies.
@@ -2682,6 +2819,9 @@ class CMSession:
         self._require_msg_dicts(msgs, "render")
         if self._note_off_canonical(msgs, "render"):
             return [dict(m) if isinstance(m, dict) else m for m in msgs]
+        # F (§12.58): a form that cannot apply must not keep claiming a
+        # substitution. Runs on the CANONICAL list only (the gate above).
+        self._lapse_forms(msgs)
         by_msg: Dict[int, List[Block]] = {}
         for block in self.universe.ordered():
             form = self.view.form_of(block.block_id)

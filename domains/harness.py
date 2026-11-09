@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from datetime import datetime
 from utils.telemetry import TelemetryServer
 from gan.framework.traj_chain import TrajChain
@@ -679,17 +680,30 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
         with tempfile.TemporaryFile(mode="w+b") as result_file:
             result_fd = result_file.fileno()
             payload["result_fd"] = result_fd
-            proc = subprocess.run(
-                _sandbox_command(stage_root, "./task_agent.py",
-                                 proxy_socket, telemetry_socket=telemetry_socket),
-                input=json.dumps(payload, ensure_ascii=False, default=str),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=child_env,
-                timeout=QUESTION_TIMEOUT,
-                pass_fds=(result_fd,),
-            )
+            # S (docs/19 §12.61): a QUESTION TIMEOUT must not skip the latch
+            # feed. `subprocess.run(timeout=...)` used to raise straight past
+            # the scan, so a generation whose first question timed out after
+            # the module had already failed never latched it — every later
+            # question paid the same failure again (the latch's whole point is
+            # "one strike, rest of the generation"). The scan therefore runs
+            # on EVERY exit path, including the timeout one.
+            _run_timeout: Optional[BaseException] = None
+            proc = None
+            try:
+                proc = subprocess.run(
+                    _sandbox_command(stage_root, "./task_agent.py",
+                                     proxy_socket,
+                                     telemetry_socket=telemetry_socket),
+                    input=json.dumps(payload, ensure_ascii=False, default=str),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=child_env,
+                    timeout=QUESTION_TIMEOUT,
+                    pass_fds=(result_fd,),
+                )
+            except subprocess.TimeoutExpired as exc:
+                _run_timeout = exc
             # F5 P1: no copy-back — the sink appended received cm events to
             # the host sidecar LIVE (the writer is the trusted harness now).
             # The CM-03 generation latch feed reads the RECEIVED events
@@ -706,6 +720,10 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
                     _CM_LATCH[kind] = True
                     print(f"[cm] {kind} latched for the rest of this "
                           f"generation (cm_{kind}_failed seen)", flush=True)
+            if _run_timeout is not None:
+                # the latch feed has run; keep the pre-S contract (the caller
+                # maps TimeoutExpired to its own per-question failure)
+                raise _run_timeout
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "no worker output")[-2000:]
                 raise RuntimeError(f"Sandboxed TaskAgent failed (rc={proc.returncode}): {detail}")

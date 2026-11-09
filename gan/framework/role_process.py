@@ -79,13 +79,19 @@ class _InvokeWatchdog:
         self._stop = threading.Event()
         self._fired = False
         self._thread: Optional[threading.Thread] = None
+        # P (docs/19 §12.57): the type of the last frame received. A kill is
+        # otherwise undiagnosable — "900s idle" does not say whether the child
+        # was inside an LLM call, a tool, or nothing at all.
+        self.last_frame: Optional[str] = None
 
     @property
     def fired(self) -> bool:
         return self._fired
 
-    def touch(self) -> None:
+    def touch(self, frame: Optional[str] = None) -> None:
         self._last = time.monotonic()
+        if frame:
+            self.last_frame = frame
 
     def start(self) -> None:
         if self._timeout is None or self._proxy._socket is None:
@@ -104,6 +110,10 @@ class _InvokeWatchdog:
                 "role_session_timeout", seat=self._seat,
                 method=self._method, call_id=self._call_id,
                 idle_s=round(idle, 1), timeout_s=self._timeout,
+                # P (§12.57): which frame type was last seen — the one hint
+                # that separates "stuck in a tool" from "stuck in an LLM call"
+                # from "never got going".
+                last_frame=self.last_frame,
                 # diagnosis only (user decision: NO auto-latch from a kill)
                 cm_assembly_stem=self._cm_assembly_stem,
                 action="channel_closed_worker_stopped")
@@ -616,7 +626,7 @@ class RoleProcess:
                                 f"role seat call {method!r} hit the inactivity "
                                 f"watchdog; worker stopped (CM-03)") from exc
                         raise
-                    watchdog.touch()
+                    watchdog.touch(reply.get("type"))
                     if reply.get("type") == "event":
                         self._handle_event(reply)
                         continue

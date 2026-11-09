@@ -118,7 +118,10 @@ _CM_KEYS: Dict[str, Dict[str, Any]] = {
     },
     "cm_window_k": {
         "type": "int", "min": 1, "max": 50, "default": 4,
-        "consumer": "cm seam (default pin window; framework floor is the min)",
+        "consumer": ("cm seam pin window: keep the newest K LLM CALLS verbatim "
+                     "(one call = the assistant reply + the user message "
+                     "carrying its tool outputs, so K calls = 2K entries; the "
+                     "framework floor is 1 call — docs/19 §12.56)"),
     },
     "cm_head_tail_keep": {
         "type": "int", "min": 1, "max": 2000, "default": 600,

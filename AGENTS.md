@@ -45,7 +45,12 @@ live under `scripts/dgmh/`.
   the SENT TEXT of every form and the saving number are single-sourced in
   the session: ``view_text`` (context-free forms delegate to ``bake``; dedup /
   derived_host are session-anchored) and the accounting funnel books `saved`
-  as a SIGNED TRANSITION delta from the previous rendered form — primitives
+  as a SIGNED TRANSITION delta from the previous rendered form (`cm_window_k`
+  counts LLM CALLS — one call = assistant reply + its tool-output entry, so
+  `k` = 2k entries; the window, the compaction tier and dedup all share ONE
+  membership rule, `_window_kept_ids`, docs/19 §12.56; a dedup form that can
+  no longer apply is DEMOTED to full with an exact refund rather than left
+  claiming a substitution, docs/19 §12.58) — primitives
   carry no ``saved``, a repeated/no-op op books 0, a restore refunds, and
   ``pin`` on an already-elided block restores it to FULL (dedup the only
   exempt non-full pinned form; docs/19 §12.40 — the P1 ``pinned_form``
@@ -134,11 +139,17 @@ live under `scripts/dgmh/`.
   from the same visible files); the seat layer bounds what the budgets
   cannot (CM-03
   residual): an INACTIVITY watchdog (``loop.role_inactivity_timeout_s``,
-  no-frame based; a kill converges as ``planner_failed``/``evaluator_failed``
-  and is deliberately NOT a CM latch signal) plus a post-session hygiene
-  restart when the session summary reports leaked worker threads
-  (``thread_leaks``/``thread_leak_delta`` — conditional fields, absence =
-  clean); the task seat latches a failed named assembly OR POLICY for the
+  no-frame based — its duration is DERIVED as
+  ``max(llm_client_timeout_s, tool_call_timeout_s) + 300s`` and an explicit
+  value below that bound REFUSES the build, because the longest legitimate
+  frame-free stretch is ONE LLM call or tool call, never the sum of two
+  (docs/19 §12.57); the kill event names ``last_frame`` and converges as
+  ``planner_failed``/``evaluator_failed`` and is deliberately NOT a CM latch
+  signal) plus a post-session hygiene restart when the session summary reports
+  leaked worker threads (``thread_leaks``/``thread_leak_delta`` — conditional
+  fields, absence = clean; framework plumbing threads are excluded by NAME
+  prefix ``rsi-gan-``/``f5-telemetry``/``role-inactivity-watchdog``, so the
+  census only sees what an agent module actually spawned, docs/19 §12.59); the task seat latches a failed named assembly OR POLICY for the
   REST of the generation (harness-injected ``GAN_CM_ASSEMBLY_DISABLED`` /
   ``GAN_CM_POLICY_DISABLED`` — the agent child is per-question);
   STDLIB-ONLY import contract because it is

@@ -7,6 +7,12 @@ import shutil
 import time
 from typing import List, Optional
 
+# P (docs/19 §12.57): headroom over the longest single frame-free operation.
+# Rationale for 300s: a healthy reasoning call was observed at 150-350s, so the
+# watchdog must not fire on a slow-but-legitimate call, while still catching a
+# wedged child within one outer step.
+_CM_INACTIVITY_MARGIN_S = 300.0
+
 from gan.framework.access import AccessBroker
 from gan.framework import models as model_registry
 from gan.framework import paths
@@ -265,11 +271,38 @@ def build_gan_loop(
     # The loop's per-instantiation attempt id rides along so the role binds its
     # OUTER-level trajectory file to the attempt-keyed name at construction
     # (session content and stop records share one file; see loop._refresh_roles).
-    # CM-03 L2-01: seat-call inactivity watchdog (loop.role_inactivity_
-    # timeout_s). Must exceed the longest legit frame gap: LLM calls are
-    # capped by llm_client_timeout_s (600), tools by tool_call_timeout_s
-    # (600); the default gives 50% headroom over both.
-    role_inactivity_timeout_s = cfg.get("loop.role_inactivity_timeout_s", 900)
+    # CM-03 L2-01 + P (docs/19 §12.57): seat-call inactivity watchdog.
+    #
+    # WHAT IT MEASURES: the parent's reader touches the watchdog on EVERY
+    # child frame (traj_row / event / broker_call / error / result). The seat
+    # child forwards every trajectory append as a `traj_row`, and the per-call
+    # `llm_call` sidecar lives under the trajectory tree — so each LLM call
+    # (successful OR failed) emits a frame, and so does each tool call. The
+    # longest legitimate FRAME-FREE stretch is therefore ONE operation, never
+    # the sum of two: a call that times out still frames, and litellm retries
+    # are capped by agent/llm.py's backoff max_time (120s).
+    #
+    # Hence the bound is max(client budget, tool budget) + margin, DERIVED
+    # instead of a magic 900, and an explicitly configured value below the
+    # bound REFUSES the run — raising a budget above the watchdog used to
+    # silently kill healthy sessions (before this, the relation existed only
+    # as a comment in loop.yaml).
+    _llm_budget = float(os.environ.get("GAN_LLM_TIMEOUT_S")
+                        or cfg.get("loop.llm_client_timeout_s", 600))
+    _tool_budget = float(cfg.get("loop.tool_call_timeout_s", 600))
+    _min_inactivity = max(_llm_budget, _tool_budget) + _CM_INACTIVITY_MARGIN_S
+    _configured_inactivity = cfg.get("loop.role_inactivity_timeout_s")
+    role_inactivity_timeout_s = (float(_configured_inactivity)
+                                 if _configured_inactivity else _min_inactivity)
+    if role_inactivity_timeout_s < _min_inactivity:
+        raise ValueError(
+            f"loop.role_inactivity_timeout_s={role_inactivity_timeout_s:g}s is "
+            f"below the frame-free bound {_min_inactivity:g}s "
+            f"(max(llm_client_timeout_s={_llm_budget:g}, "
+            f"tool_call_timeout_s={_tool_budget:g}) + margin "
+            f"{_CM_INACTIVITY_MARGIN_S:g}s): a single legitimate LLM or tool "
+            f"call would be killed as a stalled seat. Raise the watchdog to at "
+            f"least {_min_inactivity:g}s or lower the budgets (docs/19 §12.57).")
 
     def _planner_factory(outer: int, attempt: str, instance: Optional[str] = None):
         return RoleProcess("planner", p_model, output_dir,

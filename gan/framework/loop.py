@@ -250,11 +250,16 @@ class GanLoop:
         # release the other's latch and overwrite its failure report. Scope is
         # part of the KEY only: a scope entry still persists across outers,
         # exactly like the main one.
-        # Last settled "your CM module failed" facts per (role, scope)
-        # (docs/19 §12.14 feedback): the next self-improve session reads the
-        # MAIN seat's entry (``_cm_report_for``), falling back to the eval one.
-        self._cm_assembly_report: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        self._cm_policy_report: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Last settled "your CM module failed" facts per (role, seat, scope)
+        # (docs/19 §12.14 feedback; seat keyed in §12.60-O): the next
+        # self-improve session reads the MAIN/self_improve seat's entry
+        # (``_cm_report_for``), falling back to any other seat of the role.
+        # Before O the key was (role, scope) only, so the plan seat and the
+        # self_improve seat of the same role overwrote each other's failure
+        # report — the self-improve session could read a report written by a
+        # seat it never repairs against.
+        self._cm_assembly_report: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._cm_policy_report: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         # kind-keyed fingerprint latch (docs/19 §12.17): one table for BOTH
         # agent-owned CM modules; entry shape {kind: {fp, stem, reason, ...}}.
         self._cm_agent_latch: Dict[Tuple[str, str, str],
@@ -1407,18 +1412,25 @@ class GanLoop:
         Anything else (direct construction, no instance) is "main"."""
         return "eval" if str(instance or "").endswith("_eval") else "main"
 
-    def _cm_report_for(self, store: Dict[Tuple[str, str], Dict[str, Any]],
+    def _cm_report_for(self, store: Dict[Tuple[str, str, str], Dict[str, Any]],
                        role: str) -> Optional[Dict[str, Any]]:
         """The failure report a role's self-improve should read.
 
-        MAIN first, eval as the fallback: the self-improve repairs the role's
-        own design/module, which the main seat ran on last; the eval round's
-        report is the same module and still worth surfacing when the main seat
-        never failed. Deterministic (sorted) fallback."""
-        main = store.get((role, "main"))
-        if main:
-            return main
-        for (r, _scope), rep in sorted(store.items()):
+        Keyed by (role, seat, scope) — docs/19 §12.60-O. An entry is stamped
+        with the seat that WROTE it, and the self-improve session repairs
+        against the module configuration that seat ran, so the self_improve
+        seat's own failure (when there is one) wins; the plan seat is the next
+        preference (it is what actually runs the module every outer), then any
+        other seat of the role (deterministic: sorted by seat name).
+
+        Before O the key was (role, scope), so the plan seat and the
+        self_improve seat of the same role overwrote each other and the reader
+        could not tell which seat the failure came from."""
+        for seat in ("self_improve", "plan", "evaluate"):
+            rep = store.get((role, seat, "main"))
+            if rep:
+                return rep
+        for (r, _seat, _scope), rep in sorted(store.items()):
             if r == role:
                 return rep
         return None
@@ -1468,9 +1480,10 @@ class GanLoop:
         for role, payload in (("evaluator", recent_eval),
                               ("planner", recent_plan)):
             try:
-                # Docs/19 §12.45: reports are (role, scope)-keyed — the MAIN
-                # seat's failure is what self-improve repairs; the eval
-                # round's report is the fallback.
+                # Docs/19 §12.45 + §12.60-O: reports are (role, seat, scope)
+                # keyed — the self_improve/plan seat's MAIN-scope failure is
+                # what self-improve repairs; the eval round's report is only a
+                # fallback.
                 cm_assembly_rep = self._cm_report_for(self._cm_assembly_report,
                                                       role)
                 if cm_assembly_rep:
@@ -1624,7 +1637,11 @@ class GanLoop:
         scope = self._cm_seat_scope(instance)
         report = (summary or {}).get(report_key)
         if report:
-            report_store[(role, scope)] = {
+            # O (§12.60): seat is part of the KEY, not just a stamped field —
+            # the plan seat and the self_improve seat of one role each run a
+            # DIFFERENT session (different design keys are possible) and must
+            # not overwrite each other's failure report.
+            report_store[(role, seat, scope)] = {
                 **report, "seat": seat, "scope": scope,
                 "latched": kind in self._cm_agent_latch.get(
                     (role, seat, scope), {}),

@@ -58,15 +58,19 @@ loop:
                                    # QUESTION_TIMEOUT via GAN_QUESTION_TIMEOUT_S; consumers:
                                    # task_runner env + harness-total scaling). domains.yaml
                                    # overrides per domain.
-  role_inactivity_timeout_s: 900  # CM-03 L2-01: seat-call INACTIVITY watchdog
-                                   # (role_process). No frame from the worker child for
-                                   # this long -> channel closed, worker stopped, call
-                                   # converges as planner_failed/evaluator_failed. Must
-                                   # exceed the longest legit frame gap: LLM calls are
-                                   # capped by llm_client_timeout_s (600), tools by
-                                   # tool_call_timeout_s (600). Deliberately NOT a CM
-                                   # latch signal (load-in-budget removed the CM hang
-                                   # path; a kill is almost certainly non-CM).
+  role_inactivity_timeout_s: 900  # CM-03 L2-01 + docs/19 §12.57 (P): seat-call
+                                   # INACTIVITY watchdog (role_process). It measures the
+                                   # FRAME gap: the parent touches it on every child frame,
+                                   # and the child frames each LLM call (its llm_call
+                                   # sidecar row + the output row) and each tool call — so
+                                   # the longest legitimate frame-free stretch is ONE call
+                                   # (llm_client_timeout_s=600 / tool_call_timeout_s=600),
+                                   # never two. gan/build.py DERIVES this default as
+                                   # max(600,600)+300 and REFUSES a configured value below
+                                   # that bound. A kill logs last_frame (the frame type it
+                                   # last saw) and converges as planner_failed/
+                                   # evaluator_failed; deliberately NOT a CM latch signal
+                                   # (load-in-budget removed the CM hang path).
   trajectory_expose_reasoning: true
                                    # trajectories ONLY (read_trajectory, role="task");
                                    # role sessions (read_session_trajectory, incl. its
