@@ -39,11 +39,24 @@ sys.path.insert(0, REPO)
 # non-numeric scope id (a8ce2dd): eval_outer<N>_s<M>. scope_type is still
 # "genid", so the gen table must partition by scope-id shape, not by type.
 _EVAL_SCOPE_RE = re.compile(r"^eval_outer(\d+)_s(\d+)$")
+# ROLE-plane scope ids are the outer number for the main chain and
+# ``<N>_eval`` for the fixed-root evaluation's second planner instance
+# (docs/19 §12.68). Parsing them with ``int()`` raised ValueError and killed
+# this report on the first run that carried an eval-round seat.
+_OUTER_SCOPE_RE = re.compile(r"^(\d+)(_eval)?$")
 
 
 def _eval_scope(scope_id: Any) -> Optional[tuple]:
     m = _EVAL_SCOPE_RE.match(str(scope_id or ""))
     return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _outer_scope(scope_id: Any) -> Optional[tuple]:
+    """``(outer, is_eval_instance)`` for a ROLE-plane scope id, else None."""
+    m = _OUTER_SCOPE_RE.match(str(scope_id or ""))
+    if not m:
+        return None
+    return int(m.group(1)), bool(m.group(2))
 
 
 def _load_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -124,8 +137,17 @@ def analyze(run_dir: str, prices: Optional[dict]) -> Dict[str, Any]:
     per_outer: Dict[int, Dict[str, Any]] = defaultdict(dict)
     for e in calls:
         if e.get("scope_type") == "outer":
-            per_outer[int(e.get("scope_id"))].setdefault(
-                _role_of(e), []).append(e)
+            sc = _outer_scope(e.get("scope_id"))
+            if sc is None:
+                continue  # unknown scope shape: never crash the report
+            o, is_eval = sc
+            role = _role_of(e)
+            # The eval instance FOLDS into its owning outer (per-outer totals
+            # stay complete) and keeps its own bucket so the eval share stays
+            # visible -- the same convention the task side already uses.
+            per_outer[o].setdefault(role, []).append(e)
+            if is_eval:
+                per_outer[o].setdefault(f"{role}_eval", []).append(e)
         elif e.get("scope_type") == "genid":
             ev = _eval_scope(e.get("scope_id"))
             if ev is not None:
@@ -152,6 +174,11 @@ def analyze(run_dir: str, prices: Optional[dict]) -> Dict[str, Any]:
         eval_a = _agg(per_outer[o].get("task_eval", []))
         row["task_eval"] = {"calls": eval_a["calls"],
                             "total_tokens": eval_a["total_tokens"]}
+        for r in ("planner", "evaluator"):
+            re_ = _agg(per_outer[o].get(f"{r}_eval", []))
+            if re_["calls"]:
+                row[f"{r}_eval"] = {"calls": re_["calls"],
+                                    "total_tokens": re_["total_tokens"]}
         row["usd"] = _cost_usd([e for r in ("planner", "evaluator", "task")
                                 for e in per_outer[o].get(r, [])], prices)
         outer_table.append(row)

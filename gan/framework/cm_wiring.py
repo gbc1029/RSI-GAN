@@ -504,8 +504,12 @@ def emit_summary(session: Any, *, role: str, seat: str, genid: Any,
         summary = session.summary()
     except Exception:  # noqa: BLE001 -- audit-only enrichment
         return None
+    # The instance label (docs/19 §12.68) rides the summary too: without it a
+    # reader cannot tell the main plan seat from the fixed-root evaluation's
+    # plan seat (same role, same seat, one events.jsonl).
     record = {"type": "cm_session_summary", "role": role, "seat": seat,
               "genid": (None if genid is None else str(genid)),
+              "instance": (os.environ.get("GAN_ROLE_INSTANCE") or None),
               "summary": summary}
     from utils import trajectory_log
     trajectory_log.append(event_path, record)

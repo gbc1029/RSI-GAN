@@ -1353,6 +1353,16 @@ def _worker_main() -> None:
             if cm_value is not None:
                 cm_genid = cm_value.get("genid")
 
+                # Attribution (docs/19 §12.68): role+seat alone cannot tell the
+                # MAIN plan seat from the fixed-root evaluation's plan seat --
+                # both are ``planner/plan`` and both live in one events.jsonl,
+                # while their trajectories sit in different outer trees. The
+                # instance label (``outer_<N>`` / ``outer_<N>_eval``) and the
+                # generation are stamped onto EVERY CM event here, which is the
+                # only place the child knows both.
+                _cm_instance = os.environ.get("GAN_ROLE_INSTANCE") or None
+                _cm_genid = (None if cm_genid is None else str(cm_genid))
+
                 def _cm_sink(event: Dict[str, Any]) -> None:
                     # Ride the framework event stream: an append onto the
                     # events path is forwarded to the parent (see the patched
@@ -1363,7 +1373,8 @@ def _worker_main() -> None:
                     # ``loop.log_event`` wrapper exists in this process.
                     role_trajectory_log.append(
                         role_paths.events_path(init["output_dir"]),
-                        {**event, "role": role_name, "seat": expected_seat})
+                        {**event, "role": role_name, "seat": expected_seat,
+                         "genid": _cm_genid, "instance": _cm_instance})
 
                 try:
                     cm_session, cm_report = cm_wiring.build_from_descriptor(

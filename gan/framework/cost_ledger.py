@@ -33,6 +33,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -41,6 +42,12 @@ from utils import trajectory_log
 
 _STATEMENT_MAX_CHARS = 1500
 _RECONCILE_MISMATCH_CAP = 20
+# Outer-tree labels are ``outer_<N>`` for the main chain and ``outer_<N>_eval``
+# for the fixed-root evaluation instance (docs/19 §12.68). The reconcile used
+# to hard-cast the label with ``int()``, so an ``_eval`` tree raised ValueError
+# and the whole tree was SKIPPED — the eval seat's tokens then appeared on the
+# audit side only and produced a permanent false mismatch.
+_OUTER_LABEL_RE = re.compile(r"^(\d+)(_eval)?$")
 
 
 # -- row helpers -------------------------------------------------------------
@@ -602,10 +609,16 @@ def reconcile(output_dir: str) -> Dict[str, Any]:
             outer_dir = os.path.join(traj_root, outer_name)
             if not os.path.isdir(outer_dir) or not outer_name.startswith("outer_"):
                 continue
-            try:
-                outer = int(outer_name[len("outer_"):])
-            except ValueError:
+            label = outer_name[len("outer_"):]
+            m = _OUTER_LABEL_RE.match(label)
+            if not m:
                 continue
+            outer = int(m.group(1))
+            # BOTH labels are real trees with their own sessions: the main chain
+            # (``outer_1``) and the fixed-root evaluation instance
+            # (``outer_1_eval``). Keys are built from the LABEL, so the audit
+            # side (proxy ``scope_id``) and this side can finally agree — the
+            # proxy issues the eval plan seat its own ``<N>_eval`` scope.
             # Role sessions: the F5 seat-keyed trees are the ONLY shape a role
             # process writes — the genid set is derived from those trees, not
             # from the legacy numeric genid dirs (a genid whose only session
@@ -614,7 +627,7 @@ def reconcile(output_dir: str) -> Dict[str, Any]:
             # state, not an address).
             genids = set()
             for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
-                seat_dir = paths.role_traj_dir(output_dir, outer, role, seat)
+                seat_dir = paths.role_traj_dir(output_dir, label, role, seat)
                 if not os.path.isdir(seat_dir):
                     continue
                 for f in os.listdir(seat_dir):
@@ -624,21 +637,29 @@ def reconcile(output_dir: str) -> Dict[str, Any]:
             for gid in sorted(genids):
                 # Through the F5 readers (gen_session_costs): re-walking raw
                 # paths here re-created the exact drift those readers fixed.
-                per_gen = gen_session_costs(output_dir, outer, gid)
+                per_gen = gen_session_costs(output_dir, label, gid)
                 for role, seat in (("planner", "plan"), ("evaluator", "evaluate")):
                     _add(f"role:{role}:{outer_name}", per_gen.get(f"{role}_{seat}"))
-            # The task child stays in the numeric genid dir (task has no seat).
+            # The task child stays in its own genid dir (task has no seat): the
+            # main chain uses the numeric genid, the fixed-root evaluation
+            # instance uses ``eval_outer<N>_s<M>`` — and the proxy audit keys
+            # that child ``task:gen_<scope_id>`` with the SAME string, so both
+            # shapes must be collected or the eval child reads as unattributed
+            # while its tokens sit on the audit side.
             for name in sorted(os.listdir(outer_dir)):
                 sub = os.path.join(outer_dir, name)
-                if os.path.isdir(sub) and name.isdigit():
-                    rec = session_cost_from_file(
-                        os.path.join(sub, "task.jsonl"),
-                        role="task", seat="task", outer=outer, genid=name)
-                    _add(f"task:gen_{name}", rec)
+                if not os.path.isdir(sub):
+                    continue
+                if not (name.isdigit() or name.startswith("eval_outer")):
+                    continue
+                rec = session_cost_from_file(
+                    os.path.join(sub, "task.jsonl"),
+                    role="task", seat="task", outer=outer, genid=name)
+                _add(f"task:gen_{name}", rec)
             # Outer-level self-improve sessions (canonical + attempt siblings),
             # collected by the F5 self reader.
             for role in ("planner", "evaluator"):
-                for rec in self_session_costs(output_dir, outer, role):
+                for rec in self_session_costs(output_dir, label, role):
                     _add(f"role:{role}:{outer_name}", rec)
 
     mismatches: List[Dict[str, Any]] = []
