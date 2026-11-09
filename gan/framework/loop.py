@@ -564,6 +564,27 @@ class GanLoop:
         # centrally by gan/framework/models.py and injected by the runner.
         # Generation-0 prompt comes from gan/design/seeds/task.md, through the
         # SAME helper the planner/evaluator self-designs use.
+        #
+        # docs/19 §12.69: a PRE-SEEDED root design is AUTHORITATIVE. The
+        # planner/evaluator seeds already obey that rule (their store file is
+        # the authority and is never re-seeded), but the TASK root did not:
+        # generation 0 always ran the code seed, so nobody could pre-set the
+        # reserved ``cost`` slot — the only way to a non-default task CM mode
+        # was to wait for a planner session to ``set_config`` it. Reading
+        # ``design/task/initial/config.json`` when present gives the task root
+        # the same contract (and makes a task-side CM round reproducible
+        # instead of dependent on a planner's whim).
+        try:
+            from gan.design.store import DesignStore
+            from gan.design.schema import normalize_config
+            _store = DesignStore(paths.design_root(self.output_dir))
+            _root = _store.path("task", "initial")
+            if os.path.isfile(_root):
+                return normalize_config(_store.load("task", "initial"))
+        except Exception as exc:  # noqa: BLE001 -- a pre-seed must never fail silent
+            soft_fail(f"pre-seeded task root design ignored "
+                      f"({type(exc).__name__}: {exc})",
+                      event_path=paths.events_path(self.output_dir))
         return initial_config("task")
 
     def _parent_config(self, parent: Optional[Node]) -> Dict[str, Any]:
