@@ -15,6 +15,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import wraps
+import importlib
 import json
 import multiprocessing
 import os
@@ -67,6 +68,7 @@ def _clean_broker_start_environment():
         "HOME": "/tmp",
         "TMPDIR": "/tmp",
         "GAN_SECURE_MODE": "1",
+        "PYTHONNOUSERSITE": "1",
         "PYTHON_DOTENV_DISABLED": "1",
     })
     os.environ.clear()
@@ -76,6 +78,48 @@ def _clean_broker_start_environment():
     finally:
         os.environ.clear()
         os.environ.update(previous)
+
+
+def _sanitize_user_site_imports() -> None:
+    """Remove user installs before privileged runtime imports and spawning."""
+    import site
+
+    os.environ["PYTHONNOUSERSITE"] = "1"
+    raw_roots = site.getusersitepackages()
+    roots = [raw_roots] if isinstance(raw_roots, str) else list(raw_roots or [])
+    if os.name == "posix":
+        raw_uid = os.environ.get("SUDO_UID", "")
+        if raw_uid.isdigit():
+            import pwd
+            try:
+                home = pwd.getpwuid(int(raw_uid)).pw_dir
+            except KeyError:
+                pass
+            else:
+                roots.append(os.path.join(
+                    home, ".local", "lib",
+                    f"python{sys.version_info.major}.{sys.version_info.minor}",
+                    "site-packages",
+                ))
+    roots = [os.path.realpath(path) for path in roots if path]
+
+    def in_user_site(path: str) -> bool:
+        if not path:
+            return False
+        resolved = os.path.realpath(path)
+        try:
+            return any(os.path.commonpath([root, resolved]) == root
+                       for root in roots)
+        except ValueError:
+            return False
+
+    sys.path[:] = [path for path in sys.path if not in_user_site(path)]
+    for name, module in list(sys.modules.items()):
+        if name != "proofgrader" and not name.startswith("proofgrader."):
+            continue
+        if in_user_site(str(getattr(module, "__file__", "") or "")):
+            sys.modules.pop(name, None)
+    importlib.invalidate_caches()
 
 
 def _validate_run_paths(repo_root: str, output_dir: str) -> tuple[str, str]:
@@ -670,6 +714,7 @@ def run_gan_driver(
     resume: bool = False,
     force: bool = False,
 ) -> str:
+    _sanitize_user_site_imports()
     from gan.framework import checkpoint as ckpt_mod
     from gan.framework import models as model_registry
     from gan.framework import task_execution as task_execution
@@ -798,6 +843,12 @@ def run_gan_driver(
         raise RuntimeError(f"trusted Python executable is not executable: {python_executable}")
     if os.path.commonpath([python_prefix, python_executable]) != python_prefix:
         raise RuntimeError("trusted Python executable is outside its canonical prefix")
+    if domain == "imo_proof":
+        task_execution._require_sandboxable_proofgrader(
+            "proofgrader.task_agent", trusted_prefix=python_prefix)
+        if bool(cfg.get("challenge.enabled", False)):
+            task_execution._require_sandboxable_proofgrader(
+                "proofgrader.challenge_agent", trusted_prefix=python_prefix)
 
     models = {
         "task": model_registry.resolve("gan.task"),
@@ -852,6 +903,7 @@ def run_gan_driver(
     }
     domain_cfg = resolve_domain(reg, domain)
     safe_broker_env["GAN_SECURE_MODE"] = "1"
+    safe_broker_env["PYTHONNOUSERSITE"] = "1"
     safe_broker_env["PYTHON_DOTENV_DISABLED"] = "1"
     # Per-outer budgets must cover the LARGER of the main-line and evaluation
     # question sets -- otherwise every evaluation launch is refused ("task
@@ -899,6 +951,7 @@ def run_gan_driver(
         # run-persistent seed file at launch time (per generation) so a resume
         # reuses the same base seed without restart-order constraints.
         "sampling_mode": str((cfg.get("sampling") or {}).get("mode", "seeded")),
+        "challenge_enabled": bool(cfg.get("challenge.enabled", False)),
         "sandbox_profile": sandbox_profile,
         "owner_uid": owner_uid,
         "owner_gid": owner_gid,

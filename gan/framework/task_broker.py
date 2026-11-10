@@ -386,7 +386,9 @@ class _TaskBrokerState:
             agent_path = "./task_agent.py"
             if challenge_adjudication:
                 tx._require_sandboxable_proofgrader(
-                    "proofgrader.challenge_agent")
+                    "proofgrader.challenge_agent",
+                    trusted_prefix=str(self.config["python_prefix"]),
+                )
                 agent_path = tx._write_challenge_adjudicator_shim(
                     run_dir,
                     expected_owner_uid=int(self.config["owner_uid"]),
@@ -575,6 +577,16 @@ def broker_process_main(control: Connection, socket_path: str,
     server = None
     thread = None
     try:
+        if str(config.get("domain") or "") == "imo_proof":
+            from gan.framework import task_execution as tx
+            trusted_prefix = str(config["python_prefix"])
+            tx._require_sandboxable_proofgrader(
+                "proofgrader.task_agent", trusted_prefix=trusted_prefix)
+            if bool(config.get("challenge_enabled")):
+                tx._require_sandboxable_proofgrader(
+                    "proofgrader.challenge_agent",
+                    trusted_prefix=trusted_prefix,
+                )
         if os.path.lexists(socket_path):
             raise RuntimeError(f"task broker socket path already exists: {socket_path}")
         state = _TaskBrokerState(config)

@@ -5,6 +5,7 @@ import os
 import shutil
 import fnmatch
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -354,7 +355,8 @@ def main():
     print("\nDone.")
     print("Next steps:")
     print(
-        "python -m pip install --no-deps --no-build-isolation "
+        f"{shlex.quote(os.path.realpath(sys.executable))} -m pip install "
+        "--no-deps --no-build-isolation "
         "--force-reinstall ./proofgrader_repo"
     )
 

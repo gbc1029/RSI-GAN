@@ -2796,6 +2796,7 @@ def _write_challenge_adjudicator_shim(
 
 def _require_sandboxable_proofgrader(
     module: str = "proofgrader.task_agent",
+    trusted_prefix: Optional[str] = None,
 ) -> None:
     """Require a proofgrader entry point to live inside the trusted prefix."""
     try:
@@ -2803,15 +2804,21 @@ def _require_sandboxable_proofgrader(
     except (ImportError, ModuleNotFoundError, ValueError) as exc:
         raise RuntimeError(f"{module} is not importable") from exc
     origin = os.path.realpath(str(spec.origin or "")) if spec else ""
-    prefix = os.path.realpath(sys.prefix)
-    if not origin or not (
-        origin == prefix
-        or origin.startswith(prefix + os.sep)
-        or origin.startswith(os.path.realpath("/usr") + os.sep)
-    ):
+    prefix = os.path.realpath(trusted_prefix or sys.prefix)
+    trusted_roots = (prefix, os.path.realpath("/usr"))
+    try:
+        trusted = bool(origin) and any(
+            os.path.commonpath([root, origin]) == root
+            for root in trusted_roots
+        )
+    except ValueError:
+        trusted = False
+    if not trusted:
         raise RuntimeError(
             f"{module} must be installed inside the trusted Python "
-            "environment; editable source outside the sandbox is refused"
+            "environment; editable source outside the sandbox is refused "
+            f"(origin={origin or '<missing>'!r}, trusted_prefix={prefix!r}, "
+            f"broker_prefix={os.path.realpath(sys.prefix)!r})"
         )
 
 
@@ -3031,7 +3038,7 @@ def run_imo_proof_grading(
         expected_owner_uid,
         expected_owner_gid,
     )
-    _require_sandboxable_proofgrader()
+    _require_sandboxable_proofgrader(trusted_prefix=python_prefix)
     grading_run_id = f"{run_id}_proof_grading"
     _prepare_harness_output_dir(
         run_dir, grading_run_id,
