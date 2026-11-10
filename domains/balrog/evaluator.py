@@ -118,6 +118,45 @@ def close_env(env, env_name=None, task=None, episode_idx=None):
         logging.warning("env.close failed (%s/%s ep%s): %s",
                         env_name, task, episode_idx, e)
 
+
+# Stable marker of the rendered window. The offline delivery tripwire
+# (scripts/local/check_history_delivery.py) greps for it in the archived
+# prompts, so if an evolved task_agent ever stops dumping ``inputs`` the loss
+# of cross-step memory becomes visible instead of silent.
+HISTORY_MARKER = "Recent steps (oldest first; you DID each action below):"
+
+
+def _history_block(entries):
+    """Numbered lines for ``[(observation, executed_action), ...]``, oldest first."""
+    lines = [HISTORY_MARKER]
+    for idx, (obs_text, action) in enumerate(entries, 1):
+        flat = " ".join(str(obs_text or "").split())
+        lines.append(f"{idx}. saw: {flat} | did: {action}")
+    return "\n".join(lines)
+
+
+def render_history(entries, max_chars=0):
+    """Render the rolling window sent to the task child (upstream semantics).
+
+    Upstream kept the last ``agent.max_text_history`` MESSAGES in the LLM
+    conversation (one step = observation + action = 2 messages). Our step child
+    has no conversation to keep, so the same window is re-rendered into the
+    per-step payload. Plain text, one stable marker line, and NO instruction of
+    its own: guidance belongs to the design prompt, which the roles may rewrite.
+
+    ``max_chars`` drops from the OLDEST end first (the most recent step matters
+    most); a single oversized block is hard-truncated with an explicit tail.
+    """
+    kept = list(entries or [])
+    if not kept:
+        return ""
+    while max_chars and len(kept) > 1 and len(_history_block(kept)) > max_chars:
+        kept.pop(0)
+    block = _history_block(kept)
+    if max_chars and len(block) > max_chars:
+        block = block[:max_chars] + " ...[history truncated]"
+    return block
+
 class EvaluatorManager:
     """Manages evaluation of agents across multiple environments and tasks.
 
@@ -520,6 +559,23 @@ class Evaluator:
         self.num_workers = config.eval.num_workers
         self.max_steps_per_episode = config.eval.max_steps_per_episode
 
+        # CROSS-STEP MEMORY (方案 a, 2026-11-10). Upstream kept the last
+        # ``agent.max_text_history`` MESSAGES in the LLM conversation; our step
+        # child is a fresh process with no conversation, so the window is
+        # re-rendered into each step's payload instead. Same name, same unit
+        # (messages; one step = 2), same default (16 = 8 steps); 0 = off, which
+        # keeps the prompt byte-identical to the pre-history behaviour.
+        agent_cfg = config.get("agent") or {}
+        try:
+            self.history_messages = max(0, int(agent_cfg.get("max_text_history") or 0))
+        except (TypeError, ValueError):
+            self.history_messages = 0
+        try:
+            self.history_max_chars = max(0, int(agent_cfg.get("history_max_chars") or 0))
+        except (TypeError, ValueError):
+            self.history_max_chars = 0
+        self.history_steps = self.history_messages // 2
+
         # NOTE: the upstream in-context-learning dataset was REMOVED (P2-14).
         # `InContextDataset` was constructed here but never used by
         # `run_episode`, its `records/` directory does not exist in this repo,
@@ -619,6 +675,10 @@ class Evaluator:
                 disable=True,
             )
 
+            # Rolling (observation, executed action) window, oldest first. Lives
+            # in this function scope, so it CANNOT leak across episodes (a new
+            # episode starts with an empty window by construction).
+            history = []
             action = None
             for step in range(max_steps_per_episode):
                 inputs = {
@@ -627,6 +687,15 @@ class Evaluator:
                     "observation": to_jsonable({k: v for k, v in obs.items() if k != "image"}),
                     "prev_action": action,
                 }
+                # What the model is ABOUT to see at this step, captured verbatim
+                # (including the invalid-action feedback prefix) so the window
+                # replays the episode as the agent experienced it.
+                seen_text = ((inputs["observation"].get("text") or {})
+                             .get("long_term_context", ""))
+                if self.history_steps > 0:
+                    block = render_history(history, self.history_max_chars)
+                    if block:
+                        inputs["history"] = block
                 response_str, _ = agent.forward(inputs)
                 # ``executed`` is what the ENV will actually do (an unparseable
                 # reply is replaced by ``default_action`` and counted in
@@ -653,6 +722,15 @@ class Evaluator:
                 )
                 # ``prev_action`` = the action the ENVIRONMENT EXECUTED.
                 action = executed
+                # Feed the window with what this step SAW and what it DID (the
+                # executed action, never the raw reply -- same rule as
+                # ``prev_action``). Reasoning is deliberately not carried: the
+                # upstream ``remember_cot`` default is not part of this port and
+                # it would triple the prompt growth.
+                if self.history_steps > 0:
+                    history.append((seen_text, executed))
+                    if len(history) > self.history_steps:
+                        del history[0]
                 # Write the step data to the CSV file. Column semantics are now
                 # honest: Action = executed, Reasoning = the model's raw reply
                 # (the only record of an illegal attempt, since a defaulted
@@ -693,6 +771,12 @@ class Evaluator:
 
             episode_log["episode_return"] = episode_return
             episode_log["num_steps"] = step + 1  # pyright: ignore
+            # Memory-window facts (方案 a): the DECLARED depth and how much of it
+            # this episode actually used. Reported per episode so report.json (and
+            # the offline tripwire) can tell "history was off" from "history was
+            # on but the prompt never carried it".
+            episode_log["history_steps"] = self.history_steps
+            episode_log["history_used"] = len(history)
             episode_log["failed_candidates"] = env.failed_candidates
             episode_log.update(env.get_stats())
             episode_log["process_num"] = process_num

@@ -271,6 +271,11 @@ domains:
     # here on purpose: resolve_domain picks the LONGEST prefix only, so a
     # concrete family never inherits the generic one's keys.
     max_aborted_ratio: 0.25
+    # CROSS-STEP MEMORY (方案 a): 16 messages = the last 8 steps, the upstream
+    # default. Measured prompt cost on this domain: +~1.1KB / +275 tokens per
+    # step (+14% on the 2032-char step prompt).
+    history_messages: 16
+    history_max_chars: 4000
     # EPISODE PLAN (the balrog analogue of paper_review's question sampling):
     # a balrog "question" is one EPISODE, so the anchor core is a frozen list of
     # (task, episode seed) pairs -- `<task>#<seed>` in ckpt/sample_seed.json --
@@ -335,6 +340,13 @@ domains:
     # Aborted-round guard -- see the generic `balrog` family (repeated because
     # this family SHADOWS it: longest-prefix resolution only).
     max_aborted_ratio: 0.25
+    # CROSS-STEP MEMORY (方案 a): OFF by default here. 40 tasks x 100 steps per
+    # unit makes the window the largest single cost adder in the repo (~+275
+    # tokens/step x 4000 steps), so it stays at 0 until the babyai A/B shows
+    # the window actually buys accuracy (scripts/local/check_history_delivery.py
+    # + the A/B in README). Flip to 16 to enable.
+    history_messages: 0
+    history_max_chars: 4000
     # Episode plan -- see balrog_babyai above. 40 tasks (config.yaml
     # babaisai_tasks), so at num_samples=2 this freezes 40 anchor episodes and
     # rotates 40 per generation.
@@ -405,6 +417,16 @@ domains:
 families:
   balrog:
     score_key: average_progress
+    # CROSS-STEP MEMORY (方案 a, 2026-11-10). Upstream kept the last
+    # ``agent.max_text_history`` MESSAGES in the LLM conversation; a step child
+    # here is a fresh process, so ``Evaluator._play_episode`` re-renders that
+    # window into every step's payload (key ``history``). Unit = messages (one
+    # step = observation + action = 2), so 16 = the last 8 steps.
+    # ``history_messages: 0`` turns the window OFF and makes the prompt
+    # byte-identical to the pre-window behaviour (the A/B switch).
+    # ``history_max_chars`` caps the rendered block; oldest steps drop first.
+    history_messages: 16
+    history_max_chars: 4000
     # ABORTED-ROUND GUARD (P2-16b). An aborted episode is scored 0.0 (a played
     # and lost episode), so an infrastructure failure that kills part of the
     # round silently depresses the mean. Above this share of the played episodes,

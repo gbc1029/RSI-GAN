@@ -1297,6 +1297,16 @@ if __name__ == "__main__":
              "cap, which keeps the sandboxed path at one episode at a time.",
     )
     parser.add_argument(
+        "--history_messages", type=int, default=None,
+        help="Cross-step memory window in MESSAGES (upstream agent.max_text_history;"
+             " one step = 2). 0 disables the window. None = keep the in-repo "
+             "default from domains/balrog/config/config.yaml.",
+    )
+    parser.add_argument(
+        "--history_max_chars", type=int, default=None,
+        help="Cap on the rendered history block (oldest steps dropped first).",
+    )
+    parser.add_argument(
         "--resume_from",
         type=str,
         default=None,
@@ -1483,6 +1493,15 @@ if __name__ == "__main__":
         else:
             eval_workers = max(1, min(int(args.episode_workers), int(args.num_workers)))
         with initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+            history_overrides = []
+            if args.history_messages is not None:
+                # 0 is a REAL value (window off), so this cannot be an `if value:`
+                # test -- that would silently re-enable the default.
+                history_overrides.append(
+                    f"agent.max_text_history={int(args.history_messages)}")
+            if args.history_max_chars is not None:
+                history_overrides.append(
+                    f"agent.history_max_chars={int(args.history_max_chars)}")
             cfg = compose(
                 config_name="config",
                 overrides=[
@@ -1492,6 +1511,7 @@ if __name__ == "__main__":
                     f"eval.run_id={args.run_id if args.run_id is not None else 'null'}",
                     f"model={args.model}",
                 ]
+                + history_overrides
                 + (
                     [f"eval.num_episodes.{env_name}={args.num_samples}"]
                     if args.num_samples > 0

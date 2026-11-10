@@ -251,6 +251,18 @@ Known constraints:
   round's score is voided (`score: null`, `invalid_reason`, and a
   `task_round_degraded` event) instead of letting infrastructure failures enter
   the lineage as a depressed score.
+- **Cross-step memory** (`domains.yaml history_messages`, upstream
+  `agent.max_text_history` unit = messages, one step = 2): a step child has no
+  conversation, so the last N steps are re-rendered into every prompt
+  (`inputs["history"]`, `(observation as seen, executed action)` pairs).
+  `balrog_babyai` declares 16 (= the last 8 steps, the upstream default);
+  `balrog_babaisai` declares 0 (cost: 40 tasks x 100 steps per unit). Measured
+  prompt cost on babyai: **+~1.1 KB / +275 tokens per step (+14 %)**. Setting it
+  to `0` restores the exact pre-window prompt (the A/B switch). Verify that the
+  window really reached the model with
+  `scripts/local/check_history_delivery.py <run_dir>` (greps the archived
+  prompts for the marker; violations mean an evolved `task_agent.py` stopped
+  dumping `inputs`).
 - `balrog_minihack` / `balrog_nle` / `crafter` / `textworld` are **not** wired
   into the GAN path and are not covered by this script (`post_install.py`
   downloads their data from GitHub/Drive and needs network). This is now

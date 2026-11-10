@@ -2582,6 +2582,39 @@ def task_llm_call_budget(domain_cfg: Dict[str, Any], num_samples: int,
     return max(1, int(num_samples or 1)) * max(1, calls)
 
 
+def history_window(domain: str) -> Tuple[Optional[int], Optional[int]]:
+    """Declared cross-step memory window: ``(messages, max_chars)``.
+
+    Episode domains (balrog) re-render the last N steps into every step's
+    payload, because a step child is a fresh process with no conversation
+    (upstream kept the same window as real LLM messages). The depth is DECLARED
+    in ``domains.yaml`` (``history_messages``, upstream unit = messages; one
+    step = 2) so an A/B can turn it off with ONE number instead of a code edit.
+
+    ``(None, None)`` = the domain declares nothing: no CLI arg is sent at all and
+    the harness keeps its own in-repo default. Question domains are untouched by
+    construction.
+    """
+    from gan.framework.loader import load_registry, resolve_domain
+    domain_cfg = resolve_domain(load_registry(), domain) or {}
+
+    def _int(key):
+        raw = domain_cfg.get(key)
+        if raw is None:
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"domains.yaml {key} for {domain!r} is not an integer: {raw!r}")
+        if value < 0:
+            raise RuntimeError(
+                f"domains.yaml {key} for {domain!r} must be >= 0 (got {value})")
+        return value
+
+    return _int("history_messages"), _int("history_max_chars")
+
+
 def episode_worker_limit(domain: str, requested: int) -> Optional[int]:
     """Declared cap on PARALLEL EPISODES (``domains.yaml harness_episode_workers``).
 
@@ -2747,6 +2780,14 @@ def _run_harness_and_report_local(
     episode_workers = episode_worker_limit(domain, num_workers)
     if episode_workers is not None:
         harness_args.extend(["--episode_workers", str(episode_workers)])
+    # CROSS-STEP MEMORY (方案 a): same declared-budget pattern -- the depth is a
+    # registry declaration, crosses as an explicit CLI arg, never as a literal
+    # inside the domain harness.
+    history_messages, history_max_chars = history_window(domain)
+    if history_messages is not None:
+        harness_args.extend(["--history_messages", str(history_messages)])
+    if history_max_chars is not None:
+        harness_args.extend(["--history_max_chars", str(history_max_chars)])
     if reasoning_effort:
         # Explicit CLI transport (mirrors --model); never an env variable.
         harness_args.extend(["--reasoning_effort", str(reasoning_effort)])

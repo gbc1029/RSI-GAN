@@ -604,6 +604,33 @@ with a GAN-native data layer.
   Guard `scripts/local/verify_score_integrity.py` (32 checks: the CSV/prev_action
   semantics on the real episode loop, the threshold table, and
   longest-prefix declaration resolution).
+- **Cross-step memory window (方案 a, 2026-11-10).** Upstream kept the last
+  `agent.max_text_history` MESSAGES in the LLM conversation (one step = 1
+  observation + 1 action = 2 messages). A step child here is a FRESH process
+  whose `msg_history` starts empty, so the episode loop RE-RENDERS the same
+  window into each step's payload (`inputs["history"]`) —
+  `domains/balrog/evaluator.py:render_history` emits a plain-text block behind a
+  stable marker (`HISTORY_MARKER`), oldest-first, `(observation AS THE MODEL SAW
+  IT, EXECUTED action)` pairs only — no reasoning (`remember_cot` is not part of
+  this port) and never the raw reply. The window lives in `_play_episode`'s
+  function scope, so it cannot leak across episodes. Depth is DECLARED:
+  `gan/framework/domains.yaml history_messages` (upstream unit; babyai 16 = 8
+  steps, babaisai 0) → `task_execution.history_window` →
+  `domains.harness --history_messages` (explicit CLI, never env);
+  `history_max_chars` drops the OLDEST steps first and never the newest. `0`
+  means the key never appears at all, i.e. the prompt is byte-identical to the
+  pre-window behaviour (the ablation switch). `report.json` states
+  `history_steps` / `history_used_max` and each `episodes[].history_used`, and
+  `scripts/local/check_history_delivery.py` greps the archived prompts for the
+  marker — an evolved `task_agent.py` that stopped dumping `inputs` would
+  otherwise lose the memory SILENTLY. **Why not CM**: the task child's CM
+  universe is ONE block / ONE turn by construction (`docs/19 §12.69.3`, and 40
+  calls / 40 step children measured on 2026-11-09), so there is no in-session
+  history for CM to manage; §12.69's pre-seed channel pre-seeds the task DESIGN
+  config (`prompt`/`tools`/`cost`), not session content. Guards:
+  `scripts/local/verify_episode_history.py` (30 checks, including an ON-vs-OFF
+  behavioural difference that proves the window reaches the DECISION surface,
+  not just the payload string).
 ### Output layout — `gan/framework/paths.py` is the single source
 
 | path | contents |

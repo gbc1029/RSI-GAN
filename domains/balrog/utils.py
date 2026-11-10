@@ -304,6 +304,8 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
     aborted_episodes = []
     sidecar_missing = []
     llm_calls_total = 0
+    history_steps = 0
+    history_used_max = 0
     action_distribution = Counter()
     steps_total = 0
     invalid_actions_total = 0
@@ -338,6 +340,16 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
                 sidecar_missing.append(eid)
             else:
                 llm_calls_total += calls
+            # CROSS-STEP MEMORY (方案 a): how deep the declared window is and how
+            # much of it this episode used. ``None`` on a log written before the
+            # window existed (so "absent" is distinguishable from "0 used").
+            used = episode_log.get("history_used")
+            row["history_used"] = used
+            if used is not None:
+                history_used_max = max(history_used_max, int(used))
+            steps_declared = episode_log.get("history_steps")
+            if steps_declared is not None:
+                history_steps = max(history_steps, int(steps_declared))
             # Objective facts for the evaluator (P1-9). The ACTION stream is
             # balrog's analogue of a predicted label: aggregated here so
             # ``policy.constant-output`` / ``policy.*-bias`` and
@@ -376,6 +388,11 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
         len(aborted_episodes) / len(episodes) if episodes else 0.0)
     summary["episodes_sidecar_missing"] = sidecar_missing
     summary["llm_calls_total"] = llm_calls_total
+    # Memory-window facts (方案 a): the generation-level depth plus the deepest
+    # window any episode reached. ``history_steps == 0`` means the window was
+    # OFF for this generation (prompt identical to the pre-history behaviour).
+    summary["history_steps"] = history_steps
+    summary["history_used_max"] = history_used_max
 
     # --- episode-domain objective facts (P1-9) -------------------------------
     # The contract `compute_report_summary` (gan/framework/task_execution.py)

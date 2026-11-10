@@ -2,14 +2,27 @@
 # (domains/harness.py injects `model=<id>`). No env/fallback.
 model: null
 
-# agent: 
-#   type: naive            # Type of agent to use (e.g., 'naive', 'cot', etc.)
-#   remember_cot: True     # Whether the agent should remember its reasoning across turns
-#   max_text_history: 16   # Maximum number of text messages to keep in the history
-#   max_image_history: 0   # Maximum number of images to keep in the history
-#   max_cot_history: 1     # Maximum number of chain-of-thought steps to keep in history (if using 'cot' type of agent)
-#   max_icl_history: 1000   # Maximum number of ICL steps to keep in history (if using 'few_shot' type of agent)
-#   cache_icl: False
+# agent: CROSS-STEP MEMORY (方案 a, 2026-11-10 -- upstream semantics restored)
+#
+# Upstream kept the last `max_text_history` MESSAGES in the LLM conversation
+# (one step = 1 observation + 1 action = 2 messages), i.e. the last 8 steps at
+# the default 16. Our task child is ONE sandboxed process PER STEP with no
+# conversation, so the same window is re-rendered into each step's payload by
+# `Evaluator._play_episode` (payload key `history`).
+#
+#   max_text_history  : window depth in MESSAGES (upstream unit). 0 = OFF, and
+#                       the prompt is then byte-identical to the pre-window
+#                       behaviour (the ablation switch).
+#   history_max_chars : cap on the rendered block (long observations are the
+#                       reason it exists); the OLDEST steps are dropped first.
+#
+# The framework overrides `max_text_history` per domain from
+# gan/framework/domains.yaml (`history_messages`, balrog family + per-domain);
+# the value here is the in-repo default for a direct `python -m domains.harness`
+# run that bypasses the driver.
+agent:
+  max_text_history: 16
+  history_max_chars: 4000
 
 eval:
   output_dir: "results"  # Directory where evaluation results will be saved
