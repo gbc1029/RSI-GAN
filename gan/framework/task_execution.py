@@ -360,6 +360,24 @@ _CM_RESERVED_STEMS = ({os.path.splitext(f)[0] for f in _CM_CORE_FILES}
                       | {"cm_policy", "cm_assembly"})
 
 
+def materialize_audit_chain(run_dir: str) -> Dict[str, Any]:
+    """Deliver the frozen audit-chain module into a sandbox run directory."""
+    report: Dict[str, Any] = {"audit_files": [], "skipped": []}
+    source = os.path.join(os.path.dirname(__file__), "traj_chain.py")
+    target = os.path.join(run_dir, ".gan_runtime", "traj_chain.py")
+    if not os.path.isfile(source):
+        report["skipped"].append({"file": "traj_chain.py",
+                                  "reason": "missing in framework"})
+        return report
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copy2(source, target)
+    with open(source, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()[:12]
+    report["audit_files"].append({"file": "traj_chain.py",
+                                  "sha256_12": digest})
+    return report
+
+
 def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
                             code_root: Optional[str] = None
                             ) -> Dict[str, Any]:
@@ -387,26 +405,11 @@ def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
     report: Dict[str, Any] = {"core_files": [], "policy": None, "skipped": [],
                               "assembly": None, "policy_selection": None,
                               "audit_files": []}
-    # A″ (docs/19 §12.65): the AUDIT module the harness needs is delivered the
-    # SAME way the CM core is — copied into ``.gan_runtime`` and imported as a
-    # top-level module. ``gan/framework/traj_chain.py`` is stdlib-only and
-    # self-contained, so this is a COPY (one implementation), never a fork.
-    # Why it must exist inside the sandbox at all: the task harness is the one
-    # trusted writer of the task trajectory (F5, §12.28) and it runs in the
-    # stage, where ``gan/`` is deliberately absent (``_RUNTIME_DIRS``). An
-    # import of ``gan.framework.traj_chain`` there is a ModuleNotFoundError at
-    # process start — measured 2026-11-09 R1: rc=1 in 0.3s, every score null.
-    _audit_src = os.path.join(os.path.dirname(__file__), "traj_chain.py")
-    _audit_dst = os.path.join(run_dir, ".gan_runtime", "traj_chain.py")
-    if os.path.isfile(_audit_src):
-        os.makedirs(os.path.dirname(_audit_dst), exist_ok=True)
-        shutil.copy2(_audit_src, _audit_dst)
-        with open(_audit_src, "rb") as fh:
-            _ad = __import__("hashlib").sha256(fh.read()).hexdigest()[:12]
-        report["audit_files"].append({"file": "traj_chain.py", "sha256_12": _ad})
-    else:
-        report["skipped"].append({"file": "traj_chain.py",
-                                  "reason": "missing in framework"})
+    # The sandbox has no ``gan/`` package, so the harness imports this frozen
+    # stdlib-only module from its staged runtime directory.
+    audit_report = materialize_audit_chain(run_dir)
+    report["audit_files"].extend(audit_report["audit_files"])
+    report["skipped"].extend(audit_report["skipped"])
     core_src = os.path.join(os.path.dirname(__file__), "cm")
     dst_root = os.path.join(run_dir, ".gan_runtime", "cm")
     os.makedirs(dst_root, exist_ok=True)

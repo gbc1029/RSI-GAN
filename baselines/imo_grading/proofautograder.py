@@ -110,7 +110,7 @@ class TaskAgent(AgentSystem):
             reasoning_effort=self.reasoning_effort,
         )
 
-        raw_text = new_msg_history[-1].get("text", "") if new_msg_history else ""
+        raw_text = new_msg_history[-1].get("content", "") if new_msg_history else ""
         prediction = extract_points(raw_text)
         if prediction is None:
             self.log("Point score was not exactly one valid 0-7 <points> block; retrying format once.")
@@ -123,7 +123,7 @@ class TaskAgent(AgentSystem):
                     reasoning_effort=self.reasoning_effort,
                 )
                 repaired_text = (
-                    new_msg_history[-1].get("text", "") if new_msg_history else ""
+                    new_msg_history[-1].get("content", "") if new_msg_history else ""
                 )
                 prediction = extract_points(repaired_text)
             except Exception as e:

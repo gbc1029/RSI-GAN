@@ -487,7 +487,12 @@ class DomainTaskRunner:
         source_root = self.code_root or self.repo_root
         run_dir, _ = tx.prepare_run_dir(
             source_root, node_dir, "", domain="imo_proof")
-        os.makedirs(os.path.join(run_dir, ".gan_runtime"), exist_ok=True)
+        audit_runtime = tx.materialize_audit_chain(run_dir)
+        if not audit_runtime["audit_files"]:
+            raise RuntimeError(
+                "fixed challenge adjudicator runtime is incomplete: "
+                + "; ".join(row.get("reason", "unknown audit runtime error")
+                             for row in audit_runtime["skipped"]))
         run_id = f"gan_{scope_id}"
         output_dir = os.path.join(run_dir, "outputs", run_id)
         os.makedirs(output_dir, exist_ok=True)
@@ -573,12 +578,27 @@ class DomainTaskRunner:
         if rc != 0:
             raise RuntimeError(
                 "fixed challenge adjudicator failed: " + str(output)[-1000:])
+        failures_path = os.path.join(output_dir, "agent_evals",
+                                     "eval_failures.jsonl")
+        failure_summary = summarize_question_failures(failures_path)
+        if failure_summary:
+            self._event(
+                "challenge_adjudicator_question_failures",
+                genid=str(child.genid), **failure_summary)
+            if failure_summary.get("all_failed"):
+                raise RuntimeError(
+                    "fixed challenge adjudicator had no successful questions: "
+                    f"{failure_summary}")
         report_path = os.path.join(output_dir, "report.json")
         with open(report_path, "r", encoding="utf-8") as stream:
             report = json.load(stream)
         verdicts = report.get("challenge_adjudications")
         if not isinstance(verdicts, dict):
             raise RuntimeError("fixed challenge adjudicator report is malformed")
+        if rows and not verdicts:
+            raise RuntimeError(
+                "fixed challenge adjudicator produced no usable verdicts: "
+                f"{report.get('invalid_challenge_ids') or []}")
         evidence_dir = paths.runs_dir(self.output_dir, child.genid)
         os.makedirs(evidence_dir, exist_ok=True)
         shutil.copy2(

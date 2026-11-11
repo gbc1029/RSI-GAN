@@ -36,6 +36,24 @@ _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
+_CHALLENGE_ADJUDICATION_TASK_BRIEF = """Adjudicate one proof challenge by comparing the parent and child proofs against the stated defect claim and repair criterion. Return one JSON object with exactly these six keys: parent_present (boolean), child_present (boolean), actionable (boolean), actionability_basis (transferable_strategy, instance_specific_content, or uncertain), modification_scope (transferable_strategy, instance_specific_memory, answer_leakage, or uncertain), and reason (non-empty string). Assess parent_present and child_present independently from the proofs. Set actionable=true only when the defect can be addressed by a general strategy change without using this problem's answer, identifier, or instance-specific memory; then both actionability_basis and modification_scope must be transferable_strategy. For a challenge whose proposed remedy requires problem-specific memory, set actionable=false, actionability_basis=instance_specific_content, and modification_scope=instance_specific_memory. If it requires answer leakage, use actionable=false, actionability_basis=instance_specific_content, and modification_scope=answer_leakage. If uncertain, set actionable=false and set both basis and scope to uncertain. Do not omit fields, add fields, or return null values."""
+_CHALLENGE_ADJUDICATION_RESPONSE_CONTRACT = (
+    "The response must be a non-empty string containing exactly one JSON object "
+    "with parent_present, child_present, actionable, actionability_basis, "
+    "modification_scope, and reason. Use booleans for the first three fields; "
+    "use the enumerated string values specified in the task instructions. "
+    "Do not include markdown fences or surrounding prose."
+)
+
+
+def task_contract_for_run(domain: str, task_brief: str,
+                          response_contract: str) -> Tuple[str, str]:
+    """Select the framework-owned task instructions for a broker run."""
+    if domain == "imo_challenge_adjudication":
+        return (_CHALLENGE_ADJUDICATION_TASK_BRIEF,
+                _CHALLENGE_ADJUDICATION_RESPONSE_CONTRACT)
+    return task_brief, response_contract
+
 
 class _OuterNotActive(RuntimeError):
     pass
@@ -358,10 +376,11 @@ class _TaskBrokerState:
             "GAN_QUESTION_TIMEOUT_S": str(int(self.config["question_timeout_s"])),
             "GAN_LLM_TIMEOUT_S": str(float(self.config["llm_client_timeout_s"])),
         })
-        task_brief = str(self.config.get("task_brief") or "")
+        task_brief, response_contract = task_contract_for_run(
+            domain, str(self.config.get("task_brief") or ""),
+            str(self.config.get("response_contract") or ""))
         if task_brief:
             env["GAN_TASK_BRIEF"] = task_brief
-        response_contract = str(self.config.get("response_contract") or "")
         if response_contract:
             env["GAN_RESPONSE_CONTRACT"] = response_contract
 

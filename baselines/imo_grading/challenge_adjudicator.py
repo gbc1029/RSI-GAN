@@ -150,14 +150,14 @@ class TaskAgent(AgentSystem):
             instruction, model=self.model, msg_history=[], logging=self.log,
             reasoning_effort=self.reasoning_effort,
         )
-        raw = history[-1].get("text", "") if history else ""
+        raw = history[-1].get("content", "") if history else ""
         verdict = _parse(raw)
         if verdict is None:
             history = chat_with_agent(
                 REPAIR_PROMPT, model=self.model, msg_history=history,
                 logging=self.log, reasoning_effort=self.reasoning_effort,
             )
-            raw = history[-1].get("text", "") if history else ""
+            raw = history[-1].get("content", "") if history else ""
             verdict = _parse(raw)
         return (json.dumps(verdict, ensure_ascii=False, sort_keys=True)
                 if verdict is not None else ""), history
