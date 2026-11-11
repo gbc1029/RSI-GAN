@@ -309,6 +309,20 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
     action_distribution = Counter()
     steps_total = 0
     invalid_actions_total = 0
+    # L1 BEHAVIOUR FACTS (2026-11-11). The loop's improvement verdict reads only
+    # the solved rate, whose 10-episode quantum is 0.1 -- an identical
+    # code+prompt+episode set scored 0.2 and 0.3 in two runs, so one flipped
+    # episode is indistinguishable from progress. These counts give the
+    # evaluator a quantity with hundreds of samples per generation:
+    # ``episodes_zero_displacement`` (the episode never left its starting
+    # neighbourhood: <=2 distinct observable states) and the share of steps whose
+    # action changed nothing at all. Aggregated over episodes that REPORTED a
+    # trace (an aborted episode has none -- absence, not zero).
+    behavior_episodes = 0
+    behavior_zero_displacement = 0
+    behavior_distinct_total = 0
+    behavior_repeat_steps = 0
+    behavior_traced_steps = 0
     _idx = 0
     for env_name, episode_logs in results_summaries.items():
         for episode_log in episode_logs:
@@ -364,6 +378,20 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
                         continue
             steps_total += int(episode_log.get("num_steps") or 0)
             invalid_actions_total += row["invalid_actions"]
+            # --- L1 behaviour facts (per episode, then aggregated below) -------
+            d_states = episode_log.get("distinct_obs_states")
+            r_steps = episode_log.get("obs_repeat_steps")
+            row["distinct_obs_states"] = d_states
+            row["obs_repeat_steps"] = r_steps
+            row["zero_displacement"] = episode_log.get("zero_displacement")
+            if isinstance(d_states, int) and not isinstance(d_states, bool):
+                behavior_episodes += 1
+                behavior_distinct_total += d_states
+                if d_states <= 2:
+                    behavior_zero_displacement += 1
+                if isinstance(r_steps, int) and not isinstance(r_steps, bool):
+                    behavior_repeat_steps += r_steps
+                    behavior_traced_steps += int(episode_log.get("num_steps") or 0)
             # An ABORTED episode is scored 0.0 (it was played and lost) but it is
             # flagged, so "the agent fails this task" and "the infrastructure
             # killed this episode" stay distinguishable offline.
@@ -393,6 +421,22 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
     # OFF for this generation (prompt identical to the pre-history behaviour).
     summary["history_steps"] = history_steps
     summary["history_used_max"] = history_used_max
+    summary["behavior"] = {
+        # Denominator the reader must use: episodes that actually reported a
+        # trace (aborted episodes do not). ``null`` shares mean "no data".
+        "episodes": behavior_episodes,
+        "episodes_zero_displacement": behavior_zero_displacement,
+        "zero_displacement_share": (
+            behavior_zero_displacement / behavior_episodes
+            if behavior_episodes else None),
+        "distinct_obs_states_mean": (
+            behavior_distinct_total / behavior_episodes
+            if behavior_episodes else None),
+        "obs_repeat_steps_total": behavior_repeat_steps,
+        "obs_repeat_step_share": (
+            behavior_repeat_steps / behavior_traced_steps
+            if behavior_traced_steps else None),
+    }
 
     # --- episode-domain objective facts (P1-9) -------------------------------
     # The contract `compute_report_summary` (gan/framework/task_execution.py)

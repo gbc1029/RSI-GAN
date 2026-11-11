@@ -144,10 +144,15 @@ live under `scripts/dgmh/`.
   cannot (CM-03
   residual): an INACTIVITY watchdog (``loop.role_inactivity_timeout_s``,
   no-frame based — its duration is DERIVED as
-  ``max(llm_client_timeout_s, tool_call_timeout_s) + 300s`` and an explicit
-  value below that bound REFUSES the build, because the longest legitimate
-  frame-free stretch is ONE LLM call or tool call, never the sum of two
-  (docs/19 §12.57); the kill event names ``last_frame`` and converges as
+  ``retry_budget + max(llm_client_timeout_s, tool_call_timeout_s) + 300s`` and an
+  explicit value below that bound REFUSES the build. The RETRY TERM was added
+  2026-11-11: a retrying call is ONE frame-free stretch, because the child writes
+  its ``llm_call`` row only after the whole retry sequence ends (measured:
+  ``attempts: 3, duration_s: 198``), so the bound is one call INCLUDING its
+  retries, never two operations. Leaving it out was harmless only while the
+  budget was ``max_time=120`` against a 300 s margin; with 300 s it would have put
+  a legitimate retrying call exactly ON the watchdog (docs/19 §12.57); the kill
+  event names ``last_frame`` and converges as
   ``planner_failed``/``evaluator_failed`` and is deliberately NOT a CM latch
   signal) plus a post-session hygiene restart when the session summary reports
   leaked worker threads (``thread_leaks``/``thread_leak_delta`` — conditional
@@ -305,6 +310,19 @@ with a GAN-native data layer.
   - *deep delete* — removes the registry entry + source file via `unregister_component`;
   - *deep add/modify* — new tool or logic; must touch source via the gated `gan/tools/deep/request_source_access`.
 - After a `modify` grant, planner/evaluator edit their granted copies with `edit_source`, confined to the instance workspace `src/`. Roles are never given raw `bash` (it cannot be confined). A repeated `request_source_access` on an already-granted path does NOT re-copy from `code_root` — in-scope edits survive; pass `refresh=true` to discard them and re-sync.
+- **Shallow first, then ESCALATE (2026-11-11, `gan/design/seeds/planner.md` rule 4).**
+  The seed used to leave the choice implicit, and the first evolution round showed
+  the cost: after the evaluator judged the prompt rule ineffective, the planner
+  rewrote the prompt AGAIN, and only on the third generation did it request a
+  source grant (a generation then lost to an upstream 502). The seed now names
+  the escalation triggers — "the evaluator says the prompt/config rule is
+  ineffective or was never followed", "the same `issue_key` is `judged_unfixed`
+  two rounds in a row", "`report_summary.behavior` shows the config edits changed
+  nothing" — after which the planner must go to depth 2 in that round instead of
+  re-editing the prompt. It is explicitly an ESCALATION rule, not "always patch
+  source": with no such evidence the shallow path stays first, otherwise the
+  shallow-evolution axis (`B3` shallow_prompt_only / `B1` deny_deep) stops being
+  meaningful.
 - **Deep-write recovery (6 layers, so a deep modification can actually land):**
   1. *copy* — `AccessBroker._safe_copy` writes a temp sibling + `os.replace` and only tries `copystat` best-effort, so a refresh can never fail with `Operation not permitted` just because the workspace copy belongs to another uid (the old `shutil.copy2` did).
   2. *backup* — every overwrite (`refresh=true`, session reset, `clear_workspace` at an outer boundary) copies the actually-EDITED files to `workspaces/_backup/<role>/<instance>/<seq>/` **outside** the purged tree, logs `workspace_backup{files,count,reason}`, and names the discarded files in the tool's answer. Nothing a session wrote is deleted silently any more.
@@ -612,6 +630,26 @@ with a GAN-native data layer.
   still read `cm_events_ingest_empty`: a generation runs from the STAGED copy
   (`work/<genid>/repo`, snapshotted at generation start), so a mid-round source
   edit cannot reach it — the proof must come from a run STARTED after the edit.
+- **Behaviour facts in the report (L1, 2026-11-11).** The loop's improvement
+  verdict reads the SOLVED RATE only, and on a 10-episode generation its quantum
+  is 0.1 — measured: an IDENTICAL code+prompt+episode set scored 0.2 in one run
+  and 0.3 in another, while a prompt patch moved the turn share 80.5% → 91.4%
+  (a real regression) with solved unchanged at 0.3. So two process measurements
+  now ride `report.json`: per episode `distinct_obs_states` (distinct observable
+  states = facing + the two relative descriptor blocks, with the invalid-action
+  feedback prefix STRIPPED so the same cell cannot look new) and
+  `obs_repeat_steps` (steps whose action changed nothing), plus the derived
+  `zero_displacement` (`distinct_obs_states <= 2` — the episode never went
+  anywhere); `behavior` aggregates them with a denominator of TRACED episodes
+  only (an aborted episode has no trace — absence, not zero).
+  `compute_report_summary` forwards `behavior`, so the evaluator can quote a
+  stable number instead of inferring "it is spinning" from an action histogram;
+  it carries no ground truth, so it is blind-phase safe. **`zero_displacement` is
+  deliberately the gameable-resistant one**: inaction cannot lower it (sitting
+  still IS two states), so the only way to reduce it is to actually move — use
+  it, never the go-forward share, if a behaviour term is ever added to the
+  improvement gate. Guard `scripts/local/test_llm_retry_budget.py` (32 checks,
+  including a scripted spin-vs-walk drive of the real `_play_episode`).
 - **The recorded action is the EXECUTED one.** `_play_episode` used to do
   `action = response_str` after the step, so the next turn's `prev_action` was
   the model's raw prose while the env had executed `default_action` (the

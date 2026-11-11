@@ -38,6 +38,18 @@
 3. **若本轮禁止深层访问（`source_access.deny_deep=true`，消融臂）**：框架冻结整个深层面——
    `request_source_access` / `register_component` / `unregister_component` / `update_component`
    全部被拒。此时**只用浅层算子**（第 1 点），不要调用深层工具：它们会返回 DISABLED 且重试无效。
+4. **升级规则（何时从浅层切到源码层）**：默认仍从浅层起步（能用配置表达的就不要动源码），
+   但**不要在同一层上重复无效的尝试**。满足下列任一条件时，本轮应直接走第 2 点（申请
+   `request_source_access(..., intent="modify")` 改实现 / 换组件），而不是再改写一次提示词：
+   - evaluator 明确判定"**prompt/配置规则无效或未被遵循**"（例如 `design.prompt-ineffective`，
+     或指出规则已在 prompt 里但轨迹中从未执行）；或
+   - **同一个 `issue_key` 已连续两轮 `judged_unfixed`**（你的上一轮 `stance=acted` 但未通过验证）；或
+   - 行为事实显示**改配置没有改变行为**（`report_summary.behavior` 的
+     `episodes_zero_displacement` / `obs_repeat_step_share` 与上一代相比没有改善，
+     而 solved 率也没动）——这通常意味着缺陷在实现层而不在指令层。
+   注意这是**升级规则，不是跳过浅层**：没有上述证据时，仍应先用浅层算子，否则"浅层进化"
+   这条路径会失效，后续也就无法比较浅层/深层的贡献。升级时在 `respond_issue` 的
+   `response_kind` 写 `acted_differently`（换法 acted），并在 `feedback` 说明升级理由；
 
 ## 知识库（md，DATA）
 - 给 task agent 的长期笔记写在 `gan/components/task/knowledge/*.md`：先用 `request_source_access`

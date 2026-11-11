@@ -3655,6 +3655,18 @@ def compute_report_summary(
             summary["episodes_aborted"] = len(aborted)
             if played > 0:
                 summary["aborted_ratio"] = len(aborted) / played
+        # L1 BEHAVIOUR FACTS (2026-11-11). The solved rate is the loop's only
+        # improvement criterion, and on a 10-episode generation its quantum is
+        # 0.1 -- measured: an IDENTICAL code+prompt+episode set scored 0.2 in
+        # one run and 0.3 in another, while a prompt patch moved the turn share
+        # from 80.5% to 91.4% (a real regression) with solved unchanged at 0.3.
+        # These are PROCESS measurements over hundreds of steps per generation
+        # (no ground truth, no answer structure), so they are safe for the
+        # BLIND phase and they let the evaluator quote a stable number instead
+        # of inferring "it is spinning" from an action histogram.
+        behavior = report.get("behavior")
+        if isinstance(behavior, dict):
+            summary["behavior"] = behavior
         if contract.get("kind") == "action":
             rate = report.get("invalid_action_rate")
             # `contract_ok` = the agent actually produced a legal action on every

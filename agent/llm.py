@@ -390,11 +390,30 @@ def _attempt_completion(model, messages, temperature, max_tokens,
         raise
 
 
+# The retry budget is a DECLARED number, not an inline literal (2026-11-11).
+#
+# It used to be ``max_time=120`` -- five times shorter than the per-attempt
+# client budget (``llm_client_timeout_s: 600``). Measured cost of that mismatch
+# on the first evolution round: a ~3-minute upstream brownout exhausted the
+# retries and killed the WHOLE planner session
+# (``inner_invalid: planner_failed: TransientUpstreamError ... upstream proxy
+# failure``, 3 attempts over 198 s, while the planner was mid-way through its
+# first deep patch of ``task_agent.py``), i.e. one generation lost to a blip.
+#
+# The value is MIRRORED by ``gan/build.py:_LLM_RETRY_BUDGET_S`` because the
+# seat-inactivity watchdog has to cover it: a retrying call is ONE frame-free
+# stretch (the child frames the call only after the whole retry sequence
+# finishes), so the frame-free bound is retry_budget + one attempt budget.
+# ``scripts/local/test_llm_retry_budget.py`` asserts the two numbers agree --
+# drift either kills healthy seats (watchdog too low) or hides a hung one.
+LLM_RETRY_MAX_TIME_S = 300.0
+LLM_RETRY_MAX_VALUE_S = 60
+
 _completion_with_backoff = backoff.on_exception(
     backoff.expo,
     _BACKOFF_EXCEPTIONS,
-    max_time=120,
-    max_value=60,
+    max_time=LLM_RETRY_MAX_TIME_S,
+    max_value=LLM_RETRY_MAX_VALUE_S,
     on_backoff=_on_backoff,
     on_giveup=_on_giveup,
 )(_attempt_completion)

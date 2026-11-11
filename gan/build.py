@@ -13,6 +13,15 @@ from typing import List, Optional
 # wedged child within one outer step.
 _CM_INACTIVITY_MARGIN_S = 300.0
 
+# MIRROR of ``agent/llm.py:LLM_RETRY_MAX_TIME_S`` -- the litellm retry budget.
+# It has to enter the inactivity bound because a retrying call is ONE
+# frame-free stretch: the child writes its ``llm_call`` row only after the
+# whole retry sequence ends (measured 2026-11-11: ``attempts: 3,
+# duration_s: 198``). The two numbers are kept in sync by
+# ``scripts/local/test_llm_retry_budget.py``; a silent drift either kills
+# healthy seats (watchdog too low) or hides a hung one (too high).
+_LLM_RETRY_BUDGET_S = 300.0
+
 from gan.framework.access import AccessBroker
 from gan.framework import models as model_registry
 from gan.framework import paths
@@ -279,20 +288,26 @@ def build_gan_loop(
     # child frame (traj_row / event / broker_call / error / result). The seat
     # child forwards every trajectory append as a `traj_row`, and the per-call
     # `llm_call` sidecar lives under the trajectory tree — so each LLM call
-    # (successful OR failed) emits a frame, and so does each tool call. The
-    # longest legitimate FRAME-FREE stretch is therefore ONE operation, never
-    # the sum of two: a call that times out still frames, and litellm retries
-    # are capped by agent/llm.py's backoff max_time (120s).
+    # (successful OR failed) emits a frame, and so does each tool call.
     #
-    # Hence the bound is max(client budget, tool budget) + margin, DERIVED
+    # CORRECTION (2026-11-11): the frame-free stretch of an LLM call is NOT just
+    # one attempt. The child writes the `llm_call` row only after the WHOLE
+    # retry sequence finishes (measured: `attempts: 3, duration_s: 198`), so a
+    # retrying call is frame-free for up to ``retry_budget + one attempt``.
+    # Leaving the retry budget out of the bound was harmless only while it was
+    # 120 s against a 300 s margin; once it became 300 s the omission would put
+    # a legitimate retrying call exactly ON the watchdog. The bound therefore
+    # names all three terms.
+    #
+    # Hence: retry budget + max(client budget, tool budget) + margin, DERIVED
     # instead of a magic 900, and an explicitly configured value below the
     # bound REFUSES the run — raising a budget above the watchdog used to
-    # silently kill healthy sessions (before this, the relation existed only
-    # as a comment in loop.yaml).
+    # silently kill healthy sessions.
     _llm_budget = float(os.environ.get("GAN_LLM_TIMEOUT_S")
                         or cfg.get("loop.llm_client_timeout_s", 600))
     _tool_budget = float(cfg.get("loop.tool_call_timeout_s", 600))
-    _min_inactivity = max(_llm_budget, _tool_budget) + _CM_INACTIVITY_MARGIN_S
+    _min_inactivity = (_LLM_RETRY_BUDGET_S + max(_llm_budget, _tool_budget)
+                       + _CM_INACTIVITY_MARGIN_S)
     _configured_inactivity = cfg.get("loop.role_inactivity_timeout_s")
     role_inactivity_timeout_s = (float(_configured_inactivity)
                                  if _configured_inactivity else _min_inactivity)

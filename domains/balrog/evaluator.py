@@ -135,6 +135,68 @@ def _history_block(entries):
     return "\n".join(lines)
 
 
+def _obs_state_key(obs):
+    """The OBSERVABLE state of one step, as a comparable string key.
+
+    Deliberately built from what the MODEL sees (facing + the two relative
+    descriptor blocks), not from the env's internal grid: the behaviour facts
+    below answer "could the agent tell these two situations apart?", which is
+    exactly the information a prompt-only policy is missing. Two different
+    cells that yield the same relative descriptors collapse into one key on
+    purpose -- the agent cannot distinguish them either.
+
+    The invalid-action feedback prefix is STRIPPED: it is appended to
+    ``long_term_context`` after a defaulted action, so keeping it would make
+    the same position look like a new state and inflate the diversity count.
+    """
+    if not isinstance(obs, dict):
+        return ""
+    text = obs.get("text") or {}
+    long_term = str(text.get("long_term_context") or "")
+    marker = "\n\nObservation:\n"
+    if marker in long_term:
+        long_term = long_term.rsplit(marker, 1)[1]
+    return "{}|{}|{}".format(obs.get("direction"), long_term,
+                             text.get("short_term_context") or "")
+
+
+def _behaviour_summary(state_keys, num_steps):
+    """Episode-level behaviour facts for the evaluator (L1, 2026-11-11).
+
+    WHY (measured on the first A0 evolution round): the loop's improvement
+    verdict only reads solved rate, whose 10-episode quantum is 0.1 -- the same
+    generation scored 0.2 and 0.3 on an IDENTICAL code+prompt+episode set, so
+    one flipped episode is indistinguishable from an improvement. The same
+    round's prompt patch moved the turn share from 80.5% to 91.4% (a clear
+    regression) while solved stayed at 0.3. These facts give the evaluator a
+    quantity with hundreds of samples per generation instead of ten:
+
+      ``distinct_obs_states``  how many different observable states the episode
+                               visited (2 = it never moved: spinning between two
+                               headings, or pushing a wall/object forever);
+      ``obs_repeat_steps``     steps whose action produced NO observable change
+                               (wall/object blocks);
+      ``zero_displacement``    ``distinct_obs_states <= 2`` -- the episode never
+                               went anywhere.
+
+    ``zero_displacement`` is the gameable-resistant one: inaction cannot reduce
+    it (sitting still IS two states), so the only way to lower it is to move.
+    """
+    keys = [k for k in (state_keys or []) if k is not None]
+    distinct = len(set(keys))
+    repeats = sum(1 for i in range(1, len(keys)) if keys[i] == keys[i - 1])
+    out = {
+        "distinct_obs_states": distinct,
+        "obs_repeat_steps": repeats,
+        "zero_displacement": bool(distinct <= 2),
+    }
+    # A step count that disagrees with the key trace means the loop exited
+    # before recording (defensive; the two are built in the same loop).
+    if num_steps is not None and int(num_steps) != len(keys):
+        out["obs_states_traced"] = len(keys)
+    return out
+
+
 def render_history(entries, max_chars=0):
     """Render the rolling window sent to the task child (upstream semantics).
 
@@ -679,6 +741,9 @@ class Evaluator:
             # in this function scope, so it CANNOT leak across episodes (a new
             # episode starts with an empty window by construction).
             history = []
+            # Observable-state trace (L1 behaviour facts): one key per step, the
+            # observation the agent SAW at that step. See _behaviour_summary.
+            state_keys = []
             action = None
             for step in range(max_steps_per_episode):
                 inputs = {
@@ -692,6 +757,9 @@ class Evaluator:
                 # replays the episode as the agent experienced it.
                 seen_text = ((inputs["observation"].get("text") or {})
                              .get("long_term_context", ""))
+                # The state the agent is deciding FROM (feedback prefix already
+                # merged into inputs["observation"], so _obs_state_key strips it).
+                state_keys.append(_obs_state_key(inputs["observation"]))
                 if self.history_steps > 0:
                     block = render_history(history, self.history_max_chars)
                     if block:
@@ -777,6 +845,9 @@ class Evaluator:
             # on but the prompt never carried it".
             episode_log["history_steps"] = self.history_steps
             episode_log["history_used"] = len(history)
+            # L1 behaviour facts (see _behaviour_summary): per-episode, so the
+            # report can aggregate them and the evaluator can quote them.
+            episode_log.update(_behaviour_summary(state_keys, step + 1))  # pyright: ignore
             episode_log["failed_candidates"] = env.failed_candidates
             episode_log.update(env.get_stats())
             episode_log["process_num"] = process_num
