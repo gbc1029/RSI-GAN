@@ -255,14 +255,20 @@ Known constraints:
   `agent.max_text_history` unit = messages, one step = 2): a step child has no
   conversation, so the last N steps are re-rendered into every prompt
   (`inputs["history"]`, `(observation as seen, executed action)` pairs).
-  `balrog_babyai` declares 16 (= the last 8 steps, the upstream default);
-  `balrog_babaisai` declares 0 (cost: 40 tasks x 100 steps per unit). Measured
-  prompt cost on babyai: **+~1.1 KB / +275 tokens per step (+14 %)**. Setting it
-  to `0` restores the exact pre-window prompt (the A/B switch). Verify that the
-  window really reached the model with
-  `scripts/local/check_history_delivery.py <run_dir>` (greps the archived
-  prompts for the marker; violations mean an evolved `task_agent.py` stopped
-  dumping `inputs`).
+  BOTH wired balrog domains declare 16 (= the last 8 steps, the upstream
+  default); `balrog_babaisai` was 0 while the A/B was pending and was flipped
+  after it. Measured prompt cost on babyai: **+~1.1 KB / +275 tokens per step
+  (+14 %)**. Setting it to `0` restores the exact pre-window prompt (the A/B
+  switch). **A/B verdict (2026-11-10, real length, both arms on the same frozen
+  5-episode eval plan)**: ON 1/5 solved vs OFF 0/5, and the qualitative
+  difference was the decisive one — ON used `toggle`/`pick up` (75 of 397
+  steps) while OFF used NO interaction action at all in 384 steps (only
+  turn-left / turn-right / go-forward, ~1/3 each), i.e. without the window the
+  agent cannot tell "I am already facing / have already toggled this" and can
+  never solve a task that needs an interaction. Verify that the window really
+  reached the model with `scripts/local/check_history_delivery.py <run_dir>`
+  (greps the archived prompts for the marker; violations mean an evolved
+  `task_agent.py` stopped dumping `inputs`).
 - `balrog_minihack` / `balrog_nle` / `crafter` / `textworld` are **not** wired
   into the GAN path and are not covered by this script (`post_install.py`
   downloads their data from GitHub/Drive and needs network). This is now

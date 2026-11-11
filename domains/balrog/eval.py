@@ -67,6 +67,19 @@ def harness_balrog(config, agent_factory=None, sample_seed=None, anchor_ids=None
     if agent_factory is None:
         from domains.balrog.agents import AgentFactory
         agent_factory = AgentFactory(config)
+    # CM SEAM SIDECAR (docs/19 §12.28 F5 P1). The trusted per-step sink owns the
+    # audit file, and there is exactly ONE of them per harness run -- the same
+    # path the framework reads back (``paths.task_cm_events_path`` ->
+    # ``task_runner._ingest_cm_events``). This is computed HERE because the
+    # output dir is only final once the run_name/``resume_from`` rule above has
+    # run; an in-process ``AgentFactory`` simply has no setter, so legacy/direct
+    # balrog runs are unaffected. Before this, every balrog generation ingested
+    # "sidecar file missing" and the seam events lived only in the harness's own
+    # ``[f5] ... cm_events=N`` print -- the audit stream had a hole exactly where
+    # the memory window's cost is decided.
+    if hasattr(agent_factory, "set_cm_events_target"):
+        agent_factory.set_cm_events_target(
+            os.path.join(output_dir, "cm_events.jsonl"))
     with redirect_to_file(log_filename):
         evaluator_manager.run(agent_factory)
 

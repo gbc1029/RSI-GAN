@@ -559,31 +559,59 @@ with a GAN-native data layer.
   `domains.yaml output_contract.allowed_labels` == the env's own vocabulary).
 - **Per-episode cost ATTRIBUTION (P2-18).** `agent/llm_withtools.py` writes its
   per-call rows to `llm_calls_sidecar(<trajectory>)`, i.e. a SIBLING of the
-  transcript; the sandbox bound only the transcript, so every step child's rows
-  died in the tmpfs. `domains/harness._stage_sidecar` pre-creates/copies it,
-  `_sandbox_command(..., sidecar_path=)` binds it at
-  `/workspace/trajectory.jsonl.llm_calls.jsonl`, and `_copy_back_sidecar`
-  copies it back after the child exits. `archive_episode_trajectory` already
-  mirrored `<transcript>.llm_calls.jsonl` into `agent_evals/`, so
-  `trajectory._collect_llm_calls_sidecar` folds it into the archived sidecar
-  with `qid=<env>__<task>__epNN` — no framework change was needed. The report
-  adds `episodes[].llm_calls` (`None` when absent), `episodes_sidecar_missing[]`
-  and `llm_calls_total`; `episode_idx` rides the episode log so the report can
-  locate the sidecar. **Attribution only**: the child counts its own calls, the
-  root-side proxy meters usage — money/tokens stay the proxy audit's numbers and
-  the two are never summed. Guard
+  transcript; binding only the transcript meant every step child's rows died in
+  the tmpfs. Two successive transports fixed it: first a staged sidecar
+  bind+copy-back, and since the F5 telemetry rewrite (docs/19 §12.28) the rows
+  simply STREAM to the trusted harness tagged `stream: "llm_calls"`
+  (`_telemetry_stream_target` routes them to
+  `trajectory_source + LLM_CALLS_SIDECAR_SUFFIX`) and are written hash-chained
+  there — the child holds no write path to its own accounting. Either way
+  `archive_episode_trajectory` mirrors `<transcript>.llm_calls.jsonl` into
+  `agent_evals/`, so `trajectory._collect_llm_calls_sidecar` folds it into the
+  archived sidecar with `qid=<env>__<task>__epNN` — no framework change was
+  needed. The report adds `episodes[].llm_calls` (`None` when absent),
+  `episodes_sidecar_missing[]` and `llm_calls_total`; `episode_idx` rides the
+  episode log so the report can locate the sidecar. **Attribution only**: the
+  child counts its own calls, the root-side proxy meters usage — money/tokens
+  stay the proxy audit's numbers and the two are never summed. Guard
   `scripts/local/verify_episode_sidecar.py` (30 checks).
-- **Every STEP of an episode reaches the archive (2026-11-08).** The task agent
-  truncates its transcript at construction (`agent/base_agent.py`:
-  `trajectory_log.reset`), so a multi-step balrog episode kept only its LAST
-  step — measured on the first real round with the new pipeline
-  (`balrog_verify_1108a`: 10 episodes / 98 step children → 10 transcript rows,
-  which silently blinded the evaluator). `domains.harness._copy_back_transcript`
-  now has two modes: `replace` (one child owns the whole transcript: every
-  question domain) and `append` (the child is ONE STEP — the staged file is
-  created EMPTY, because the child wipes it anyway, and its rows are appended to
-  the host file). `_SandboxedBalrogAgent.forward` selects `append`. Re-measured
-  after the fix (`balrog_verify_1108b`): 55 calls → 55 input + 55 output rows.
+- **Every STEP of an episode reaches the archive (2026-11-08, transport reworked
+  2026-11-09).** The task agent truncates its transcript at construction
+  (`agent/base_agent.py`: `trajectory_log.reset`), so a multi-step balrog episode
+  kept only its LAST step — measured on the first real round with the new
+  pipeline (`balrog_verify_1108a`: 10 episodes / 98 step children → 10
+  transcript rows, which silently blinded the evaluator). In the TELEMETRY
+  design the same hazard reappears as a `traj_reset` message, so the parent (the
+  trusted side) decides: `_telemetry_reset_allowed(msg, trajectory_reset)`
+  DROPS a transcript reset from a child that is ONE STEP of an episode
+  (`trajectory_reset=False`, selected by `_SandboxedBalrogAgent.forward`) while
+  always honouring an `llm_calls` reset (that sidecar IS per step child). A
+  child that changed its own logging behaviour therefore cannot re-truncate the
+  archive. Re-measured after the fix (`balrog_verify_1108b`): 55 calls → 55 input
+  + 55 output rows; and after the telemetry rewrite (`balrog_verify_1109a`):
+  40 calls → 40 rows with chain fields `seq`/`prev_hash`.
+- **The CM seam sidecar of a balrog round (2026-11-10).** `task_runner`
+  ingests exactly ONE path per round (`paths.task_cm_events_path` =
+  `<run_dir>/outputs/<run_id>/cm_events.jsonl`); question domains satisfy it
+  incidentally through `run_agent`'s `cm_events_target`, but the per-step
+  balrog path never passed one, so every balrog generation reported
+  `cm_events_ingest_empty` ("sidecar file missing") and the seam events existed
+  only in the harness's own `[f5] ... cm_events=N` print — the audit stream was
+  empty on exactly the domain where the memory window's cost is decided.
+  `_SandboxedBalrogAgentFactory.set_cm_events_target()` is called once by
+  `harness_balrog` after `output_dir` is final (the path rule stays single-
+  sourced there, so it cannot drift from `paths`; the in-process `AgentFactory`
+  has no setter, so legacy/direct runs are unchanged). Appends are serialized
+  on `harness._CM_SIDECAR_LOCK`: one harness run has N episode workers, each
+  with its own telemetry thread, and an interleaved partial line would be
+  skipped as a torn line by the ingest = silently lost audit events. Acceptance:
+  the next balrog round shows `cm_events_ingested events=N`. Guard:
+  `scripts/local/verify_balrog_cm_sidecar.py` (13 checks — the wiring, the
+  `resume_from` branch, the in-process no-setter path, and that 120 concurrent
+  appends land as 120 parseable lines). NOTE the first real round after the fix
+  still read `cm_events_ingest_empty`: a generation runs from the STAGED copy
+  (`work/<genid>/repo`, snapshotted at generation start), so a mid-round source
+  edit cannot reach it — the proof must come from a run STARTED after the edit.
 - **The recorded action is the EXECUTED one.** `_play_episode` used to do
   `action = response_str` after the step, so the next turn's `prev_action` was
   the model's raw prose while the env had executed `default_action` (the
@@ -614,8 +642,9 @@ with a GAN-native data layer.
   IT, EXECUTED action)` pairs only — no reasoning (`remember_cot` is not part of
   this port) and never the raw reply. The window lives in `_play_episode`'s
   function scope, so it cannot leak across episodes. Depth is DECLARED:
-  `gan/framework/domains.yaml history_messages` (upstream unit; babyai 16 = 8
-  steps, babaisai 0) → `task_execution.history_window` →
+  `gan/framework/domains.yaml history_messages` (upstream unit; both wired
+  balrog domains 16 = 8 steps — babaisai was 0 until the babyai A/B verdict,
+  then flipped) → `task_execution.history_window` →
   `domains.harness --history_messages` (explicit CLI, never env);
   `history_max_chars` drops the OLDEST steps first and never the newest. `0`
   means the key never appears at all, i.e. the prompt is byte-identical to the
@@ -623,14 +652,22 @@ with a GAN-native data layer.
   `history_steps` / `history_used_max` and each `episodes[].history_used`, and
   `scripts/local/check_history_delivery.py` greps the archived prompts for the
   marker — an evolved `task_agent.py` that stopped dumping `inputs` would
-  otherwise lose the memory SILENTLY. **Why not CM**: the task child's CM
-  universe is ONE block / ONE turn by construction (`docs/19 §12.69.3`, and 40
-  calls / 40 step children measured on 2026-11-09), so there is no in-session
-  history for CM to manage; §12.69's pre-seed channel pre-seeds the task DESIGN
-  config (`prompt`/`tools`/`cost`), not session content. Guards:
-  `scripts/local/verify_episode_history.py` (30 checks, including an ON-vs-OFF
-  behavioural difference that proves the window reaches the DECISION surface,
-  not just the payload string).
+  otherwise lose the memory SILENTLY. **The A/B verdict (2026-11-10, full
+  length, both arms on ONE frozen 5-episode eval plan)**: ON 1/5 solved vs OFF
+  0/5, and the stronger evidence was the action census — ON used `toggle`/
+  `pick up` (75 of 397 steps), OFF used **no interaction action at all** in 384
+  steps (turn-left / turn-right / go-forward ≈ 1/3 each: pure rotation +
+  blind forward), so the window is what makes "already facing / already
+  toggled" representable. Harnesses: `scripts/local/run_full_arm.sh`
+  (`<messages> <out_dir> [seed_from_dir]`, refuses a pinned step count),
+  comparison `scripts/local/run_full_ab_chain.sh`. **Why not CM**: the task
+  child's CM universe is ONE block / ONE turn by construction (`docs/19
+  §12.69.3`, and 40 calls / 40 step children measured on 2026-11-09), so there
+  is no in-session history for CM to manage; §12.69's pre-seed channel
+  pre-seeds the task DESIGN config (`prompt`/`tools`/`cost`), not session
+  content. Guards: `scripts/local/verify_episode_history.py` (30 checks,
+  including an ON-vs-OFF behavioural difference that proves the window reaches
+  the DECISION surface, not just the payload string).
 ### Output layout — `gan/framework/paths.py` is the single source
 
 | path | contents |

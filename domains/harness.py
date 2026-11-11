@@ -13,6 +13,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -293,13 +294,20 @@ def _accepted_kwargs(cls, kwargs):
 
 class _SandboxedBalrogAgent:
     def __init__(self, model, chat_history_file, proxy_socket, proxy_token,
-                 reasoning_effort=None, cost_overrides=None):
+                 reasoning_effort=None, cost_overrides=None,
+                 cm_events_target=None):
         self.model = model
         self.chat_history_file = chat_history_file
         self.proxy_socket = proxy_socket
         self.proxy_token = proxy_token
         self.reasoning_effort = reasoning_effort
         self.cost_overrides = cost_overrides
+        # Host path of the ONE CM seam sidecar for this harness run. Question
+        # domains get theirs from ``run_agent`` (next to ``agent_evals``); the
+        # balrog path has no ``run_agent`` per episode of its own, so the
+        # harness hands it down through the factory. ``None`` keeps the legacy
+        # "no sidecar" behaviour of direct/legacy balrog runs.
+        self.cm_events_target = cm_events_target
 
     def forward(self, inputs):
         prediction = _run_sandboxed_agent(
@@ -316,6 +324,7 @@ class _SandboxedBalrogAgent:
             # construction-time reset must NOT truncate the earlier steps
             # (docs/19 §12.28 F5 P1 + balrog P2-18b).
             trajectory_reset=False,
+            cm_events_target=self.cm_events_target,
         )
         return prediction, []
 
@@ -337,6 +346,23 @@ class _SandboxedBalrogAgentFactory:
         self.proxy_token = proxy_token
         self.reasoning_effort = reasoning_effort
         self.cost_overrides = _design_cost_overrides()
+        self.cm_events_target = None
+
+    def set_cm_events_target(self, path):
+        """Declare the run's CM seam sidecar (called by ``harness_balrog``).
+
+        A SETTER rather than a constructor argument on purpose: the factory has
+        to exist before ``harness_balrog`` runs, and only ``harness_balrog``
+        knows the FINAL output directory (``eval.resume_from`` or
+        ``eval.output_dir/<run_id>``). Routing the path through one setter keeps
+        that rule single-sourced in the balrog harness, so it cannot drift from
+        ``gan.framework.paths.task_cm_events_path`` -- the path ``task_runner``
+        ingests. Without it every balrog generation reported
+        ``cm_events_ingest_empty`` ("sidecar file missing") while the seam
+        events only ever existed in the harness's own
+        ``[f5] ... cm_events=N`` print.
+        """
+        self.cm_events_target = path or None
 
     def create_agent(self, chat_history_file):
         return _SandboxedBalrogAgent(
@@ -346,6 +372,7 @@ class _SandboxedBalrogAgentFactory:
             self.proxy_token,
             self.reasoning_effort,
             self.cost_overrides,
+            self.cm_events_target,
         )
 
 
@@ -585,6 +612,15 @@ def _sandbox_command(run_root, agent_path, proxy_socket=None,
 # at all — no name is ever rebound, so no declaration can be forgotten.
 _CM_LATCH = {"assembly": False, "policy": False}
 
+# The CM seam sidecar is ONE file per harness run, but a balrog run puts
+# several EPISODE WORKERS in parallel (``harness_episode_workers``) and each of
+# them owns its own telemetry thread. The append therefore has to be serialized
+# here: two workers interleaving a partial line would make
+# ``task_runner._ingest_cm_events`` read back a torn JSON line (it skips those),
+# i.e. lose audit events silently. Question domains are sequential, so the lock
+# is uncontended there.
+_CM_SIDECAR_LOCK = threading.Lock()
+
 # kind -> the child env key that carries it (task_worker whitelists both).
 _CM_LATCH_ENV = {
     "assembly": "GAN_CM_ASSEMBLY_DISABLED",
@@ -767,10 +803,14 @@ def _run_sandboxed_agent(model, inputs, agent_path, trajectory_path, proxy_socke
             elif mtype == "cm_event" and isinstance(msg.get("event"), dict):
                 cm_received.append(msg["event"])
                 if cm_events_target:
-                    with open(os.path.abspath(cm_events_target), "a",
-                              encoding="utf-8") as handle:
-                        handle.write(json.dumps(
-                            msg["event"], ensure_ascii=False, default=str) + "\n")
+                    line = json.dumps(msg["event"], ensure_ascii=False,
+                                      default=str) + "\n"
+                    # Serialized for the parallel-episode case; see
+                    # ``_CM_SIDECAR_LOCK``.
+                    with _CM_SIDECAR_LOCK:
+                        with open(os.path.abspath(cm_events_target), "a",
+                                  encoding="utf-8") as handle:
+                            handle.write(line)
 
         _telemetry = TelemetryServer(telemetry_socket, _on_telemetry)
         _telemetry.start()

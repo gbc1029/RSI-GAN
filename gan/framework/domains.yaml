@@ -340,12 +340,18 @@ domains:
     # Aborted-round guard -- see the generic `balrog` family (repeated because
     # this family SHADOWS it: longest-prefix resolution only).
     max_aborted_ratio: 0.25
-    # CROSS-STEP MEMORY (方案 a): OFF by default here. 40 tasks x 100 steps per
-    # unit makes the window the largest single cost adder in the repo (~+275
-    # tokens/step x 4000 steps), so it stays at 0 until the babyai A/B shows
-    # the window actually buys accuracy (scripts/local/check_history_delivery.py
-    # + the A/B in README). Flip to 16 to enable.
-    history_messages: 0
+    # CROSS-STEP MEMORY (方案 a): ON at the same depth as babyai (16 messages =
+    # the last 8 steps). The babyai A/B this key was waiting for is DONE
+    # (2026-11-10, `scripts/local/run_full_arm.sh`, both arms on the SAME frozen
+    # 5-episode eval plan): 1/5 solved vs 0/5 for the OFF arm, and the decisive
+    # difference was qualitative -- the window used toggle/pickup (75 of 397
+    # steps) while the OFF arm used NO interaction action AT ALL in 384 steps
+    # (only turn-left/turn-right/go-forward, ~1/3 each). baba is the same env
+    # family and the same agent, so the mechanism ("am I already facing / have I
+    # already toggled this") transfers; `history_max_chars` keeps the cost of
+    # long baba observations bounded (4000 chars, oldest steps dropped first).
+    # 0 disables the window and restores the byte-identical pre-window prompt.
+    history_messages: 16
     history_max_chars: 4000
     # Episode plan -- see balrog_babyai above. 40 tasks (config.yaml
     # babaisai_tasks), so at num_samples=2 this freezes 40 anchor episodes and
