@@ -256,7 +256,11 @@ domains:
   # `len(cfg.tasks.<env>_tasks)` and `EnvWrapper.max_steps` after reset.
   balrog_babyai:
     # 5 tasks; BabyAI-MixedTrainLocal samples a sub-task per episode and its
-    # max_steps is 64 (goto/pickup/open) or 128 (putnext, seq). Worst case:
+    # max_steps is 64 (goto/pickup) or 128 (open/putnext/pick_up_seq_go_to) --
+    # the 64/128 split was re-measured on full-length rounds 2026-11-10, where
+    # `open` ran to the 128 cap in BOTH arms (the earlier note claimed 64 for
+    # open; the budgets below already assumed the worst case, so nothing
+    # functional changes). Worst case:
     # 5 x 128 steps x 20s = 12800s per unit; 5 x 128 x 4 calls = 2560 calls.
     harness_timeout_per_sample_s: 12800
     task_llm_calls_per_sample: 2560
