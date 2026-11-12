@@ -64,6 +64,24 @@ DEFAULT_PARAMS: Dict[str, float] = {
     # time, 1.6% at n=6). Set to 0 to disable.
     "constant_min_samples": 6,
     "acc_tol": 0.05,          # overcorrection: "clearly worse than the parent"
+    # `process.dead-end` (the balrog/step-based analogue of a spinning policy).
+    # CALIBRATED on the 2026-11-11 six-generation A0 round (same frozen plan),
+    # whose per-generation (zero_displacement_share, obs_repeat_step_share) were
+    #   gen0 (0.60, 0.028) gens1-2 (0.70/0.90, ~0.00)   <- dead end
+    #   gens3-4 (0.20/0.10, 0.16/0.02)                  <- moving, solved 6/10, 5/10
+    #   gen5   (0.10, 0.444)                            <- new form: pushing walls
+    # 0.5 sits between the two clusters with margin on both sides. The SECOND
+    # term exists because "going nowhere" changed shape: gen5 MOVED (only 1/10
+    # zero-displacement) yet wasted 44% of its steps on actions that changed
+    # nothing -- the same defect, so the key must still read PRESENT (the
+    # evaluator itself called it "turn-loop/empty-action dead-end persists in new
+    # form"). 0.35 is above every moving-but-productive generation (max 0.16)
+    # and below gen5's 0.444.
+    "dead_end_share": 0.5,
+    "dead_end_repeat_share": 0.35,
+    # Traced episodes needed before a share claim is decidable (aborted episodes
+    # carry no trace, so the denominator is smaller than the episode count).
+    "behavior_min_episodes": 4,
 }
 
 _INFRA_REASONS = frozenset({
@@ -234,6 +252,65 @@ def _chk_constant_output(facts: Dict[str, Any], p: Dict[str, float]) -> Check:
     return Check(STATE_PRESENT, True, f"one predicted label for {n} sample(s)")
 
 
+def _chk_dead_end(facts: Dict[str, Any], p: Dict[str, float]) -> Check:
+    """The generation spent its step budget going nowhere.
+
+    This is the checker ``process.dead-end`` never had, and its absence was
+    MEASURED: on the 2026-11-11 six-generation round the evaluator raised the
+    key in EVERY generation (6/6) and no generation ever carried a verdict,
+    even after zero-displacement episodes fell from 9/10 to 1/10 -- i.e. the
+    ledger kept charging an unfixable defect while the behaviour had already
+    improved (``verdict_stability`` stayed UNKNOWN, so nothing caught it).
+
+    Two shapes of "going nowhere", both read from the L1 ``behavior`` block:
+
+    * ``zero_displacement_share`` -- half the traced episodes visited at most two
+      observable states (they never left their starting neighbourhood);
+    * ``obs_repeat_step_share`` -- a third of ALL steps changed nothing
+      observable, i.e. the agent moves but wastes its budget (the wall-pushing
+      shape gen 5 landed in: 0.444).
+
+    ``UNKNOWN`` without a behaviour block (a report from before L1, or a
+    non-episode domain) or with too few TRACED episodes (aborted episodes carry
+    no trace, so the denominator is smaller than the episode count). The
+    thresholds are calibrated in ``DEFAULT_PARAMS`` against the six measured
+    generations; they are not round numbers picked in advance.
+    """
+    beh = facts["report_summary"].get("behavior")
+    if not isinstance(beh, dict) or not beh:
+        return _unknown("no behavior block (pre-L1 report or a question domain)")
+    n = beh.get("episodes")
+    if not isinstance(n, (int, float)) or isinstance(n, bool):
+        return _unknown("behavior block carries no traced-episode denominator")
+    n = int(n)
+    need = int(p.get("behavior_min_episodes", DEFAULT_PARAMS["behavior_min_episodes"]))
+    if n < need:
+        return _unknown(f"only {n} traced episode(s) (< behavior_min_episodes {need})")
+    zs = beh.get("zero_displacement_share")
+    rs = beh.get("obs_repeat_step_share")
+    zs = float(zs) if isinstance(zs, (int, float)) and not isinstance(zs, bool) else None
+    rs = float(rs) if isinstance(rs, (int, float)) and not isinstance(rs, bool) else None
+    if zs is None and rs is None:
+        return _unknown("behaviour block carries neither share")
+    z_limit = float(p.get("dead_end_share", DEFAULT_PARAMS["dead_end_share"]))
+    r_limit = float(p.get("dead_end_repeat_share",
+                         DEFAULT_PARAMS["dead_end_repeat_share"]))
+    fired = [name for name, val, limit in (
+        ("zero_displacement", zs, z_limit),
+        ("repeat_steps", rs, r_limit)) if val is not None and val >= limit]
+    metric = {
+        "zero_displacement_share": zs,
+        "obs_repeat_step_share": rs,
+        "traced_episodes": n,
+        "distinct_obs_states_mean": beh.get("distinct_obs_states_mean"),
+    }
+    return _flag(bool(fired), metric,
+                 f"dead-end signals {fired or 'none'} out of "
+                 f"[zero_displacement>={z_limit}, repeat_steps>={r_limit}]; "
+                 f"zero_displacement_share={zs}, obs_repeat_step_share={rs}, "
+                 f"traced={n}")
+
+
 def _chk_grant_broken(facts: Dict[str, Any], p: Dict[str, float]) -> Check:
     """A granted source path was not readable in the role workspace.
 
@@ -317,6 +394,7 @@ _CHECKERS = {
     "cost.truncation": _chk_cost_truncation,
     "harness.infra": _chk_harness_infra,
     "design.contract-format": _chk_contract_format,
+    "process.dead-end": _chk_dead_end,
     "access.grant-broken": _chk_grant_broken,
     "policy.accept-bias": lambda f, p: _bias(f, p, "accept"),
     "policy.reject-bias": lambda f, p: _bias(f, p, "reject"),

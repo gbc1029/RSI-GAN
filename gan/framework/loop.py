@@ -469,6 +469,11 @@ class GanLoop:
             "min_samples": int(cfg.get("issues.check.min_samples", 10)),
             "constant_min_samples": int(cfg.get("issues.check.constant_min_samples", 6)),
             "acc_tol": float(cfg.get("issues.check.acc_tol", 0.05)),
+            "dead_end_share": float(cfg.get("issues.check.dead_end_share", 0.5)),
+            "dead_end_repeat_share": float(
+                cfg.get("issues.check.dead_end_repeat_share", 0.35)),
+            "behavior_min_episodes": int(
+                cfg.get("issues.check.behavior_min_episodes", 4)),
         }
         self.eval_samples = int(cfg.get("eval.eval_samples", 3))
         self.eval_base_ref = str(cfg.get("eval.eval_base", "eval_base"))
