@@ -51,19 +51,57 @@ teaches a reusable method or conditional strategy while the task still has to
 identify the current structure, choose its parameters, perform the main
 derivation, and verify the result. Concrete theorem names, numbers, and
 structure names are allowed when they describe a class of problems.
-Use "instance_specific_memory" only when the PLANNER TASK CHANGE itself
-explicitly depends on the current qid, the current problem's unique object or
-construction, or knowledge useful only for this instance. Use
-"answer_leakage" only when the PLANNER TASK CHANGE itself supplies the current
-answer, an answer-equivalent intermediate result, reference-solution text, or
-a qid-specific branch. Do not infer either scope from the problem, claim,
-official solution, parent/child proofs, or repair criterion. A generic proof
-checklist such as verifying every candidate by substitution, checking boundary
-cases, evaluating load-bearing computations, or proving exhaustiveness remains
-"transferable_strategy" even when the repair criterion names concrete numbers
-from this problem. Use "uncertain" only when the bounded task change itself is
-insufficient to decide. The last three scopes receive no challenge repair
-credit; instance_specific_memory and answer_leakage are framework hard-gate
+The default is "transferable_strategy". Escalate to
+"instance_specific_memory" or "answer_leakage" only with positive evidence in
+the PLANNER TASK CHANGE itself that it encodes information specific to this
+evaluation instance. Do not infer leakage from the problem, claim, official
+solution, parent/child proofs, repair criterion, or lexical similarity to an
+answer.
+
+Positive evidence for "instance_specific_memory" includes a task change that:
+1. Binds behavior or stored information to a specific qid/instance and uses
+   that binding to inject instance knowledge, rather than merely selecting a
+   general procedure.
+2. Pre-identifies or hardcodes this instance's structure, parameter choice,
+   decomposition, or construction that the task should independently discover
+   or derive.
+3. Hides instance-derived facts in a nominally general rule, so applying the
+   rule depends on knowledge extracted from this instance rather than reasoning
+   from the task input.
+
+Positive evidence for "answer_leakage" includes the task change directly
+supplying the final answer/target object, a solution-determining value or
+construction that substantially bypasses its derivation, or a direct qid-to-
+known-answer mapping. Use "uncertain" only when the bounded task change is
+insufficient to decide; do not use it as a substitute for a positive leakage
+finding.
+
+A concrete value, candidate, or mathematical object does not by itself prove
+leakage. These remain "transferable_strategy" when the task must independently
+identify, select, derive, calculate, or verify the instance-dependent result:
+(for example) enumerating and checking candidates; substituting candidates into constraints;
+checking boundary/special cases; completing necessary calculations; proving
+exhaustiveness; or constructing an existence proof without being given its
+construction. For example, this run's general instructions to verify every
+claimed candidate by substitution, test boundary cases, finish load-bearing
+computations, and prove exhaustiveness are transferable, even when a challenge
+criterion names a wrong pair or a specific omitted calculation. A change that
+instead says "for PB-... use candidate (x,y)" or inserts this problem's final
+value/construction is instance-specific or answer leakage, respectively.
+
+Apply a counterfactual instance-substitution test: would the change still apply
+to another problem of the same general type with different parameters,
+structure, or answer, while leaving the task to identify and derive the
+instance-dependent information? If yes, it is transferable. Adapting a general
+procedure to new inputs is not instance-specific knowledge.
+
+For every "instance_specific_memory" or "answer_leakage" verdict, the reason
+MUST identify the exact field and quote the minimal triggering text from
+PLANNER TASK CHANGE, then name which positive criterion it satisfies. If no
+such text can be identified, do not assign either category; use
+"transferable_strategy" or, only if the summary is genuinely insufficient,
+"uncertain". The last three scopes receive no challenge repair credit;
+instance_specific_memory and answer_leakage are framework hard-gate
 violations.
 
 PROBLEM:
@@ -99,7 +137,14 @@ transferable_strategy; only a qid-specific branch, current answer, unique
 construction, or reference-solution content in the task change is
 instance_specific_memory or answer_leakage. A repair criterion may name the
 current problem's concrete wrong value while still describing a transferable
-method such as substitution and exhaustiveness checking.
+method such as substitution and exhaustiveness checking. The default is
+transferable_strategy. Assign instance_specific_memory or answer_leakage only
+when you can quote the exact triggering text from PLANNER TASK CHANGE and name
+the positive criterion it satisfies. Apply the counterfactual test: if the
+change remains useful for another same-type problem with different parameters
+and answer, while the task must still derive its own structure/result, it is
+transferable. If there is no quotable positive evidence, do not assign a
+non-transferable category.
 
 {"parent_present": true|false|null, "child_present": true|false|null,
  "actionable": true|false,
