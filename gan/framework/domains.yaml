@@ -266,11 +266,20 @@ domains:
     task_llm_calls_per_sample: 2560
     # PARALLEL EPISODES (P2-16). Every ENV STEP is its own sandboxed child, so
     # this is a namespace-tree budget, not a thread count: babyai is 5 tasks x
-    # <=128 steps and was measured at ~10s/step, so two concurrent episodes is
-    # the smallest useful parallelism that still leaves the host headroom. The
-    # value crosses as `domains.harness --episode_workers` and the harness takes
+    # <=128 steps, measured at ~10s/step. The value crosses as
+    # `domains.harness --episode_workers` and the harness takes
     # min(that, --num_workers); a domain that declares NOTHING stays at 1.
-    harness_episode_workers: 2
+    #
+    # 2 -> 3 is the MEASURED round the old comment asked for (2026-11-12 probe,
+    # 3 arms x 3 workers = 9 concurrent episodes on this host, 10 minutes):
+    # steady-state ~16 task calls/min PER ARM versus 10.9/min at 2 workers in a
+    # single-arm round => ~1.45x, and three arms in parallel do NOT slow each
+    # other down (all three sat at 15.8-16.0/min). Memory held: peak RSS ~4.5 GB
+    # against ~7 GB total (min free 3.9 GB), no OOM, no sandbox/child errors, and
+    # a clean teardown (0 leftover bwrap / task_worker). The binding constraint is
+    # MEMORY, not the 32 cores: do not raise this and the arm count together
+    # (3 arms x 4 workers would put ~6 GB of step children on a 7 GB box).
+    harness_episode_workers: 3
     # Aborted-round guard -- see the generic `balrog` family below. REPEATED
     # here on purpose: resolve_domain picks the LONGEST prefix only, so a
     # concrete family never inherits the generic one's keys.
