@@ -595,6 +595,14 @@ class DomainTaskRunner:
         verdicts = report.get("challenge_adjudications")
         if not isinstance(verdicts, dict):
             raise RuntimeError("fixed challenge adjudicator report is malformed")
+        invalid_ids = report.get("invalid_challenge_ids")
+        if isinstance(invalid_ids, list) and invalid_ids:
+            self._event(
+                "challenge_adjudicator_invalid_verdicts",
+                genid=str(child.genid), requested=len(rows),
+                parsed=len(verdicts), invalid_challenge_ids=[str(value)
+                for value in invalid_ids],
+            )
         if rows and not verdicts:
             raise RuntimeError(
                 "fixed challenge adjudicator produced no usable verdicts: "
