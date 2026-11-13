@@ -12,18 +12,34 @@ Judge the named defect only. Use the problem, official solution, and grading
 guidelines as private evidence. Do not assign points and do not propose a fix.
 
 Return whether the challenged defect is present in the parent proof and in the
-child proof. Set actionable=true only when ALL of these hold:
+child proof. Make the following two decisions independently and in this order.
+
+First judge challenge actionability from the REPAIR CRITERION, not from the
+planner task change, official solution, or proof text. Set actionable=true only
+when all of these hold:
 1. The defect is an observable proof-generation or proof-verification failure.
-2. The repair criterion describes a transferable strategy for a structural
-   class of problems, not merely a vague request to be careful.
-3. The same strategy could be copied to another problem with different qid,
-   numbers, and answer while remaining meaningful.
-4. The strategy can be expressed through the existing planner-to-task design
+2. The repair criterion describes a reusable method for a structural class of
+   problems, not merely a vague request to be careful.
+3. The task agent must still identify, derive, calculate, or verify the
+   instance-dependent result while applying that method.
+4. The method can be expressed through the existing planner-to-task design
    surface (prompt, config, or reusable component behavior).
-5. The proposed remedy is a reusable method, even if the acceptance check
-   names concrete values from this problem. A criterion is non-transferable
-   only when the remedy itself supplies or depends on the current answer,
-   unique construction, reference-solution text, or qid-specific branch.
+
+Do NOT classify a repair as instance-specific merely because the criterion
+names the current problem's number, candidate, equation, point, exact formula,
+or required answer. Those are acceptance evidence when the task must derive
+them. Examples of transferable repairs include exact divisibility with an
+explicit construction, candidate substitution plus exhaustiveness, small-case
+enumeration plus classification, explicit geometric angle equalities, and
+direct arithmetic/tool verification. Classify actionability_basis as
+instance_specific_content only when the proposed repair requires supplying
+the task with a qid/sibling-specific fact, the current answer, or a unique
+construction as a pre-known input, rather than asking the task to derive it
+from the problem, or requires other information that cannot be independently
+derived from the task input using the stated method. A challenge relying on an
+unprovided sibling problem is therefore non-actionable unless made
+self-contained. Use uncertain only when the repair criterion is genuinely
+insufficient to decide. In the latter two cases actionable MUST be false.
 
 Specific mathematics is allowed. For example, a conditional CRT strategy is
 transferable: check pairwise coprimality, check compatibility otherwise, solve
@@ -33,11 +49,12 @@ claim or acceptance check alone are NOT answer leakage. For example,
 even when the criterion names a particular wrong pair; the planner still has
 to identify the candidates and derive the answer for each new problem.
 
-Use actionability_basis="transferable_strategy" only when all five conditions
-hold. Use "instance_specific_content" when the criterion depends on this
-problem's answer/construction, and "uncertain" when the evidence is
-insufficient. In the latter two cases actionable MUST be false. If either
-presence judgment is not reliably decidable, use null for that field. Return
+Use actionability_basis="transferable_strategy" only when the actionable
+conditions above hold. Use "instance_specific_content" only for the positive
+non-transferability evidence described above, and "uncertain" when the
+criterion is insufficient to decide. In the latter two cases actionable MUST
+be false. If either presence judgment is not reliably decidable, use null for
+that field. Return
 exactly one JSON object:
 {{"parent_present": true|false|null, "child_present": true|false|null,
   "actionable": true|false,
@@ -46,7 +63,8 @@ exactly one JSON object:
   "reason": "short evidence-based reason"}}
 
 Judge the planner's submitted task change separately from challenge
-actionability. Use modification_scope="transferable_strategy" when the change
+actionability, using only the bounded PLANNER TASK CHANGE. Use
+modification_scope="transferable_strategy" when the change
 teaches a reusable method or conditional strategy while the task still has to
 identify the current structure, choose its parameters, perform the main
 derivation, and verify the result. Concrete theorem names, numbers, and
@@ -56,7 +74,8 @@ The default is "transferable_strategy". Escalate to
 the PLANNER TASK CHANGE itself that it encodes information specific to this
 evaluation instance. Do not infer leakage from the problem, claim, official
 solution, parent/child proofs, repair criterion, or lexical similarity to an
-answer.
+answer. Never use a concrete value appearing only in a proof or repair
+criterion as evidence about modification_scope.
 
 Positive evidence for "instance_specific_memory" includes a task change that:
 1. Binds behavior or stored information to a specific qid/instance and uses
@@ -77,17 +96,16 @@ insufficient to decide; do not use it as a substitute for a positive leakage
 finding.
 
 A concrete value, candidate, or mathematical object does not by itself prove
-leakage. These remain "transferable_strategy" when the task must independently
-identify, select, derive, calculate, or verify the instance-dependent result:
-(for example) enumerating and checking candidates; substituting candidates into constraints;
-checking boundary/special cases; completing necessary calculations; proving
-exhaustiveness; or constructing an existence proof without being given its
-construction. For example, this run's general instructions to verify every
-claimed candidate by substitution, test boundary cases, finish load-bearing
-computations, and prove exhaustiveness are transferable, even when a challenge
-criterion names a wrong pair or a specific omitted calculation. A change that
-instead says "for PB-... use candidate (x,y)" or inserts this problem's final
-value/construction is instance-specific or answer leakage, respectively.
+leakage. A task change remains transferable when the task must independently
+identify, select, derive, calculate, or verify the instance-dependent result,
+including enumerating candidates, substituting candidates into constraints,
+checking boundary cases, completing calculations, proving exhaustiveness, or
+constructing an existence proof without being given its construction. A change
+that instead says "for a named qid use candidate (x,y)" or inserts this
+problem's final value/construction is instance-specific or answer leakage,
+respectively. Generic instructions to verify every claimed candidate by
+substitution, finish load-bearing computations, and prove exhaustiveness are
+transferable.
 
 Apply a counterfactual instance-substitution test: would the change still apply
 to another problem of the same general type with different parameters,
@@ -129,22 +147,29 @@ CHILD PROOF:
 """
 
 REPAIR_PROMPT = """Re-check the previous task and return exactly one JSON
-object and nothing else. Keep the two judgments separate: modification_scope
-must be inferred from the bounded PLANNER TASK CHANGE itself, not from the
-problem, challenge claim, repair criterion, or proof text. Generic instructions
-to verify computations, candidates, boundary cases, or completeness are
-transferable_strategy; only a qid-specific branch, current answer, unique
-construction, or reference-solution content in the task change is
-instance_specific_memory or answer_leakage. A repair criterion may name the
-current problem's concrete wrong value while still describing a transferable
-method such as substitution and exhaustiveness checking. The default is
-transferable_strategy. Assign instance_specific_memory or answer_leakage only
-when you can quote the exact triggering text from PLANNER TASK CHANGE and name
-the positive criterion it satisfies. Apply the counterfactual test: if the
-change remains useful for another same-type problem with different parameters
-and answer, while the task must still derive its own structure/result, it is
-transferable. If there is no quotable positive evidence, do not assign a
-non-transferable category.
+object and nothing else. Keep the two judgments independent. Judge
+actionability_basis from the REPAIR CRITERION only: naming the current value,
+candidate, equation, point, formula, or target answer as something the task
+must derive or verify does not make a reusable repair instance-specific.
+Candidate substitution plus exhaustiveness, exact calculations, explicit
+geometric equalities, and small-case checks followed by classification are
+transferable when the task derives the instance-dependent result. Use
+instance_specific_content only when the repair requires supplying the task
+with qid/sibling-specific facts, the current answer, or a unique construction
+as pre-known input rather than asking it to derive them, or requires reference-
+solution content or information not derivable from the task input. A sibling-
+dependent challenge is non-actionable unless made self-contained.
+
+Judge modification_scope using only the bounded PLANNER TASK CHANGE, not the
+problem, claim, repair criterion, official solution, or proofs. Generic
+instructions to verify computations, candidates, boundary cases, or
+completeness are transferable_strategy. Only assign instance_specific_memory
+or answer_leakage when you can quote the exact triggering text from PLANNER
+TASK CHANGE and name the positive criterion it satisfies. If no such text is
+present, do not assign a non-transferable scope. Apply the counterfactual test:
+if the change remains useful for another same-type problem with different
+parameters and answer, while the task must still derive its own
+structure/result, it is transferable.
 
 {"parent_present": true|false|null, "child_present": true|false|null,
  "actionable": true|false,
