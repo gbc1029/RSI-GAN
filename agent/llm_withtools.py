@@ -1054,10 +1054,16 @@ def chat_with_agent(
                 pass
 
     if return_info:
+        # Preserve the final call's termination facts for callers that need to
+        # distinguish an incomplete response from an ordinary parse failure.
+        # ``info`` is the last successful LLM call in this session.
+        last_info = info if isinstance(info, dict) else {}
         return new_msg_history, {"truncated": truncated, "tool_calls": num_tool_calls,
                                  "repeat_break": repeat_break,
                                  "token_budget_exhausted": token_budget_exhausted,
-                                 "total_tokens": (tokens_used if tokens_used else None)}
+                                 "total_tokens": (tokens_used if tokens_used else None),
+                                 "finish_reason": last_info.get("finish_reason"),
+                                 "usage": last_info.get("usage")}
     return new_msg_history
 
 if __name__ == "__main__":

@@ -7,7 +7,8 @@ import json
 MAX_POINTS = 7  # max possible score per question
 
 
-def report_proof_grading(dname):
+def report_proof_grading(dname, source_requested_total=None,
+                         source_question_ids_ungraded=None):
     # Get predictions
     path = os.path.join(dname, "predictions.csv")
     df = pd.read_csv(path, dtype=str, keep_default_na=False)
@@ -15,12 +16,18 @@ def report_proof_grading(dname):
     # Numeric 0-7 preserves the full IMO scale. Four legacy labels remain
     # readable for old installed proofgrader packages during deployment.
     requested_total = len(df)
+    if source_requested_total is not None:
+        requested_total = max(requested_total, int(source_requested_total))
     normalized = df["prediction"].astype(str).str.strip().str.lower()
     numeric = pd.to_numeric(normalized, errors="coerce")
     legacy = normalized.map({"incorrect": 0, "partial": 1, "almost": 6, "correct": 7})
     points = numeric.where(numeric.notna(), legacy)
     valid = points.isin(range(MAX_POINTS + 1)) & (points % 1 == 0)
     question_ids_ungraded = df.loc[~valid, "Problem ID"].astype(str).tolist()
+    for qid in source_question_ids_ungraded or []:
+        qid = str(qid)
+        if qid not in question_ids_ungraded:
+            question_ids_ungraded.append(qid)
     df = df.loc[valid].copy()
     df["prediction_points"] = points.loc[valid].astype(int)
     df["prediction"] = df["prediction_points"].astype(str)

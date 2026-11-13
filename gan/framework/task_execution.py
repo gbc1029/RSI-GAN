@@ -2978,6 +2978,17 @@ def _prepare_imo_proof_grading_input(
     os.mkdir(grading_input_dir, mode=0o755)
     grading_input_path = os.path.join(grading_input_dir, "predictions.csv")
     grading_input.to_csv(grading_input_path, index=False)
+    source_manifest = {
+        "requested_total": int(len(predictions)),
+        "question_ids_ungraded": [
+            str(qid) for qid, value in zip(
+                predictions[question_id_col], predictions["prediction"]
+            ) if not str(value).strip()
+        ],
+    }
+    manifest_path = os.path.join(grading_input_dir, "source_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as stream:
+        json.dump(source_manifest, stream, ensure_ascii=False, indent=2)
     if expected_owner_uid is not None:
         if input_root_created:
             os.chown(
@@ -2993,8 +3004,13 @@ def _prepare_imo_proof_grading_input(
             grading_input_path, int(expected_owner_uid), int(expected_owner_gid),
             follow_symlinks=False,
         )
+        os.chown(
+            manifest_path, int(expected_owner_uid), int(expected_owner_gid),
+            follow_symlinks=False,
+        )
     os.chmod(grading_input_dir, 0o755)
     os.chmod(grading_input_path, 0o644)
+    os.chmod(manifest_path, 0o644)
     return grading_input_dir
 
 
@@ -3098,7 +3114,15 @@ def run_imo_proof_grading(
     if os.path.lexists(src):
         raise RuntimeError(f"imo_proof grading report path already exists: {src}")
     from domains.imo.proof_eval import report_proof_grading
-    report_proof_grading(grading_dir)
+    source_manifest = {}
+    manifest_path = os.path.join(grading_input_dir, "source_manifest.json")
+    with open(manifest_path, "r", encoding="utf-8") as stream:
+        source_manifest = json.load(stream)
+    report_proof_grading(
+        grading_dir,
+        source_requested_total=source_manifest.get("requested_total"),
+        source_question_ids_ungraded=source_manifest.get("question_ids_ungraded"),
+    )
     dst = os.path.join(predictions_dir, "report.json")
     if not os.path.isfile(src):
         raise RuntimeError(f"imo_proof grading report is missing: {src}")
