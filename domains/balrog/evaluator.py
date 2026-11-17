@@ -195,10 +195,20 @@ def _behaviour_summary(state_keys, actions, num_steps):
       ``revisit_steps``             steps whose (state, action) pair already
                                     occurred earlier in THIS episode;
       ``no_progress_action_counts`` the steps whose action changed nothing,
-                                    keyed by the EXECUTED action (the framework
-                                    splits these into blocked-forward vs
+                                    keyed by the action that PRODUCED the
+                                    unchanged observation (the framework splits
+                                    these into blocked-forward vs
                                     failed-interaction via the domain's
                                     declared ``action_classes``).
+
+    The attribution is ``actions[i-1]``, not ``actions[i]``: ``state_keys[i]``
+    is what the agent saw BEFORE acting at step ``i``, so ``keys[i] ==
+    keys[i-1]`` means the step ``i-1`` action changed nothing. Keying it by
+    ``actions[i]`` (the first version) reported the NEXT action and made every
+    failed ``pick up`` look like whatever came after it -- measured on the
+    stage-2 run: 48 of the 307 no-progress steps were attributed to ``turn``,
+    which cannot change nothing by construction (a turn always changes the
+    facing, hence the state key).
 
     Both families are ABSENT (never zero) when the action trace is missing or
     length-mismatched, so a reader can tell "no data" from "measured 0" -- the
@@ -222,8 +232,10 @@ def _behaviour_summary(state_keys, actions, num_steps):
                 revisit += 1
             seen.add((k, a))
             if i and k == keys[i - 1]:
-                key = str(a)
-                no_progress[key] = no_progress.get(key, 0) + 1
+                # ``acts[i-1]`` is the action that produced this unchanged
+                # observation -- see the docstring (off-by-one guard).
+                culprit = str(acts[i - 1])
+                no_progress[culprit] = no_progress.get(culprit, 0) + 1
         out["revisit_steps"] = revisit
         out["revisit_share"] = revisit / len(acts)
         out["no_progress_action_counts"] = no_progress
