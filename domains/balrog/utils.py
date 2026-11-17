@@ -16,6 +16,15 @@ from utils.trajectory_log import LLM_CALLS_SIDECAR_SUFFIX
 # the episode IS balrog's question and the qid is ``env__task__ep<NN>``.
 AGENT_EVALS_DIRNAME = "agent_evals"
 
+# A single episode counts as CYCLE-DEGENERATE when this share of its steps
+# revisits a (state, action) pair the same episode already tried. The harness
+# owns this per-episode line; the checker's GENERATION-level line
+# (``issues.check.dead_end_revisit_share``) is framework config and must be
+# calibrated on data that did not produce this number (docs/20 §8).
+# MEASURED (31 generations, 2026-11-17): a healthy arm tops out at 20% of its
+# episodes above this line, the spinning generation reaches 70%.
+DEGENERATE_REVISIT_SHARE = 0.80
+
 
 def episode_qid(env_name, task, episode_idx):
     """Filesystem-safe per-EPISODE id (balrog's analogue of a question id)."""
@@ -323,6 +332,15 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
     behavior_distinct_total = 0
     behavior_repeat_steps = 0
     behavior_traced_steps = 0
+    # CYCLE facts (docs/20 §4.2, 2026-11-17): "this (state, action) pair was
+    # already tried earlier in the same episode". ``obs_repeat_steps`` above is
+    # lowest in the WORST generation (a turn always changes the facing, hence
+    # the state key), so the pair-based count is what actually catches a spin.
+    behavior_revisit_steps = 0
+    behavior_revisit_episodes = 0
+    behavior_revisit_traced_steps = 0
+    behavior_degenerate_revisit = 0
+    behavior_no_progress_actions = Counter()
     _idx = 0
     for env_name, episode_logs in results_summaries.items():
         for episode_log in episode_logs:
@@ -392,6 +410,29 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
                 if isinstance(r_steps, int) and not isinstance(r_steps, bool):
                     behavior_repeat_steps += r_steps
                     behavior_traced_steps += int(episode_log.get("num_steps") or 0)
+            # Cycle facts: a TRACED episode (carries ``revisit_steps``) whose
+            # share of already-tried (state, action) pairs reaches the
+            # degenerate line. The per-episode threshold lives HERE because the
+            # harness owns the measurement; the checker's generation-level
+            # threshold is framework config (docs/20 §4.3).
+            rv_steps = episode_log.get("revisit_steps")
+            rv_share = episode_log.get("revisit_share")
+            row["revisit_steps"] = rv_steps
+            row["revisit_share"] = rv_share
+            if isinstance(rv_steps, int) and not isinstance(rv_steps, bool):
+                behavior_revisit_episodes += 1
+                behavior_revisit_steps += rv_steps
+                behavior_revisit_traced_steps += int(episode_log.get("num_steps") or 0)
+                if isinstance(rv_share, (int, float)) and not isinstance(rv_share, bool) \
+                        and float(rv_share) >= DEGENERATE_REVISIT_SHARE:
+                    behavior_degenerate_revisit += 1
+            np_counts = episode_log.get("no_progress_action_counts")
+            if isinstance(np_counts, dict):
+                for act, n in np_counts.items():
+                    try:
+                        behavior_no_progress_actions[str(act)] += int(n)
+                    except (TypeError, ValueError):
+                        continue
             # An ABORTED episode is scored 0.0 (it was played and lost) but it is
             # flagged, so "the agent fails this task" and "the infrastructure
             # killed this episode" stay distinguishable offline.
@@ -436,6 +477,24 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
         "obs_repeat_step_share": (
             behavior_repeat_steps / behavior_traced_steps
             if behavior_traced_steps else None),
+        # CYCLE family (docs/20 §4.2). Reported, NOT a verdict input: the
+        # checker consumes the generation-level share below. Denominator = the
+        # episodes/steps that actually carried an action trace, the same
+        # absence-not-zero rule as the pair above.
+        "revisit_traced_episodes": behavior_revisit_episodes,
+        "episodes_degenerate_revisit": behavior_degenerate_revisit,
+        "episodes_degenerate_revisit_share": (
+            behavior_degenerate_revisit / behavior_revisit_episodes
+            if behavior_revisit_episodes else None),
+        "revisit_steps_total": behavior_revisit_steps,
+        "revisit_step_share": (
+            behavior_revisit_steps / behavior_revisit_traced_steps
+            if behavior_revisit_traced_steps else None),
+        # The steps whose action changed nothing, keyed by the EXECUTED action.
+        # The framework splits these into blocked-forward vs failed-interaction
+        # through the domain's declared ``action_classes`` (docs/20 §4.1) -- the
+        # harness deliberately knows no action vocabulary.
+        "no_progress_action_counts": dict(behavior_no_progress_actions),
     }
 
     # --- episode-domain objective facts (P1-9) -------------------------------

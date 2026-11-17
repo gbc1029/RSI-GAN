@@ -366,6 +366,12 @@ class DomainTaskRunner:
         # live in ``extract_score`` (P1-7).
         self.score_divisor = float(self.domain_cfg.get("score_divisor") or 1.0)
         self.output_contract = self.domain_cfg.get("output_contract") or {}
+        # FAIL-CLOSED at construction (docs/20 §4.1): a declared
+        # ``action_classes`` must be an exact PARTITION of ``allowed_labels``.
+        # A drifting partition would silently mis-attribute the action shares
+        # (``up`` reported as a forward move, an unlisted action dropped), so it
+        # is refused before the first harness run rather than reported wrong.
+        tx.validate_action_classes(self.output_contract, domain)
         self.task_brief = self.domain_cfg.get("task_brief") or ""
         # Framework-owned final-answer requirement (F4/C1): one derivation,
         # three consumers — the child's explicit output-contract section, the

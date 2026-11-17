@@ -650,6 +650,40 @@ with a GAN-native data layer.
   it, never the go-forward share, if a behaviour term is ever added to the
   improvement gate. Guard `scripts/local/test_llm_retry_budget.py` (32 checks,
   including a scripted spin-vs-walk drive of the real `_play_episode`).
+- **Cycle facts + action classes (docs/20, 2026-11-17).** `obs_repeat_steps`
+  measured INFORMATION change, not progress: the state key carries the facing, so
+  a turning step always changes it and the WORST generation scored LOWEST (A0
+  gen8: 5.4% while turning in 92% of its steps) while a healthy agent that keeps
+  trying and failing scored 36–53% (A1) — the sign is inverted, so it is no
+  longer a verdict input. Two EVIDENCE-ONLY additions (measured over 31 archived
+  generations; no checker threshold reads them): per episode `revisit_steps` /
+  `revisit_share` — steps whose `(state, action)` pair already occurred earlier
+  in the SAME episode, i.e. a CYCLE detector (spinning generation 90.9%, healthy
+  arm 46.8%) — plus `no_progress_action_counts` (steps whose action changed
+  nothing, keyed by the EXECUTED action); aggregated as `behavior.{revisit_
+  steps_total, revisit_step_share, episodes_degenerate_revisit[_share]`
+  (per-episode line `DEGENERATE_REVISIT_SHARE = 0.80`), `no_progress_action_
+  counts}`, and both families are ABSENT (never 0) when the action trace is
+  missing or length-mismatched. The framework then derives
+  `behavior.action_class_shares` (where the STEPS went) and
+  `behavior.no_progress_class_counts` (where the WASTED steps went) from the
+  domain's declared `output_contract.action_classes`, which must be an exact
+  PARTITION of `allowed_labels` (`task_execution.validate_action_classes`,
+  refused at `TaskRunner` construction, asserted offline by the unit it enables);
+  babyai declares `turn/forward/interact`, babaisai `move/idle` (it has no turn
+  semantics — forcing a unification would make an always-zero `interact` share
+  read as "never manipulates", which is false). Blocked forward vs failed
+  interaction are DIFFERENT defects, and the aggregate wasted-step count cannot
+  tell them apart because trying things is what produces failures (the healthy
+  arm wastes MORE). A low `interact` share is deliberately NOT an issue key: one
+  arm solved 5–6/10 at 7% interaction. `process.dead-end` still keys on
+  `zero_displacement_share` alone until the generation-level revisit threshold is
+  calibrated on data that did not produce it (docs/20 §8: metrics →
+  calibration run → verdict, never the same batch twice). Guards
+  `scripts/local/test_behaviour_facts.py` (34 checks: 4 constructed sequences +
+  an archive replay that reproduces the deployed `obs_repeat_steps_total`
+  exactly) and `scripts/local/test_action_classes.py` (26 checks: partition
+  refusals, both real domains, shares/denominator/drift visibility).
 - **The recorded action is the EXECUTED one.** `_play_episode` used to do
   `action = response_str` after the step, so the next turn's `prev_action` was
   the model's raw prose while the env had executed `default_action` (the

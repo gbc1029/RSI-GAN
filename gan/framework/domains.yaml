@@ -332,6 +332,23 @@ domains:
         - "pick up"
         - "drop"
         - "toggle"
+      # ACTION CLASSES (docs/20 §4.1). A PARTITION of ``allowed_labels``, declared
+      # here because it is the same domain knowledge as the vocabulary itself --
+      # the framework derives ``behavior.action_class_shares`` from it and never
+      # hard-codes an action name. Purely EVIDENCE for the evaluator/planner ("is
+      # the agent moving, turning, or actually manipulating objects?"); no
+      # checker consumes it.
+      #
+      # The partition is what makes "stuck" diagnosable: blocked ``go forward``
+      # (turning is in its own class, so a turn can never be a blocked step) and
+      # failed ``pick up``/``toggle``/``drop`` are DIFFERENT defects with
+      # different fixes, and the aggregate "wasted steps" number cannot tell
+      # them apart (measured: the healthy arm wastes MORE steps than the spinning
+      # one, because trying things is what produces failures).
+      action_classes:
+        turn: ["turn left", "turn right"]
+        forward: ["go forward"]
+        interact: ["pick up", "drop", "toggle"]
     task_brief: >-
       Play the BabyAI navigation environment. At each step, inspect the mission
       and observation and respond with exactly one valid environment action.
@@ -428,6 +445,17 @@ domains:
         - "right"
         - "down"
         - "left"
+      # ACTION CLASSES (docs/20 §4.1): Baba Is AI has NO "turn" action -- the
+      # four directions are ABSOLUTE moves and pushing a block IS walking into
+      # it, so there is no interact class either. Deliberately NOT unified with
+      # babyai's turn/forward/interact: forcing ``up`` into a ``forward`` bucket
+      # would make the reported shares lie (up is not facing-relative), and an
+      # always-zero ``interact`` share reads as "the agent never manipulates",
+      # which is false. These numbers are evidence only, so a per-domain naming
+      # costs nothing (decision D4, docs/20 §9).
+      action_classes:
+        move: ["up", "down", "left", "right"]
+        idle: ["idle"]
     task_brief: >-
       Play the Baba Is AI puzzle environment. At each step, inspect the active
       rules and object positions and respond with exactly one valid action.

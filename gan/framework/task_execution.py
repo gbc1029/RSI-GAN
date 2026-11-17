@@ -3585,6 +3585,81 @@ def aborted_round_reason(report_summary: Optional[Dict[str, Any]],
             f"({float(ratio):.0%} > limit {limit:.0%})")
 
 
+def validate_action_classes(contract: Optional[Dict[str, Any]],
+                            domain: Optional[str] = None) -> Dict[str, List[str]]:
+    """``output_contract.action_classes`` as a validated PARTITION.
+
+    Why this exists (docs/20 §4.1): the framework derives the action-class
+    SHARES (turn / forward / interact) from a domain's own declaration instead of
+    hard-coding action names, so the vocabulary stays in ``domains.yaml`` like
+    ``allowed_labels`` does. The declaration is only useful if it is EXACTLY a
+    partition of ``allowed_labels``: a label in two classes is double-counted, a
+    label in none silently disappears from the shares, and an unknown name makes
+    the reported buckets lie. All three are refused instead of reported wrong.
+
+    Returns ``{class_name: [labels]}``; empty when the contract declares nothing
+    (question domains, and every domain that has not adopted the field, stay
+    byte-identical).
+    """
+    contract = contract or {}
+    classes = contract.get("action_classes")
+    if not classes:
+        return {}
+    where = f" (domain {domain!r})" if domain else ""
+    if not isinstance(classes, dict):
+        raise RuntimeError(f"domains.yaml action_classes must be a mapping{where}")
+    labels = [str(a) for a in (contract.get("allowed_labels") or []) if str(a).strip()]
+    if not labels:
+        raise RuntimeError(
+            f"domains.yaml action_classes declared without allowed_labels{where}: "
+            "nothing to partition")
+    owner: Dict[str, str] = {}
+    normalized: Dict[str, List[str]] = {}
+    for raw_name, members in classes.items():
+        name = str(raw_name)
+        if not isinstance(members, (list, tuple)) or not members:
+            raise RuntimeError(
+                f"domains.yaml action_classes.{name} must be a non-empty list{where}")
+        bucket: List[str] = []
+        for raw in members:
+            label = str(raw)
+            if not label.strip():
+                raise RuntimeError(
+                    f"domains.yaml action_classes.{name} carries an empty label{where}")
+            if label in owner:
+                raise RuntimeError(
+                    f"domains.yaml action label {label!r} appears in two classes "
+                    f"({owner[label]!r}, {name!r}){where}")
+            owner[label] = name
+            bucket.append(label)
+        normalized[name] = bucket
+    missing = [label for label in labels if label not in owner]
+    extra = [label for label in owner if label not in labels]
+    if missing or extra:
+        raise RuntimeError(
+            "domains.yaml action_classes must PARTITION allowed_labels"
+            f"{where}: unclassified={missing or 'none'}, not-in-vocabulary={extra or 'none'}")
+    return normalized
+
+
+def _action_class_counts(dist: Any, classes: Dict[str, List[str]]) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """``({class: n}, {unclassified action: n})`` from a raw action histogram."""
+    owner = {label: name for name, labels in (classes or {}).items() for label in labels}
+    per = {name: 0 for name in (classes or {})}
+    unclassified: Dict[str, int] = {}
+    for action, n in (dist or {}).items() if isinstance(dist, dict) else []:
+        try:
+            count = int(n)
+        except (TypeError, ValueError):
+            continue
+        cls = owner.get(str(action))
+        if cls is None:
+            unclassified[str(action)] = unclassified.get(str(action), 0) + count
+        else:
+            per[cls] += count
+    return per, unclassified
+
+
 def compute_report_summary(
     report: Optional[Dict[str, Any]],
     requested: int,
@@ -3666,7 +3741,43 @@ def compute_report_summary(
         # of inferring "it is spinning" from an action histogram.
         behavior = report.get("behavior")
         if isinstance(behavior, dict):
-            summary["behavior"] = behavior
+            # COPY: the derived shares below are added for the evaluator, not
+            # written back into the report the harness produced.
+            beh = dict(behavior)
+            # ACTION CLASS SHARES (docs/20 §4.1): a pure derivation from the
+            # report's own histogram + the domain's declared partition. EVIDENCE
+            # only -- deliberately NOT a checker input: measured, a low
+            # ``interact`` share is not a defect by itself (one arm solved 5-6 of
+            # 10 episodes at 7% interaction), so turning it into a threshold
+            # would manufacture findings the planner cannot act on.
+            #   action_class_shares        -- where the STEPS went
+            #   no_progress_class_counts   -- where the WASTED steps went
+            #                                 (blocked forward vs failed
+            #                                 interaction: different defects)
+            try:
+                classes = validate_action_classes(contract)
+            except RuntimeError:
+                raise
+            if classes:
+                dist = report.get("action_distribution")
+                if isinstance(dist, dict) and dist:
+                    per, unclassified = _action_class_counts(dist, classes)
+                    total = sum(per.values()) + sum(unclassified.values())
+                    if total:
+                        beh["action_class_shares"] = {
+                            name: n / total for name, n in per.items()}
+                    if unclassified:
+                        # Fail-OPEN but loud: an action outside the declared
+                        # vocabulary is drift, and it must be visible instead of
+                        # silently vanishing from the shares.
+                        beh["action_class_unclassified"] = unclassified
+                np_counts = beh.get("no_progress_action_counts")
+                if isinstance(np_counts, dict) and np_counts:
+                    per_np, np_unclassified = _action_class_counts(np_counts, classes)
+                    beh["no_progress_class_counts"] = per_np
+                    if np_unclassified:
+                        beh["no_progress_class_unclassified"] = np_unclassified
+            summary["behavior"] = beh
         if contract.get("kind") == "action":
             rate = report.get("invalid_action_rate")
             # `contract_ok` = the agent actually produced a legal action on every

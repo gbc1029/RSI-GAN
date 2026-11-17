@@ -160,7 +160,7 @@ def _obs_state_key(obs):
                              text.get("short_term_context") or "")
 
 
-def _behaviour_summary(state_keys, num_steps):
+def _behaviour_summary(state_keys, actions, num_steps):
     """Episode-level behaviour facts for the evaluator (L1, 2026-11-11).
 
     WHY (measured on the first A0 evolution round): the loop's improvement
@@ -181,8 +181,31 @@ def _behaviour_summary(state_keys, num_steps):
 
     ``zero_displacement`` is the gameable-resistant one: inaction cannot reduce
     it (sitting still IS two states), so the only way to lower it is to move.
+
+    CYCLE facts (docs/20 §4.2, 2026-11-17) -- the fix for a MEASURED sign error.
+    ``obs_repeat_steps`` counts INFORMATION change, not progress, and the state
+    key contains the facing: a turning step always changes it, so a spinning
+    agent scores ZERO on it (A0 gen8: 5.4% while turning in 92% of its steps)
+    while a healthy agent that keeps trying and failing scores high (A1: 36-53%).
+    The pair-based count below fixes the direction by asking a different
+    question -- "have I already tried exactly this action from exactly this
+    state?" -- which a 4-step rotation cycle hits on every lap (A0 gen8: 90.9%)
+    and a genuine attempt never does (A1 gen0: 46.8%):
+
+      ``revisit_steps``             steps whose (state, action) pair already
+                                    occurred earlier in THIS episode;
+      ``no_progress_action_counts`` the steps whose action changed nothing,
+                                    keyed by the EXECUTED action (the framework
+                                    splits these into blocked-forward vs
+                                    failed-interaction via the domain's
+                                    declared ``action_classes``).
+
+    Both families are ABSENT (never zero) when the action trace is missing or
+    length-mismatched, so a reader can tell "no data" from "measured 0" -- the
+    same rule the aborted-episode row follows.
     """
     keys = [k for k in (state_keys or []) if k is not None]
+    acts = list(actions or [])
     distinct = len(set(keys))
     repeats = sum(1 for i in range(1, len(keys)) if keys[i] == keys[i - 1])
     out = {
@@ -190,6 +213,20 @@ def _behaviour_summary(state_keys, num_steps):
         "obs_repeat_steps": repeats,
         "zero_displacement": bool(distinct <= 2),
     }
+    if acts and len(acts) == len(keys):
+        seen = set()
+        revisit = 0
+        no_progress = {}
+        for i, (k, a) in enumerate(zip(keys, acts)):
+            if (k, a) in seen:
+                revisit += 1
+            seen.add((k, a))
+            if i and k == keys[i - 1]:
+                key = str(a)
+                no_progress[key] = no_progress.get(key, 0) + 1
+        out["revisit_steps"] = revisit
+        out["revisit_share"] = revisit / len(acts)
+        out["no_progress_action_counts"] = no_progress
     # A step count that disagrees with the key trace means the loop exited
     # before recording (defensive; the two are built in the same loop).
     if num_steps is not None and int(num_steps) != len(keys):
@@ -744,6 +781,10 @@ class Evaluator:
             # Observable-state trace (L1 behaviour facts): one key per step, the
             # observation the agent SAW at that step. See _behaviour_summary.
             state_keys = []
+            # Executed-action trace, index-aligned with ``state_keys``: the pair
+            # (what it decided FROM, what it DID) is the unit the cycle detector
+            # in _behaviour_summary counts (docs/20 §4.2).
+            executed_actions = []
             action = None
             for step in range(max_steps_per_episode):
                 inputs = {
@@ -775,6 +816,7 @@ class Evaluator:
                 executed = env.check_action_validity(response_str)
 
                 episode_log["action_frequency"][executed] += 1
+                executed_actions.append(executed)
 
                 obs, reward, terminated, truncated, info = env.step(executed)
                 done = terminated or truncated
@@ -847,7 +889,8 @@ class Evaluator:
             episode_log["history_used"] = len(history)
             # L1 behaviour facts (see _behaviour_summary): per-episode, so the
             # report can aggregate them and the evaluator can quote them.
-            episode_log.update(_behaviour_summary(state_keys, step + 1))  # pyright: ignore
+            episode_log.update(  # pyright: ignore
+                _behaviour_summary(state_keys, executed_actions, step + 1))
             episode_log["failed_candidates"] = env.failed_candidates
             episode_log.update(env.get_stats())
             episode_log["process_num"] = process_num
