@@ -65,20 +65,38 @@ DEFAULT_PARAMS: Dict[str, float] = {
     "constant_min_samples": 6,
     "acc_tol": 0.05,          # overcorrection: "clearly worse than the parent"
     # `process.dead-end` (the balrog/step-based analogue of a spinning policy).
-    # CALIBRATED on the 2026-11-11 six-generation A0 round (same frozen plan),
-    # whose per-generation (zero_displacement_share, obs_repeat_step_share) were
-    #   gen0 (0.60, 0.028) gens1-2 (0.70/0.90, ~0.00)   <- dead end
-    #   gens3-4 (0.20/0.10, 0.16/0.02)                  <- moving, solved 6/10, 5/10
-    #   gen5   (0.10, 0.444)                            <- new form: pushing walls
-    # 0.5 sits between the two clusters with margin on both sides. The SECOND
-    # term exists because "going nowhere" changed shape: gen5 MOVED (only 1/10
-    # zero-displacement) yet wasted 44% of its steps on actions that changed
-    # nothing -- the same defect, so the key must still read PRESENT (the
-    # evaluator itself called it "turn-loop/empty-action dead-end persists in new
-    # form"). 0.35 is above every moving-but-productive generation (max 0.16)
-    # and below gen5's 0.444.
+    # Signal 1 -- `zero_displacement_share`: the episode never left its starting
+    # neighbourhood. CALIBRATED on the 2026-11-11 six-generation A0 round (same
+    # frozen plan), whose per-generation zero_displacement_share was
+    #   gen0 (0.60) gens1-2 (0.70/0.90)   <- dead end
+    #   gens3-4 (0.20/0.10)              <- moving, solved 6/10, 5/10
+    #   gen5   (0.10)                    <- moved but wasted its steps
+    # 0.5 sits between the two clusters with margin on both sides.
+    #
+    # Signal 2 was `obs_repeat_step_share >= 0.35` and it was WRONG IN SIGN
+    # (REMOVED 2026-11-17, docs/20). It counts steps whose action changed nothing
+    # observable, and the state key contains the FACING: a turning step always
+    # changes it, so the spinning generation scored 5.4% while a healthy agent
+    # that keeps trying and failing scored 36-53%. Measured over 31 archived
+    # generations: it fired on 12/12 generations of the BEST arm and 0/8 of the
+    # full arm. The replacement counts CYCLES instead -- the share of episodes
+    # whose steps mostly revisit a (state, action) pair already tried earlier in
+    # the same episode -- which a 4-step rotation hits on every lap (A0 gen8:
+    # 70% of its episodes degenerate) and a genuine attempt never does (A1:
+    # 0-20%).
+    #
+    # 0.40 is calibrated on TWO independent samples: the archived 3-arm round
+    # (A1 max 20%, A0 gen4/gen8 70%, A2 gen9/gen10 60%) and the stage-2 fresh-plan
+    # A1 run (3 generations, exactly 20% each). That is a 2x margin below the
+    # worst dead generation and 2x above the healthy ceiling -- and the
+    # calibration run used data the rule was NOT written on (docs/20 §8).
     "dead_end_share": 0.5,
-    "dead_end_repeat_share": 0.35,
+    "dead_end_revisit_share": 0.4,
+    # A single episode counts as cycle-degenerate when this share of its steps
+    # revisit an already-tried (state, action) pair. Owned by the HARNESS
+    # (`domains/balrog/utils.py DEGENERATE_REVISIT_SHARE`) and mirrored here for
+    # the metric display only -- changing it here does NOT change the report.
+    "degenerate_revisit_share": 0.8,
     # Traced episodes needed before a share claim is decidable (aborted episodes
     # carry no trace, so the denominator is smaller than the episode count).
     "behavior_min_episodes": 4,
@@ -264,17 +282,22 @@ def _chk_dead_end(facts: Dict[str, Any], p: Dict[str, float]) -> Check:
 
     Two shapes of "going nowhere", both read from the L1 ``behavior`` block:
 
-    * ``zero_displacement_share`` -- half the traced episodes visited at most two
+    * ``zero_displacement_share`` — half the traced episodes visited at most two
       observable states (they never left their starting neighbourhood);
-    * ``obs_repeat_step_share`` -- a third of ALL steps changed nothing
-      observable, i.e. the agent moves but wastes its budget (the wall-pushing
-      shape gen 5 landed in: 0.444).
+    * ``episodes_degenerate_revisit_share`` — half the traced episodes spent 80%
+      of their steps re-trying a ``(state, action)`` pair the same episode had
+      already tried, i.e. it is CYCLING (docs/20 §4.2). Deliberately a cycle
+      detector, not a "wasted steps" counter: the latter was the previous second
+      signal and had an inverted sign (a turn always changes the observable
+      state, so the spinning generation scored 5.4% while the healthy arm scored
+      36-53% — it fired on 12/12 generations of the best arm and 0/8 of the full
+      arm).
 
     ``UNKNOWN`` without a behaviour block (a report from before L1, or a
     non-episode domain) or with too few TRACED episodes (aborted episodes carry
     no trace, so the denominator is smaller than the episode count). The
-    thresholds are calibrated in ``DEFAULT_PARAMS`` against the six measured
-    generations; they are not round numbers picked in advance.
+    thresholds are calibrated in ``DEFAULT_PARAMS`` against measured generations
+    on TWO independent samples; they are not round numbers picked in advance.
     """
     beh = facts["report_summary"].get("behavior")
     if not isinstance(beh, dict) or not beh:
@@ -288,26 +311,36 @@ def _chk_dead_end(facts: Dict[str, Any], p: Dict[str, float]) -> Check:
         return _unknown(f"only {n} traced episode(s) (< behavior_min_episodes {need})")
     zs = beh.get("zero_displacement_share")
     rs = beh.get("obs_repeat_step_share")
+    vs = beh.get("episodes_degenerate_revisit_share")
     zs = float(zs) if isinstance(zs, (int, float)) and not isinstance(zs, bool) else None
     rs = float(rs) if isinstance(rs, (int, float)) and not isinstance(rs, bool) else None
-    if zs is None and rs is None:
-        return _unknown("behaviour block carries neither share")
+    vs = float(vs) if isinstance(vs, (int, float)) and not isinstance(vs, bool) else None
+    if zs is None and vs is None:
+        return _unknown("behaviour block carries neither zero_displacement nor "
+                        "degenerate-revisit share (pre-docs/20 report?)")
     z_limit = float(p.get("dead_end_share", DEFAULT_PARAMS["dead_end_share"]))
-    r_limit = float(p.get("dead_end_repeat_share",
-                         DEFAULT_PARAMS["dead_end_repeat_share"]))
+    v_limit = float(p.get("dead_end_revisit_share",
+                         DEFAULT_PARAMS["dead_end_revisit_share"]))
+    # A signal that is ABSENT cannot fire AND cannot be read as "fixed": the
+    # caller aggregates the pair, and None here means "no data", never ABSENT.
     fired = [name for name, val, limit in (
         ("zero_displacement", zs, z_limit),
-        ("repeat_steps", rs, r_limit)) if val is not None and val >= limit]
+        ("degenerate_revisit", vs, v_limit)) if val is not None and val >= limit]
     metric = {
         "zero_displacement_share": zs,
+        "episodes_degenerate_revisit_share": vs,
+        # REPORT ONLY (never a verdict input since 2026-11-17): the sign is
+        # inverted -- see DEFAULT_PARAMS.
         "obs_repeat_step_share": rs,
+        "revisit_step_share": beh.get("revisit_step_share"),
         "traced_episodes": n,
         "distinct_obs_states_mean": beh.get("distinct_obs_states_mean"),
     }
     return _flag(bool(fired), metric,
                  f"dead-end signals {fired or 'none'} out of "
-                 f"[zero_displacement>={z_limit}, repeat_steps>={r_limit}]; "
-                 f"zero_displacement_share={zs}, obs_repeat_step_share={rs}, "
+                 f"[zero_displacement>={z_limit}, degenerate_revisit>={v_limit}]; "
+                 f"zero_displacement_share={zs}, "
+                 f"episodes_degenerate_revisit_share={vs}, "
                  f"traced={n}")
 
 

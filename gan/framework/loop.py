@@ -470,8 +470,16 @@ class GanLoop:
             "constant_min_samples": int(cfg.get("issues.check.constant_min_samples", 6)),
             "acc_tol": float(cfg.get("issues.check.acc_tol", 0.05)),
             "dead_end_share": float(cfg.get("issues.check.dead_end_share", 0.5)),
-            "dead_end_repeat_share": float(
-                cfg.get("issues.check.dead_end_repeat_share", 0.35)),
+            # REPLACED `dead_end_repeat_share` 0.35 on 2026-11-17 (docs/20): that
+            # signal had an INVERTED sign -- the state key carries the facing, so
+            # a turning step always changes it, and it fired on 12/12
+            # generations of the best arm while missing the spinning one. The
+            # replacement counts CYCLES (already-tried (state, action) pairs).
+            # The old key is no longer read: drop it from any saved override.
+            "dead_end_revisit_share": float(
+                cfg.get("issues.check.dead_end_revisit_share", 0.4)),
+            "degenerate_revisit_share": float(
+                cfg.get("issues.check.degenerate_revisit_share", 0.8)),
             "behavior_min_episodes": int(
                 cfg.get("issues.check.behavior_min_episodes", 4)),
         }

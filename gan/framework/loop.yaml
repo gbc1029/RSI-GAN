@@ -207,6 +207,18 @@ issues:
     acc_tol: 0.05               # policy.overcorrection: 子代准确率比父代"明显更差"的容差
                                 # （判据 = 决策规则反转[acc_C <= 少数类占比 - acc_tol]
                                 #  且 acc_C < acc_P - acc_tol；见 issue_checks.py）
+    # process.dead-end（episode 域）：两个信号任一命中即 PRESENT。
+    # 信号一 没离开原地：有轨迹的局里 >= 一半只访问过 <=2 个可观察状态。
+    dead_end_share: 0.5
+    # 信号二 绕圈子（2026-11-17 取代旧的 dead_end_repeat_share=0.35，docs/20）:
+    # "本局 80% 的步都在重复已试过的 (状态,动作) 对" 的局占比 >= 0.4。
+    # 旧信号方向是反的（状态含朝向，转向必然改变状态 ⇒ 转圈的人当年只有 5.4%，
+    # 而健康臂 36-53%，12/12 打在最好的臂上）。0.4 由**两份独立样本**定：
+    #   归档三臂（A1 最高 20%；A0 gen4/gen8 = 70%；A2 gen9/gen10 = 60%）
+    #   阶段 2 全新题集的 A1 三代（各 20%）—— 这一跑没有参与写规则。
+    dead_end_revisit_share: 0.4
+    degenerate_revisit_share: 0.8   # 单局退化线（实测在 harness 侧；此处仅供显示）
+    behavior_min_episodes: 4        # 少于这个数的有轨迹局 ⇒ 判不了（UNKNOWN）
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
