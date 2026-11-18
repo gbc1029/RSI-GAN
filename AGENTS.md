@@ -679,7 +679,16 @@ with a GAN-native data layer.
   arm solved 5–6/10 at 7% interaction. `process.dead-end` now keys on
   `zero_displacement_share` OR `episodes_degenerate_revisit_share >= 0.4`, the
   cycle signal replacing the sign-inverted `obs_repeat_step_share` (docs/20 §8
-  staged it: metrics → a fresh A1 calibration run → verdict). Guards
+  staged it: metrics → a fresh A1 calibration run → verdict). STAGE-4
+  ACCEPTANCE (2026-11-18, A0+A1 × 3 generations on one fresh plan, $1.85): A1
+  3/3 absent, and A0's degenerate generation (turn 92.6%, interact **0.2%**,
+  revisit 95%, deg 0.90, solved 2/10) judged PRESENT — while A0 gen1 (turn
+  62.7% but solved **6/10**, deg 0.20) is correctly ABSENT, which is why `turn`
+  share is NOT a dead-end criterion (the first draft of the gate used
+  `turn >= 0.60` and false-alarmed on it, the same shape of mistake as the
+  repeat signal). Healthy `deg` measured 0.20–0.30, so the 0.40 line has only
+  0.10 of headroom on the healthy side: if a healthy arm ever reaches 0.40,
+  raise the threshold instead of re-labelling that generation. Guards
   `scripts/local/test_behaviour_facts.py` (35 checks: 4 constructed sequences +
   an off-by-one guard on the no-progress attribution + an archive replay that
   reproduces the deployed `obs_repeat_steps_total` exactly),
