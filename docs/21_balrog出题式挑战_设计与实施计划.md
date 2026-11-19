@@ -320,3 +320,87 @@ F_e_adv = w_prec · z(precision_smoothed)
 
 **对 A 层（去重/新颖性）的影响**：重复检测用 grid 指纹（而非 mission/seed），因为不同 seed
 可能生成同一布局（概率低但存在），而同一 mission 文本对应当不同布局。
+
+> 追加（2026-11-19）：本节之后是阶段 0 的落地记录，见 §12。
+
+---
+
+## 12. 阶段 0 落地记录（2026-11-19，已实现，零行为影响）
+
+三个提交：`4e1f1bc`（契约层）/ `41d9e9a`（题面空间 + 机械适配器）/ 本节。
+
+### 12.1 落了什么
+
+| 文件 | 内容 |
+|---|---|
+| `gan/framework/challenge_ledger.py` | 盲锁生命周期；**域参数化**（IMO 把 `"imo_proof"` 写死） |
+| `gan/framework/challenge_adjudication.py` | 5 状态机 + 证据可用性；**新增** `register_adjudicator` / `adjudicator_for`（取代 `is_imo_proof` 硬分支） |
+| `gan/framework/challenge_metrics.py` | 移植；**去掉** `evaluator_adversarial_score`（它给"出不可修的题"发钱）；**新增** `challenge_calibration`；两阶段激活闸门 |
+| `gan/framework/defect_lines.py` | 单局缺陷线的唯一读者（闭词表 + 缺声明 = `{}` 而非 0 + 非法值直接抛） |
+| `domains/balrog/challenge_space.py` | L1 物化：同族**题对**（train/eval）+ 指纹去重 + 难度档 + 确定性 |
+| `domains/balrog/challenge_adjudication.py` | 零 LLM 机械适配器（`process.dead-end`） |
+| `gan/framework/task_execution.py` | `compute_report_summary` 用声明线**重算**循环份额，仅在**不一致**时写 `behavior.defect_line_drift` |
+| `gan/framework/loop.yaml` | `challenge:` 块，`enabled: false` |
+
+### 12.2 实现时测得的三件事实（都改过代码）
+
+1. **指纹必须在 reset 时取。** 先 rollout 再取指纹会把不同实例压成同一个哈希 ——
+   每个解出来的局最后都是"机器人站在目标上"同一个姿势。实测：pickup 24 个 seed
+   得到 **1** 个"唯一布局"，真相是 **23** 个。所以 `materialize()` 先 reset→取指纹，
+   再 rollout 算难度。mission 文本同样不能当身份（两个不同 `open` 关卡都叫
+   "open the door"）。
+2. **`adjudicator_for` 不能直接拼 `domains.<域名>`。** 域名是 `balrog_babyai`，
+   包是 `domains.balrog`（与 `domains.yaml` 的**最长前缀**规则一致）。按朴素写法，
+   每次 balrog 结算都会 import 失败 → 永远 `UNDECIDABLE`，而且看起来像"证据不足"。
+   现在按 `_` 前缀逐级回退，`test_challenge_ledger.py` 断言 `balrog_babyai` 解析成功。
+3. **D3（进度不降）只能在父代确实有病时生效。** 无条件套用会把
+   `UNSUPPORTED_CHALLENGE`（假挑战）变成 `REGRESSION_AFTER_FALSE_CHALLENGE` ——
+   等于因为一次普通进度波动去惩罚 planner 一个它从来没有的缺陷。真实数据回放
+   直接抓到了这个 bug。
+
+### 12.3 难度档（实测，24 seed/族）
+
+| family | min | p10 | p50 | p90 | max | 采纳档 `[max(4,p10), p90]` |
+|---|---|---|---|---|---|---|
+| goto | 1 | 2 | 5 | 7 | 8 | **[4, 7]** |
+| pickup | 3 | 4 | 5 | 8 | 10 | [4, 8] |
+| open | 7 | 12 | 16 | 19 | 24 | [12, 19] |
+| putnext | 6 | 7 | 12 | 15 | 16 | [7, 15] |
+| pick_up_seq_go_to | 6 | 9 | 13 | 16 | 17 | [9, 16] |
+
+布局去重率 23–24/24（pickup 有一个 seed 撞布局，被正确拒收）。
+`goto` 的 p10=2 说明该族十分之一近乎平凡，所以 4 步地板在这里是**上调**而非装饰。
+
+### 12.4 两条通道的一致性（真数据）
+
+阶段 4 的 6 代真报告回放：`issue_checks._chk_dead_end` 的代级判决与
+challenge 通道的逐局判决**无一矛盾**。
+
+| 代 | checker | 命中局/有轨迹局 |
+|---|---|---|
+| A0 gen0 | present | 9/10 |
+| A0 gen1/2 | absent | 2/10, 3/10 |
+| A1 gen0/1/2 | absent | 3/10, 2/10, 3/10 |
+
+同时验证：框架用声明线重算的 `episodes_degenerate_revisit_share` 与 harness 值
+**逐代相等**（不报 `defect_line_drift`），故意污染一局后必须报警。
+
+### 12.5 故意没做的
+
+- `policy.no-interaction` / `policy.blocked-forward` **不接**：它们需要**单局动作类计数**，
+  而报告行目前只带代级的 `action_class_shares`。靠代级份额反推单局 = 编一个与另一
+  通道"偶然一致"的代理指标，比诚实的"暂时判不了"更坏。阶段 1 把单局计数加进报告后，
+  在 `SUPPORTED_DEFECT_CLASSES` 里加一行即可。
+- `challenge_questions.py`（A 层校验 / K 预算 / 去重）、`context.py` 字段、
+  `propose_challenge` / `respond_challenge` 工具、采样注入：全部属于**阶段 1**
+  （它们只有在接线后才有可验证语义）。
+
+### 12.6 阶段 0 硬门
+
+| 门 | 结果 |
+|---|---|
+| balrog 12 套（389 断言）+ 三个新回归（35/26/48） | ✅ 全绿 |
+| 框架 5 套 + `compileall gan domains agent utils` | ✅ 全绿 |
+| 默认 `challenge.enabled: false` ⇒ 报告逐字段不变 | ✅ `compute_report_summary` 只在**不一致**时加字段；循环链路无人读 `challenge.*` |
+| 两条通道结论一致性断言 | ✅ `test_challenge_adjudication.py`（39 断言） |
+| 新增套件 | `test_challenge_ledger` 40 / `test_challenge_space` 36 / `test_challenge_adjudication` 39 |
