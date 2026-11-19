@@ -253,7 +253,11 @@ class _TaskBrokerState:
         # Fixed-root eval runners materialize their explicit question list
         # before asking the broker. Treat that scope like a parent-scored run
         # for input selection, including independent domains such as imo_proof.
-        fixed_eval = scope_id.startswith("eval_outer")
+        # CHALLENGE-VAL (docs/21 §4.1) is the SAME shape of round -- a pinned
+        # episode set, no questions.csv -- under its own scope prefix, so it is
+        # launched by the same fixed-plan path and cannot fall back to a rotating
+        # draw.
+        fixed_eval = scope_id.startswith(("eval_outer", "cval_outer"))
         questions_path = os.path.join(run_dir, "input", "questions.csv")
         launch_num_samples = int(self.config["num_samples"])
         grading_subset = str(self.config["subset"])
@@ -275,7 +279,7 @@ class _TaskBrokerState:
             try:
                 fixed_plan = tx.fixed_eval_launch_plan(
                     seed_info, resolve_domain(load_registry(), domain),
-                    default_subset=str(self.config["subset"]))
+                    default_subset=str(self.config["subset"]), scope_id=scope_id)
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
             launch_num_samples = int(fixed_plan["num_samples"])
@@ -367,11 +371,12 @@ class _TaskBrokerState:
             # from the run-persistent seed file written by the driver.
             sample_seed = None
             anchor_ids = None
-            if fixed_plan.get("mode") == "episodes":
+            if fixed_plan.get("mode") in ("episodes", "challenge_val"):
                 # Fixed-root evaluation on an episode domain: the frozen
                 # evaluation list fills EVERY episode slot of every task
                 # (``plan_episodes`` takes anchors first), so there is no
-                # rotating half and ``sample_seed`` must stay None.
+                # rotating half and ``sample_seed`` must stay None. The
+                # challenge-val round is the same shape with its own id list.
                 anchor_ids = list(fixed_plan["anchor_ids"])
             elif (not parent_scored and not fixed_eval
                     and str(self.config.get("sampling_mode", "")) == "seeded"):

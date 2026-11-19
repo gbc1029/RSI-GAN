@@ -473,13 +473,35 @@ class DomainTaskRunner:
 
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,
-                 genid: Any = None, base: Optional[str] = None) -> Node:
+                 genid: Any = None, base: Optional[str] = None,
+                 fixed_episode_override: Optional[Dict[str, Any]] = None) -> Node:
+        """Run one generation / evaluation round.
+
+        ``fixed_episode_override`` (docs/21 §4.1) runs a DIFFERENT pinned episode
+        set than this runner's own ``fixed_episode_ids`` -- the challenge-val
+        round reuses the eval runner for one outer without touching its shared
+        state (two rounds of the same outer must not fight over one attribute).
+        Shape: ``{"episode_ids": [...], "per_task": n}``.
+        """
         plan = plan or {}
         records = plan.get("records", []) or []
         config = plan.get("config")
         if not isinstance(config, dict):
             config = {}
         patch_str = plan.get("patch", "") or ""
+        # The episode set THIS call pins (``override`` wins). Everything below
+        # reads the local variable, so a round can never inherit the other
+        # round's exam.
+        pinned_episode_ids = list(self.fixed_episode_ids)
+        pinned_per_task = int(self.fixed_episodes_per_task or 0)
+        if fixed_episode_override:
+            pinned_episode_ids = [str(x) for x in
+                                   (fixed_episode_override.get("episode_ids") or [])]
+            pinned_per_task = int(fixed_episode_override.get("per_task") or 0)
+            if pinned_episode_ids and pinned_per_task <= 0:
+                raise ValueError(
+                    "fixed_episode_override requires per_task > 0 "
+                    f"(got {pinned_per_task})")
 
         node_dir = paths.work_dir(self.output_dir, genid)
         os.makedirs(node_dir, exist_ok=True)
@@ -751,7 +773,7 @@ class DomainTaskRunner:
         else:
             # Preserve independent harness/evaluator domains.
             _t_harness = time.time()
-            if self.fixed_episode_ids:
+            if pinned_episode_ids:
                 # Fixed-root evaluation on an EPISODE domain (balrog): the frozen
                 # ``<task>#<seed>`` list is the whole episode set, so there is no
                 # questions.csv and no per-genid draw -- the root-side broker
@@ -759,15 +781,19 @@ class DomainTaskRunner:
                 # ``eval_outer*`` scope and hands it to the harness as the anchor
                 # list (plan_episodes fills every slot from it). ``num_samples``
                 # is the PER-TASK count (see __init__).
+                # The CHALLENGE-VAL round (``fixed_episode_override``) uses the
+                # same branch with its own id list and per-task count: its plan
+                # lives in the seed file under ``challenge_val_episodes``.
                 sample_info = {
-                    "mode": "fixed_episodes",
-                    "episode_ids": list(self.fixed_episode_ids),
-                    "anchor_ids": list(self.fixed_episode_ids),
-                    "episodes_per_task": self.fixed_episodes_per_task,
+                    "mode": ("challenge_val" if fixed_episode_override
+                             else "fixed_episodes"),
+                    "episode_ids": list(pinned_episode_ids),
+                    "anchor_ids": list(pinned_episode_ids),
+                    "episodes_per_task": pinned_per_task,
                 }
                 rc, _out = tx.run_harness_and_report(
                     self.python, run_dir, self.domain, run_id, self.subset,
-                    self.num_samples, model, env, self.timeout,
+                    pinned_per_task, model, env, self.timeout,
                     dataset_root=self.repo_root, scope_id=str(genid),
                     log_path=self.log_path,
                     reasoning_effort=self.reasoning_effort,
@@ -803,7 +829,7 @@ class DomainTaskRunner:
                             sample_mode=sample_info.get("mode"),
                             sampled_ids=sample_info.get("sampled_ids"),
                             anchor_ids=sample_info.get("anchor_ids"))
-            elif self.fixed_episode_ids:
+            elif pinned_episode_ids:
                 # Same audit shape as the question domains: rc, wall clock and
                 # the episode set this evaluation round actually asked for.
                 self._event("task_harness_done", genid=str(genid), rc=rc,
@@ -856,9 +882,9 @@ class DomainTaskRunner:
                     anchor_tasks={k: len(v) for k, v in
                                   (_plan.get("anchor_seeds") or {}).items()},
                 )
-                if self.fixed_episode_ids:
+                if pinned_episode_ids:
                     plan_ids = sorted(str(e.get("id")) for e in _eps)
-                    expected = sorted(self.fixed_episode_ids)
+                    expected = sorted(pinned_episode_ids)
                     fixed_eval_plan_ok = (
                         plan_ids == expected
                         and all(e.get("anchor") for e in _eps)
@@ -1035,7 +1061,7 @@ class DomainTaskRunner:
         parent_score = parent.value.score if parent is not None else None
         delta = (score - parent_score) if (score is not None and parent_score is not None) else None
 
-        if self.fixed_episode_ids and not fixed_eval_plan_ok:
+        if pinned_episode_ids and not fixed_eval_plan_ok:
             # FAIL CLOSED: a fixed-root evaluation that did NOT run the frozen
             # episode set is incomparable with every other supernode's. Raising
             # here (after the evidence copy above, so the artifacts survive)
@@ -1045,8 +1071,8 @@ class DomainTaskRunner:
             raise RuntimeError(
                 f"fixed-root evaluation plan mismatch for genid {genid}: the harness "
                 f"did not run the frozen episode set "
-                f"({len(self.fixed_episode_ids)} ids, "
-                f"{self.fixed_episodes_per_task}/task)")
+                f"({len(pinned_episode_ids)} ids, "
+                f"{pinned_per_task}/task)")
 
         return Node(
             genid=genid,

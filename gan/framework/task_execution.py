@@ -23,6 +23,7 @@ import json
 import math
 import os
 import random
+from collections import Counter
 from pathlib import PurePosixPath
 import shutil
 import stat
@@ -1571,14 +1572,72 @@ def episode_eval_launch(seed_info: Dict[str, Any],
     return {"episode_ids": ids, "per_task": per_task, "tasks": tasks}
 
 
+def challenge_val_launch(seed_info: Dict[str, Any],
+                         domain_cfg: Optional[Dict[str, Any]],
+                         scope_id: Any) -> Optional[Dict[str, Any]]:
+    """The CHALLENGE-VAL round's episode plan for one outer (docs/21 §4.1), or None.
+
+    A challenge-val round is a fixed-root evaluation of its own scope
+    (``cval_outer<N>``): it plays the ``instances.eval`` sibling of every
+    challenge this outer's generations answered, and NOTHING else. It is
+    deliberately a SEPARATE round rather than extra slots in the frozen core
+    eval, for two reasons:
+
+    * the frozen core (``eval_episode_ids``) must stay byte-identical so
+      ``val_mean`` remains comparable across outers -- a challenge would
+      otherwise change the exam of the very number that selects parents;
+    * the sibling must be played by the SAME code (the supernode) but must not
+      disturb the core's per-task episode count.
+
+    Every declared task still runs, because the harness runs all of them: tasks
+    without a challenge get their FIRST frozen core episode as the single anchor,
+    so the plan is fully deterministic (no rotating draw, ``sample_seed`` stays
+    None) and the extra episodes are ordinary core measurements the loop simply
+    does not read as ``challenge_val``.
+
+    Returns ``None`` when this scope has no challenge episodes (the round is then
+    not launched at all).
+    """
+    table = ((seed_info or {}).get("challenge_val_episodes") or {})
+    row = table.get(str(scope_id)) if isinstance(table, dict) else None
+    if not isinstance(row, dict):
+        return None
+    ids = [str(x) for x in (row.get("episode_ids") or []) if str(x)]
+    if not ids:
+        return None
+    per_task = int(row.get("per_task") or 0)
+    if per_task <= 0:
+        raise ValueError(
+            f"challenge-val plan {scope_id!r} has ids but no positive per_task")
+    for raw in ids:
+        split_episode_id(raw)  # a malformed id is refused, never dropped
+    return {
+        "mode": "challenge_val",
+        "num_samples": per_task,
+        "anchor_ids": ids,
+        "sample_seed": None,
+        "questions_required": False,
+        "subset": str(row.get("subset") or ""),
+        "episode_ids": ids,
+        "per_task": per_task,
+    }
+
+
 def fixed_eval_launch_plan(seed_info: Dict[str, Any],
                            domain_cfg: Optional[Dict[str, Any]],
-                           *, default_subset: str
+                           *, default_subset: str,
+                           scope_id: Any = None
                            ) -> Dict[str, Any]:
     """What a FIXED-ROOT EVALUATION launch feeds the harness (ONE decision point).
 
-    Two mutually exclusive shapes, both derived from the run seed file so the
+    Three mutually exclusive shapes, all derived from the run seed file so the
     evaluation set is identical in every outer:
+
+    ``challenge_val`` (episode domains, one extra round per outer)
+        The challenges' ``instances.eval`` siblings for THIS outer. Selected by
+        ``scope_id`` (``cval_outer<N>``) and checked FIRST: a challenge-val scope
+        must never fall into the frozen core plan, and the core scope must never
+        pick up a challenge episode.
 
     ``episodes`` (episode domains, balrog)
         ``eval_episode_ids`` -- a frozen ``<task>#<seed>`` list -- becomes the
@@ -1594,6 +1653,21 @@ def fixed_eval_launch_plan(seed_info: Dict[str, Any],
     Returned keys: ``mode``, ``num_samples``, ``anchor_ids``, ``sample_seed``,
     ``questions_required``, ``subset``, ``episode_ids``, ``per_task``.
     """
+    if scope_id is not None:
+        cval = challenge_val_launch(seed_info, domain_cfg, scope_id)
+        if cval:
+            if not cval["subset"]:
+                cval["subset"] = str(default_subset)
+            return cval
+        if str(scope_id).startswith("cval_"):
+            # FAIL CLOSED: a challenge-val scope with no registered plan must not
+            # fall through to the FROZEN CORE plan -- that would play the core
+            # exam and report it as a challenge generalization result, i.e. a
+            # wrong answer to a different question.
+            raise ValueError(
+                f"challenge-val scope {scope_id!r} has no challenge_val_episodes "
+                f"entry in the run seed file; refusing to fall back to the core "
+                f"evaluation plan")
     episode = episode_eval_launch(seed_info, domain_cfg)
     if episode:
         return {
@@ -1863,9 +1937,68 @@ def register_challenge_episodes(output_dir: str, genid: Any,
     return ids
 
 
+def register_challenge_val_episodes(output_dir: str, scope_id: Any,
+                                    episode_ids: Iterable[str], *,
+                                    per_task: int = 1,
+                                    fallback_ids: Iterable[str] = (),
+                                    ) -> List[str]:
+    """Freeze ONE challenge-val round's episodes into the run seed file.
+
+    Same discipline as :func:`register_challenge_episodes` (root-side sampling,
+    idempotent per scope, a different list for the same scope is refused). The
+    ``fallback_ids`` are the frozen core eval episodes of the tasks that have no
+    challenge: they fill those tasks' single slot so the round stays fully
+    deterministic instead of drawing a rotating episode per task.
+    """
+    ids = [str(i) for i in (episode_ids or ()) if str(i)]
+    if not ids:
+        return []
+    path = challenge_episodes_path(output_dir)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"challenge-val episodes need the run seed file at {path}: {exc}") from exc
+    if not isinstance(info, dict):
+        raise RuntimeError(f"run seed file at {path} is not an object")
+    per_task = int(per_task or 0)
+    if per_task <= 0:
+        raise RuntimeError("challenge_val per_task must be positive")
+    # ONE fallback per task that has no challenge id, in the caller's order: the
+    # harness runs EVERY declared task, so a task with no anchor would otherwise
+    # fall back to a time-seeded rotating episode (an exam nobody asked for).
+    fallback_by_task: Dict[str, str] = {}
+    for raw in (fallback_ids or ()):
+        task, _seed = split_episode_id(str(raw))
+        fallback_by_task.setdefault(task, str(raw))
+    have = {split_episode_id(i)[0] for i in ids}
+    full = list(ids) + [v for t, v in fallback_by_task.items() if t not in have]
+    counts = Counter(split_episode_id(i)[0] for i in full)
+    per_task = max(per_task, max(counts.values()) if counts else 1)
+    table = info.get("challenge_val_episodes")
+    if not isinstance(table, dict):
+        table = {}
+    key = str(scope_id)
+    payload = {"episode_ids": full, "per_task": int(per_task)}
+    existing = table.get(key)
+    if existing is not None:
+        if list(existing.get("episode_ids") or []) != full:
+            raise RuntimeError(
+                f"challenge-val episodes for scope {key} are already "
+                f"{existing.get('episode_ids')} and cannot change")
+        return full
+    table[key] = payload
+    info["challenge_val_episodes"] = table
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+    os.replace(tmp, path)
+    return full
+
+
 def _log_soft_sample_note(message: str) -> None:
     print(f"[sample] {message}")
-
 
 def prepare_questions(
     dataset_root: str,

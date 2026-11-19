@@ -61,6 +61,7 @@ from gan.framework import challenge_questions as _challenge_questions
 from gan.framework import defect_lines as defect_lines_mod
 from gan.framework import task_execution as tx
 from gan.framework.loader import load_registry, resolve_domain
+from gan.framework.task_runner import DomainTaskRunner
 from gan.framework.reward.evaluator_reward import build_feedback_digest
 from gan.framework.reward.packet import RewardPacket
 from gan.summary import build_diff_summary, make_feedback, project_responses_for_evaluator
@@ -86,6 +87,17 @@ _EVALUATOR_META_KEYS = (
     # pressure must not be fittable), "feedback", "run_dir"/"report_path"/
     # "report_sha"/"design_path"/"model" (paperwork, not judgement input).
 )
+
+
+def _challenge_val_scope(outer: Any) -> str:
+    """The challenge-val round's genid/scope (the broker keys the plan on it).
+
+    ``cval_outer<N>`` is a THIRD scope kind next to the main line (``<genid>``)
+    and the fixed-root evaluation (``eval_outer<N>_s<M>``): the broker treats a
+    ``cval_`` prefix as a pinned episode round, and the run seed file keys the
+    plan on this exact string, so the round can only ever play its own ids.
+    """
+    return f"cval_outer{outer}"
 
 
 def _challenge_evidence(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -699,6 +711,9 @@ class GanLoop:
         # is the ACCESSOR, so the cache cannot share its name -- an attribute
         # shadowing the method turned every call into "dict is not callable".
         self._challenge_cache: Optional[Dict[str, Any]] = None
+        # Last challenge-val column (also stamped on the supernode): kept here so
+        # the current outer can be read without re-opening the supernode file.
+        self._challenge_val_last: Dict[str, Any] = {}
 
     # -- helpers -----------------------------------------------------------
     def _max_int_genid(self) -> int:
@@ -2623,6 +2638,137 @@ class GanLoop:
             self.log_event({"type": "challenge_settle_failed",
                             "genid": str(getattr(child, "genid", "")),
                             "error": f"{type(e).__name__}: {e}"[:400]})
+
+    def _challenge_val_round(self, outer: int) -> None:
+        """Play the challenges' ``instances.eval`` siblings with the supernode code.
+
+        Shape A of docs/21 §4.1: a dedicated fixed round whose episode plan is
+        the sibling instance of every challenge this outer's generations
+        answered. Why not extra slots in the core eval round: the frozen core must
+        stay byte-identical (``val_mean`` selects parents), and the harness runs
+        EVERY declared task, so squeezing in two episodes would change the core's
+        per-task count. Why a round at all (instead of the same batch): the
+        sibling is the GENERALIZATION check -- it must be played by the code
+        under evaluation and it must not be part of the exam the generation was
+        tuned on.
+
+        Result: ``benchmark.challenge_val`` per challenge id, never inside
+        ``val_mean``, never an input to fitness or parent selection.
+        """
+        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
+            return
+        if self.eval_runner is None or self.eval_runner is self.task_runner:
+            # No dedicated evaluation runner = no fixed-root evaluation infra in
+            # this run; the sibling needs it. Recorded, never guessed.
+            self.log_event({"type": "challenge_val_skipped", "outer": outer,
+                            "reason": "no dedicated eval runner"})
+            return
+        eval_base = self._resolve_eval_base()
+        if eval_base is None:
+            self.log_event({"type": "challenge_val_skipped", "outer": outer,
+                            "reason": "no evaluation base"})
+            return
+        ledger = self._challenge_data()
+        rows = [r for r in (ledger.get("challenges") or {}).values()
+                if isinstance(r, dict) and r.get("status") == "consumed"
+                and (r.get("instances") or {}).get("eval")]
+        if not rows:
+            return
+        scope = _challenge_val_scope(outer)
+        ids: List[str] = []
+        for row in rows:
+            eid = str(((row.get("instances") or {}).get("eval") or {})
+                      .get("episode_id") or "")
+            if eid:
+                ids.append(eid)
+        if not ids:
+            return
+        # One fallback (frozen core) episode per task with NO challenge, so the
+        # harness's per-task launch stays deterministic instead of drawing a
+        # rotating episode for that task.
+        fallback = [str(x) for x in (getattr(self.eval_runner, "fixed_episode_ids", []) or [])]
+        try:
+            tx.register_challenge_val_episodes(
+                self.output_dir, scope, ids, per_task=1, fallback_ids=fallback)
+        except Exception as e:  # noqa: BLE001 -- registration refused = no round
+            self.log_event({"type": "challenge_val_unregistered", "outer": outer,
+                            "error": f"{type(e).__name__}: {e}"[:400]})
+            return
+        initial = self.task_tree.get("initial")
+        plan_result = self._empty_plan_result(
+            self._parent_config(initial) if initial is not None else {})
+        if not (isinstance(self.eval_runner, DomainTaskRunner)
+                or self._accepts_kwarg(self.eval_runner, "fixed_episode_override")):
+            self.log_event({"type": "challenge_val_skipped", "outer": outer,
+                            "reason": "eval runner has no per-round episode override"})
+            return
+        # per_task must cover the largest per-task count actually pinned (a task
+        # with two challenges needs two slots); the fallback episodes fill the
+        # remaining tasks' single slot.
+        per_task = 1
+        counts: Dict[str, int] = {}
+        for raw in ids:
+            task = str(raw).rsplit("#", 1)[0]
+            counts[task] = counts.get(task, 0) + 1
+        per_task = max([per_task] + list(counts.values()))
+        try:
+            node = self.eval_runner(
+                plan=plan_result, parent=initial, genid=scope, base=eval_base,
+                fixed_episode_override={"episode_ids": ids, "per_task": per_task})
+        except Exception as e:  # noqa: BLE001 -- advisory round
+            self.log_event({"type": "challenge_val_round_failed", "outer": outer,
+                            "scope": scope,
+                            "error": f"{type(e).__name__}: {e}"[:400]})
+            return
+        if node is None:
+            self.log_event({"type": "challenge_val_round_empty", "outer": outer,
+                            "scope": scope})
+            return
+        report = self._challenge_report(scope)
+        epub = {str(r.get("id")): r for r in (report.get("episodes") or [])
+                if isinstance(r, dict)}
+        lines = self._challenge_lines()
+        column: Dict[str, Any] = {}
+        for row in rows:
+            cid = str(row.get("challenge_id") or "")
+            inst = (row.get("instances") or {}).get("eval") or {}
+            ep = epub.get(str(inst.get("episode_id") or ""))
+            present = (_balrog_primitive(self.challenge_domain,
+                                         str(row.get("defect_class") or ""), ep, lines)
+                       if isinstance(ep, dict) else None)
+            column[cid] = {
+                "defect_class": row.get("defect_class"),
+                "family": row.get("family"),
+                "episode_id": inst.get("episode_id"),
+                "defect_present": present,
+                "progression": (ep or {}).get("progression"),
+                "aborted": bool((ep or {}).get("aborted")),
+                # Generalization asks the SAME question the adjudicator asked on
+                # the train instance; it is reported beside the verdict, never
+                # folded into it (the ledger adjudication is immutable and was
+                # settled at the generation boundary).
+                "generalized": (None if present is None else not present),
+            }
+        self._challenge_val_last = dict(column)
+        self.log_event({"type": "challenge_val_ready", "outer": outer,
+                        "scope": scope, "challenges": len(column),
+                        "generalized": sum(1 for v in column.values()
+                                           if v.get("generalized") is True),
+                        "undecidable": sum(1 for v in column.values()
+                                           if v.get("generalized") is None)})
+        try:
+            from gan.framework.supernode import load_supernode, update_supernode
+
+            sn = load_supernode(self.output_dir, outer)
+            if sn:
+                sn.setdefault("benchmark", {})["challenge_val"] = column
+                # Same ledger gate as every other supernode write (the token is
+                # threaded, never re-minted): a decision-grade artifact must not
+                # gain an unguarded writer just because the value is diagnostic.
+                update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
+        except Exception as e:  # noqa: BLE001 -- the column is also in events
+            self.log_event({"type": "challenge_val_stamp_failed", "outer": outer,
+                            "error": f"{type(e).__name__}: {e}"[:300]})
 
     def _challenge_stats(self) -> Dict[str, Any]:
         """Cumulative challenge metrics (DIAGNOSTICS -- never a fitness term)."""
@@ -5207,6 +5353,17 @@ class GanLoop:
             self._update_issue_ledger(outer, outer_genids)
             self._record_supernode(outer, outer_genids)
             self._evaluate_supernode(outer)
+            # CHALLENGE-VAL (docs/21 §4.1): ONE extra fixed round per outer that
+            # plays the challenges' ``instances.eval`` siblings with the
+            # supernode's code. It is a SEPARATE round on purpose -- the frozen
+            # core eval above must stay byte-identical, because ``val_mean`` is
+            # what selects parents. Runs AFTER the eval round so it never delays
+            # the decision-grade number, and its failure is advisory.
+            try:
+                self._challenge_val_round(outer)
+            except Exception as e:  # noqa: BLE001 -- advisory, never fatal
+                self.log_event({"type": "challenge_val_failed", "outer": outer,
+                                "error": f"{type(e).__name__}: {e}"[:400]})
             self._archive_supernode(outer)
 
         return self.task_tree
