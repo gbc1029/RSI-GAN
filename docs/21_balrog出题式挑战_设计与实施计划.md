@@ -482,3 +482,62 @@ B 只需在 `challenge_episodes` 里多放一个 id 并在报告侧分流。
 
 **推荐 A**（与决策 D2 的"outer 边界泛化确认"一致，且不改变每代的批次构成），
 但先把决策写进文档再动代码。
+
+---
+
+## 14. 阶段 1b 落地记录（2026-11-19，形状 A 已实现）
+
+提交 `42b14d3`。**`instances.eval` 现在真的会跑**：每个 outer 在
+`_evaluate_supernode` 之后多跑一轮 `cval_outer<N>`，用超节点代码打本 outer
+所有被消费 challenge 的 eval 同族实例，结果进 `benchmark.challenge_val`。
+
+### 14.1 数据流（零新增传输）
+
+```
+loop._challenge_val_round(outer)
+  -> tx.register_challenge_val_episodes(ckpt/sample_seed.json: challenge_val_episodes["cval_outer3"])
+  -> eval_runner(..., fixed_episode_override={"episode_ids": [...], "per_task": n})
+  -> task_broker: scope_id.startswith(("eval_outer","cval_outer")) -> fixed_eval
+  -> tx.fixed_eval_launch_plan(..., scope_id) 先查 challenge_val 形状
+  -> 报告 episodes[] 按 episode_id 分流 -> benchmark.challenge_val
+```
+
+`per_task` 取"该 task 上 challenge 实例数的最大值"；**没有 challenge 的 task 用
+冻结 core 的第一局占位**（否则 harness 会给它抽一局时间种子的旋转题——正是
+`balrog_feval_1105` 那个坑）。
+
+### 14.2 四个原本会静默出错的地方
+
+1. **`cval_` scope 没有注册时必须报错**，不能退回核心评估计划——那会拿核心考卷
+   冒充"泛化结果"。现在 `fixed_eval_launch_plan` 显式抛。
+2. **runner 的共享 `fixed_episode_ids` 不动**：本轮走 `fixed_episode_override`，
+   episode 分支、计划 tripwire、fail-closed 抛错三处都读 per-call 值，同一 outer
+   的两轮不可能互换考卷。
+3. **没有 challenge 的 task 必须给确定性的占位局**（见上）。
+4. **超节点写入必须带 WriterToken**：诊断列也是 decision-grade 产物。
+
+### 14.3 与 val_mean 的关系（硬约束）
+
+| 数 | 来源 | 进 fitness / 选父 |
+|---|---|---|
+| `benchmark.mean` | 主线 train | 是（历史） |
+| `benchmark.val_mean` | 冻结 core 评估轮 | 是（F_p） |
+| `benchmark.challenge_val` | `cval_outer<N>` 独立轮 | **否**（诊断 + 泛化确认） |
+
+`challenge_val` 里每道题三个字段：`defect_present`（同族新实例上缺陷是否仍在）、
+`progression`、`generalized`（= `not defect_present`，`None` 表示行不可判/aborted）。
+它**不折回**账本的 5 状态（adjudication 不可变，那一步在代边界就已结算）。
+
+### 14.4 验收
+
+`test_challenge_flow.py` 72 断言（新增 H 段 15 条：注册/占位/不可偷换、两种
+launch plan 形状、fail-closed 拒、broker scope 谓词、runner override 钩子）。
+全量回归：balrog 12 套（389 断言）+ 三个行为回归 35/26/48 + 框架 5 套 +
+`compileall` + 五套 challenge（40/36/39/tools/72）全绿。
+
+### 14.5 阶段 1 剩余的验收（要花钱，需批准）
+
+§9 阶段 1 的硬门里还差两条，都需要**一次真实跑**（约 3 小时 / ~$2）：
+- 一代真实跑确认 `instances.train` 出现在 `question_points`、`instances.eval`
+  出现在 `challenge_val`；
+- `UNDECIDABLE` 率 < 20%。
