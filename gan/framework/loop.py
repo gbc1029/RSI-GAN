@@ -649,6 +649,9 @@ class GanLoop:
         }
         self.challenge_domain = (self.domains[0] if self.domains else "")
         self._challenge_cfg_state = {"authorable": False, "reason": "disabled"}
+        # Closed vocabularies the author may use (empty when authoring is off).
+        self._challenge_defect_classes: List[str] = []
+        self._challenge_families: List[str] = []
         if self.challenge_enabled:
             from gan.framework import challenge_questions as _cq
 
@@ -662,6 +665,27 @@ class GanLoop:
                 _ok_auth, _why = _cq.authorable(self.challenge_domain, _dcfg)
                 _state = {"authorable": _ok_auth, "reason": _why}
             self._challenge_cfg_state = _state
+            # The AUTHOR cannot infer these two closed vocabularies from the
+            # report: measured 2026-11-19 (first real round) the evaluator filed
+            # `defect_class="no_progress_loop"` on `family="balrog_babyai"` --
+            # both plausible, both unusable -- and the tool then fail-OPENED
+            # because it resolved the vocabulary by importing domain code in a
+            # child that has no `domains` package. They are therefore computed
+            # HERE (worker side, where the domain is importable) and ride the
+            # broker mirror to both the instruction and the tool.
+            _classes = list(_challenge_adjudication.supported_classes_for(
+                self.challenge_domain))
+            _space = (_dcfg or {}).get("challenge_space") or {}
+            _params = (_space.get("params") if isinstance(_space, dict) else None) or {}
+            _families = sorted(str(f) for f in _params) if isinstance(_params, dict) else []
+            self._challenge_defect_classes = _classes
+            self._challenge_families = _families
+            if _state["authorable"] and (not _classes or not _families):
+                self._challenge_cfg_state = {
+                    "authorable": False,
+                    "reason": ("no_adjudicable_defect_class" if not _classes
+                               else "no_family_band_declared")}
+                _state = self._challenge_cfg_state
             if _state["authorable"]:
                 # The batch size belongs to the RUNNER (it is what the harness is
                 # told), so the budget is checked against it instead of a second
@@ -708,6 +732,9 @@ class GanLoop:
                 "max_k": self.challenge_max_k,
                 "authorable": bool(self._challenge_cfg_state.get("authorable")),
                 "reason": str(self._challenge_cfg_state.get("reason") or ""),
+                # Closed vocabularies for the author + the tool's own check.
+                "defect_classes": list(self._challenge_defect_classes),
+                "families": list(self._challenge_families),
             }
         if self.challenge_enabled:
             self.log_event({"type": "challenge_broker_mirror",

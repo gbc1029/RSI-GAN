@@ -54,23 +54,31 @@ class Evaluator(Role):
             # an invented challenge costs the author precision.
             from gan.framework.context import challenge_config as _cc
             _chal = _cc()
-            if _chal.get("enabled") and _chal.get("authorable"):
+            _classes = list(_chal.get("defect_classes") or [])
+            _families = list(_chal.get("families") or [])
+            if _chal.get("enabled") and _chal.get("authorable") and _classes and _families:
+                # The allowed values are printed VERBATIM. Measured 2026-11-19
+                # (first real round): without them the author filed
+                # `defect_class="no_progress_loop"` on `family="balrog_babyai"` --
+                # both plausible, both unusable -- and the round produced nothing.
                 parts.append(
                     "\n## Optional: author a challenge (same-family fresh episode)\n"
                     "If a defect you found is about HOW the agent plays (not about one "
-                    "particular level), you may file ONE to "
-                    f"`{_chal.get('max_k')}` challenge(s) with `propose_challenge("
-                    "defect_class, family, evidence_ref, repair_criterion)`. You name "
-                    "the defect class and the task family where you actually saw it; "
-                    "the framework draws a fresh episode of that family (you never see "
-                    "the level or its seed) and a mechanical check decides later whether "
-                    "the defect is gone. Rules: `defect_class` must come from the "
-                    "adjudicable vocabulary (the tool tells you which values are "
-                    "allowed), `family` must be a task whose episodes in THIS generation "
-                    "showed the defect, and `repair_criterion` must be a mechanical "
-                    "condition. Do not describe a level, a seed or an answer. This is "
-                    "optional and blind-phase-only: a challenge you cannot support costs "
-                    "you precision."
+                    f"particular level), you may file up to {_chal.get('max_k')} "
+                    "challenge(s) with `propose_challenge(defect_class, family, "
+                    "evidence_ref, repair_criterion)`.\n"
+                    f"- `defect_class` MUST be one of: {', '.join(_classes)}\n"
+                    f"- `family` MUST be one of these task ids: {', '.join(_families)}\n"
+                    "  (pick the task whose episodes in THIS generation actually showed "
+                    "the defect; a family with no such episode is refused)\n"
+                    "- `evidence_ref` is a pointer to where you saw it (episode id or "
+                    "report path); `repair_criterion` is the mechanical condition that "
+                    "would count as repaired.\n"
+                    "The framework draws a fresh episode of that family -- you never see "
+                    "the level or its seed -- and a mechanical check decides later "
+                    "whether the defect is gone. Do not describe a level, a seed or an "
+                    "answer. This is optional and blind-phase-only; a challenge you "
+                    "cannot support costs you precision."
                 )
         elif benchmark_score is not None:
             # C1 ablation (ablation.disable_blind=true): the objective score is

@@ -379,10 +379,21 @@ def challenge_config() -> Dict[str, Any]:
         max_k = int(cfg.get("max_k") or 0)
     except (TypeError, ValueError):
         max_k = 0
+    def _list(name: str) -> List[str]:
+        value = cfg.get(name)
+        if not isinstance(value, (list, tuple)):
+            return []
+        return [str(v) for v in value if str(v)]
     return {
         "enabled": bool(cfg.get("enabled")),
         "domain": (None if cfg.get("domain") in (None, "") else str(cfg.get("domain"))),
         "max_k": max(0, max_k),
         "authorable": bool(cfg.get("authorable")),
         "reason": str(cfg.get("reason") or ""),
+        # Closed vocabularies, computed worker-side (where the domain package IS
+        # importable) and mirrored here. Empty means "not wired" -- a caller must
+        # treat that as "refuse", never as "anything goes": the first real round
+        # fail-OPENED exactly that way.
+        "defect_classes": _list("defect_classes"),
+        "families": _list("families"),
     }
