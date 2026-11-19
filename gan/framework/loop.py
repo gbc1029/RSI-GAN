@@ -54,6 +54,12 @@ from gan.framework import cost_ledger
 from gan.framework import cost_keys
 from gan.framework import paths, scores, trajectory
 from gan.framework import ledger as ledger_mod
+from gan.framework import challenge_adjudication as _challenge_adjudication
+from gan.framework import challenge_ledger as _challenge_ledger_mod
+from gan.framework import challenge_metrics as _challenge_metrics
+from gan.framework import challenge_questions as _challenge_questions
+from gan.framework import defect_lines as defect_lines_mod
+from gan.framework import task_execution as tx
 from gan.framework.loader import load_registry, resolve_domain
 from gan.framework.reward.evaluator_reward import build_feedback_digest
 from gan.framework.reward.packet import RewardPacket
@@ -80,6 +86,51 @@ _EVALUATOR_META_KEYS = (
     # pressure must not be fittable), "feedback", "run_dir"/"report_path"/
     # "report_sha"/"design_path"/"model" (paperwork, not judgement input).
 )
+
+
+def _challenge_evidence(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """One episode row -> the ``_evidence_ok`` shape the contract validates.
+
+    ``qid_score_status`` is "ok" only for a PLAYED, non-aborted row: an aborted
+    episode carries ``progression: 0.0`` by construction (it was played and lost),
+    and reading that zero as evidence would manufacture "the defect is present in
+    the child" out of an infrastructure failure.
+    """
+    if not isinstance(row, dict):
+        return None
+    points = row.get("progression")
+    try:
+        value = float(points) if points is not None else None
+    except (TypeError, ValueError):
+        value = None
+    aborted = bool(row.get("aborted"))
+    return {
+        "qid": str(row.get("id") or ""),
+        "points": value,
+        "qid_score_status": ("aborted" if aborted else "ok"),
+        "qid_coverage": (0.0 if value is None else 1.0),
+        "imputed": False,
+    }
+
+
+def _balrog_primitive(domain: str, defect_class: str, row: Dict[str, Any],
+                      lines: Dict[str, float]) -> Optional[bool]:
+    """The per-episode defect predicate of a domain adapter (``None`` = undecidable).
+
+    Read through the adapter rather than re-implemented here: the challenge
+    channel and the ordinary issue channel must answer "is this episode
+    defective" with the SAME primitive, or the two can disagree about one
+    episode (docs/21 §3.3).
+    """
+    module = _challenge_adjudication._challenge_submodule(  # noqa: SLF001 -- same package
+        domain, "challenge_adjudication")
+    fn = getattr(module, "defect_present", None) if module is not None else None
+    if not callable(fn):
+        return None
+    try:
+        return fn(defect_class, row, lines)
+    except Exception:  # noqa: BLE001 -- a broken predicate is "undecidable"
+        return None
 
 
 def _report_view_for_evaluator(report_summary):
@@ -555,6 +606,100 @@ class GanLoop:
             if not self.task_brief:
                 self.log_event({"type": "task_brief_missing", "domain": self.domains[0]})
 
+        # ------------------------------------------------------------------
+        # CHALLENGE (docs/21): the evaluator may author a same-family fresh
+        # question about a defect it found; a mechanical adjudicator then decides
+        # from the child's own episode. Default OFF -- and "off" must be
+        # INDISTINGUISHABLE from the pre-docs/21 framework, so everything below
+        # only computes state and never touches a report when disabled.
+        #
+        # Startup fail-closed (docs/21 §4.1): the train batch must still fit
+        # anchor_k + max_k + random_min inside num_samples. Refusing here beats
+        # silently dropping a challenge slot (a challenge that never runs looks
+        # exactly like one that was answered).
+        # ------------------------------------------------------------------
+        self.challenge_enabled = bool(cfg.get("challenge.enabled", False))
+        self.challenge_max_k = int(cfg.get("challenge.max_k", 0) or 0)
+        self.challenge_random_min = int(cfg.get("challenge.random_min", 1) or 0)
+        self.challenge_progression_tol = float(cfg.get("challenge.progression_tol", 0.0) or 0.0)
+        self.challenge_metrics_cfg = {
+            "min_supported": int(cfg.get("challenge.metrics.min_supported", 30) or 30),
+            "min_determinate_rate": float(
+                cfg.get("challenge.metrics.min_determinate_rate", 0.8) or 0.8),
+        }
+        self.challenge_weights = {
+            "precision": float(cfg.get("challenge.metrics.weights.precision",
+                                       _challenge_metrics.DEFAULT_WEIGHTS["precision"]) or 0.0),
+            "actionability": float(cfg.get("challenge.metrics.weights.actionability",
+                                           _challenge_metrics.DEFAULT_WEIGHTS["actionability"]) or 0.0),
+            "calibration": float(cfg.get("challenge.metrics.weights.calibration",
+                                         _challenge_metrics.DEFAULT_WEIGHTS["calibration"]) or 0.0),
+        }
+        self.challenge_domain = (self.domains[0] if self.domains else "")
+        self._challenge_cfg_state = {"authorable": False, "reason": "disabled"}
+        if self.challenge_enabled:
+            from gan.framework import challenge_questions as _cq
+
+            _state = {"authorable": False, "reason": ""}
+            try:
+                _dcfg = resolve_domain(load_registry(), self.challenge_domain) or {}
+            except Exception as e:  # noqa: BLE001 -- resolution failure = not authorable
+                _dcfg = {}
+                _state["reason"] = f"domain registry error: {e}"
+            if not _state["reason"]:
+                _ok_auth, _why = _cq.authorable(self.challenge_domain, _dcfg)
+                _state = {"authorable": _ok_auth, "reason": _why}
+            self._challenge_cfg_state = _state
+            if _state["authorable"]:
+                # The batch size belongs to the RUNNER (it is what the harness is
+                # told), so the budget is checked against it instead of a second
+                # copy of the number living here. Offline / loop-only
+                # constructions have no runner batch to check: the fact is
+                # recorded, never silently assumed to fit.
+                _n = int(getattr(self.task_runner, "num_samples", 0) or 0)
+                if _n <= 0:
+                    self.log_event({"type": "challenge_budget_unverified",
+                                    "reason": "no task_runner batch size in scope"})
+                else:
+                    try:
+                        _cq.batch_budget_check(
+                            k=self.challenge_max_k, num_samples=_n,
+                            anchor_k=self._challenge_anchor_k(_dcfg, _n),
+                            random_min=self.challenge_random_min)
+                    except Exception as e:  # noqa: BLE001 -- fail closed, never truncate
+                        raise RuntimeError(
+                            f"challenge batch budget refused: {e}") from e
+            else:
+                # Authorable=False is NOT fatal: the run proceeds with authoring
+                # off and SAYS so once, so "enabled but nothing ever proposed" is
+                # answerable from events instead of from silence.
+                self.log_event({"type": "challenge_unavailable",
+                                "domain": self.challenge_domain,
+                                "reason": _state["reason"]})
+            self.log_event({
+                "type": "challenge_config", "enabled": True,
+                "max_k": self.challenge_max_k,
+                "authorable": _state["authorable"],
+                "reason": _state["reason"],
+            })
+        # Mirror onto the broker so the AUTHORING TOOLS (which run in the role
+        # child and read `context.challenge_config()`) see the same answer. An
+        # unmirrored value reads as "disabled" there -- the B1 lesson.
+        if broker is not None and hasattr(broker, "challenge"):
+            broker.challenge = {
+                "enabled": self.challenge_enabled,
+                "domain": self.challenge_domain,
+                "max_k": self.challenge_max_k,
+                "authorable": bool(self._challenge_cfg_state.get("authorable")),
+                "reason": str(self._challenge_cfg_state.get("reason") or ""),
+            }
+        # Ledger handle: the run's BLIND challenge lifecycle (locked ->
+        # materialized -> reserved -> consumed -> settled). Loaded lazily so a
+        # disabled run never touches the file. NOTE the name: `_challenge_data`
+        # is the ACCESSOR, so the cache cannot share its name -- an attribute
+        # shadowing the method turned every call into "dict is not callable".
+        self._challenge_cache: Optional[Dict[str, Any]] = None
+
     # -- helpers -----------------------------------------------------------
     def _max_int_genid(self) -> int:
         mx = -1
@@ -632,6 +777,10 @@ class GanLoop:
         return {
             "records": [],
             "responses": [],
+            # Mirrors the real plan result's shape (docs/21): a no-planner arm
+            # answers nothing, and the loop's challenge settle step must read a
+            # KEY, not a special case.
+            "challenge_responses": [],
             "config": cfg,
             "patch": "",
             "patch_proposed": "",
@@ -2149,6 +2298,352 @@ class GanLoop:
             self.task_tree.update(node.genid, meta=node.meta)
             stamped += 1
         return stamped
+
+    # -- challenge lifecycle (docs/21) -------------------------------------
+    @staticmethod
+    def _challenge_anchor_k(domain_cfg: Dict[str, Any], num_samples: int) -> int:
+        """How many of a generation's episodes are the FROZEN anchor core.
+
+        Episode domains do NOT use ``sampling.anchor_k`` (that is a QUESTION
+        count, default 10): the episode core is declared per domain as
+        ``anchor_episodes_per_task`` with ``auto`` = ``min(n, max(1, n // 2))`` --
+        the same rule ``task_execution.ensure_sampling_seed`` applies. Reading the
+        question number here made the budget check refuse healthy runs
+        (measured: anchor_k(10) + max_k(2) > num_samples(10)).
+        """
+        n = max(0, int(num_samples or 0))
+        if (domain_cfg or {}).get("episode_tasks"):
+            declared = (domain_cfg or {}).get("anchor_episodes_per_task", "auto")
+            if str(declared).strip().lower() in ("", "auto"):
+                return min(n, max(1, n // 2))
+            try:
+                return max(0, int(declared))
+            except (TypeError, ValueError):
+                return min(n, max(1, n // 2))
+        return 0
+
+    def _challenge_domain_cfg(self) -> Dict[str, Any]:
+        """This run's domain registry entry (the ``challenge_space`` lives there)."""
+        try:
+            return resolve_domain(load_registry(), self.challenge_domain) or {}
+        except Exception:  # noqa: BLE001 -- unresolved domain = no challenge config
+            return {}
+
+    def _challenge_lines(self, domain_cfg: Optional[Dict[str, Any]] = None
+                         ) -> Dict[str, float]:
+        """The declared per-episode defect lines for this domain (``{}`` if none)."""
+        cfg = domain_cfg if domain_cfg is not None else self._challenge_domain_cfg()
+        contract = (cfg or {}).get("output_contract") or {}
+        try:
+            return dict(defect_lines_mod.declared(contract))
+        except RuntimeError as exc:
+            self.log_event({"type": "challenge_defect_lines_invalid", "error": str(exc)})
+            return {}
+
+    def _challenge_report(self, genid: Any) -> Dict[str, Any]:
+        """The generation's own report.json (episode rows live here)."""
+        try:
+            p = os.path.join(paths.runs_dir(self.output_dir, genid), "report.json")
+            if not os.path.isfile(p):
+                return {}
+            with open(p, "r", encoding="utf-8") as f:
+                rep = json.load(f)
+            return rep if isinstance(rep, dict) else {}
+        except Exception:  # noqa: BLE001 -- absent evidence is not a crash
+            return {}
+
+    def _challenge_data(self) -> Dict[str, Any]:
+        """Load (once) the run's blind challenge ledger."""
+        if self._challenge_cache is None:
+            self._challenge_cache = _challenge_ledger_mod.load(
+                self.output_dir, self.challenge_domain)
+        return self._challenge_cache
+
+    def _challenge_save(self) -> None:
+        _challenge_ledger_mod.save(self.output_dir, self._challenge_cache or
+                                   _challenge_ledger_mod.empty(self.challenge_domain),
+                                   self.ledger_writer, self.challenge_domain)
+
+    def _challenge_lock_from_eval(self, ctx: Any, genid: Any,
+                                  outer: int) -> List[str]:
+        """Lock the evaluator's proposals for this generation (blind, bounded).
+
+        Runs AFTER the evaluate session (so the proposals are complete) and
+        BEFORE the score is used for anything downstream: the ledger's blind lock
+        is the structural guarantee that a challenge cannot be written with the
+        answer visible. Every refusal is recorded as ``challenge_rejected`` with
+        its reason -- "the evaluator proposed 3 and 2 were admitted" must be
+        auditable, not inferred from an empty ledger.
+        """
+        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
+            return []
+        proposals = [dict(c) for c in (getattr(ctx, "challenges", None) or [])
+                     if isinstance(c, dict)]
+        if not proposals:
+            return []
+        report = self._challenge_report(genid)
+        rows = [r for r in (report.get("episodes") or []) if isinstance(r, dict)]
+        cfg = self._challenge_domain_cfg()
+        admitted: List[Dict[str, Any]] = []
+        qids: List[str] = []
+        try:
+            ledger = self._challenge_data()
+            seen_instances = [row for row in (ledger.get("challenges") or {}).values()
+                              if isinstance(row, dict)]
+            for proposal in proposals:
+                defect_class = str(proposal.get("defect_class") or "")
+                citable = _challenge_questions.citable_families(
+                    self.challenge_domain, defect_class, rows,
+                    (cfg.get("output_contract") or {}))
+                try:
+                    row = _challenge_questions.validate_admission(
+                        proposal, domain=self.challenge_domain,
+                        used=len(admitted), max_k=self.challenge_max_k,
+                        existing=admitted, citable=citable,
+                        forbidden_ids=(self.anchor_ids or []),
+                    )
+                except Exception as e:  # noqa: BLE001 -- A/B refusal, never fatal
+                    self.log_event({"type": "challenge_rejected", "genid": str(genid),
+                                    "defect_class": defect_class,
+                                    "family": str(proposal.get("family") or ""),
+                                    "reason": str(e)[:400]})
+                    continue
+                # The framework picks WHICH episode the claim is about: the first
+                # cited-family episode where the defect primitive actually fired.
+                qid = ""
+                for r in rows:
+                    if str(r.get("task") or "") != row["family"]:
+                        continue
+                    present = _balrog_primitive(self.challenge_domain, defect_class, r,
+                                                self._challenge_lines(cfg))
+                    if present:
+                        qid = str(r.get("id") or "")
+                        if qid:
+                            break
+                if not qid:
+                    self.log_event({"type": "challenge_rejected", "genid": str(genid),
+                                    "defect_class": defect_class,
+                                    "family": row["family"],
+                                    "reason": "no_offending_episode_found"})
+                    continue
+                admitted.append(row)
+                qids.append(qid)
+            if not admitted:
+                return []
+            ids = _challenge_ledger_mod.lock(
+                ledger, domain=self.challenge_domain, outer=outer,
+                producer_node=genid,
+                evaluator_version=self._design_hash("evaluator") or "unknown",
+                challenges=admitted,
+                allowed_families=sorted({r["family"] for r in admitted}),
+                max_k=self.challenge_max_k, qids=qids)
+            # Materialize NOW (still blind): the instance pair is framework-chosen
+            # and its seeds must not collide with the frozen anchor / eval core or
+            # with each other.
+            used_seeds: List[int] = []
+            used_prints: List[str] = []
+            for other in seen_instances:
+                inst = other.get("instances") or {}
+                for side in ("train", "eval"):
+                    row_i = inst.get(side) if isinstance(inst, dict) else None
+                    if isinstance(row_i, dict):
+                        used_seeds.append(int(row_i.get("seed") or 0))
+                        used_prints.append(str(row_i.get("grid_sha1") or ""))
+            for cid, row in zip(ids, admitted):
+                base_seed = int(self._run_base_seed() or 0) + int(genid) \
+                    if self._run_base_seed() is not None else int(genid)
+                pair = _challenge_questions.materialize_pair(
+                    row, domain=self.challenge_domain, domain_cfg=cfg,
+                    base_seed=base_seed, exclude_seeds=used_seeds,
+                    exclude_fingerprints=used_prints)
+                _challenge_ledger_mod.attach_instances(
+                    ledger, challenge_id=cid, instances={
+                        "train": pair["train"], "eval": pair["eval"],
+                        "band": pair.get("band"),
+                    })
+                used_seeds.extend([int(pair["train"]["seed"]), int(pair["eval"]["seed"])])
+                used_prints.extend([str(pair["train"]["grid_sha1"]),
+                                    str(pair["eval"]["grid_sha1"])])
+                self.log_event({
+                    "type": "challenge_locked", "genid": str(genid),
+                    "challenge_id": cid,
+                    "defect_class": row["defect_class"], "family": row["family"],
+                    "qid": qids[ids.index(cid)] if cid in ids else "",
+                    "train": pair["train"]["episode_id"],
+                    "eval": pair["eval"]["episode_id"],
+                    "band": pair.get("band"),
+                })
+            self._challenge_save()
+            return ids
+        except Exception as e:  # noqa: BLE001 -- challenge machinery never sinks a round
+            self.log_event({"type": "challenge_lock_failed", "genid": str(genid),
+                            "error": f"{type(e).__name__}: {e}"[:400]})
+            return []
+
+    def _run_base_seed(self) -> Optional[int]:
+        """The run-persistent base seed (challenge instance derivation root)."""
+        try:
+            with open(os.path.join(self.output_dir, "ckpt", "sample_seed.json"),
+                      "r", encoding="utf-8") as f:
+                info = json.load(f)
+            value = info.get("base_seed")
+            return int(value) if value is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _challenge_available(self, parent: Any, genid: Any) -> List[Dict[str, Any]]:
+        """Challenges the parent produced and this child must answer.
+
+        Reserves them for ``genid`` (one child only) and registers the TRAIN
+        instance into the run seed file so the broker appends it to this
+        generation's episode plan. Returns the id-free projection the planner
+        sees: no instance, no seed, no level.
+        """
+        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
+            return []
+        try:
+            ledger = self._challenge_data()
+            rows = _challenge_ledger_mod.available_for_parent(
+                ledger, parent_node=getattr(parent, "genid", parent))
+            if not rows:
+                return []
+            rows = _challenge_ledger_mod.reserve_for_child(
+                ledger, parent_node=getattr(parent, "genid", parent), child_node=genid)
+            self._challenge_save()
+        except Exception as e:  # noqa: BLE001 -- never block a plan on the ledger
+            self.log_event({"type": "challenge_available_failed", "genid": str(genid),
+                            "error": f"{type(e).__name__}: {e}"[:400]})
+            return []
+        train_ids = []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            inst = (row.get("instances") or {}).get("train") or {}
+            if inst.get("episode_id"):
+                train_ids.append(str(inst["episode_id"]))
+            out.append({
+                "challenge_id": str(row.get("challenge_id") or ""),
+                "defect_class": str(row.get("defect_class") or ""),
+                "family": str(row.get("family") or ""),
+                "repair_criterion": str(row.get("repair_criterion") or ""),
+                "evidence_ref": str(row.get("evidence_ref") or ""),
+            })
+        if train_ids:
+            try:
+                tx.register_challenge_episodes(self.output_dir, genid, train_ids)
+                self.log_event({"type": "challenge_episodes_registered",
+                                "genid": str(genid), "count": len(train_ids),
+                                "challenge_ids": [r["challenge_id"] for r in out]})
+            except Exception as e:  # noqa: BLE001 -- refused registration = no question
+                self.log_event({"type": "challenge_episodes_unregistered",
+                                "genid": str(genid),
+                                "error": f"{type(e).__name__}: {e}"[:400]})
+                return []
+        return out
+
+    def _challenge_consume(self, parent: Any, genid: Any,
+                           plan_result: Dict[str, Any]) -> None:
+        """Consume the reservation once the plan session actually ran."""
+        if not self.challenge_enabled:
+            return
+        try:
+            ledger = self._challenge_data()
+            _challenge_ledger_mod.consume_for_child(
+                ledger, parent_node=getattr(parent, "genid", parent), child_node=genid,
+                planner_version=self._design_hash("planner") or "unknown")
+            self._challenge_save()
+            responses = plan_result.get("challenge_responses") or []
+            self.log_event({"type": "challenge_consumed", "genid": str(genid),
+                            "responses": len(responses)})
+        except Exception as e:  # noqa: BLE001
+            self.log_event({"type": "challenge_consume_failed", "genid": str(genid),
+                            "error": f"{type(e).__name__}: {e}"[:400]})
+
+    def _challenge_settle(self, parent: Any, child: Node, outer: int) -> None:
+        """Adjudicate the challenges this generation was asked to answer.
+
+        The parent side comes from the OLD episode the parent actually played
+        (``qid``), the child side from the fresh ``instances.train`` episode --
+        no extra episode is ever run for this (decision D2 scheme b).
+        """
+        if not self.challenge_enabled:
+            return
+        adjudicate = _challenge_adjudication.adjudicator_for(self.challenge_domain)
+        if adjudicate is None:
+            return
+        try:
+            ledger = self._challenge_data()
+            rows = [r for r in (ledger.get("challenges") or {}).values()
+                    if isinstance(r, dict)
+                    and str(r.get("consumed_child_node")) == str(child.genid)]
+            if not rows:
+                return
+            cfg = self._challenge_domain_cfg()
+            lines = self._challenge_lines(cfg)
+            contract = cfg.get("output_contract") or {}
+            parent_report = self._challenge_report(getattr(parent, "genid", parent))
+            child_report = self._challenge_report(child.genid)
+            parent_rows = {str(r.get("id")): r for r in
+                           (parent_report.get("episodes") or []) if isinstance(r, dict)}
+            child_rows = {str(r.get("id")): r for r in
+                          (child_report.get("episodes") or []) if isinstance(r, dict)}
+            for row in rows:
+                inst = (row.get("instances") or {}).get("train") or {}
+                parent_row = parent_rows.get(str(row.get("qid") or ""))
+                child_row = child_rows.get(str(inst.get("episode_id") or ""))
+                item = {
+                    **row,
+                    "defect_lines": lines,
+                    "parent_row": parent_row,
+                    "child_row": child_row,
+                    "progression_tol": self.challenge_progression_tol,
+                    "patch": (child.meta or {}).get("patch") or "",
+                    "config": (child.meta or {}).get("config_dict") or {},
+                }
+                try:
+                    result = adjudicate(item,
+                                        _challenge_evidence(parent_row),
+                                        _challenge_evidence(child_row))
+                except Exception as e:  # noqa: BLE001 -- one bad row, not the batch
+                    self.log_event({"type": "challenge_settle_failed",
+                                    "genid": str(child.genid),
+                                    "challenge_id": row.get("challenge_id"),
+                                    "error": f"{type(e).__name__}: {e}"[:400]})
+                    continue
+                _challenge_ledger_mod.settle(
+                    ledger, challenge_id=row.get("challenge_id"), adjudication=result)
+                self.log_event({"type": "challenge_settled", "genid": str(child.genid),
+                                "outer": outer,
+                                "challenge_id": row.get("challenge_id"),
+                                "defect_class": row.get("defect_class"),
+                                "family": row.get("family"),
+                                "state": result.get("state"),
+                                "reason": result.get("reason")})
+            self._challenge_save()
+        except Exception as e:  # noqa: BLE001
+            self.log_event({"type": "challenge_settle_failed",
+                            "genid": str(getattr(child, "genid", "")),
+                            "error": f"{type(e).__name__}: {e}"[:400]})
+
+    def _challenge_stats(self) -> Dict[str, Any]:
+        """Cumulative challenge metrics (DIAGNOSTICS -- never a fitness term)."""
+        if not self.challenge_enabled:
+            return {}
+        try:
+            ledger = self._challenge_data()
+            rows = [r for r in (ledger.get("challenges") or {}).values()
+                    if isinstance(r, dict)]
+            metrics = _challenge_metrics.compute(rows)
+            gate = _challenge_metrics.activation_status(metrics, **self.challenge_metrics_cfg)
+            metrics["gate"] = gate
+            # Fitness is computed but DELIBERATELY not consumed anywhere yet
+            # (stage 1): the three-term combination is gated on
+            # ``supported >= 30`` and this stage never has that many, so it
+            # reports 0.0 while the diagnostics stay visible.
+            metrics["fitness"] = _challenge_metrics.fitness_terms(
+                metrics, active=gate["active"], weights=self.challenge_weights)
+            return metrics
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"[:300]}
 
     def _read_per_question(self, genid: Any) -> Dict[str, float]:
         """Read per-question points, with a 0/1 fallback for old reports."""
@@ -3994,6 +4489,14 @@ class GanLoop:
                 plan_carried = ([] if (text_feedback_off or plan_issues)
                                 else self._carried_over("planner"))
                 traj_plan = self._traj_vis([], parent_ref)
+                # CHALLENGE (docs/21 §4): challenges the PARENT produced and this
+                # generation must answer. Reserving them here binds them to this
+                # child (one child only) and registers the train instance into
+                # the run seed file, which is where the broker reads this
+                # generation's episode plan from. An A1 arm (no planner) cannot
+                # be asked to answer anything, so it takes none.
+                plan_challenges = ([] if disable_plan
+                                   else self._challenge_available(parent, genid))
 
                 # Reserved cost keys for the PLAN seat (docs/10 §10, phase C):
                 # effective values from the planner's OWN design (fallbacks =
@@ -4062,6 +4565,7 @@ class GanLoop:
                             max_tool_calls=plan_ck.get("plan_max_tool_calls", self.plan_max_tool_calls),
                             tool_repeat_limit=self.tool_repeat_limit,
                             carried_over=plan_carried,
+                            challenges=plan_challenges,
                             **plan_cost_kwargs,
                         ) or {}
                 except code_repo.RepoIntegrityError:
@@ -4082,6 +4586,11 @@ class GanLoop:
                 # qualified id, so it still joins the parent issue in the digest
                 # and the ledger instead of becoming a silent "unjudged".
                 self._normalize_plan_issue_refs(plan_result, parent_feedback)
+                # The plan session ran -> the reservation is now a consumption
+                # (docs/21 D4: one generation, then closed forever). Recorded even
+                # when the planner answered nothing: "consumed with no stance" is
+                # a fact the stats read, not an absence.
+                self._challenge_consume(parent, genid, plan_result)
                 # Settled plan session -> cost ledger (A5). Success-only: a
                 # planner_failed round has no settled session to record. The
                 # close settles the summary AND clears the stamps in one place.
@@ -4314,6 +4823,12 @@ class GanLoop:
                 if issue_id_report.get("renamed"):
                     self.log_event({"type": "issue_id_duplicate", "genid": str(genid),
                                     "renamed": issue_id_report["renamed"]})
+                # CHALLENGE (docs/21): lock what this evaluator proposed for THIS
+                # generation, blind and bounded, and materialize the instance pair.
+                # The proposals were collected in the blind phase (the tool refuses
+                # after the reveal); the lock is the structural gate that keeps a
+                # score-fitted challenge out of the ledger.
+                self._challenge_lock_from_eval(ctx, genid, outer)
 
                 packet = self._build_packet(child, ctx)
                 if getattr(ctx, "predicted_score", None) is not None:
@@ -4337,6 +4852,11 @@ class GanLoop:
                 child.meta["packet_path"] = os.path.join(run_dir, "packet.json")
 
                 child.source_access_log = self._source_access_log(outer)
+                # CHALLENGE truth (docs/21 §5): now that the child's own episode
+                # rows exist, the mechanical adjudicator can decide each challenge
+                # this generation was asked to answer. Diagnostics only -- the
+                # result never feeds fitness in this stage.
+                self._challenge_settle(parent, child, outer)
                 self.task_tree.add_node(child)
                 self._append_score(child)
                 self._write_eval(child, ctx, packet)

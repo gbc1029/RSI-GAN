@@ -383,6 +383,14 @@ class _TaskBrokerState:
                     sample_seed = tx.derive_sample_seed(
                         int(seed_info["base_seed"]), scope_id)
                     anchor_ids = list(seed_info.get("anchor_ids") or [])
+                    # CHALLENGE train instances (docs/21 §4): the loop froze this
+                    # generation's challenge episodes into the SAME seed file, and
+                    # they join the anchor list -- ``plan_episodes`` fills slots
+                    # from anchors first, so a challenge takes a rotating slot of
+                    # its own family and the frozen anchor core is untouched.
+                    extra = ((seed_info.get("challenge_episodes") or {}) or {}).get(str(scope_id))
+                    if isinstance(extra, list) and extra:
+                        anchor_ids = anchor_ids + [str(x) for x in extra]
                 except (OSError, ValueError, KeyError):
                     sample_seed = None  # fall back to the legacy prefix slice
             # The balrog harness needs ``dataset_root`` (it is also the signal

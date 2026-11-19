@@ -28,9 +28,28 @@ class PlanContext:
     output_dir: Optional[str] = None
     records: List[Dict[str, Any]] = field(default_factory=list)
     responses: List[Dict[str, Any]] = field(default_factory=list)
+    # Challenges the evaluator raised about the PARENT generation (docs/21).
+    # The planner must take a stance on each; `respond_challenge` appends here.
+    challenge_responses: List[Dict[str, Any]] = field(default_factory=list)
+    # Framework-injected: the challenges this session is asked to answer. Set by
+    # the loop BEFORE the session (never by a tool), so the model cannot widen
+    # its own mandate.
+    challenges: List[Dict[str, Any]] = field(default_factory=list)
 
     def record(self, op: str, **detail: Any) -> None:
         self.records.append({"op": op, **detail})
+
+    def add_challenge_response(self, challenge_id: str, response_kind: str,
+                               addressed: bool = True,
+                               feedback: str = "") -> None:
+        # Same discipline as `add_response`: the structured stance is what crosses
+        # to the framework; `feedback` stays in the session record only.
+        self.challenge_responses.append({
+            "challenge_id": str(challenge_id),
+            "response_kind": str(response_kind),
+            "addressed": bool(addressed),
+            "feedback": feedback or "",
+        })
 
     def add_response(self, issue_id: str, accepted: bool, feedback: str = "",
                      response_kind: str = "unspecified") -> None:
@@ -73,9 +92,17 @@ class EvalContext:
     # (blind + reveal). Mirrors the plan/self receipts' budget flags.
     token_budget_exhausted: bool = False
     truncated: bool = False
+    # Challenge proposals raised in the BLIND phase (docs/21 §4). A dataclass
+    # field so it survives the IPC result contract (`_validated_result` mirrors
+    # it); the loop locks them AFTER the session, so the tool itself can never
+    # write the ledger.
+    challenges: List[Dict[str, Any]] = field(default_factory=list)
 
     def add_issue(self, issue: Dict[str, Any]) -> None:
         self.issues.append(issue)
+
+    def add_challenge(self, challenge: Dict[str, Any]) -> None:
+        self.challenges.append(dict(challenge))
 
     def add_fix_verdict(self, issue_id: str, fixed: bool, evidence: str = "") -> None:
         self.fix_verdicts.append({
@@ -327,3 +354,35 @@ def shallow_op_error(op_name: str, key: Optional[str] = None) -> Optional[str]:
                     "(ablation.shallow_prompt_only=true); component selection "
                     "and other config keys are frozen.")
     return None
+
+
+def challenge_config() -> Dict[str, Any]:
+    """The run's challenge-authoring config, as seen from a role session.
+
+    Read from the access context's broker for the SAME reason as the ablation
+    flags: a role session lives in a child process and calls back over IPC, so a
+    value that is not mirrored onto ``_RemoteBroker`` (``broker_info``) silently
+    reads as its default. The default here is the SAFE one --
+    ``enabled=False`` -- so a missing mirror disables authoring instead of
+    enabling a half-wired path.
+
+    Returned keys:
+    ``enabled`` (bool), ``domain`` (str|null), ``max_k`` (int),
+    ``authorable`` (bool: the domain can actually be adjudicated + materialized),
+    ``reason`` (why not, when ``authorable`` is false).
+    """
+    actx = get_access_context()
+    broker = getattr(actx, "broker", None) if actx is not None else None
+    raw = getattr(broker, "challenge", None) if broker is not None else None
+    cfg = dict(raw) if isinstance(raw, dict) else {}
+    try:
+        max_k = int(cfg.get("max_k") or 0)
+    except (TypeError, ValueError):
+        max_k = 0
+    return {
+        "enabled": bool(cfg.get("enabled")),
+        "domain": (None if cfg.get("domain") in (None, "") else str(cfg.get("domain"))),
+        "max_k": max(0, max_k),
+        "authorable": bool(cfg.get("authorable")),
+        "reason": str(cfg.get("reason") or ""),
+    }

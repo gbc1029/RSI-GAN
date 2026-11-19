@@ -78,6 +78,7 @@ class Planner(Role):
         disable_shallow: bool = False,
         require_deep_patch: bool = False,
         carried_over: Optional[List[Dict[str, Any]]] = None,
+        challenges: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -144,6 +145,26 @@ class Planner(Role):
                 "failed. The evaluator re-detects and re-prescribes them itself.\n"
                 f"```json\n{json.dumps(carried_over, ensure_ascii=False, indent=2)[:1200]}\n```"
             )
+        if challenges:
+            # CHALLENGE (docs/21 §4): a same-family fresh episode is waiting in
+            # this generation's batch. The planner cannot see the instance or its
+            # seed (L1) -- only the defect class, the family and the mechanical
+            # sentence that will be tested. It MUST answer each one: the verdict
+            # is mechanical and comes from the child's own episode, so silence is
+            # indistinguishable from "declined and did nothing".
+            parts.append(
+                "\n## Challenges from the evaluator (answer EVERY one)\n"
+                "For each challenge below call "
+                "`respond_challenge(challenge_id, response_kind, feedback)` with a "
+                "structured stance (acted / acted_differently / out_of_scope / "
+                "disputed / deferred). A requirement to read carefully: a fresh "
+                "episode of the SAME family runs in this generation's batch, and a "
+                "mechanical check decides whether the defect is gone -- so a "
+                "strategy that only works on the episodes you have seen will be "
+                "recorded as unrepaired."
+                "\n```json\n"
+                f"{json.dumps(challenges, ensure_ascii=False, indent=2)[:3000]}\n```"
+            )
         if parent_predicted_score is not None or parent_benchmark_score is not None:
             parts.append(
                 "\n## Selected parent calibration\n"
@@ -179,12 +200,18 @@ class Planner(Role):
         require_deep_patch: bool = False,
         response_contract: Optional[str] = None,
         carried_over: Optional[List[Dict[str, Any]]] = None,
+        challenges: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
 
         task_design = config if isinstance(config, dict) else {}
         plan_ctx = PlanContext(config=task_design, node_id=node_id, output_dir=self.output_dir)
+        # CHALLENGES awaiting an answer (docs/21 §4): framework-injected so the
+        # `respond_challenge` tool can check ids and the instruction can list
+        # them. `challenges` is never writable by a tool -- the model answers
+        # them, it does not choose them.
+        plan_ctx.challenges = [dict(c) for c in (challenges or []) if isinstance(c, dict)]
         # F4/C1: the framework's output contract rides the design context so
         # the AUTHOR sees it at the point of rewriting the task prompt
         # (soft constraint: known to exist; not a set_config-writable key).
@@ -232,7 +259,8 @@ class Planner(Role):
                     disable_shallow=bool(getattr(broker, "disable_shallow", False))
                     if broker is not None else False,
                     require_deep_patch=require_deep_patch,
-                    carried_over=carried_over),
+                    carried_over=carried_over,
+                    challenges=plan_ctx.challenges),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
             _absorb_run_flags()
@@ -328,6 +356,10 @@ class Planner(Role):
         return {
             "records": records,
             "responses": plan_ctx.responses,
+            # Structured stances on this round's challenges (docs/21). The
+            # evaluator NEVER sees these free of the mechanical verdict: the
+            # adjudicator decides, the stance only explains.
+            "challenge_responses": plan_ctx.challenge_responses,
             "config": task_design,
             "patch": "" if rejected else patch_str,
             "patch_proposed": patch_str,

@@ -171,8 +171,17 @@ def _challenge_id(outer: Any, producer_node: Any, index: int) -> str:
 
 def lock(data: Dict[str, Any], *, domain: str, outer: Any, producer_node: Any,
          evaluator_version: Any, challenges: Sequence[Mapping[str, Any]],
-         allowed_families: Iterable[Any], max_k: int = 2) -> List[str]:
-    """Blind-lock a bounded set of family-bound challenges (idempotent on resume)."""
+         allowed_families: Iterable[Any], max_k: int = 2,
+         qids: Optional[Sequence[Any]] = None) -> List[str]:
+    """Blind-lock a bounded set of family-bound challenges (idempotent on resume).
+
+    ``qids`` binds each challenge to the concrete GENERATION ITEM the claim is
+    about (for an episode domain: the episode the producer actually played where
+    the defect appeared). It is framework-owned evidence -- the model never
+    supplies it, and it is what the adjudicator later reads the parent side from,
+    so "the defect was present in the parent" cannot drift to a different
+    instance than the one the author cited.
+    """
     if not isinstance(data, dict):
         raise ChallengeError("challenge ledger must be a mapping")
     if data.get("version") != LEDGER_VERSION or data.get("domain") != str(domain):
@@ -182,6 +191,9 @@ def lock(data: Dict[str, Any], *, domain: str, outer: Any, producer_node: Any,
     items = list(challenges or [])
     if len(items) > max_k:
         raise ChallengeError(f"challenge count exceeds max_k={max_k}")
+    bound = [str(q) for q in (qids or [])]
+    if bound and len(bound) != len(items):
+        raise ChallengeError("qids must align 1:1 with challenges")
     key = _lock_key(outer, producer_node, evaluator_version)
     locks = data.setdefault("locks", {})
     records = data.setdefault("challenges", {})
@@ -208,6 +220,7 @@ def lock(data: Dict[str, Any], *, domain: str, outer: Any, producer_node: Any,
             "producer_node": str(producer_node),
             "producer_evaluator_version": str(evaluator_version),
             **row,
+            "qid": (bound[index] if bound else ""),
             "status": STATUS_LOCKED,
             "instances": None,
             "reserved_child_node": None,
@@ -215,7 +228,8 @@ def lock(data: Dict[str, Any], *, domain: str, outer: Any, producer_node: Any,
             ADJUDICATION_FIELD: None,
         }
         ids.append(challenge_id)
-    locks[key] = {"payload": copy.deepcopy(payload), "challenge_ids": ids}
+    locks[key] = {"payload": copy.deepcopy(payload), "challenge_ids": ids,
+                  "qids": list(bound)}
     return ids
 
 

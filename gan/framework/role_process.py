@@ -219,7 +219,7 @@ def _validated_result(method: str, value: Any) -> Any:
         fields = {
             "predicted_score", "issues", "fix_verdicts", "penalties",
             "eval_point_results", "weaknesses", "token_budget_exhausted",
-            "truncated",
+            "truncated", "challenges",
         }
         _exact_keys(value, fields, "evaluate result")
         score = value["predicted_score"]
@@ -228,6 +228,7 @@ def _validated_result(method: str, value: Any) -> Any:
         _dict_list(value["issues"], "evaluate issues")
         _dict_list(value["fix_verdicts"], "evaluate fix_verdicts")
         _dict_list(value["eval_point_results"], "evaluate eval_point_results")
+        _dict_list(value["challenges"], "evaluate challenges")
         if not isinstance(value["penalties"], dict):
             raise RoleProcessError("evaluate penalties must be an object")
         if (not isinstance(value["weaknesses"], list)
@@ -241,11 +242,12 @@ def _validated_result(method: str, value: Any) -> Any:
             "records", "responses", "config", "patch", "patch_proposed",
             "patch_rejection", "attempts", "truncated", "budget_exhausted",
             "token_budget_exhausted", "deep_probe_required",
-            "deep_probe_patch_proposed",
+            "deep_probe_patch_proposed", "challenge_responses",
         }
         _exact_keys(value, fields, "plan result")
         _dict_list(value["records"], "plan records")
         _dict_list(value["responses"], "plan responses")
+        _dict_list(value["challenge_responses"], "plan challenge_responses")
         if not isinstance(value["config"], dict):
             raise RoleProcessError("plan config must be an object")
     else:
@@ -603,7 +605,14 @@ class RoleProcess:
                                       "prompt_rewrite_min_survival": float(
                                           getattr(broker, "prompt_rewrite_min_survival", 0.0) or 0.0),
                                       "prompt_rewrite_max_growth": float(
-                                          getattr(broker, "prompt_rewrite_max_growth", 0.0) or 0.0)}
+                                          getattr(broker, "prompt_rewrite_max_growth", 0.0) or 0.0),
+                                      # CHALLENGE config (docs/21): the authoring tools
+                                      # gate on it, so it MUST cross the boundary -- an
+                                      # unmirrored key reads as the safe default
+                                      # (disabled) in the child and silently turns the
+                                      # whole mechanism off.
+                                      "challenge": (dict(broker.challenge)
+                                                    if getattr(broker, "challenge", None) else None)}
                                     if broker is not None else None),
                     "role_state": {
                         "attempt_id": self.attempt_id,
@@ -992,7 +1001,8 @@ class _RemoteBroker:
                  shallow_prompt_only: bool = False, disable_shallow: bool = False,
                  prompt_rewrite_min_similarity: float = 0.0,
                  prompt_rewrite_min_survival: float = 0.0,
-                 prompt_rewrite_max_growth: float = 0.0):
+                 prompt_rewrite_max_growth: float = 0.0,
+                 challenge: Optional[Dict[str, Any]] = None):
         self._reader = reader
         self._writer = writer
         self._call_id = call_id
@@ -1011,6 +1021,10 @@ class _RemoteBroker:
         # silently 0.0 in the child = gate off, the B1 lesson).
         self.prompt_rewrite_min_survival = float(prompt_rewrite_min_survival or 0.0)
         self.prompt_rewrite_max_growth = float(prompt_rewrite_max_growth or 0.0)
+        # Challenge-authoring config (docs/21): read by `challenge_config()` in
+        # the child. `None` == authoring unavailable (the safe default).
+        self.challenge: Optional[Dict[str, Any]] = (
+            dict(challenge) if isinstance(challenge, dict) else None)
         self.last_result: Dict[str, Any] = {}
         # Last patch build's three-way-merge / conflict facts (mirrored).
         self.last_patch_report: Dict[str, Any] = {}
@@ -1416,7 +1430,7 @@ def _worker_main() -> None:
                         "shallow_prompt_only", "disable_shallow",
                         "prompt_rewrite_min_similarity",
                         "prompt_rewrite_min_survival",
-                        "prompt_rewrite_max_growth"}:
+                        "prompt_rewrite_max_growth", "challenge"}:
                     raise RoleProcessError("invalid broker info")
                 remote = _RemoteBroker(
                     reader, protocol_writer, call_id,
@@ -1430,7 +1444,9 @@ def _worker_main() -> None:
                     prompt_rewrite_min_survival=float(
                         info.get("prompt_rewrite_min_survival", 0.0) or 0.0),
                     prompt_rewrite_max_growth=float(
-                        info.get("prompt_rewrite_max_growth", 0.0) or 0.0))
+                        info.get("prompt_rewrite_max_growth", 0.0) or 0.0),
+                    challenge=(dict(info["challenge"])
+                               if isinstance(info.get("challenge"), dict) else None))
                 index = _BROKER_POSITION[method]
                 if len(args) > index:
                     args[index] = remote

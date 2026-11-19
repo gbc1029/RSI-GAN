@@ -111,6 +111,37 @@ def defect_present(defect_class: str, row: Optional[Mapping[str, Any]],
     return None
 
 
+def defect_families(rows: Any, defect_class: str,
+                    lines: Mapping[str, float]) -> Dict[str, Dict[str, int]]:
+    """``{family: {"hits": n, "decided": m}}`` over ONE generation's episode rows.
+
+    The A layer's "the family must be one where the defect actually appeared"
+    rule (docs/21 §6). It runs on the PARENT generation's own report, before any
+    question exists, so the author cannot cite a family whose episodes were
+    healthy -- the failure mode that would let it ask about a defect it cannot
+    demonstrate.
+
+    ``decided`` counts traced episodes (an aborted row decides nothing), so a
+    caller can tell "no hits" from "no evidence" and refuse to offer a family
+    whose only episodes were aborted.
+    """
+    out: Dict[str, Dict[str, int]] = {}
+    for row in (rows or ()):
+        if not isinstance(row, Mapping):
+            continue
+        family = str(row.get("task") or "")
+        if not family:
+            continue
+        present = defect_present(defect_class, row, lines)
+        if present is None:
+            continue
+        bucket = out.setdefault(family, {"hits": 0, "decided": 0})
+        bucket["decided"] += 1
+        if present:
+            bucket["hits"] += 1
+    return out
+
+
 def adjudicate(challenge: Mapping[str, Any],
                parent_evidence: Optional[Mapping[str, Any]],
                child_evidence: Optional[Mapping[str, Any]],
@@ -216,6 +247,7 @@ __all__ = [
     "DEFAULT_PROGRESSION_TOL",
     "SUPPORTED_DEFECT_CLASSES",
     "adjudicate",
+    "defect_families",
     "defect_present",
     "episode_dead_end",
 ]

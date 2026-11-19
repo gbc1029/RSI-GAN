@@ -1810,6 +1810,59 @@ def ensure_sampling_seed(
     return info
 
 
+def challenge_episodes_path(output_dir: str) -> str:
+    return os.path.join(output_dir, "ckpt", "sample_seed.json")
+
+
+def register_challenge_episodes(output_dir: str, genid: Any,
+                                episode_ids: Iterable[str]) -> List[str]:
+    """Freeze the CHALLENGE episodes of ONE generation into the run seed file.
+
+    WHY THE SEED FILE (and not a new transport): the sampling plan of a
+    generation is deliberately derived ROOT-SIDE from ``ckpt/sample_seed.json``
+    (``task_broker``) so no worker can choose which episodes it is graded on. A
+    challenge train instance therefore has to be registered HERE, before the task
+    run, and the broker appends it to the anchor list it already computes. The
+    transport stays unchanged and the audit trail is the same file that already
+    answers "which episodes did this run use".
+
+    Idempotent per genid: a resumed generation re-registers the same list (the
+    ledger's consumption is idempotent too), and a DIFFERENT list for the same
+    genid is REFUSED -- a generation cannot swap its exam mid-flight.
+    """
+    ids = [str(i) for i in (episode_ids or ()) if str(i)]
+    path = challenge_episodes_path(output_dir)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"challenge episodes need the run seed file at {path} "
+            f"(challenge authoring requires seeded episode sampling): {exc}") from exc
+    if not isinstance(info, dict):
+        raise RuntimeError(f"run seed file at {path} is not an object")
+    table = info.get("challenge_episodes")
+    if not isinstance(table, dict):
+        table = {}
+    key = str(genid)
+    existing = table.get(key)
+    if existing is not None:
+        if [str(x) for x in existing] != ids:
+            raise RuntimeError(
+                f"challenge episodes for generation {key} are already "
+                f"{existing} and cannot be changed to {ids}")
+        return ids
+    if not ids:
+        return []
+    table[key] = ids
+    info["challenge_episodes"] = table
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(info, f, indent=2)
+    os.replace(tmp, path)
+    return ids
+
+
 def _log_soft_sample_note(message: str) -> None:
     print(f"[sample] {message}")
 

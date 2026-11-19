@@ -84,6 +84,14 @@ class AccessBroker:
         self.deep_view_only = bool(deep_view_only)
         self.shallow_prompt_only = bool(shallow_prompt_only)
         self.disable_shallow = bool(disable_shallow)
+        # CHALLENGE authoring config (docs/21). Not an ablation and not a
+        # permission: it is the run's feature switch, read by the evaluator /
+        # planner tools through `context.challenge_config()`. Set by whoever
+        # builds the loop (None == authoring unavailable, the safe default), and
+        # mirrored onto the child's `_RemoteBroker` like every other config value
+        # that a tool reads -- an unmirrored key would read as "disabled" there
+        # and turn the mechanism off silently.
+        self.challenge: Optional[Dict[str, Any]] = None
         # R2 design-write limit (NOT an ablation switch): a prompt write below
         # this CHARACTER-level similarity to the text it replaces is a wholesale
         # rewrite and is refused by set_prompt.prompt_rewrite_error. Enforced at

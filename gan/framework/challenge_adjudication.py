@@ -131,6 +131,50 @@ def validate_result(result: Mapping[str, Any]) -> Dict[str, Any]:
 _ADJUDICATORS: Dict[str, Any] = {}
 
 
+def domain_module(domain: str) -> Optional[Any]:
+    """Import ``domains.<family>.challenge_*`` for a domain id, or ``None``.
+
+    ``<family>`` is resolved with the SAME longest-prefix discipline
+    ``domains.yaml`` already uses (``balrog_babyai`` -> ``balrog``): a domain id is
+    not a package name, and the naive ``domains.balrog_babyai`` import the first
+    port would have used can never resolve -- so every balrog generation would
+    silently settle ``UNDECIDABLE`` instead of being judged.
+
+    ONE resolver for every per-domain challenge hook (the adjudicator, the
+    per-episode defect scan, the question space): three copies of this walk would
+    drift the moment a domain is renamed.
+    """
+    key = str(domain or "")
+    if not key:
+        return None
+    import importlib
+
+    parts = key.split("_")
+    for i in range(len(parts), 0, -1):
+        pkg = "_".join(parts[:i])
+        try:
+            return importlib.import_module(f"domains.{pkg}")
+        except Exception:  # noqa: BLE001 -- try the next prefix
+            continue
+    return None
+
+
+def _challenge_submodule(domain: str, name: str) -> Optional[Any]:
+    import importlib
+
+    key = str(domain or "")
+    if not key:
+        return None
+    parts = key.split("_")
+    for i in range(len(parts), 0, -1):
+        pkg = "_".join(parts[:i])
+        try:
+            return importlib.import_module(f"domains.{pkg}.{name}")
+        except Exception:  # noqa: BLE001 -- try the next prefix
+            continue
+    return None
+
+
 def register_adjudicator(domain: str, fn: Any) -> None:
     """Register one domain adjudicator: ``fn(challenge, parent_ev, child_ev)``."""
     if not callable(fn):
@@ -139,35 +183,43 @@ def register_adjudicator(domain: str, fn: Any) -> None:
 
 
 def adjudicator_for(domain: str) -> Optional[Any]:
-    """Look up a domain adjudicator by importing ``domains.<pkg>.challenge_adjudication``.
-
-    ``<pkg>`` is resolved with the SAME longest-prefix discipline ``domains.yaml``
-    already uses (``balrog_babyai`` -> ``balrog``): a domain id is not a package
-    name, and the naive ``domains.balrog_babyai`` import the first port would have
-    used can never resolve -- so every balrog generation would silently settle
-    ``UNDECIDABLE`` instead of being judged.
-    """
+    """Look up a domain adjudicator by importing ``domains.<family>.challenge_adjudication``."""
     key = str(domain)
     if key in _ADJUDICATORS:
         return _ADJUDICATORS[key]
-    import importlib
-
-    parts = key.split("_")
-    candidates = ["_".join(parts[:i]) for i in range(len(parts), 0, -1)]
-    for pkg in candidates:
-        try:
-            module = importlib.import_module(f"domains.{pkg}.challenge_adjudication")
-        except Exception:  # noqa: BLE001 -- try the next prefix
-            continue
-        fn = getattr(module, "adjudicate", None)
-        if callable(fn):
-            _ADJUDICATORS[key] = fn
-            return fn
+    module = _challenge_submodule(key, "challenge_adjudication")
+    fn = getattr(module, "adjudicate", None) if module is not None else None
+    if callable(fn):
+        _ADJUDICATORS[key] = fn
+        return fn
     return None
+
+
+def defect_scan_for(domain: str) -> Optional[Any]:
+    """The domain's PER-EPISODE defect scan (``defect_families(rows, cls, lines)``).
+
+    Separate from the adjudicator on purpose: the A-layer validator must know
+    which families may be cited BEFORE any question is materialized, and that
+    answer comes from the parent generation's episode rows, not from a verdict.
+    """
+    module = _challenge_submodule(domain, "challenge_adjudication")
+    fn = getattr(module, "defect_families", None) if module is not None else None
+    return fn if callable(fn) else None
+
+
+def supported_classes_for(domain: str) -> tuple:
+    """Defect classes this domain can actually decide (empty => not adjudicable)."""
+    module = _challenge_submodule(domain, "challenge_adjudication")
+    classes = getattr(module, "SUPPORTED_DEFECT_CLASSES", ()) if module is not None else ()
+    try:
+        return tuple(str(c) for c in classes or ())
+    except TypeError:  # a malformed declaration is "nothing supported", never a crash
+        return ()
 
 
 __all__ = [
     "UNDECIDABLE", "VERIFIED_REPAIR", "VERIFIED_UNRESOLVED",
     "UNSUPPORTED_CHALLENGE", "REGRESSION_AFTER_FALSE_CHALLENGE",
     "adjudicate", "validate_result", "register_adjudicator", "adjudicator_for",
+    "defect_scan_for", "domain_module", "supported_classes_for",
 ]
