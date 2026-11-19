@@ -349,6 +349,28 @@ domains:
         turn: ["turn left", "turn right"]
         forward: ["go forward"]
         interact: ["pick up", "drop", "toggle"]
+      # DEFECT LINES (docs/21 §3.3): the PER-EPISODE thresholds that decide
+      # "this episode shows defect X". Declared ONCE here and read by EVERY
+      # consumer (`gan/framework/defect_lines.py`): the ordinary-issue checker
+      # aggregates them into a generation-level share, and the challenge
+      # adjudicator applies them to one named episode. Two copies of these
+      # numbers is how the same defect ends up judged two different ways.
+      #
+      # cycle_degenerate_revisit_share -- docs/20 §4.2: the share of steps that
+      #   re-try an already-tried (state, action) pair. A 4-step rotation hits
+      #   it on every lap (measured: 0.90-0.98 on the spinning generation) while
+      #   a healthy agent that keeps trying and failing sits at 0.47-0.65.
+      #   NOT expressible as a `turn` share: A0 gen1 turned 62.7% and still
+      #   solved 6/10.
+      # blocked_forward_share -- a fifth of the steps are a `go forward` that
+      #   changed nothing. Measured healthy ceiling ~0.35 of the no-progress
+      #   steps, so 0.40 bounds the shape where the agent only pushes walls.
+      # no_interaction_max_steps -- 0 means "any interaction attempt passes";
+      #   the defect is "this episode never tried to manipulate anything".
+      defect_lines:
+        cycle_degenerate_revisit_share: 0.80
+        blocked_forward_share: 0.40
+        no_interaction_max_steps: 0
     task_brief: >-
       Play the BabyAI navigation environment. At each step, inspect the mission
       and observation and respond with exactly one valid environment action.
@@ -456,6 +478,13 @@ domains:
       action_classes:
         move: ["up", "down", "left", "right"]
         idle: ["idle"]
+      # DEFECT LINES (docs/21 §3.3): only the domain-neutral cycle line applies.
+      # ``blocked_forward_share`` is deliberately ABSENT -- Baba Is AI has no
+      # facing-relative forward action, so "pushing a wall" cannot be told apart
+      # from "walking into a block on purpose" by action name. Absence means "not
+      # declared" (the consumer keeps its own default), never 0.
+      defect_lines:
+        cycle_degenerate_revisit_share: 0.80
     task_brief: >-
       Play the Baba Is AI puzzle environment. At each step, inspect the active
       rules and object positions and respond with exactly one valid action.
