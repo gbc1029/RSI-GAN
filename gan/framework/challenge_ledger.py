@@ -316,6 +316,33 @@ def consume_for_child(data: Dict[str, Any], *, parent_node: Any, child_node: Any
     return rows
 
 
+def release_for_child(data: Dict[str, Any], *, child_node: Any) -> int:
+    """Free the challenges RESERVED for a child that never played them.
+
+    A reservation is not a consumption: it says "this generation is going to be
+    asked". When that generation DIES before its plan session (measured
+    2026-11-19: ``planner_failed`` on an upstream proxy error), the reservation
+    would otherwise be stranded forever -- the row stays ``reserved`` to a node
+    that never existed as a valid generation, no other child may take it, and the
+    author's ``max_k`` slot is spent for nothing.
+
+    Releasing is safe by construction: ``consume`` is what closes a challenge
+    (D4, one generation), and a released row keeps its instances, so the next
+    child reserves and consumes the SAME materialized question. Idempotent.
+    """
+    released = 0
+    for row in (data.get("challenges") or {}).values():
+        if not isinstance(row, dict):
+            continue
+        if (row.get("status") == STATUS_RESERVED
+                and str(row.get("reserved_child_node")) == str(child_node)):
+            row["status"] = (STATUS_MATERIALIZED if row.get("instances")
+                             else STATUS_LOCKED)
+            row["reserved_child_node"] = None
+            released += 1
+    return released
+
+
 def settle(data: Dict[str, Any], *, challenge_id: Any,
            adjudication: Mapping[str, Any]) -> Dict[str, Any]:
     """Attach one immutable adjudication to an already-consumed challenge."""
@@ -342,5 +369,6 @@ __all__ = [
     "LEDGER_VERSION", "STATUS_LOCKED", "STATUS_MATERIALIZED", "STATUS_RESERVED",
     "STATUS_CONSUMED", "ChallengeError", "empty", "load", "save", "lock",
     "attach_instances", "validate_candidate", "available_for_parent",
-    "reserve_for_child", "consume_for_child", "settle", "audit_hardcoding",
+    "reserve_for_child", "consume_for_child", "release_for_child", "settle",
+    "audit_hardcoding",
 ]

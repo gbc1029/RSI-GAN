@@ -2155,6 +2155,7 @@ class GanLoop:
         node.meta["invalid_detail"] = detail[:500]
         if outer is not None:
             node.meta["outer_id"] = outer
+        self._challenge_release(node.genid)
         self.task_tree.add_node(node)
         prune.safe_rmtree(
             paths.work_dir(self.output_dir, node.genid),
@@ -2603,6 +2604,29 @@ class GanLoop:
                                 "error": f"{type(e).__name__}: {e}"[:400]})
                 return []
         return out
+
+    def _challenge_release(self, genid: Any) -> None:
+        """Free challenges reserved for a generation that died before planning.
+
+        A reservation means "this generation is going to be asked", not "asked"
+        (D4: only CONSUME closes a challenge). Measured 2026-11-19: gen 1 died in
+        its planner session on an upstream proxy error, and without this the
+        challenge stayed reserved to a node that never existed -- unusable by any
+        other child and its ``max_k`` slot spent for nothing. The next child now
+        reserves and consumes the SAME materialized question.
+        """
+        if not self.challenge_enabled:
+            return
+        try:
+            n = _challenge_ledger_mod.release_for_child(
+                self._challenge_data(), child_node=genid)
+            if n:
+                self._challenge_save()
+                self.log_event({"type": "challenge_released", "genid": str(genid),
+                                "count": n})
+        except Exception as e:  # noqa: BLE001 -- never block the invalid path
+            self.log_event({"type": "challenge_release_failed", "genid": str(genid),
+                            "error": f"{type(e).__name__}: {e}"[:300]})
 
     def _challenge_consume(self, parent: Any, genid: Any,
                            plan_result: Dict[str, Any]) -> None:
