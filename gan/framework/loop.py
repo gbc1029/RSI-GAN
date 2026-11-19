@@ -4264,6 +4264,54 @@ class GanLoop:
                         "code_applied": rec["code_patch"]["applied"], "rejected": bool(rejected)})
         return rec
 
+    def _challenge_publish_citable(self, genid: Any) -> Dict[str, Any]:
+        """Publish THIS generation's citable (family -> hits) table to the author.
+
+        The evaluator raises its claim from the TRAJECTORY ("it oscillates between
+        step 6 and 8"), which is a LOCAL loop; the mechanical per-episode primitive
+        asks a GLOBAL question ("did this episode spend >= 80% of its steps
+        re-trying an already-tried (state, action) pair, or never leave its
+        start?"). The two can disagree honestly -- and measured 2026-11-19 they
+        did: a healthy-but-spinning generation had the defect in `open`/`pickup`/
+        `putnext` while the author cited `goto` (0 hits), and the proposal was
+        refused. Nobody could have told it which family was supportable.
+
+        So the table the A layer will judge against is handed to the author BEFORE
+        it writes, through the same broker mirror as the vocabulary. An EMPTY
+        table is published too: "no family currently shows an adjudicable defect"
+        is the single most useful thing to say, and it stops the round from filing
+        a claim that cannot be supported.
+        """
+        if not self.challenge_enabled:
+            return {}
+        if self.broker is None or not hasattr(self.broker, "challenge"):
+            return {}
+        cfg = self._challenge_domain_cfg()
+        classes = list(self._challenge_defect_classes)
+        report = self._challenge_report(genid)
+        rows = [r for r in (report.get("episodes") or []) if isinstance(r, dict)]
+        table: Dict[str, Dict[str, int]] = {}
+        for defect_class in classes:
+            try:
+                fams = _challenge_questions.citable_families(
+                    self.challenge_domain, defect_class, rows,
+                    (cfg.get("output_contract") or {}))
+            except Exception as e:  # noqa: BLE001 -- advisory
+                self.log_event({"type": "challenge_citable_failed",
+                                "genid": str(genid), "class": defect_class,
+                                "error": f"{type(e).__name__}: {e}"[:300]})
+                continue
+            table[defect_class] = {str(k): int(v.get("hits") or 0)
+                                   for k, v in (fams or {}).items()
+                                   if int((v or {}).get("hits") or 0) > 0}
+        cur = dict(getattr(self.broker, "challenge") or {})
+        cur["citable"] = table
+        cur["citable_genid"] = str(genid)
+        self.broker.challenge = cur
+        self.log_event({"type": "challenge_citable", "genid": str(genid),
+                        "citable": table})
+        return table
+
     def _write_eval(self, child: Node, ctx: Any, packet: RewardPacket) -> None:
         """Persist the refined evaluator schema (issues/verdicts/prediction)."""
         try:
@@ -4946,6 +4994,11 @@ class GanLoop:
                         ctx = EvalContext()
                         self.log_event({"type": "ablation_skip_eval", "genid": str(genid)})
                     else:
+                        # CHALLENGE (docs/21 §6 A layer): the author may only cite a
+                        # family whose episodes mechanical show an adjudicable
+                        # defect, so hand it THAT table before it writes (empty is
+                        # a real answer: "nothing to challenge this round").
+                        self._challenge_publish_citable(genid)
                         ctx = self.evaluator.evaluate(
                             run_summary={
                                 "genid": genid,

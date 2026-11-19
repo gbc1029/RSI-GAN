@@ -384,6 +384,21 @@ def challenge_config() -> Dict[str, Any]:
         if not isinstance(value, (list, tuple)):
             return []
         return [str(v) for v in value if str(v)]
+    def _citable(raw: Any) -> Dict[str, Dict[str, int]]:
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, Dict[str, int]] = {}
+        for cls, fams in raw.items():
+            if not isinstance(fams, dict):
+                continue
+            row = {}
+            for fam, hits in fams.items():
+                try:
+                    row[str(fam)] = int(hits)
+                except (TypeError, ValueError):
+                    continue
+            out[str(cls)] = row
+        return out
     return {
         "enabled": bool(cfg.get("enabled")),
         "domain": (None if cfg.get("domain") in (None, "") else str(cfg.get("domain"))),
@@ -396,4 +411,10 @@ def challenge_config() -> Dict[str, Any]:
         # fail-OPENED exactly that way.
         "defect_classes": _list("defect_classes"),
         "families": _list("families"),
+        # THIS generation's citable table: ``{defect_class: {family: hits}}``.
+        # Recomputed by the loop before every evaluate session, because what is
+        # citable is a property of the round, not of the run. Missing/empty = no
+        # family currently shows an adjudicable defect (do NOT challenge).
+        "citable": _citable(cfg.get("citable")),
+        "citable_genid": str(cfg.get("citable_genid") or ""),
     }

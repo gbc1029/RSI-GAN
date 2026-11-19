@@ -92,6 +92,20 @@ def tool_function(defect_class, family, evidence_ref, repair_criterion, **kwargs
     if str(defect_class) not in allowed:
         return (f"Error: unknown defect_class '{defect_class}'; allowed for this "
                 f"domain: {', '.join(allowed)}")
+    # Citable families for THIS generation (the mechanical per-episode primitive
+    # already ran on its report). Measured 2026-11-19: the author cited a family
+    # whose defect it saw in the trajectory but which the primitive did not
+    # confirm, and admission refused it -- nobody had told it which family was
+    # supportable. An empty table means "nothing to challenge this round".
+    citable = (config.get("citable") or {}).get(str(defect_class)) or {}
+    if not citable:
+        return (f"Error: no family in this generation shows '{defect_class}' "
+                "mechanically; do not file a challenge this round (use report_issue)")
+    if str(family) not in citable:
+        listing = ", ".join(f"{fam} ({n} episode(s))"
+                            for fam, n in sorted(citable.items()))
+        return (f"Error: family '{family}' does not show {defect_class} in this "
+                f"generation; citable families are: {listing}")
     if str(family) not in families:
         return (f"Error: unknown family '{family}'; allowed families (task ids): "
                 f"{', '.join(families)}")

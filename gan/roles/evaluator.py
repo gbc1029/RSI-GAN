@@ -56,11 +56,33 @@ class Evaluator(Role):
             _chal = _cc()
             _classes = list(_chal.get("defect_classes") or [])
             _families = list(_chal.get("families") or [])
+            _citable = dict(_chal.get("citable") or {})
+            _pairs = [(cls, fam, n) for cls, fams in _citable.items()
+                      for fam, n in (fams or {}).items()]
             if _chal.get("enabled") and _chal.get("authorable") and _classes and _families:
                 # The allowed values are printed VERBATIM. Measured 2026-11-19
                 # (first real round): without them the author filed
                 # `defect_class="no_progress_loop"` on `family="balrog_babyai"` --
                 # both plausible, both unusable -- and the round produced nothing.
+                # The CITABLE pairs are printed too (second round): the author
+                # cited a family whose loop it saw in the trajectory but which the
+                # mechanical per-episode primitive did not confirm, so admission
+                # had to refuse a perfectly honest claim.
+                if _pairs:
+                    _citable_txt = "; ".join(
+                        f"{cls} on {fam} ({n} episode(s))"
+                        for cls, fam, n in sorted(_pairs))
+                    _advice = (
+                        "These are the ONLY pairs this generation can support "
+                        "mechanically -- pick one of them (or do not file a "
+                        "challenge):\n"
+                        f"  {_citable_txt}\n")
+                else:
+                    _advice = (
+                        "NOTHING is citable this round: no episode of any family "
+                        "shows an adjudicable defect with the mechanical lines, so "
+                        "do NOT call `propose_challenge` (it would be refused). "
+                        "Use `report_issue` instead.\n")
                 parts.append(
                     "\n## Optional: author a challenge (same-family fresh episode)\n"
                     "If a defect you found is about HOW the agent plays (not about one "
@@ -69,8 +91,7 @@ class Evaluator(Role):
                     "evidence_ref, repair_criterion)`.\n"
                     f"- `defect_class` MUST be one of: {', '.join(_classes)}\n"
                     f"- `family` MUST be one of these task ids: {', '.join(_families)}\n"
-                    "  (pick the task whose episodes in THIS generation actually showed "
-                    "the defect; a family with no such episode is refused)\n"
+                    f"- {_advice}"
                     "- `evidence_ref` is a pointer to where you saw it (episode id or "
                     "report path); `repair_criterion` is the mechanical condition that "
                     "would count as repaired.\n"
