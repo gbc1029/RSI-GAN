@@ -16,10 +16,18 @@ gan:
   # task arm is latency-bound (per-question wall budget); low keeps long calls
   # away from the wall. planner/evaluator are bound by the per-call client
   # budget instead, so they take the higher-effort thinking mode.
+  #
+  # 2026-11-19 (measured through the REAL client path, litellm): the `openai/`
+  # prefix is litellm's PROVIDER selector and is stripped on the wire, so keep
+  # it -- a direct-HTTP probe with the literal prefixed string 503s and would
+  # have sent us renaming everything for no reason. The actual failure was the
+  # `gpt-4o-mini` DEPLOYMENT being token-rate-limited
+  # (`429 ... exceeded token rate limit ... in francecentral`): 335 of 373 task
+  # calls in a 10-episode round got 429, every step child retried into its 600 s
+  # wall, all episodes aborted and the generation produced no report. Same size
+  # class, separate channel, 5/5 x 200 through litellm -> `gpt-4.1-mini`.
   task:
-     model: openai/gpt-4o-mini
-#    model: openai/glm-5.3-flash
-#    reasoning_effort: low
+     model: openai/gpt-4.1-mini
   planner:
     model: openai/glm-5.3-flash
     reasoning_effort: high
