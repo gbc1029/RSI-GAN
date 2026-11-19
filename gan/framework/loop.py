@@ -696,8 +696,12 @@ class GanLoop:
             })
         # Mirror onto the broker so the AUTHORING TOOLS (which run in the role
         # child and read `context.challenge_config()`) see the same answer. An
-        # unmirrored value reads as "disabled" there -- the B1 lesson.
-        if broker is not None and hasattr(broker, "challenge"):
+        # unmirrored value reads as "disabled" there -- the B1 lesson. The
+        # boolean is LOGGED because a broker object without the slot (a proxy, a
+        # stub) would otherwise fail silently: the tools would refuse every
+        # proposal and the ledger would simply stay empty.
+        _mirrored = bool(broker is not None and hasattr(broker, "challenge"))
+        if _mirrored:
             broker.challenge = {
                 "enabled": self.challenge_enabled,
                 "domain": self.challenge_domain,
@@ -705,6 +709,10 @@ class GanLoop:
                 "authorable": bool(self._challenge_cfg_state.get("authorable")),
                 "reason": str(self._challenge_cfg_state.get("reason") or ""),
             }
+        if self.challenge_enabled:
+            self.log_event({"type": "challenge_broker_mirror",
+                            "applied": _mirrored,
+                            "broker": type(broker).__name__ if broker is not None else None})
         # Ledger handle: the run's BLIND challenge lifecycle (locked ->
         # materialized -> reserved -> consumed -> settled). Loaded lazily so a
         # disabled run never touches the file. NOTE the name: `_challenge_data`

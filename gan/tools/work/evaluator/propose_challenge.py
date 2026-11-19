@@ -78,6 +78,14 @@ def tool_function(defect_class, family, evidence_ref, repair_criterion, **kwargs
     if not config["authorable"]:
         return (f"Error: this domain cannot host challenges ({config['reason']}); "
                 "use report_issue instead")
+    # Vocabulary check HERE (cheap, actionable) rather than only at admission:
+    # the closed set is the domain's, so the agent must be told the exact values
+    # it may use instead of discovering them through a rejected round.
+    from gan.framework.challenge_adjudication import supported_classes_for
+    allowed = supported_classes_for(config["domain"] or "")
+    if allowed and str(defect_class) not in allowed:
+        return (f"Error: unknown defect_class '{defect_class}'; allowed for this "
+                f"domain: {', '.join(sorted(allowed))}")
     if getattr(ctx, "revealed", False):
         # Blind discipline: a post-reveal proposal would be fitted to the score.
         return ("Error: challenges may only be proposed in the BLIND phase; the "

@@ -45,6 +45,33 @@ class Evaluator(Role):
                 "Use `record_predicted_score` for your predicted score, and `report_issue` "
                 "for each problem you find (process / cheating / detail / overfitting)."
             )
+            # CHALLENGE AUTHORING (docs/21 §4), announced ONLY when the run really
+            # enabled it: the tool exists in every session (always-on), and an
+            # agent that is never told it may answer with a fresh question will
+            # simply never use it. The note is a CAPABILITY statement, not a
+            # nudge to file more claims: admission is mechanical (the family must
+            # really have shown the defect) and the verdict is mechanical too, so
+            # an invented challenge costs the author precision.
+            from gan.framework.context import challenge_config as _cc
+            _chal = _cc()
+            if _chal.get("enabled") and _chal.get("authorable"):
+                parts.append(
+                    "\n## Optional: author a challenge (same-family fresh episode)\n"
+                    "If a defect you found is about HOW the agent plays (not about one "
+                    "particular level), you may file ONE to "
+                    f"`{_chal.get('max_k')}` challenge(s) with `propose_challenge("
+                    "defect_class, family, evidence_ref, repair_criterion)`. You name "
+                    "the defect class and the task family where you actually saw it; "
+                    "the framework draws a fresh episode of that family (you never see "
+                    "the level or its seed) and a mechanical check decides later whether "
+                    "the defect is gone. Rules: `defect_class` must come from the "
+                    "adjudicable vocabulary (the tool tells you which values are "
+                    "allowed), `family` must be a task whose episodes in THIS generation "
+                    "showed the defect, and `repair_criterion` must be a mechanical "
+                    "condition. Do not describe a level, a seed or an answer. This is "
+                    "optional and blind-phase-only: a challenge you cannot support costs "
+                    "you precision."
+                )
         elif benchmark_score is not None:
             # C1 ablation (ablation.disable_blind=true): the objective score is
             # revealed up front; the blind discipline is off.
