@@ -217,8 +217,45 @@ issues:
     #   归档三臂（A1 最高 20%；A0 gen4/gen8 = 70%；A2 gen9/gen10 = 60%）
     #   阶段 2 全新题集的 A1 三代（各 20%）—— 这一跑没有参与写规则。
     dead_end_revisit_share: 0.4
+    # 单局退化线：已下沉到 domains.yaml 的 output_contract.defect_lines
+    # （gan/framework/defect_lines.py 是唯一读者）。此处保留一份只为显示，
+    # 一致性由 scripts/local/test_challenge_adjudication.py 断言；漂移则
+    # report 的 behavior.defect_line_drift 会显式报警（docs/21 §3.3）。
     degenerate_revisit_share: 0.8   # 单局退化线（实测在 harness 侧；此处仅供显示）
     behavior_min_episodes: 4        # 少于这个数的有轨迹局 ⇒ 判不了（UNKNOWN）
+
+# ---------------------------------------------------------------------------
+# CHALLENGE（出题式对抗，docs/21）—— 默认关闭。
+#
+# 设计：evaluator 不再只"判卷"，还可以为该代报告的缺陷出一道**同族新题**
+# （L1：模型只给 (defect_class, family)，实例由环境生成器采样，见
+# domains/balrog/challenge_space.py）；题目在**蒙眼期**锁定，planner 只能看到
+# train 实例、看不到 eval 实例；真值由**机械 adjudicator** 出（零 LLM），
+# 见 domains/balrog/challenge_adjudication.py。
+#
+# enabled: false 时整条链路不可达 —— 阶段 0 的硬门就是"默认关闭时报告逐字段
+# 不变"（与阶段 4 的 6 代真报告 diff 为空）。
+# ---------------------------------------------------------------------------
+challenge:
+  enabled: false               # 阶段 1 打开；关 = 零行为影响（硬门）
+  max_k: 2                     # 每代最多几道题（占旋转位；预算见下）
+  # 批次预算：train 批 = anchor 5 + challenge <= max_k + 随机 >= 1 = num_samples。
+  # 启动时 fail-closed 校验，违反即拒绝启动而不是静默截断（docs/21 §4.1）。
+  random_min: 1
+  # challenge_val（eval 批）只做泛化确认，单独成列：绝不进 val_mean、
+  # 不参与选父、不参与 stagnation。
+  eval_max_per_challenge: 1
+  # 结算用：修复判据 D3 的进度容差（0 = 同族同档下"不许降"）。
+  progression_tol: 0.0
+  # 两阶段激活（沿用 IMO 纪律）：settled 样本数达到 min_supported 且
+  # determinate_rate >= min_determinate_rate 才把三项信号接进 F_e_adv。
+  metrics:
+    min_supported: 30
+    min_determinate_rate: 0.8
+    weights:
+      precision: 0.10
+      actionability: 0.05
+      calibration: 0.05
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）

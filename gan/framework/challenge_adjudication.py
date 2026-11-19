@@ -139,19 +139,30 @@ def register_adjudicator(domain: str, fn: Any) -> None:
 
 
 def adjudicator_for(domain: str) -> Optional[Any]:
-    """Look up a domain adjudicator, importing ``domains.<d>.challenge_adjudication``."""
+    """Look up a domain adjudicator by importing ``domains.<pkg>.challenge_adjudication``.
+
+    ``<pkg>`` is resolved with the SAME longest-prefix discipline ``domains.yaml``
+    already uses (``balrog_babyai`` -> ``balrog``): a domain id is not a package
+    name, and the naive ``domains.balrog_babyai`` import the first port would have
+    used can never resolve -- so every balrog generation would silently settle
+    ``UNDECIDABLE`` instead of being judged.
+    """
     key = str(domain)
     if key in _ADJUDICATORS:
         return _ADJUDICATORS[key]
-    try:
-        import importlib
-        module = importlib.import_module(f"domains.{key}.challenge_adjudication")
-    except Exception:  # noqa: BLE001 -- a missing adapter is "not adjudicable"
-        return None
-    fn = getattr(module, "adjudicate", None)
-    if callable(fn):
-        _ADJUDICATORS[key] = fn
-        return fn
+    import importlib
+
+    parts = key.split("_")
+    candidates = ["_".join(parts[:i]) for i in range(len(parts), 0, -1)]
+    for pkg in candidates:
+        try:
+            module = importlib.import_module(f"domains.{pkg}.challenge_adjudication")
+        except Exception:  # noqa: BLE001 -- try the next prefix
+            continue
+        fn = getattr(module, "adjudicate", None)
+        if callable(fn):
+            _ADJUDICATORS[key] = fn
+            return fn
     return None
 
 

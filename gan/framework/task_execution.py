@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from gan.design.store import DesignStore
+from gan.framework import defect_lines
 from gan.framework.sandbox_etc import SANDBOX_HOSTNAME, validate_sandbox_etc
 from gan.patch import apply_patch
 from gan.tools.assembly import assemble_tools_dir_reported
@@ -3777,6 +3778,58 @@ def compute_report_summary(
                     beh["no_progress_class_counts"] = per_np
                     if np_unclassified:
                         beh["no_progress_class_unclassified"] = np_unclassified
+            # DEFECT-LINE CROSS-CHECK (docs/21 §3.3). The per-episode cycle line
+            # (``episodes_degenerate_revisit_share``) is computed by the HARNESS
+            # from a constant in ``domains/balrog/utils.py`` -- it has to be,
+            # because a direct ``python -m domains.harness`` run has no framework
+            # at all. The DECLARED line lives in ``domains.yaml`` and is what the
+            # challenge adjudicator (and any future checker) uses, so the same
+            # episode can be judged by two numbers that were each maintained
+            # separately. This recomputes the aggregate from the report's own
+            # per-episode rows through ``defect_lines`` and, when it disagrees
+            # with the harness value, says so ONCE per generation
+            # (``defect_line_drift``) instead of silently preferring one.
+            #
+            # ABSENT when they agree, so a run with a consistent declaration is
+            # byte-identical to the pre-docs/21 report (stage-0 gate).
+            try:
+                declared_lines = defect_lines.declared(contract)
+            except RuntimeError:
+                raise
+            cycle_line = None
+            if declared_lines:
+                cycle_line = declared_lines.get("cycle_degenerate_revisit_share")
+            if cycle_line is not None:
+                rows = report.get("episodes")
+                if isinstance(rows, list) and rows:
+                    traced = 0
+                    degenerate = 0
+                    for ep in rows:
+                        if not isinstance(ep, dict):
+                            continue
+                        if ep.get("aborted"):
+                            continue
+                        share = ep.get("revisit_share")
+                        steps = ep.get("revisit_steps")
+                        if isinstance(steps, bool) or not isinstance(steps, int):
+                            continue
+                        traced += 1
+                        if isinstance(share, (int, float)) and not isinstance(share, bool) \
+                                and float(share) >= float(cycle_line):
+                            degenerate += 1
+                    if traced:
+                        derived = degenerate / traced
+                        harness = beh.get("episodes_degenerate_revisit_share")
+                        if harness is None:
+                            beh["episodes_degenerate_revisit_share_derived"] = derived
+                        elif abs(float(harness) - derived) > 1e-9:
+                            beh["defect_line_drift"] = {
+                                "key": "cycle_degenerate_revisit_share",
+                                "declared": float(cycle_line),
+                                "harness": float(harness),
+                                "derived": derived,
+                                "traced_episodes": traced,
+                            }
             summary["behavior"] = beh
         if contract.get("kind") == "action":
             rate = report.get("invalid_action_rate")
