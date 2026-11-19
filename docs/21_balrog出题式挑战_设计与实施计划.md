@@ -404,3 +404,81 @@ challenge 通道的逐局判决**无一矛盾**。
 | 默认 `challenge.enabled: false` ⇒ 报告逐字段不变 | ✅ `compute_report_summary` 只在**不一致**时加字段；循环链路无人读 `challenge.*` |
 | 两条通道结论一致性断言 | ✅ `test_challenge_adjudication.py`（39 断言） |
 | 新增套件 | `test_challenge_ledger` 40 / `test_challenge_space` 36 / `test_challenge_adjudication` 39 |
+
+---
+
+## 13. 阶段 1a 落地记录（2026-11-19，已实现，默认仍关闭）
+
+提交 `f2da9b1`。evaluator 能**提**、框架能**收**、下一代能**真跑**；真值结算与
+eval 侧同族实例见 §13.5（尚未实现）。
+
+### 13.1 链路
+
+```
+evaluator 盲期 propose_challenge(defect_class, family, evidence_ref, repair_criterion)
+  -> EvalContext.challenges                      (工具不写账本，只记账)
+  -> loop._challenge_lock_from_eval              (评估后立刻；盲锁)
+       A 层：闭词表 / 族必须真出过该缺陷 / K 上限 / 去重 / 不引冻结 id / 多余字段拒
+       B 层：domains/balrog/challenge_space.materialize（同族题对 + 难度档 + 去重）
+       -> ckpt/challenges/ledger.json: locked -> materialized
+  -> loop._challenge_available(parent, genid)    (下一代的计划前)
+       reserve_for_child（只能被一个子代消费）
+       tx.register_challenge_episodes(genid, train_id) -> ckpt/sample_seed.json
+  -> task_broker（root 侧）把 challenge 实例并进 anchor 列表
+       plan_episodes 先填 anchor ⇒ challenge 占自己家族的旋转位，冻结 anchor 核心不动
+  -> planner 收到 challenge（无实例、无 seed、无题面）-> respond_challenge(stance)
+  -> loop._challenge_consume                     (计划会话后；一代生命周期)
+  -> loop._challenge_settle(parent, child)       (子代报告落盘后；机械判真值)
+```
+
+### 13.2 三条"不越界"的边界
+
+1. **模型不碰题面**：proposal 只有 4 个字段，多余字段直接拒（防泄漏后门）；
+   实例 seed 由框架派生（`challenge-ep` 独立 kind，与 anchor/rotate/eval 种子
+   构造性不相交）。
+2. **采样权仍在 root 侧**：challenge 实例走 `ckpt/sample_seed.json`，broker 只
+   多做一次并集；**没有新增传输通道**，worker 仍然无法决定自己考哪几题。
+3. **结算权在机械适配器**：planner 的 `respond_challenge` 只记立场（自由文本
+   不进 record），是否修好由 `domains/balrog/challenge_adjudication` 从子代自己
+   那一局判。
+
+### 13.3 写这条链路时被抓到的两个 bug
+
+- **episode 域的 anchor 核心不是 `sampling.anchor_k`**：那是**题目**计数（默认 10），
+  episode 域用 `anchor_episodes_per_task: auto = min(n, max(1, n//2))`。按 10 算，
+  预算检查会把健康运行拒掉（anchor_k(10) + max_k(2) > num_samples(10)）。现在
+  `GanLoop._challenge_anchor_k` 按域类型分支，并有断言。
+- **账本缓存属性与访问器同名**：`self._challenge_ledger = None` 遮蔽了
+  `_challenge_ledger()`，每次调用都抛 `'dict' object is not callable`。改名
+  `_challenge_cache` + `_challenge_data()`。
+
+### 13.4 离线验收（`scripts/local/test_challenge_flow.py`，57 断言）
+
+A 层 12 条（含"族里只有 aborted 局也要拒"）、B 层物化 4 条（真环境）、
+采样注入 5 条（含"同一代不得偷换实例"）、两个工具的 10 条拒绝路径、
+IPC 契约 3 条（`_validated_result` 的 exact-field-set 必须两侧同时含新字段）、
+循环级 6 条（关闭时零副作用、开预算检查 fail-closed）。
+另加 `test_challenge_tools_load.py`（loader 身份/模式门 + 归属分类）。
+
+回归：balrog 12 套（389 断言）、`test_behaviour_facts` 35、
+`test_action_classes` 26、`test_deadend_revisit` 48、框架 5 套、
+`compileall`、阶段 0 三套（40/39/36）全绿。
+
+### 13.5 阶段 1b（未做，需要决策）
+
+**`instances.eval` -> `challenge_val`**。§4.1 写的是"outer 边界额外一轮，
+固定 core 5 不可动 + challenge_val ≤ 2×K，单列不进 val_mean"。
+
+两种落地形状，代价差很多：
+
+| 形状 | 做法 | 代价 | 语义 |
+|---|---|---|---|
+| A（按原文） | outer 边界单独一轮 `cval_outer<N>`，broker 视作固定评估；只跑 challenge 实例（其它 task 用固定的 core 那一局占位） | 每个 outer +5 局（约 +1 个评估轮） | 泛化 = 超节点代码在**没见过的同族实例**上的表现 |
+| B（更省） | 与 train 同批，报告里单列 `challenge_val` | 每代 +≤2 局 | 同上，但与被测代码同批同配置 |
+
+A 需要改 `fixed_eval_launch_plan` + broker 的 scope 判定 + `DomainTaskRunner`
+的 per-call override + 计划校验，属于**固定评估完整性**那条高信任路径；
+B 只需在 `challenge_episodes` 里多放一个 id 并在报告侧分流。
+
+**推荐 A**（与决策 D2 的"outer 边界泛化确认"一致，且不改变每代的批次构成），
+但先把决策写进文档再动代码。
