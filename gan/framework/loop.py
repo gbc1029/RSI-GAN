@@ -2433,6 +2433,20 @@ class GanLoop:
             return []
         report = self._challenge_report(genid)
         rows = [r for r in (report.get("episodes") or []) if isinstance(r, dict)]
+        if not rows:
+            # NO usable report = this generation's evidence does not exist, so no
+            # family can be citable and no question can be adjudicated. Say THAT,
+            # not "the family is not in the report": the two readings cost an hour
+            # each to tell apart in the field (2026-11-19: every episode aborted on
+            # an upstream 429, the harness raised, the report never landed, and the
+            # refusal blamed the evaluator's perfectly valid family choice).
+            self.log_event({
+                "type": "challenge_rejected", "genid": str(genid),
+                "reason": ("generation_report_unavailable: the round produced no "
+                           "report rows, so no family can be evidenced"),
+                "proposals": len(proposals),
+            })
+            return []
         cfg = self._challenge_domain_cfg()
         admitted: List[Dict[str, Any]] = []
         qids: List[str] = []
