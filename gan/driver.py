@@ -644,12 +644,28 @@ def _launch_budget(cfg: Any, inner: Optional[int]) -> tuple[int, int, int]:
     value the worker will actually use: ``--inner 4`` against a yaml of 2 would
     otherwise allocate 3 launches and kill the 4th main generation with the very
     error this budget exists to prevent.
+
+    The challenge-val round (``loop._challenge_val_round``, docs/21 §4.1) is a
+    THIRD launch family and it was starved by exactly the same mistake: with
+    ``inner_max: 2`` / ``eval_samples: 1`` the budget came out ``3`` and the cval
+    round was the 4th launch of the outer, refused 2026-11-20 (run #6: gener-
+    ations 0 and 1 consumed two, the core eval round the third, and
+    ``challenge_val_round_failed: task launch budget exhausted`` ended the outer
+    with a green main line and an empty ``challenge_val`` column). It costs at
+    most ONE launch per outer -- it fires once at the outer boundary and only
+    when that outer consumed a challenge -- so the term is ``1`` whenever the
+    feature is enabled and the round is skipped for free otherwise. A budget is
+    an UPPER bound, never an allocation: over-reserving one launch costs nothing
+    (no eval runner / no consumed challenge = the launch never happens), while
+    under-reserving silently kills the round.
     """
     inner_generations = (int(inner) if inner is not None
                          else int(cfg.get("loop.inner_max", 3)))
     eval_rounds = (max(0, int(cfg.get("eval.eval_samples", 3)))
                    if bool(cfg.get("outer_select.enabled", False)) else 0)
-    return inner_generations, eval_rounds, inner_generations + eval_rounds
+    challenge_rounds = 1 if bool(cfg.get("challenge.enabled", False)) else 0
+    return (inner_generations, eval_rounds,
+            inner_generations + eval_rounds + challenge_rounds)
 
 
 def _resolve_eval_subset(raw: str, domain_config: Any) -> tuple[str, str]:
