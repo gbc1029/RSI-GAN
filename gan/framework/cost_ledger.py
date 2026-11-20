@@ -642,15 +642,17 @@ def reconcile(output_dir: str) -> Dict[str, Any]:
                     _add(f"role:{role}:{outer_name}", per_gen.get(f"{role}_{seat}"))
             # The task child stays in its own genid dir (task has no seat): the
             # main chain uses the numeric genid, the fixed-root evaluation
-            # instance uses ``eval_outer<N>_s<M>`` — and the proxy audit keys
-            # that child ``task:gen_<scope_id>`` with the SAME string, so both
-            # shapes must be collected or the eval child reads as unattributed
-            # while its tokens sit on the audit side.
+            # instance uses ``eval_outer<N>_s<M>``, the challenge-val round uses
+            # ``cval_outer<N>`` — and the proxy audit keys that child
+            # ``task:gen_<scope_id>`` with the SAME string, so every shape must be
+            # collected or the child reads as unattributed while its tokens sit
+            # on the audit side.
             for name in sorted(os.listdir(outer_dir)):
                 sub = os.path.join(outer_dir, name)
                 if not os.path.isdir(sub):
                     continue
-                if not (name.isdigit() or name.startswith("eval_outer")):
+                if not (name.isdigit() or name.startswith("eval_outer")
+                        or name.startswith("cval_outer")):
                     continue
                 rec = session_cost_from_file(
                     os.path.join(sub, "task.jsonl"),

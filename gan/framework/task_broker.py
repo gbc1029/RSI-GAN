@@ -24,11 +24,17 @@ from typing import Any, Dict, Tuple
 # Scope ids are generation ids. The main loop uses plain integers ("0","1",...);
 # the fixed-root evaluation (docs/14 §5.5, eval_on_root.eval_genid) uses the
 # isolated namespace "eval_outer<N>_s<M>" so its task rounds never collide with
-# a tree node. Both are alphanumeric + underscore only, so they are also safe as
-# a single path component under work/ (no '/', no '..').
+# a tree node; the CHALLENGE-VAL round (docs/21 §4.1) uses "cval_outer<N>" for
+# the same reason (one extra fixed round per outer). All three are alphanumeric
+# + underscore only, so they are also safe as a single path component under
+# work/ (no '/', no '..'). This allowlist is a SECURITY boundary, so a new
+# namespace is an explicit entry, never a loosened pattern: measured 2026-11-20,
+# the cval round's first real launch was refused here with "invalid task scope
+# id" -- the launcher checked the shape and the broker checked the allowlist.
 _SCOPE_RE = re.compile(
     r"(?:0|[1-9][0-9]{0,11}"
     r"|eval_outer(?:0|[1-9][0-9]{0,11})_s(?:0|[1-9][0-9]{0,11})"
+    r"|cval_outer(?:0|[1-9][0-9]{0,11})"
     r")\Z")
 _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
