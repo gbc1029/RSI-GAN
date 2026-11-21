@@ -236,6 +236,27 @@ def fitness_p(sn: Dict[str, Any], refs: List[Dict[str, Any]],
                                                      level_key=level_key)
 
 
+def _verdict_stability(sn: Dict[str, Any]) -> Optional[float]:
+    """``verdict_stability_effective`` when present, else ``verdict_stability``.
+
+    The ONE wired challenge term (docs/21 §16) lands in the effective key: the
+    per-issue mechanical truth blended with the challenge claim-accuracy under a
+    sample-size anneal. When the blend does not apply the two values are the SAME
+    float, so a pre-§16 supernode (no effective key) and a §16 one with thin
+    challenge evidence score identically -- the fallback is what makes that true
+    rather than merely intended.
+
+    Used for BOTH the candidate and the reference window: mixing the two keys
+    across a z-score reference would compare numbers with different definitions.
+    """
+    ev = sn.get("evaluator_stats") or {}
+    for key in ("verdict_stability_effective", "verdict_stability"):
+        value = ev.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
+
+
 def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
               w1: float = 0.6, w2: float = 0.4, lambda_: float = 0.2,
               novelty_k: int = 5,
@@ -270,8 +291,6 @@ def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
     ce_val = float(ce) if isinstance(ce, (int, float)) else None
     refs_ce = _ref_scalars(refs, ("evaluator_stats",), "calibration_error")
     z_ce = z_ref(ce_val, refs_ce) if ce_val is not None else 0.0
-    vs = ev.get("verdict_stability")
-    vs_val = float(vs) if isinstance(vs, (int, float)) else None
     # verdict_stability is a [0,1] per-issue hit-rate (mechanical truth from
     # issue_checks.py since the 2026-10 rewrite); z-score it against the
     # reference window so its contribution is commensurable with z_ce and
@@ -280,8 +299,12 @@ def fitness_e(sn: Dict[str, Any], refs: List[Dict[str, Any]],
     # NEUTRAL: the term is skipped (0.0), never scored as a below-average
     # hit-rate -- in particular an outer with nothing mechanically verifiable
     # is not penalised for it.
-    z_vs = (z_ref(vs_val, _ref_scalars(refs, ("evaluator_stats",),
-                                       "verdict_stability"))
+    #
+    # The value read is the EFFECTIVE one (docs/21 §16), on BOTH sides of the
+    # z-score, so the challenge blend can never compare two definitions.
+    vs_val = _verdict_stability(sn)
+    z_vs = (z_ref(vs_val, [v for v in (_verdict_stability(r) for r in refs)
+                           if v is not None])
             if vs_val is not None else 0.0)
     # F_e never compares benchmark LEVELS, but novelty() shares the scalar feature
     # vector, so its benchmark columns must still come from ONE field -- pin them

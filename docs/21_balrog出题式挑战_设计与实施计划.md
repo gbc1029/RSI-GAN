@@ -593,3 +593,70 @@ launch plan 形状、fail-closed 拒、broker scope 谓词、runner override 钩
   **不接 fitness**，且 `_challenge_stats()` 连诊断都还没有调用点。
 - 泛化结论只有 2 个可用样本（#7 训练实例仍在打转但兄弟实例正常；#8 两处一致）。
 
+
+---
+
+## 16. 出题指标接入（2026-11-21，实现完成，未做付费对照）
+
+### 16.1 为什么只接一项
+
+`F_e` 已经有三项：`-w1·z(calibration_error)`（w1=0.6，最大）、`w2·z(verdict_stability)`
+（w2=0.4）、`λ·novelty`。在此之上再挂"三项出题指标"会犯两个错：
+
+| 项 | 判定 | 理由 |
+|---|---|---|
+| `precision` → 改名 `claim_accuracy`（"我声称的缺陷真的存在吗"） | **接**，但是**混入**不是新增轴 | 它与 `verdict_stability`（"我的判定经得起机械核对"）是**同一个潜在变量**的两种仪器；相加 = 同一份证据付两次钱 |
+| `actionability` | **不接** | 分母是 planner 的响应，记在 evaluator 头上是归类错误；且会奖励"挑好修的题"，与"浅层无效就升级深层"的规则冲突 |
+| `challenge_calibration` | **不接** | `F_e` 已用 w1=0.6 读 `calibration_error`，这是它在"有题子集"上的重测 |
+
+### 16.2 落的四个东西
+
+1. **观测（此前完全缺失）**：`_challenge_stats()` 以前**没有任何调用点**。现在
+   `_record_supernode` 调它，写进 `evaluator_stats.challenge`：
+   `supported / undecidable / outer_count / claim_accuracy / actionability /
+   calibration / transferable_share / modification_scopes / state_counts /
+   authoring_rounds / authoring_missed / blend`。纯观测，零行为影响。
+2. **一个混合项**：`challenge_metrics.blend_verdict_stability(vs_issue, metrics=…)`
+   → `evaluator_stats.verdict_stability_effective`；`fitness_e` 优先读它，
+   旧 supernode（无该键）回落到 `verdict_stability`。**分子分母共用一个读取器**
+   （`fitness._verdict_stability`），z-score 两侧口径不会混。
+3. **退火而非开关**：`w = weight_max · n/(n+shrink_n0)`，n=4→0.029、n=30→0.075、
+   n=100→0.091；三道门（`n>0`、`independent_outers >= min_outer`、
+   `determinate_rate >= determinate_min`）任一不过即 `w=0`。
+4. **合规用规则**（`challenge_authoring_round`）：本代 citable 非空但没有任何题被
+   接纳 → `challenge_authoring_missed` 事件 + 计数器（"rounds / missed"）落在
+   **ledger** 上（resume 安全），并经 broker 镜像回灌给作者自己的提示词。
+   区分三种情形：没提案（`no_proposal_despite_citable`）、全被拒
+   （`no_admitted_proposal`）、框架自身失败（`judge=False`，**不算在作者头上**）。
+
+### 16.3 惰性（这是硬要求，也是唯一的行为风险）
+
+`blend` 不适用时返回的**就是** `vs_issue` 本身（同一个 float，不做任何再计算），
+因此：challenge 关闭的运行、以及 §16 之前写的 supernode，`fitness_e` **逐位不变**。
+用真实归档数据验证（`scripts/local/s16_preview.py`，第 8 轮）：
+`outer_count=1 < min_outer=3` → `w=0.0000, applied=False, effective=1.0`（= `vs_issue`）。
+
+### 16.4 顺带修掉的两个"从未被发现"的读取 bug
+
+因为 `_challenge_stats()` 从来没有调用点，`challenge_metrics.compute` 的两个读取错误
+在归档数据上一直是错的，也没人看见：
+
+- `actionability` 读的是行的**顶层**键，而真实 ledger 把它放在 `adjudication` 里 →
+  **每个归档 run 都报 0.0**。已改为两级回退（`_actionable_of`），并注明它读的是
+  "裁决是否**可判**"，不是"这条建议是否可修"——后者正确的口径是
+  `transferable_share`（`modification_scope == "transferable_strategy"` 的占比），
+  本轮一并加入。
+- `challenge_calibration` 依赖行上的 `prediction.judge_fix`，而**没有任何代码写这个键**
+  → 恒为 `None`。保留 `None`（诚实的"缺失"）并在 docstring 里写明它还没有样本，
+  而不是用 outer 级 `predicted_score`（另一个量）冒充。
+
+### 16.5 回归
+
+新增 `scripts/local/test_s16_wiring.py`（52 断言）：`outer_count` 语义、惰性（n=0 逐位
+相等）、三道门各自独立生效、退火的单调与上界、`fitness_e` 两侧同口径、旧 supernode
+回落、合规规则四种情形、以及计数器落在 ledger 上可 resume。
+十套 challenge（40/36/39/tools/77/10/17/6/11/52）+ balrog 12 套 + 框架 5 套 +
+`test_fitness_vs_norm` + `compileall` 全绿。
+
+**未做（明确留待）**：§9 阶段 2 的付费 A/B（challenge 开 vs 关、各 3 次重复）。在拿到
+那组数据之前，本篇只能说"指标接进去了且默认行为不变"，不能说"出题提升了能力"。

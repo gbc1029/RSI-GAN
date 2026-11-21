@@ -83,6 +83,19 @@ class Evaluator(Role):
                         "shows an adjudicable defect with the mechanical lines, so "
                         "do NOT call `propose_challenge` (it would be refused). "
                         "Use `report_issue` instead.\n")
+                _missed = int(_chal.get("authoring_missed") or 0)
+                _rounds = int(_chal.get("authoring_rounds") or 0)
+                # COMPLIANCE, stated as a rule (docs/21 §16). "Something was
+                # citable and you authored nothing" is checked mechanically and
+                # surfaced here so the author can see its own record; it is NOT a
+                # fitness penalty (a penalty would pay for authoring anything).
+                _compliance = ""
+                if _missed:
+                    _compliance = (
+                        f"\n- Your record: {_missed} of {_rounds} round(s) offered "
+                        "citable evidence and you filed nothing. When the list above "
+                        "is non-empty, authoring at least one challenge is "
+                        "EXPECTED; filing nothing is recorded as a miss.\n")
                 parts.append(
                     "\n## Optional: author a challenge (same-family fresh episode)\n"
                     "If a defect you found is about HOW the agent plays (not about one "
@@ -98,8 +111,13 @@ class Evaluator(Role):
                     "The framework draws a fresh episode of that family -- you never see "
                     "the level or its seed -- and a mechanical check decides later "
                     "whether the defect is gone. Do not describe a level, a seed or an "
-                    "answer. This is optional and blind-phase-only; a challenge you "
-                    "cannot support costs you precision."
+                    "answer. This is optional and blind-phase-only.\n"
+                    "- What a claim costs: a challenge whose family did not really show "
+                    "the defect LOWERS YOUR CLAIM ACCURACY (was the defect really "
+                    "there), and that number is blended into your verdict_stability "
+                    "once enough challenges have settled. Claiming only what you can "
+                    "point at is strictly better than claiming more."
+                    f"{_compliance}"
                 )
         elif benchmark_score is not None:
             # C1 ablation (ablation.disable_blind=true): the objective score is

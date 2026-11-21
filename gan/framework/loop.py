@@ -647,6 +647,18 @@ class GanLoop:
             "calibration": float(cfg.get("challenge.metrics.weights.calibration",
                                          _challenge_metrics.DEFAULT_WEIGHTS["calibration"]) or 0.0),
         }
+        # THE WIRED PATH (docs/21 §16). One term only -- the claim accuracy --
+        # blended into ``verdict_stability`` with a sample-size anneal. Read here
+        # so a design/CLI change moves one place; the inertness rule is that with
+        # no settled challenge the blend returns the un-blended number EXACTLY.
+        self.challenge_diagnose = bool(cfg.get("challenge.metrics.diagnose", True))
+        self.challenge_fitness_cfg = {
+            "weight_max": float(cfg.get("challenge.metrics.fitness.weight_max", 0.10) or 0.0),
+            "shrink_n0": float(cfg.get("challenge.metrics.fitness.shrink_n0", 10.0) or 0.0),
+            "min_outer": int(cfg.get("challenge.metrics.fitness.min_outer", 3) or 0),
+            "determinate_min": float(
+                cfg.get("challenge.metrics.fitness.determinate_min", 0.8) or 0.0),
+        }
         self.challenge_domain = (self.domains[0] if self.domains else "")
         self._challenge_cfg_state = {"authorable": False, "reason": "disabled"}
         # Closed vocabularies the author may use (empty when authoring is off).
@@ -2415,6 +2427,57 @@ class GanLoop:
                                    _challenge_ledger_mod.empty(self.challenge_domain),
                                    self.ledger_writer, self.challenge_domain)
 
+    def _challenge_authoring_round(self, genid: Any, proposals: int,
+                                   admitted: int, *, judge: bool = True) -> None:
+        """Record whether this round's authoring was COMPLIANT (docs/21 §16).
+
+        A RULE, not a score. "There was something citable and you authored
+        nothing" is a compliance failure; making it a fitness penalty would pay
+        the evaluator for authoring something -- anything -- which is the failure
+        mode the closed vocabularies exist to prevent. So it is an event plus two
+        counters (``rounds`` / ``missed``) persisted on the ledger, and the count
+        is mirrored to the author's next session so it can see its own record.
+
+        The citable table is read from the broker mirror because that is exactly
+        what the author was SHOWN before it wrote: judging compliance against a
+        table recomputed afterwards would let a mid-round difference create a
+        violation nobody could have avoided.
+        """
+        try:
+            shown = ((getattr(self.broker, "challenge", None) or {}).get("citable") or {})
+            shown = (shown.get(str(genid)) or shown) if isinstance(shown, dict) else {}
+            families = sum(len(v) for v in shown.values() if isinstance(v, dict)) \
+                if shown else 0
+            ledger = self._challenge_data()
+            book = ledger.get("authoring")
+            if not isinstance(book, dict):
+                book = {}
+            book["rounds"] = int(book.get("rounds") or 0) + 1
+            reason = ""
+            if judge and families and admitted <= 0:
+                reason = ("no_proposal_despite_citable" if proposals <= 0
+                          else "no_admitted_proposal")
+                book["missed"] = int(book.get("missed") or 0) + 1
+                book["last_reason"] = reason
+                book["last_genid"] = str(genid)
+            book["last_citable_families"] = int(families)
+            book["last_proposals"] = int(proposals)
+            book["last_admitted"] = int(admitted)
+            ledger["authoring"] = book
+            self._challenge_save()
+            if reason:
+                self.log_event({"type": "challenge_authoring_missed",
+                                "genid": str(genid), "reason": reason,
+                                "citable_families": int(families),
+                                "proposals": int(proposals),
+                                "admitted": int(admitted),
+                                "missed_total": int(book["missed"]),
+                                "rounds_total": int(book["rounds"])})
+        except Exception as e:  # noqa: BLE001 -- compliance bookkeeping is advisory
+            self.log_event({"type": "challenge_authoring_book_failed",
+                            "genid": str(genid),
+                            "error": f"{type(e).__name__}: {e}"[:300]})
+
     def _challenge_lock_from_eval(self, ctx: Any, genid: Any,
                                   outer: int) -> List[str]:
         """Lock the evaluator's proposals for this generation (blind, bounded).
@@ -2431,6 +2494,9 @@ class GanLoop:
         proposals = [dict(c) for c in (getattr(ctx, "challenges", None) or [])
                      if isinstance(c, dict)]
         if not proposals:
+            # Still a ROUND: the author was shown a citable table and produced
+            # nothing. Recorded before the early return (docs/21 §16).
+            self._challenge_authoring_round(genid, 0, 0)
             return []
         report = self._challenge_report(genid)
         rows = [r for r in (report.get("episodes") or []) if isinstance(r, dict)]
@@ -2447,6 +2513,9 @@ class GanLoop:
                            "report rows, so no family can be evidenced"),
                 "proposals": len(proposals),
             })
+            # No report = the published table was empty too, so this is a ROUND
+            # with nothing citable: counted, never blamed on the author.
+            self._challenge_authoring_round(genid, len(proposals), 0, judge=False)
             return []
         cfg = self._challenge_domain_cfg()
         admitted: List[Dict[str, Any]] = []
@@ -2494,6 +2563,7 @@ class GanLoop:
                 admitted.append(row)
                 qids.append(qid)
             if not admitted:
+                self._challenge_authoring_round(genid, len(proposals), 0)
                 return []
             ids = _challenge_ledger_mod.lock(
                 ledger, domain=self.challenge_domain, outer=outer,
@@ -2539,10 +2609,13 @@ class GanLoop:
                     "band": pair.get("band"),
                 })
             self._challenge_save()
+            self._challenge_authoring_round(genid, len(proposals), len(admitted))
             return ids
         except Exception as e:  # noqa: BLE001 -- challenge machinery never sinks a round
             self.log_event({"type": "challenge_lock_failed", "genid": str(genid),
                             "error": f"{type(e).__name__}: {e}"[:400]})
+            # A framework failure is not an authoring miss: count the round only.
+            self._challenge_authoring_round(genid, len(proposals), 0, judge=False)
             return []
 
     def _run_base_seed(self) -> Optional[int]:
@@ -2858,7 +2931,23 @@ class GanLoop:
                             "error": f"{type(e).__name__}: {e}"[:300]})
 
     def _challenge_stats(self) -> Dict[str, Any]:
-        """Cumulative challenge metrics (DIAGNOSTICS -- never a fitness term)."""
+        """Cumulative challenge metrics -- OBSERVABILITY + the ONE wired term.
+
+        Docs/21 §16 (2026-11-21). Before this, NOTHING called this method: the
+        three terms were computed nowhere, written nowhere, and the evaluator's
+        prompt still promised consequences for them. Now the supernode carries the
+        numbers, and exactly ONE of them moves fitness -- ``claim_accuracy``,
+        blended into ``verdict_stability`` by
+        ``challenge_metrics.blend_verdict_stability``.
+
+        Deliberately NOT wired (see that module's docstring): ``actionability``
+        (its denominator is the planner's response) and ``challenge_calibration``
+        (``F_e`` already pays for ``calibration_error`` at weight 0.6).
+
+        Authoring COMPLIANCE rides here too, as a rule rather than a score: a
+        generation whose published citable table was non-empty but which got no
+        admitted challenge is recorded as ``challenge_authoring_missed``.
+        """
         if not self.challenge_enabled:
             return {}
         try:
@@ -2868,11 +2957,10 @@ class GanLoop:
             metrics = _challenge_metrics.compute(rows)
             gate = _challenge_metrics.activation_status(metrics, **self.challenge_metrics_cfg)
             metrics["gate"] = gate
-            # Fitness is computed but DELIBERATELY not consumed anywhere yet
-            # (stage 1): the three-term combination is gated on
-            # ``supported >= 30`` and this stage never has that many, so it
-            # reports 0.0 while the diagnostics stay visible.
-            metrics["fitness"] = _challenge_metrics.fitness_terms(
+            metrics["authoring"] = dict(ledger.get("authoring") or {})
+            # Kept for the audit trail only: this is the IMO three-term
+            # combination and NOTHING consumes its score (docs/21 §16).
+            metrics["fitness_legacy"] = _challenge_metrics.fitness_terms(
                 metrics, active=gate["active"], weights=self.challenge_weights)
             return metrics
         except Exception as e:  # noqa: BLE001
@@ -3051,6 +3139,77 @@ class GanLoop:
                 tr = {"verified": 0, "hits": 0, "unsupported": 0, "judged": 0}
                 verdict_stability = None
 
+            # CHALLENGE WIRING (docs/21 §16). Two facts, one meaning:
+            #
+            #   * ``challenge`` -- the numbers, OBSERVED for the first time (until
+            #     now `_challenge_stats` had no caller at all, so the three terms
+            #     existed only in a docstring while the evaluator's prompt still
+            #     threatened consequences for them);
+            #   * ``verdict_stability_effective`` -- the ONE thing that moves
+            #     fitness: ``claim_accuracy`` blended into the per-issue truth with
+            #     a sample-size anneal. It is IDENTICAL to ``verdict_stability``
+            #     whenever the blend does not apply, so this run's fitness matches
+            #     a pre-§16 run exactly when the challenge evidence is thin.
+            #
+            # ``fitness_e`` prefers the effective value and falls back, so old
+            # supernodes (no key) keep their old meaning.
+            challenge_block: Dict[str, Any] = {}
+            vs_effective = verdict_stability
+            try:
+                if self.challenge_enabled:
+                    cstats = self._challenge_stats()
+                    if cstats and not cstats.get("error"):
+                        blend = _challenge_metrics.blend_verdict_stability(
+                            verdict_stability, metrics=cstats,
+                            **self.challenge_fitness_cfg)
+                        vs_effective = blend["value"]
+                        book = cstats.get("authoring") or {}
+                        challenge_block = {
+                            "supported": cstats.get("supported_challenges"),
+                            "undecidable": cstats.get("undecidable_challenges"),
+                            # the three terms: FIRST is wired (blended), the other
+                            # two are diagnostics by decision (see the module
+                            # docstring for why they must not be scored)
+                            "claim_accuracy": cstats.get("claim_accuracy"),
+                            "actionability": cstats.get("actionability_rate"),
+                            "calibration": cstats.get("challenge_calibration"),
+                            # diagnostic that answers "did the planner learn a
+                            # method": share of transferable-strategy verdicts
+                            "transferable_share": cstats.get("transferable_share"),
+                            "modification_scopes": cstats.get("modification_scopes"),
+                            "state_counts": cstats.get("state_counts"),
+                            "outer_count": cstats.get("outer_count"),
+                            # compliance (a RULE, never a score)
+                            "authoring_rounds": book.get("rounds"),
+                            "authoring_missed": book.get("missed"),
+                            "authoring_last_reason": book.get("last_reason"),
+                            "blend": blend,
+                        }
+            except Exception as e:  # noqa: BLE001 -- never sink the supernode
+                challenge_block = {"error": f"{type(e).__name__}: {e}"[:300]}
+
+            epayload = {
+                "issues_per_task": (len(issues) / len(outer_genids)) if outer_genids else None,
+                "severity": severity,
+                "eval_points_run": sorted(eval_points),
+                "bias": bias,
+                "rule_violation": rule_violation,
+                "calibration_error": calibration_error,
+                "verdict_stability": verdict_stability,
+                # Diagnostic basis + counters: a supernode recorded before
+                # this rewrite carries the OLD definition (whole-outer
+                # verdict vector vs one shared bit) and cannot be recomputed,
+                # so offline analysis needs to tell them apart. Not consumed
+                # by fitness.
+                "verdict_stability_basis": "issue_key_checks",
+                "verdict_verified": tr["verified"],
+                "verdict_hits": tr["hits"],
+                "verdict_unsupported": tr["unsupported"],
+                # equal to verdict_stability unless the challenge blend applies
+                "verdict_stability_effective": vs_effective,
+                "challenge": challenge_block,
+            }
+
             payload = {
                 "outer": outer,
                 "planner_design_hash": self._design_hash("planner"),
@@ -3094,24 +3253,7 @@ class GanLoop:
                     "reevaluated": False,    # -> true after evaluate_on_root (B4)
                 },
                 "planner_stats": {"op_dist": op_dist, "response_kind": response_kind},
-                "evaluator_stats": {
-                    "issues_per_task": (len(issues) / len(outer_genids)) if outer_genids else None,
-                    "severity": severity,
-                    "eval_points_run": sorted(eval_points),
-                    "bias": bias,
-                    "rule_violation": rule_violation,
-                    "calibration_error": calibration_error,
-                    "verdict_stability": verdict_stability,
-                    # Diagnostic basis + counters: a supernode recorded before
-                    # this rewrite carries the OLD definition (whole-outer
-                    # verdict vector vs one shared bit) and cannot be recomputed,
-                    # so offline analysis needs to tell them apart. Not consumed
-                    # by fitness.
-                    "verdict_stability_basis": "issue_key_checks",
-                    "verdict_verified": tr["verified"],
-                    "verdict_hits": tr["hits"],
-                    "verdict_unsupported": tr["unsupported"],
-                },
+                "evaluator_stats": epayload,
             }
             record_supernode(self.output_dir, outer, payload, writer=self.ledger_writer)
             self.log_event({"type": "supernode_recorded", "outer": outer,
@@ -4345,6 +4487,16 @@ class GanLoop:
         cur = dict(getattr(self.broker, "challenge") or {})
         cur["citable"] = table
         cur["citable_genid"] = str(genid)
+        # Compliance record (docs/21 §16): the author is told its OWN count so
+        # "last round there were two citable families and you authored nothing"
+        # is visible to the entity that can act on it. A rule, not a score.
+        try:
+            book = (self._challenge_data() or {}).get("authoring") or {}
+            cur["authoring_missed"] = int(book.get("missed") or 0)
+            cur["authoring_rounds"] = int(book.get("rounds") or 0)
+        except Exception:  # noqa: BLE001 -- advisory mirror
+            cur.setdefault("authoring_missed", 0)
+            cur.setdefault("authoring_rounds", 0)
         self.broker.challenge = cur
         self.log_event({"type": "challenge_citable", "genid": str(genid),
                         "citable": table})
@@ -5140,8 +5292,14 @@ class GanLoop:
                 child.source_access_log = self._source_access_log(outer)
                 # CHALLENGE truth (docs/21 §5): now that the child's own episode
                 # rows exist, the mechanical adjudicator can decide each challenge
-                # this generation was asked to answer. Diagnostics only -- the
-                # result never feeds fitness in this stage.
+                # this generation was asked to answer.
+                #
+                # It DOES now reach fitness, indirectly and only through ONE
+                # number (docs/21 §16): the settled states feed
+                # ``claim_accuracy``, which ``_record_supernode`` blends into
+                # ``verdict_stability_effective`` under a sample-size anneal. The
+                # verdict itself is still immutable and still never a direct
+                # reward -- there is no "repaired => points" path.
                 self._challenge_settle(parent, child, outer)
                 self.task_tree.add_node(child)
                 self._append_score(child)

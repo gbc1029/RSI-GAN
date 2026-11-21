@@ -379,6 +379,13 @@ def challenge_config() -> Dict[str, Any]:
         max_k = int(cfg.get("max_k") or 0)
     except (TypeError, ValueError):
         max_k = 0
+
+    def _int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def _list(name: str) -> List[str]:
         value = cfg.get(name)
         if not isinstance(value, (list, tuple)):
@@ -417,4 +424,10 @@ def challenge_config() -> Dict[str, Any]:
         # family currently shows an adjudicable defect (do NOT challenge).
         "citable": _citable(cfg.get("citable")),
         "citable_genid": str(cfg.get("citable_genid") or ""),
+        # Compliance record for the AUTHOR (docs/21 §16): how many rounds so far
+        # published something citable and still produced no admitted challenge.
+        # It is a rule, not a score -- the note tells the author its own record;
+        # it does NOT move fitness.
+        "authoring_missed": max(0, _int(cfg.get("authoring_missed"))),
+        "authoring_rounds": max(0, _int(cfg.get("authoring_rounds"))),
     }

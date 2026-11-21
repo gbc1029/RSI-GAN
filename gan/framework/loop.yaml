@@ -248,11 +248,29 @@ challenge:
   # 结算用：修复判据 D3 的进度容差（0 = 同族同档下"不许降"）。
   progression_tol: 0.0
   # 两阶段激活（沿用 IMO 纪律）：settled 样本数达到 min_supported 且
-  # determinate_rate >= min_determinate_rate 才把三项信号接进 F_e_adv。
+  # determinate_rate >= min_determinate_rate 才认为证据够（历史口径，仍记录）。
+  #
+  # ---- docs/21 §16：真正接进 fitness 的路径（2026-11-21）-------------------
+  # 三项里只接**第一项**，而且不作为独立权重轴：
+  #   claim_accuracy（= 旧 precision_smoothed，"我声称的缺陷真的存在吗"）
+  #   通过 blend_verdict_stability **混入 verdict_stability**，写入
+  #   evaluator_stats.verdict_stability_effective；fitness_e 优先读它。
+  # 不接的两项（决定，不是遗漏）：
+  #   actionability —— 分母是 planner 的响应，记在 evaluator 头上会奖励"挑好修的题"；
+  #   calibration   —— F_e 已经用 w1=0.6 读 calibration_error，同一潜在变量的第二份钱。
+  # 退火而非开关：w = weight_max * n/(n+shrink_n0)。n=4→0.029、n=30→0.075、
+  # n=100→0.091。样本不足时该值**逐位等于**未混合的 verdict_stability，
+  # 所以关闭 challenge 的运行与 §16 之前的运行 fitness 完全一致。
   metrics:
-    min_supported: 30
+    diagnose: true             # 每 outer 把指标写进 supernode（观测，零行为影响）
+    min_supported: 30          # 旧门槛，只用于 fitness_legacy 审计列
     min_determinate_rate: 0.8
-    weights:
+    fitness:
+      weight_max: 0.10         # claim_accuracy 对 verdict_stability 的权重上限
+      shrink_n0: 10            # 贝叶斯收缩尺度：w = weight_max * n/(n+n0)
+      min_outer: 3             # settled 题来自的**独立 outer** 少于此 → w=0
+      determinate_min: 0.8     # determinate_rate 低于此 → w=0
+    weights:                   # 旧三项权重：仅 fitness_legacy 审计列使用，不进 fitness
       precision: 0.10
       actionability: 0.05
       calibration: 0.05

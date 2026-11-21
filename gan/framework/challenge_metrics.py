@@ -22,6 +22,19 @@ counts and ``repair_rate`` stay in the diagnostics column.
 Two-stage activation (IMO discipline, kept): nothing is scored until
 ``supported >= min_supported`` AND ``determinate_rate >= min_determinate_rate``,
 so an arm cannot be selected on three lucky challenges.
+
+WIRED PATH (docs/21 §16, 2026-11-21) -- what actually ships
+-----------------------------------------------------------
+Of the three terms above only the FIRST one is wired, and not as its own weight
+axis: ``precision_smoothed`` (renamed ``claim_accuracy``: "was the defect I
+claimed really there") is blended into ``verdict_stability`` by
+``blend_verdict_stability`` with a sample-size anneal. ``actionability`` is
+deliberately NOT wired (its denominator is the planner's response, so scoring it
+as the evaluator's ability rewards picking easy-to-fix defects) and
+``challenge_calibration`` is NOT wired either (``F_e`` already reads
+``calibration_error`` at weight 0.6 -- the same latent variable, so a second term
+would pay twice). ``fitness_terms`` below is kept for audit and for the IMO
+parity record; it is NOT the wired path and nothing consumes its ``score``.
 """
 from __future__ import annotations
 
@@ -55,12 +68,47 @@ def _state_of(row: Mapping[str, Any]) -> Optional[str]:
 
 
 def _predicted_fix(row: Mapping[str, Any]) -> Optional[bool]:
-    """The evaluator's own ``judge_fix`` prediction attached to the row."""
+    """The evaluator's own ``judge_fix`` prediction attached to the row.
+
+    NOTE (2026-11-21): nothing writes this key today, so ``challenge_calibration``
+    reports ``None`` -- an honest ABSENCE, not a zero. Measured on the archived
+    runs: the ledger rows carry ``adjudication`` but no ``prediction``, so the
+    agreement rate has no samples. Left as-is rather than faked from the
+    evaluator's outer-level ``predicted_score`` (a different quantity).
+    """
     prediction = row.get("prediction")
     if not isinstance(prediction, Mapping):
         return None
     value = prediction.get("judge_fix")
     return value if isinstance(value, bool) else None
+
+
+def _verdict_of(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The immutable adjudication block of a ledger row (or empty)."""
+    result = row.get("adjudication")
+    return result if isinstance(result, Mapping) else {}
+
+
+def _actionable_of(row: Mapping[str, Any]) -> Optional[bool]:
+    """Did the ADJUDICATOR decide the claim?
+
+    Lives inside ``adjudication`` on a real ledger row; the top-level key is
+    accepted for hand-built fixtures. Measured 2026-11-21: reading only the
+    top-level key made ``actionability_rate`` report 0.0 for every archived run
+    -- and because this module had no caller, nothing noticed.
+
+    READ IT AS "the verdict was decidable", NOT "the claim was fixable": the
+    domain adapter sets it to true whenever both presence bits are known, and the
+    state machine then REQUIRES it for any determinate state. The genuinely
+    interesting question -- was the planner's change a transferable strategy
+    rather than instance-specific knowledge -- is ``modification_scope``, counted
+    below as ``transferable_share``.
+    """
+    for source in (row, _verdict_of(row)):
+        value = source.get("actionable")
+        if isinstance(value, bool):
+            return value
+    return None
 
 
 def _truth_repaired(state: str) -> Optional[bool]:
@@ -82,6 +130,7 @@ def compute(rows: Iterable[Mapping[str, Any]],
             point_gains: Optional[Mapping[str, float]] = None) -> dict:
     """Compute the metrics from immutable settled challenge rows."""
     counts: Counter = Counter()
+    scopes: Counter = Counter()
     agree = 0
     calibrated = 0
     actionable = 0
@@ -93,9 +142,11 @@ def compute(rows: Iterable[Mapping[str, Any]],
         if state is None:
             continue
         counts[state] += 1
-        # actionability: the mechanical "was this claim in the closed vocabulary
-        # and about a family the parent actually played" check (stage 1 fills it)
-        if row.get("actionable") is True:
+        scope = _verdict_of(row).get("modification_scope")
+        scopes[str(scope)] += 1
+        # actionability: see _actionable_of -- it is the DECIDABILITY of the
+        # verdict, kept because the legacy three-term combination reads it.
+        if _actionable_of(row) is True:
             actionable += 1
         predicted = _predicted_fix(row)
         truth = _truth_repaired(state)
@@ -126,11 +177,32 @@ def compute(rows: Iterable[Mapping[str, Any]],
         "state_counts": {state: counts[state] for state in _STATES},
         "supported_challenges": supported,
         "undecidable_challenges": u,
+        # How many INDEPENDENT outers produced DETERMINATE settled rows. This is
+        # the sample-size guard a raw count cannot express: 30 challenges from one
+        # outer share one planner trajectory, so they are not 30 independent
+        # observations (see ``blend_verdict_stability``). An outer whose only
+        # challenges were UNDECIDABLE contributed no claim evidence, so counting
+        # it would inflate the guard -- the exact "n looks big, evidence is thin"
+        # mistake this field exists to prevent.
+        "outer_count": len({row.get("outer") for row in (rows or ())
+                            if isinstance(row, Mapping)
+                            and _state_of(row) not in (None, adjudication.UNDECIDABLE)
+                            and row.get("outer") is not None}),
         # --- fitness terms (docs/21 §7) ---
         "precision_raw": _ratio(a + b, supported),
         "precision_smoothed": float((a + b + 1) / (supported + 2)),
+        # Same quantity under the name the WIRED path uses: "was the defect I
+        # claimed really there". ``precision`` is the historical label; keeping
+        # both means the audit reads a term whose meaning is not in doubt.
+        "claim_accuracy": float((a + b + 1) / (supported + 2)),
         "actionability_rate": _ratio(actionable, supported + u),
         "challenge_calibration": _ratio(agree, calibrated),
+        # The diagnostic that actually answers "did the planner learn a METHOD":
+        # share of determinate verdicts whose change was judged a transferable
+        # strategy (the alternative scopes are instance_specific_memory /
+        # answer_leakage / uncertain).
+        "transferable_share": _ratio(scopes.get("transferable_strategy", 0), supported),
+        "modification_scopes": dict(scopes),
         # --- diagnostics only: never a fitness term (docs/21 §7) ---
         "repair_rate_raw": _ratio(a, a + b),
         "repair_rate_smoothed": float((a + 1) / (a + b + 2)),
@@ -139,6 +211,83 @@ def compute(rows: Iterable[Mapping[str, Any]],
         "mean_anchor_point_gain": (
             float(sum(gains) / len(gains)) if gains else None),
         "point_gain_count": len(gains),
+    }
+
+
+def blend_verdict_stability(vs_issue: Any, *,
+                            metrics: Mapping[str, Any],
+                            weight_max: float = 0.10,
+                            shrink_n0: float = 10.0,
+                            min_outer: int = 3,
+                            determinate_min: float = 0.8) -> dict:
+    """Blend the challenge claim-accuracy into ``verdict_stability`` (docs/21 §16).
+
+    WHY A BLEND AND NOT A NEW TERM. ``F_e`` already reads
+    ``evaluator_stats.calibration_error`` with the LARGEST weight (0.6), and
+    ``verdict_stability`` is the per-issue mechanical truth. A separate
+    ``w3 * precision`` would (a) pay twice for the same evidence -- "is what I
+    claimed actually true" is ONE latent variable, measured by two instruments --
+    and (b) leave room for two standards over two sample sets. A convex blend
+    instead lets the STRONGER instrument (a claim that survived independent
+    instantiation) pull the same number, without changing the axis.
+
+    WHY IT SHRINKS. The challenge evidence is tiny and self-selected (the author
+    picks what to claim), so it may only move the number once there are enough
+    INDEPENDENT outers and the rows are mostly determinate. ``w = weight_max *
+    n / (n + shrink_n0)``: n=4 -> 0.029, n=30 -> 0.075, n=100 -> 0.091. That is
+    deliberately an anneal, not a switch: an on/off gate would either ignore the
+    signal forever (the ``supported >= 30`` trap this project already hit) or
+    jump the fitness landscape.
+
+    INERTNESS (the hard requirement): when no term applies, the returned value IS
+    ``vs_issue`` unchanged -- same object, same float -- so a run with the
+    challenge machinery off is byte-identical to one that predates it.
+
+    ``vs_issue`` None means the issue channel had nothing mechanically verifiable
+    this outer; the blend then still yields None unless it applies, in which case
+    the challenge rate stands in as the only available truth.
+    """
+    n = int(metrics.get("supported_challenges") or 0)
+    undecidable = int(metrics.get("undecidable_challenges") or 0)
+    outers = int(metrics.get("outer_count") or 0)
+    total = n + undecidable
+    determinate = float(n / total) if total else 0.0
+    claim = metrics.get("claim_accuracy")
+    reasons = []
+    if n <= 0:
+        reasons.append("no_settled_challenges")
+    if outers < int(min_outer):
+        reasons.append(f"independent_outers<{int(min_outer)}")
+    if determinate < float(determinate_min):
+        reasons.append("determinate_rate_low")
+    if not isinstance(claim, (int, float)) or isinstance(claim, bool):
+        # nothing to blend IN: reporting a non-zero w here would document a
+        # weight that is not used
+        reasons.append("claim_accuracy_missing")
+    w = 0.0
+    if not reasons:
+        w = float(weight_max) * (n / (n + float(shrink_n0)))
+    base = float(vs_issue) if isinstance(vs_issue, (int, float)) \
+        and not isinstance(vs_issue, bool) else None
+    if w <= 0.0 or not isinstance(claim, (int, float)):
+        value = base          # INERT: identical to the un-blended number
+        applied = False
+    elif base is None:
+        value = float(claim)
+        applied = True
+    else:
+        value = (1.0 - w) * base + w * float(claim)
+        applied = True
+    return {
+        "value": value,
+        "applied": bool(applied),
+        "w": float(w),
+        "vs_issue": base,
+        "claim_accuracy": (float(claim) if isinstance(claim, (int, float)) else None),
+        "samples": n,
+        "outer_count": outers,
+        "determinate_rate": determinate,
+        "reason": ",".join(reasons),
     }
 
 
@@ -204,4 +353,5 @@ def fitness_terms(metrics: Mapping[str, Any], *,
     }
 
 
-__all__ = ["DEFAULT_WEIGHTS", "activation_status", "compute", "fitness_terms"]
+__all__ = ["DEFAULT_WEIGHTS", "activation_status", "blend_verdict_stability",
+           "compute", "fitness_terms"]
