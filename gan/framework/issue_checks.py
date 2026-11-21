@@ -100,6 +100,27 @@ DEFAULT_PARAMS: Dict[str, float] = {
     # Traced episodes needed before a share claim is decidable (aborted episodes
     # carry no trace, so the denominator is smaller than the episode count).
     "behavior_min_episodes": 4,
+    # `calibration.{under,over}-prediction` (2026-11-21). The evaluator's own
+    # `predicted_score` against the realized score of the SAME generation.
+    #
+    # 0.15 = one episode of resolution (1/10 = 0.1 on the standard 10-episode
+    # generation) plus margin. NOT yet calibrated against a real bias case: the
+    # four archived runs predicted 0.55/0.60, 0.80/0.80, 0.40/0.40 and
+    # 0.50/0.50, i.e. the maximum observed error is 0.05, five-fold inside the
+    # line. Provisional by construction and recorded as such -- a case that fires
+    # is what would calibrate it.
+    "calibration_tol": 0.15,
+    # `process.observability` (2026-11-21). The archived task transcript must
+    # carry at least this many rows PER STEP: a step child writes its own
+    # assistant/tool rows, so one step never lands as one row.
+    #
+    # Measured on three healthy runs (rows / steps_total):
+    #   2.67, 2.02, 2.00 (run #8)  3.00 / 3.00 / 3.00 (run #7)  3.00 / 3.00 / 3.00 (run #6)
+    # A floor of 1.0 therefore has a 2x margin on the healthy side, and the
+    # historical failure it exists to catch (2026-11-08 `balrog_verify_1108a`:
+    # 10 episodes / 98 step children archived as 10 rows, i.e. ~0.1) sits an
+    # order of magnitude BELOW it.
+    "observability_min_rows_per_step": 1.0,
 }
 
 _INFRA_REASONS = frozenset({
@@ -146,11 +167,22 @@ def generation_facts(node: Any) -> Dict[str, Any]:
         "harness_rc": meta.get("harness_rc"),
         "invalid_reason": meta.get("invalid_reason"),
         "toolset_report": meta.get("toolset_report"),
+        # The evaluator's own blind prediction for THIS generation, stamped on
+        # the node by the loop before the verdicts are judged. `score` above is
+        # the realized value, so the pair is {prediction, outcome} -- the only
+        # facts `calibration.*` needs.
+        "predicted_score": meta.get("predicted_score"),
         # Grant health of the generation's outer (stamped by the loop from the
         # broker's audit): True = at least one granted path was NOT readable in
         # the workspace, False = every grant verified readable, None = no grant
         # happened (or the audit predates the self-check) -> undecidable.
         "grant_unreadable": None,
+        # Observability of the generation's own trace (stamped by the loop from
+        # the archive + report): how many JSONL rows the evaluator can actually
+        # read, against how many steps the run claims to have taken. None = the
+        # archive or the report is absent -> `process.observability` undecidable.
+        "trajectory_rows": None,
+        "steps_total": None,
     }
 
 
@@ -417,6 +449,80 @@ def _pair_overcorrection(parent: Dict[str, Any], child: Dict[str, Any],
                  {"inverted": inverted, "worse": worse}, detail)
 
 
+# ---------------------------------------------------------------------------
+# CHECKERS ADDED 2026-11-21 (docs/21 §17): the three keys that had NONE
+# ---------------------------------------------------------------------------
+def _chk_calibration_under(facts: Dict[str, Any], p: Dict[str, float]) -> Check:
+    """The evaluator's blind prediction was TOO LOW for this generation.
+
+    Owner is the evaluator, so the "repair" this truth tracks is the evaluator's
+    own next round: `pair_truth` asks "under-predicting in the parent -> not
+    under-predicting in the child", which is exactly what `calibration_error`
+    measures outer-wide. The per-ISSUE version exists so the ledger can hold a
+    stance and a mechanical verdict for the claim the evaluator itself made.
+
+    Both numbers come from the same generation: `predicted_score` (blind) and
+    `score` (realized). A missing or failed score is UNKNOWN -- never "not
+    mispredicted", which would pay a free hit to every unscored generation.
+    """
+    return _calibration(facts, p, direction="under")
+
+
+def _chk_calibration_over(facts: Dict[str, Any], p: Dict[str, float]) -> Check:
+    """The evaluator's blind prediction was TOO HIGH (the mirror image)."""
+    return _calibration(facts, p, direction="over")
+
+
+def _calibration(facts: Dict[str, Any], p: Dict[str, float], *,
+                 direction: str) -> Check:
+    pred = facts.get("predicted_score")
+    score = facts.get("score")
+    if not isinstance(pred, (int, float)) or isinstance(pred, bool) \
+            or not isinstance(score, (int, float)) or isinstance(score, bool):
+        return _unknown("needs both predicted_score and a realized score")
+    if str(facts.get("score_status") or "") not in ("ok", "partial"):
+        return _unknown(f"score_status={facts.get('score_status')!r}")
+    tol = float(p.get("calibration_tol", DEFAULT_PARAMS["calibration_tol"]))
+    diff = float(score) - float(pred)
+    present = (diff > tol) if direction == "under" else ((-diff) > tol)
+    return _flag(
+        present,
+        {"predicted": float(pred), "actual": float(score),
+         "diff": diff, "tol": tol},
+        f"predicted {float(pred):.3f} vs actual {float(score):.3f} "
+        f"(diff {diff:+.3f}, tol {tol:.2f})",
+    )
+
+
+def _chk_observability(facts: Dict[str, Any], p: Dict[str, float]) -> Check:
+    """The evaluator could NOT see the generation's own steps.
+
+    This is the defect that blinded the evaluator for a whole round before anyone
+    noticed (2026-11-08: the task agent truncates its transcript at construction,
+    so a multi-step episode kept only its LAST step; 10 episodes / 98 step
+    children archived as 10 rows). The framework-owned mitigation is the parent
+    dropping such a reset, but nothing MEASURED the outcome until now.
+
+    The rule is a ratio against the report's own step count, because a step child
+    writes several rows (its assistant/tool turns), never one:
+    ``rows < steps_total * observability_min_rows_per_step`` -> PRESENT.
+
+    Both facts are stamped by the loop (archive + report are I/O). Missing either
+    is UNKNOWN: a question-domain generation has no `steps_total`, and its
+    per-question transcript cannot be judged by this line.
+    """
+    rows = facts.get("trajectory_rows")
+    steps = facts.get("steps_total")
+    if not isinstance(rows, int) or not isinstance(steps, (int, float)) or steps <= 0:
+        return _unknown("needs the archived row count AND the report's steps_total")
+    floor = float(p.get("observability_min_rows_per_step",
+                        DEFAULT_PARAMS["observability_min_rows_per_step"]))
+    ratio = float(rows) / float(steps)
+    return _flag(ratio < floor, {"rows": int(rows), "steps": int(steps),
+                                 "rows_per_step": ratio, "floor": floor},
+                 f"{rows} rows for {int(steps)} steps ({ratio:.2f}/step, floor {floor:.2f})")
+
+
 _PAIR_CHECKERS: Dict[str, Callable[[Dict[str, Any], Dict[str, Any],
                                     Dict[str, float]], Check]] = {
     "policy.overcorrection": _pair_overcorrection,
@@ -428,7 +534,10 @@ _CHECKERS = {
     "harness.infra": _chk_harness_infra,
     "design.contract-format": _chk_contract_format,
     "process.dead-end": _chk_dead_end,
+    "process.observability": _chk_observability,
     "access.grant-broken": _chk_grant_broken,
+    "calibration.under-prediction": _chk_calibration_under,
+    "calibration.over-prediction": _chk_calibration_over,
     "policy.accept-bias": lambda f, p: _bias(f, p, "accept"),
     "policy.reject-bias": lambda f, p: _bias(f, p, "reject"),
     "policy.constant-output": _chk_constant_output,

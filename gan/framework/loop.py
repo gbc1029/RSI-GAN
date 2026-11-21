@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import inspect
 import hashlib
+import glob
 import json
 import os
 import random
@@ -3420,7 +3421,8 @@ class GanLoop:
         facts = issue_checks.generation_facts(node) if node is not None else None
         if facts is not None:
             # Loop-level facts (not node facts): the budget reference the
-            # cost.tokens checker divides by, and the outer's grant health.
+            # cost.tokens checker divides by, the outer's grant health, and the
+            # observability pair (archived rows vs the report's own step count).
             facts["token_budget_per_gen"] = getattr(self, "token_budget_per_gen", None)
             outer = None
             try:
@@ -3429,8 +3431,39 @@ class GanLoop:
                 outer = None
             if outer is not None:
                 facts["grant_unreadable"] = self._grant_health(outer)
+            facts["trajectory_rows"] = self._trajectory_row_count(k)
+            facts["steps_total"] = self._report_steps_total(k)
         cache[k] = facts
         return facts
+
+    def _trajectory_row_count(self, genid: Any) -> Optional[int]:
+        """Rows in the generation's archived task transcript (None when absent).
+
+        `process.observability` divides this by the report's step count, so the
+        number must be the ARCHIVED rows -- what the evaluator can actually read
+        -- not what the run intended to write. Any outer directory is accepted
+        (the archive path carries the outer, and a resumed run may have written
+        it under an earlier one).
+        """
+        try:
+            pattern = os.path.join(paths.trajectory_root(self.output_dir),
+                                   "outer_*", str(genid), "task.jsonl")
+            hits = sorted(glob.glob(pattern))
+            if not hits:
+                return None
+            with open(hits[-1], "r", encoding="utf-8") as f:
+                return sum(1 for ln in f if ln.strip())
+        except Exception:  # noqa: BLE001 -- absent evidence is not a crash
+            return None
+
+    def _report_steps_total(self, genid: Any) -> Optional[int]:
+        """``steps_total`` from the generation's archived report (None if absent)."""
+        try:
+            rep = self._challenge_report(genid)   # same runs/<genid>/report.json
+            value = rep.get("steps_total")
+            return int(value) if isinstance(value, (int, float)) else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def _update_issue_ledger(self, outer: int, outer_genids: List[Any]) -> None:
         """Fold this outer's issue evidence into ``ckpt/issues/ledger.json``.

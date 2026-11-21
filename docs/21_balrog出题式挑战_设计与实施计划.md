@@ -660,3 +660,78 @@ launch plan 形状、fail-closed 拒、broker scope 谓词、runner override 钩
 
 **未做（明确留待）**：§9 阶段 2 的付费 A/B（challenge 开 vs 关、各 3 次重复）。在拿到
 那组数据之前，本篇只能说"指标接进去了且默认行为不变"，不能说"出题提升了能力"。
+---
+
+## 17. 补判定器：10 → 13 个（2026-11-21）
+
+### 17.1 先量了一次：真值覆盖率比想象的低
+
+对四个归档 run 的 `ckpt/issues/ledger.json` 做了一次普查（`scripts/local/issue_truth_census.py`）：
+
+| 口径 | 数量 |
+|---|---|
+| 闭合词表 | **18** 个 key |
+| 有机械判定器 | **10** 个（9 单代 + 1 配对） |
+| 真跑里被 raise 过的 | **5** 种 |
+| 真正产生过「配对真值」的 | **1** 种（`cost.tokens`，4 轮各 1 次） |
+
+被 raise 的 5 种里，**3 种完全没有判定器**（`calibration.under-prediction`、
+`design.prompt-ineffective`、`policy.under-discrimination`），它们在账本上的
+`status: fixed` 是 **evaluator 自己说的**（`judged_fixed=1` 但 `verified=0`）。
+另一件值得记的事实：`process.dead-end` 在 4 轮里**全部被判 `unsupported`**（父代本就
+没有该缺陷）——evaluator 最常提的那类 issue，在机械口径下不成立。
+
+### 17.2 补的三个（全部由已记录的事实决定，零 LLM）
+
+| key | 判据 | 线是怎么定的 |
+|---|---|---|
+| `calibration.under-prediction` | `score - predicted_score > calibration_tol` | tol=0.15 = 一个 episode 的分辨率（10 局时 0.1）加余量。**provisional**：四轮实测误差最大 0.05，全部在 5 倍线内 |
+| `calibration.over-prediction` | 镜像 | 同上 |
+| `process.observability` | `trajectory_rows < steps_total × observability_min_rows_per_step` | 实测健康 run 的 rows/step = 2.00 / 2.02 / 2.67（#8）、3.00×3（#7）、3.00×3（#6）；线取 1.0 ⇒ 健康侧 2 倍余量。而它要抓的历史事故（2026-11-08 `balrog_verify_1108a`：10 局 / 98 个 step 子进程只归档 10 行 ≈ 0.1）在**一个数量级以下** |
+
+两条硬规则照旧：
+
+- 缺证据 = `UNKNOWN`，**永不**当 `ABSENT`。`calibration.*` 在 `score_status` 不是
+  `ok/partial` 时一律 UNKNOWN——否则每个未评分的代都白拿一次「预测没跑偏」的命中；
+  `process.observability` 在缺少归档或缺少 `steps_total`（题目域没有这个概念）时同样 UNKNOWN。
+- 两条新线都是**参数**（`issues.check.calibration_tol` /
+  `observability_min_rows_per_step`），不是写死在谓词里的常数。
+
+### 17.3 仍然刻意没有判定器的 5 个（附理由）
+
+| key | 为什么不补 |
+|---|---|
+| `design.prompt-ineffective` | **旧决定，继续遵守**：这是「这次编辑有没有用」的判断，锚点/分数对已经量了它；再造一个机械孪生只会让「未修复」变得trivially 正确 |
+| `policy.under-discrimination` | 需要读观测里的**文字**（"是否出现了明确的拒绝信号"）——语义判断，是 LLM-judge 的首选候选 |
+| `design.toolset-mismatch` | 同上：装配的工具是否服务这个任务，需要任务语义 |
+| `generalization.overfit` | 目前**没有 per-node 的 val 度量**（val 只到 supernode 级），配不出配对真值。等某轮开始逐代留 val 再补 |
+| `other.new` | 逃生口，按定义不判 |
+
+### 17.4 顺带修掉的本地测试陈旧断言（不是本次逻辑改动引起的）
+
+- `test_llm_retry_budget.py` 的 `_behaviour_summary(spin, len(spin))`：该函数早已
+  增到 `(state_keys, actions, num_steps)`，测试仍是旧签名 → 直接 TypeError。
+- 同一文件的 R10d 期望 gen5 为 PRESENT，依据的正是 **2026-11-17 已被删除**的
+  `obs_repeat_step_share >= 0.35`（符号反了）。改成 ABSENT 并把 docs/20 §8 的结论
+  写进注释：gen5 现在是那次错误的**反例标本**。
+- `test_verdict_stability_v2.py` 有一条 `AccessBroker.grant` 断言失败（59 里 58），
+  **已用 `git stash` 复核：改前改后同样失败**，属环境/权限问题，与本次改动无关。
+
+### 17.5 回归
+
+新增 `scripts/local/test_issue_checks_new3.py`（**28 断言**：真实归档值 0.55/0.60、
+0.80/0.80、913/452、2184/728 全在健康侧；历史事故 10/98 必须 PRESENT；容差与 floor
+可被 `issues.check.*` 覆盖；四种缺失情形一律 UNKNOWN；`pair_truth` 的
+present→absent = 修复、父代本就 absent = unsupported；loop 的两个落盘助手在真实 run 上
+读出 913 / 452）。登记表断言同步到 13 个。
+十套 challenge（40/36/39/tools/77/10/17/6/11/52）+ balrog 12 套 + 行为三套
+（35/26/48）+ 框架 5 套 + `test_fitness_vs_norm` + `test_llm_retry_budget`（45/45）
++ `compileall` 全绿。
+
+### 17.6 现在能不能引入大模型 judge
+
+**还不能下结论，但这次的普查给出了判据**：13/18 之后，剩下 5 个里真正值得 LLM 判的只有
+`policy.under-discrimination` 与 `design.toolset-mismatch`（都需要读观测文字）。
+是否引入应当取决于：这两类 issue 在新跑里出现的频率，以及机械侧能否为 judge 提供
+可对齐的重叠样本（`process.dead-end` 是现成的校准类）。在此之前，judge 只会多一个
+漂移源而没有可验证的增益。
