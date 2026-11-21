@@ -277,11 +277,15 @@ challenge:
 
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
-  eval_samples: 1               # 每个 supernode 入档评估次数（docs/14 允许 2–3；
-                                # 1 = 显著性运行的成本取舍：固定 root 评估是每臂最大开销项，
-                                # 而消融显著性看的是主线最后一代分数、不用档案 fitness。
-                                # 代价：单轮评估使 benchmark.val_std 恒为 0 → F_p 的
-                                # -beta*z_std 退化为中性（方差项不生效），需在论文声明
+  # 每个 supernode 入档评估次数（docs/14 允许 2–3）。
+  # 2026-11-21 由 1 改为 **2**：1 轮时 `benchmark.val_std` 恒为 0，F_p 的
+  # `-beta*z_std` 退化为中性（方差项完全不生效），而 run #5–#8 的实测又显示
+  # 固定评估分数在 0.20/0.40/0.80 之间摆动 —— 单样本喂给选父是不该有的风险。
+  # 代价：每个 outer 多一次评估启动（episode 域 = 多 5 局），见
+  # `driver._launch_budget`（total = inner + eval_samples + challenge 1）。
+  # 仍为 1 时是一笔明确的成本取舍（消融显著性只看主线最后一代分数），
+  # 一旦改回 1 必须在论文里声明 val_std 无效。
+  eval_samples: 2
   # 评测题集（docs/14 §5.5 修订）：评估不再"每轮换一套题"，而是在一个 run 内
   # 固定不变。eval.subset 指向 held-out val 子集，eval.anchor_k 是其中的锚点题数，
   # 由 ckpt/sample_seed.json 的 eval_anchor_ids 落地（每个 run 只抽一次，跨 outer
