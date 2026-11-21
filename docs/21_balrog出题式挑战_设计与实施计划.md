@@ -541,3 +541,54 @@ launch plan 形状、fail-closed 拒、broker scope 谓词、runner override 钩
 - 一代真实跑确认 `instances.train` 出现在 `question_points`、`instances.eval`
   出现在 `challenge_val`；
 - `UNDECIDABLE` 率 < 20%。
+
+---
+
+## 15. 阶段 1 验收记录（2026-11-21，**PASS**，八次真实跑）
+
+### 15.1 八次跑各自的结论
+
+| 轮 | 结果 | 根因 | 修法 |
+|---|---|---|---|
+| #1 | 出题永不成立 | 缺陷类/问题族两个闭集只写在提示词里，工作进程内不可达；随后发现工具在沙箱子进程里 import 域模块失败时**放行**（fail-open） | 两套闭集在进程侧算好、经 broker 镜像、逐字打印；工具对未知值 fail-closed |
+| #2 | 全代 abort | 任务模型部署被限速（429），非逻辑问题 | 换 `openai/gpt-4.1-mini`（判定用 litellm 探针，直连 HTTP 的 503 是假信号） |
+| #3 | 健康但无可出题 | 可引用集只按"域支持什么"算，没按"**这一代**真存在可证伪的差"算 | 每代评估前发布本代 citable 表；无题时明写"不要调用" |
+| #4 | 出题成功、子代崩溃 → 题悬空 | 生命周期只有正向（出→用），没有失败归还 | `release_for_child`（保留→材料化，幂等，不碰已消费行） |
+| #5 | 出题→锁定→消费→机械结算**全链真跑通**；泛化轮被拒 | `task_broker._SCOPE_RE` 安全白名单没有 `cval_outer<N>` 命名空间 | 显式加分支；`cost_ledger` 归因前缀同步 |
+| #6 | 同上，且裁决首次给出 `VERIFIED_REPAIR` | 每 outer 启动预算只算 inner+eval，泛化轮是第 4 次启动 | `_launch_budget` 加 cval 项（预算=上界，多留一格零代价） |
+| #7 | 泛化轮**真的启动并跑完 5 局**，仍被拒 | 传给 runner 的 override 是"只有挑战实例"，而 broker 钉的是"注册计划（含占位）" | 用 `register_challenge_val_episodes` 的返回值做 override 与 per_task |
+| #8 | **五条判据全过** | — | — |
+
+四轮失败里**没有一次是出题算法错**，全部是"与仓库其它层的接线"：词汇可达性、
+沙箱 fail-open、限速、命名空间、启动预算、计划清单。这类缺陷离线套件抓不到，
+因为它们只在跨进程/跨层时出现。
+
+⚠️ 一个自造测量错误（记录在此以免重犯）：审计脚本 `audit_challenge_run.py` 早先
+扫描 `ckpt/supernode_*.json`，而真实路径是 `ckpt/supernodes/outer_<N>.json`，
+于是**对每一轮都报 `challenge_val` 为空**——包括第 8 轮列已落盘的情况。审计脚本
+读错路径 = 把"我没看见"当成"不存在"，与 §12 的字段教训同类。已修。
+
+### 15.2 第 8 轮验收证据（`/home/legion/outputs/challenge_stage1_verify8/A0`）
+
+| 判据 | 证据 |
+|---|---|
+| ① `instances.train` 进 `question_points` | `gen 1: pickup#1784266009 -> progression=1.0`（**而且解出了**） |
+| ② `instances.eval` 进 `challenge_val` | `challenge_val_ready {challenges:1, generalized:1, undecidable:0}`；supernode `benchmark.challenge_val["ch-1-0-0"] = {defect_present:false, progression:1.0, aborted:false, generalized:true}` |
+| ③ UNDECIDABLE < 20% | `0.0 (0/1)` |
+| ④ 默认关闭零影响 | 九套 challenge（40/36/39/tools/77/10/17/6/11）+ balrog 12 套 + 行为三套全绿 |
+| ⑤ 不污染 `val_mean` | `mean=0.7`、`val_mean=0.4`，`challenge_val` 独立成列 |
+
+同轮数值：主线 0.60 → **0.80**（两代均值 0.70，八次跑里最高）；分族 gen1 全部
+≥ 1/2（goto 2/2、seq 2/2、pickup 2/2、open 1/2、putnext 1/2）；退化 revisit 局
+占比 0.25 → **0.00**，`revisit_share` 0.588 → 0.305；泛化轮 4/5 解出；固定评估
+2/5 = 0.40。花费 $5.51。
+
+### 15.3 现在还不能说的
+
+- **效用**没有数据：这是单臂（A0，challenge 开），没有 challenge 开/关对照，
+  所以"出题让任务变强"仍未验证。
+- 八轮合计只有 **3 道题被消费并结算**（UNRESOLVED ×3 / REPAIR ×2 分布在不同轮），
+  任何比率（precision / calibration）都没有统计意义；三项指标仍**不接 fitness**，
+  且 `_challenge_stats()` 连诊断都还没有调用点。
+- 泛化结论只有 2 个可用样本（#7 训练实例仍在打转但兄弟实例正常；#8 两处一致）。
+
