@@ -587,8 +587,9 @@ launch plan 形状、fail-closed 拒、broker scope 谓词、runner override 钩
 
 - **效用**没有数据：这是单臂（A0，challenge 开），没有 challenge 开/关对照，
   所以"出题让任务变强"仍未验证。
-- 八轮合计只有 **3 道题被消费并结算**（UNRESOLVED ×3 / REPAIR ×2 分布在不同轮），
-  任何比率（precision / calibration）都没有统计意义；三项指标仍**不接 fitness**，
-  且 `_challenge_stats()` 连诊断都还没有调用点。
+- 八轮合计只有 **4 道题被消费并结算**（locked 7 / consumed 4 / settled 4：`VERIFIED_UNRESOLVED` ×2、
+  `VERIFIED_REPAIR` ×2，每轮各 1 道；第 1–4 轮一次都没有结算过，且它们的 run 目录已被
+  早期启动脚本删除），任何比率（precision / calibration）都没有统计意义；三项指标仍
+  **不接 fitness**，且 `_challenge_stats()` 连诊断都还没有调用点。
 - 泛化结论只有 2 个可用样本（#7 训练实例仍在打转但兄弟实例正常；#8 两处一致）。
 
