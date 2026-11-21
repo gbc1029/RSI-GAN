@@ -2761,11 +2761,23 @@ class GanLoop:
         # rotating episode for that task.
         fallback = [str(x) for x in (getattr(self.eval_runner, "fixed_episode_ids", []) or [])]
         try:
-            tx.register_challenge_val_episodes(
+            # The REGISTERED plan is what the broker pins for the harness, and it
+            # is the challenge episodes PLUS one fallback per task without one.
+            # The per-call override below must hand the runner THAT list, not the
+            # challenge-only one: `task_runner` compares the harness's actual plan
+            # against the override id-for-id and FAILS CLOSED on any difference
+            # ("the harness did not run the frozen episode set"). Measured
+            # 2026-11-21 (run #7, the first cval round that ever launched):
+            # `fixed_eval_plan_mismatch {expected: 1, got: 5, missing: 0}`, i.e.
+            # the exam was RIGHT and only the comparison list was short -- the
+            # round ran 5 correct episodes and was thrown away.
+            pinned = tx.register_challenge_val_episodes(
                 self.output_dir, scope, ids, per_task=1, fallback_ids=fallback)
         except Exception as e:  # noqa: BLE001 -- registration refused = no round
             self.log_event({"type": "challenge_val_unregistered", "outer": outer,
                             "error": f"{type(e).__name__}: {e}"[:400]})
+            return
+        if not pinned:
             return
         initial = self.task_tree.get("initial")
         plan_result = self._empty_plan_result(
@@ -2777,17 +2789,19 @@ class GanLoop:
             return
         # per_task must cover the largest per-task count actually pinned (a task
         # with two challenges needs two slots); the fallback episodes fill the
-        # remaining tasks' single slot.
+        # remaining tasks' single slot. Counted over the PINNED list so the
+        # number the runner checks is the number the harness used.
         per_task = 1
         counts: Dict[str, int] = {}
-        for raw in ids:
+        for raw in pinned:
             task = str(raw).rsplit("#", 1)[0]
             counts[task] = counts.get(task, 0) + 1
         per_task = max([per_task] + list(counts.values()))
         try:
             node = self.eval_runner(
                 plan=plan_result, parent=initial, genid=scope, base=eval_base,
-                fixed_episode_override={"episode_ids": ids, "per_task": per_task})
+                fixed_episode_override={"episode_ids": list(pinned),
+                                        "per_task": per_task})
         except Exception as e:  # noqa: BLE001 -- advisory round
             self.log_event({"type": "challenge_val_round_failed", "outer": outer,
                             "scope": scope,
