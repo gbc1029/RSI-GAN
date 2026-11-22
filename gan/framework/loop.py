@@ -2479,6 +2479,58 @@ class GanLoop:
                             "genid": str(genid),
                             "error": f"{type(e).__name__}: {e}"[:300]})
 
+    def _challenge_resolve_issue(self, proposal: Dict[str, Any], genid: Any,
+                                 defect_class: str,
+                                 issue_by_id: Dict[str, Dict[str, Any]]
+                                 ) -> Tuple[Optional[str], str]:
+        """Resolve a proposal's cited issue: ``(issue_id, issue_key)`` or refuse.
+
+        Returns ``("", "")`` for an UNLINKED proposal (accepted, counted) and
+        ``(None, "")`` when the proposal must be skipped: the citation names no
+        issue of this round, or the issue's ``issue_key`` is not the defect class
+        being challenged. Refusing beats accepting a link that points at a
+        different finding -- that would make the join rate look real while the
+        pairs are wrong.
+
+        Handles are compared generation-agnostically: the tool sees the author's
+        bare ``i-1`` and ``_qualify_issue_ids`` has already rewritten the issues
+        to ``g<genid>/i-1`` by the time this runs.
+        """
+        def bare(value: Any) -> str:
+            text = str(value or "").strip()
+            head, sep, tail = text.partition("/")
+            return tail if (sep and head.startswith("g")) else text
+
+        raw = str(proposal.get("issue_id") or "").strip()
+        wanted = bare(raw)
+        if not wanted:
+            self.log_event({"type": "challenge_unlinked", "genid": str(genid),
+                            "defect_class": defect_class,
+                            "family": str(proposal.get("family") or ""),
+                            "reason": "no issue cited by the author"})
+            return "", ""
+        target = issue_by_id.get(raw)
+        if target is None:
+            for qid, it in issue_by_id.items():
+                if bare(qid) == wanted:
+                    target = it
+                    break
+        if target is None:
+            self.log_event({"type": "challenge_rejected", "genid": str(genid),
+                            "defect_class": defect_class,
+                            "family": str(proposal.get("family") or ""),
+                            "reason": f"unknown_issue_id:{raw}"[:400]})
+            return None, ""
+        key = str(target.get("issue_key") or "").strip()
+        if key != defect_class:
+            self.log_event({"type": "challenge_rejected", "genid": str(genid),
+                            "defect_class": defect_class,
+                            "family": str(proposal.get("family") or ""),
+                            "reason": (f"issue_key_mismatch: issue {raw} was reported "
+                                       f"as '{key}'")[:400]})
+            return None, ""
+        return str(target.get("issue_id") or raw).strip(), key
+
     def _challenge_lock_from_eval(self, ctx: Any, genid: Any,
                                   outer: int) -> List[str]:
         """Lock the evaluator's proposals for this generation (blind, bounded).
@@ -2521,12 +2573,28 @@ class GanLoop:
         cfg = self._challenge_domain_cfg()
         admitted: List[Dict[str, Any]] = []
         qids: List[str] = []
+        # ISSUE ↔ CHALLENGE JOIN (docs/21 §19). The tool already checked the
+        # citation against the issues reported this round; it is re-checked HERE
+        # because the loop owns the ledger, the tool is agent-reachable code, and
+        # a proposal can arrive from a replayed/older child. The join is SOFT: an
+        # empty ``issue_id`` is legal and merely counted (a hard requirement was
+        # measured to refuse the only proposal a 3-outer run produced).
+        issue_by_id: Dict[str, Dict[str, Any]] = {}
+        for it in (getattr(ctx, "issues", None) or []):
+            if isinstance(it, dict) and str(it.get("issue_id") or "").strip():
+                issue_by_id[str(it["issue_id"]).strip()] = it
         try:
             ledger = self._challenge_data()
             seen_instances = [row for row in (ledger.get("challenges") or {}).values()
                               if isinstance(row, dict)]
             for proposal in proposals:
                 defect_class = str(proposal.get("defect_class") or "")
+                link_id, link_key = self._challenge_resolve_issue(
+                    proposal, genid, defect_class, issue_by_id)
+                if link_id is None:      # dangling or mismatched citation
+                    continue
+                proposal["issue_id"] = link_id
+                proposal["issue_key"] = link_key
                 citable = _challenge_questions.citable_families(
                     self.challenge_domain, defect_class, rows,
                     (cfg.get("output_contract") or {}))
@@ -2605,6 +2673,10 @@ class GanLoop:
                     "challenge_id": cid,
                     "defect_class": row["defect_class"], "family": row["family"],
                     "qid": qids[ids.index(cid)] if cid in ids else "",
+                    # linkage (docs/21 §19): "" = unlinked, already logged as
+                    # `challenge_unlinked`
+                    "issue_id": row.get("issue_id") or "",
+                    "issue_key": row.get("issue_key") or "",
                     "train": pair["train"]["episode_id"],
                     "eval": pair["eval"]["episode_id"],
                     "band": pair.get("band"),
@@ -3180,6 +3252,14 @@ class GanLoop:
                             "modification_scopes": cstats.get("modification_scopes"),
                             "state_counts": cstats.get("state_counts"),
                             "outer_count": cstats.get("outer_count"),
+                            # issue ↔ challenge join (docs/21 §19): the number
+                            # that says whether authoring is grounded in the
+                            # diagnosis, plus the per-issue-key breakdown that
+                            # would let this term be merged with the issue channel
+                            "linked": cstats.get("linked_challenges"),
+                            "unlinked": cstats.get("unlinked_challenges"),
+                            "join_rate": cstats.get("join_rate"),
+                            "by_issue_key": cstats.get("by_issue_key"),
                             # compliance (a RULE, never a score)
                             "authoring_rounds": book.get("rounds"),
                             "authoring_missed": book.get("missed"),

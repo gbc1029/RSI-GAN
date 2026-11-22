@@ -40,6 +40,11 @@ ADJUDICATION_FIELD = "adjudication"
 # key the domain adjudicator dispatches on.
 _REQUIRED = ("defect_class", "family", "evidence_ref", "repair_criterion")
 
+#: OPTIONAL link fields (docs/21 §19). ``issue_id`` may be EMPTY (an unlinked
+#: challenge is legal and merely counted); ``issue_key`` is the resolved defect
+#: identity the issue carried, so the two channels can be joined post hoc.
+_OPTIONAL = ("issue_id", "issue_key")
+
 # Anything that could have been read AFTER the reveal must never enter a blind
 # challenge (the whole point of locking before the score is available).
 _FORBIDDEN = {
@@ -150,6 +155,12 @@ def validate_candidate(item: Mapping[str, Any], *, allowed_families: Iterable[An
         raise ChallengeError("blind challenge contains revealed field(s): "
                              + ", ".join(sorted(forbidden)))
     row = {field: _text(item.get(field), field) for field in _REQUIRED}
+    # Link fields are carried verbatim (empty allowed): the ledger is where the
+    # issue/challenge join lives, so dropping them here would recreate the gap
+    # this field exists to close (docs/21 §19).
+    for field in _OPTIONAL:
+        value = item.get(field)
+        row[field] = str(value).strip() if isinstance(value, (str, int, float)) else ""
     allowed = {str(f) for f in allowed_families}
     if allowed and row["family"] not in allowed:
         raise ChallengeError(

@@ -166,6 +166,29 @@ def compute(rows: Iterable[Mapping[str, Any]],
     u = counts[adjudication.UNDECIDABLE]
     supported = a + b + c + d
 
+    # ISSUE ↔ CHALLENGE JOIN (docs/21 §19). ``join_rate`` is the number the soft
+    # binding exists to make observable: "of the adjudicated challenges, how many
+    # came with a cited issue whose issue_key matched". ``by_issue_key`` lets the
+    # precision be read PER DEFECT IDENTITY, i.e. in the same units the issue
+    # channel uses -- which is the precondition for ever merging the two into one
+    # term (docs/21 §16) instead of averaging two sample sets.
+    linked = 0
+    by_key: Dict[str, Dict[str, int]] = {}
+    for row in rows or ():
+        if not isinstance(row, Mapping):
+            continue
+        state = _state_of(row)
+        if state is None:
+            continue
+        key = str(row.get("issue_key") or "").strip()
+        if str(row.get("issue_id") or "").strip():
+            linked += 1
+        bucket = by_key.setdefault(key or "(unlinked)",
+                                   {name: 0 for name in _STATES})
+        bucket[state] += 1
+    decided = sum(1 for row in (rows or ())
+                  if isinstance(row, Mapping) and _state_of(row) is not None)
+
     gains = []
     for gain in (point_gains or {}).values():
         try:
@@ -197,6 +220,11 @@ def compute(rows: Iterable[Mapping[str, Any]],
         "claim_accuracy": float((a + b + 1) / (supported + 2)),
         "actionability_rate": _ratio(actionable, supported + u),
         "challenge_calibration": _ratio(agree, calibrated),
+        # --- issue ↔ challenge join (docs/21 §19; diagnostics) ---
+        "linked_challenges": linked,
+        "unlinked_challenges": decided - linked,
+        "join_rate": _ratio(linked, decided),
+        "by_issue_key": by_key,
         # The diagnostic that actually answers "did the planner learn a METHOD":
         # share of determinate verdicts whose change was judged a transferable
         # strategy (the alternative scopes are instance_specific_memory /

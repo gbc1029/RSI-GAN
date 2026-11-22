@@ -22,8 +22,34 @@ budget, duplicates) run in ``gan/framework/challenge_questions.py`` when the loo
 locks the proposal. Doing them here would need revealed evidence (the score) and
 would blur admission with truth -- the mistake that made the IMO pilot's
 ``actionable`` flag vacuous.
+
+SOFT BINDING TO AN ISSUE (docs/21 §19, 2026-11-22)
+--------------------------------------------------
+A challenge is *about a defect the evaluator FOUND*, so it should be traceable to
+the issue that recorded that finding. It used to be traceable to nothing: the
+proposal had no link, and the ledger had no field, so "did the challenge come
+from this diagnosis" was unanswerable and the two channels could only be
+compared as two unrelated sample sets.
+
+``issue_id`` is therefore REQUIRED to be CONSIDERED but allowed to be EMPTY:
+
+* given -> it must name an issue reported in this same round, and that issue's
+  ``issue_key`` must equal ``defect_class`` (a challenge about a defect the
+  author never reported, or reported under another key, is refused here so the
+  author gets a clear reason instead of a silently unlinked row);
+* empty  -> the proposal is still accepted and recorded as UNLINKED. Soft on
+  purpose: measured 2026-11-22, a hard requirement would have refused the ONE
+  proposal a 3-outer run produced (the citable family and the reported keys did
+  not line up), and the join RATE is the number we actually want to watch.
 """
 from gan.framework.context import challenge_config, get_eval_context
+
+
+def _bare(issue_id: str) -> str:
+    """Compare handles generation-agnostically (``g3/i-1`` and ``i-1`` are one)."""
+    text = str(issue_id or "").strip()
+    head, sep, tail = text.partition("/")
+    return tail if (sep and head.startswith("g")) else text
 
 
 def tool_info():
@@ -31,10 +57,11 @@ def tool_info():
         "name": "propose_challenge",
         "description": (
             "Author ONE challenge about a defect you found: name the defect class and "
-            "the task family, and state what would count as repaired. The framework "
-            "draws the actual instance from the environment's own generator, so do NOT "
-            "write a question, a seed or an answer. Available only in the blind phase "
-            "and only when the run enables challenge authoring."
+            "the task family, state what would count as repaired, and cite the issue "
+            "you reported for it. The framework draws the actual instance from the "
+            "environment's own generator, so do NOT write a question, a seed or an "
+            "answer. Available only in the blind phase and only when the run enables "
+            "challenge authoring."
         ),
         "input_schema": {
             "type": "object",
@@ -61,13 +88,22 @@ def tool_info():
                                    "(e.g. 'the episode stops cycling and does not lose "
                                    "progression').",
                 },
+                "issue_id": {
+                    "type": "string",
+                    "description": "The local handle of the issue you reported for "
+                                   "THIS defect in this round (i-1, i-2, ...). Its "
+                                   "issue_key must equal defect_class. Leave it EMPTY "
+                                   "if you reported no issue for this defect -- the "
+                                   "challenge is then recorded as unlinked.",
+                },
             },
             "required": ["defect_class", "family", "evidence_ref", "repair_criterion"],
         },
     }
 
 
-def tool_function(defect_class, family, evidence_ref, repair_criterion, **kwargs):
+def tool_function(defect_class, family, evidence_ref, repair_criterion,
+                  issue_id="", **kwargs):
     ctx = get_eval_context()
     if ctx is None:
         return "Error: no eval context"
@@ -116,15 +152,44 @@ def tool_function(defect_class, family, evidence_ref, repair_criterion, **kwargs
     used = len(getattr(ctx, "challenges", []) or [])
     if used >= config["max_k"]:
         return f"Error: challenge budget exhausted (max_k={config['max_k']})"
+    # SOFT BINDING (see the module docstring): resolve the cited issue against the
+    # issues reported in THIS round. A dangling handle is refused (it would look
+    # like a link that does not exist); a key mismatch is refused with both values
+    # named; an EMPTY handle is accepted and recorded as unlinked.
+    links: list = []
+    raw_issue = str(issue_id or "").strip()
+    wanted = _bare(raw_issue)
+    if wanted:
+        for it in (getattr(ctx, "issues", []) or []):
+            if isinstance(it, dict) and _bare(it.get("issue_id")) == wanted:
+                links.append(it)
+    if wanted and not links:
+        reported = [str(it.get("issue_id")) for it in (getattr(ctx, "issues", []) or [])
+                    if isinstance(it, dict) and it.get("issue_id")]
+        return (f"Error: issue_id '{raw_issue}' names no issue reported in this round "
+                f"(reported: {', '.join(reported) or 'none'}). Omit issue_id to file "
+                "an unlinked challenge.")
+    if links:
+        keys = sorted({str(it.get("issue_key") or "") for it in links})
+        if str(defect_class) not in keys:
+            return (f"Error: issue '{raw_issue}' was reported as "
+                    f"{', '.join(k or '(none)' for k in keys)}, not '{defect_class}'. "
+                    "A challenge must test the defect its issue actually claims "
+                    "(omit issue_id to file it unlinked).")
     ctx.add_challenge({
         "defect_class": str(defect_class),
         "family": str(family),
         "evidence_ref": str(evidence_ref),
         "repair_criterion": str(repair_criterion),
+        # The LOCAL handle as the author wrote it; the loop qualifies it and the
+        # ledger stores both it and the resolved issue_key.
+        "issue_id": raw_issue,
+        "issue_key": (str(defect_class) if links else ""),
     })
+    state = f"linked to issue '{raw_issue}'" if links else "UNLINKED (no issue cited)"
     return (f"challenge recorded ({used + 1}/{config['max_k']}): "
-            f"{defect_class} on {family}. The framework will draw the instance; "
-            "you cannot choose or see it.")
+            f"{defect_class} on {family}, {state}. The framework will draw the "
+            "instance; you cannot choose or see it.")
 
 
 op_info = tool_info

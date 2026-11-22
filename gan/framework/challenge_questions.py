@@ -35,6 +35,14 @@ from gan.framework import defect_lines as dl
 #: silently ignored: an extra field is how a revealed key would sneak in.
 PROPOSAL_FIELDS = ("defect_class", "family", "evidence_ref", "repair_criterion")
 
+#: OPTIONAL link fields (docs/21 §19, 2026-11-22). A challenge should be traceable
+#: to the issue that recorded the finding it tests; with no link the two channels
+#: can only be compared as unrelated sample sets. Kept OUT of ``PROPOSAL_FIELDS``
+#: so the four author-supplied fields stay exactly as before and an OLD caller
+#: (or an offline fixture) is still valid -- but permitted, so the loop can carry
+#: them into the ledger.
+LINK_FIELDS = ("issue_id", "issue_key")
+
 
 class ChallengeAdmissionError(RuntimeError):
     """A proposal failed A or B. The caller logs ``challenge_rejected``."""
@@ -121,10 +129,14 @@ def citable_families(domain: str, defect_class: str,
 # A layer
 # ---------------------------------------------------------------------------
 def parse_proposal(proposal: Mapping[str, Any]) -> Dict[str, str]:
-    """Validate the SHAPE of one proposal (closed fields, non-empty strings)."""
+    """Validate the SHAPE of one proposal (closed fields, non-empty strings).
+
+    ``LINK_FIELDS`` are permitted and copied through verbatim (``issue_id`` may be
+    empty = unlinked); everything else outside ``PROPOSAL_FIELDS`` is refused.
+    """
     if not isinstance(proposal, Mapping):
         raise ChallengeAdmissionError("a challenge proposal must be an object")
-    extra = {str(k) for k in proposal} - set(PROPOSAL_FIELDS)
+    extra = {str(k) for k in proposal} - set(PROPOSAL_FIELDS) - set(LINK_FIELDS)
     if extra:
         raise ChallengeAdmissionError(
             "proposal carries undeclared field(s): " + ", ".join(sorted(extra)))
@@ -135,6 +147,9 @@ def parse_proposal(proposal: Mapping[str, Any]) -> Dict[str, str]:
         if not text:
             raise ChallengeAdmissionError(f"proposal field '{field}' is required")
         out[field] = text
+    for field in LINK_FIELDS:
+        value = proposal.get(field)
+        out[field] = str(value).strip() if isinstance(value, (str, int, float)) else ""
     return out
 
 
@@ -239,16 +254,22 @@ def batch_budget_check(*, k: int, num_samples: int, anchor_k: int,
 
 
 def lock_payload(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, str]]:
-    """The blind payload stored in the ledger (a JSON-able, ordered copy)."""
+    """The blind payload stored in the ledger (a JSON-able, ordered copy).
+
+    ``LINK_FIELDS`` ride along so the lock is idempotent on the WHOLE proposal:
+    a resumed round that re-locks with a different ``issue_id`` is a different
+    claim and must be detected rather than silently accepted.
+    """
     out = []
     for row in rows or ():
-        out.append({field: str(row.get(field) or "") for field in PROPOSAL_FIELDS})
+        out.append({field: str(row.get(field) or "")
+                    for field in PROPOSAL_FIELDS + LINK_FIELDS})
     json.dumps(out)  # a payload that cannot be persisted must fail HERE
     return out
 
 
 __all__ = [
-    "PROPOSAL_FIELDS", "ChallengeAdmissionError", "authorable",
+    "PROPOSAL_FIELDS", "LINK_FIELDS", "ChallengeAdmissionError", "authorable",
     "batch_budget_check", "citable_families", "family_params", "lock_payload",
     "materialize_pair", "parse_proposal", "space_config", "space_for",
     "supported_classes", "validate_admission",

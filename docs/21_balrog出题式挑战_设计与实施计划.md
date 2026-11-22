@@ -735,3 +735,66 @@ present→absent = 修复、父代本就 absent = unsupported；loop 的两个�
 是否引入应当取决于：这两类 issue 在新跑里出现的频率，以及机械侧能否为 judge 提供
 可对齐的重叠样本（`process.dead-end` 是现成的校准类）。在此之前，judge 只会多一个
 漂移源而没有可验证的增益。
+
+---
+
+## 19. issue ↔ challenge 软绑定（2026-11-22）
+
+### 19.1 缺口
+
+`propose_challenge` 与 `report_issue` 是**两条互不相连的通道**：工具没有 `issue_id`
+参数，账本行里也没有这个字段，loop 锁题时从不读 `ctx.issues`。唯一的重叠是
+`defect_class` 与 `issue_key` 共用同一套名字。
+
+后果是三个，都会让后续的判读失真：
+
+1. **§16 的混合项变成"两把尺子加权平均"**：`claim_accuracy` 的样本是"出的题"，
+   `verdict_stability` 的样本是"报的 issue"，两者身份不同却被混在一起；
+2. **分不清"issue 是真的但题没出成"和"issue 本身是假的"**——前者该改准入，后者该改判据；
+3. **回答不了"出题能力是否以挑错能力为地基"**，因为算不出"报过的 issue 里有多少被出成了题"。
+
+### 19.2 软绑定（为什么不是硬绑定）
+
+硬绑定（必须引用已报 issue 且 key 一致）在实测里会把唯一的题也拒掉：3-outer 那一轮
+只有 1 代可引用（gen1，putnext），而该代报的 issue 是 `cost.tokens` / `process.dead-end`，
+族与 key 都对不上。所以：
+
+| 情形 | 行为 |
+|---|---|
+| `issue_id` 缺省/空 | **接受**，记为未绑定，留 `challenge_unlinked` 事件 |
+| `issue_id` 指向不存在的 issue | **拒绝**（悬空引用比没有引用更糟），`challenge_rejected: unknown_issue_id:<id>` |
+| `issue_id` 存在但 `issue_key != defect_class` | **拒绝**，理由里点名两边（`issue_key_mismatch`） |
+| 一致 | 通过，账本记 `issue_id` + **解析出的** `issue_key`（不采信作者自报） |
+
+引用比较是**代际无关**的：作者写 `i-1`，而 `_qualify_issue_ids` 已把 issue 改写成
+`g<genid>/i-1`，两者视为同一条。
+
+### 19.3 落了什么
+
+| 层 | 改动 |
+|---|---|
+| 工具 | `propose_challenge` 增参 `issue_id`（**非必填**）；内部解析 + key 校验；答复里明说 `linked` / `UNLINKED` |
+| 形状校验 | `challenge_questions.LINK_FIELDS`（`issue_id`/`issue_key`）被允许并原样保留；其他多余字段仍被拒 |
+| 账本 | `challenge_ledger._OPTIONAL` 把两个字段写进账本行（空串也写，不是缺失）；`lock_payload` 包含它们，所以"重锁时换了 issue"能被检出 |
+| loop | 新增 `_challenge_resolve_issue(...)`：工具可被绕过 / 提案可能来自旧子进程，所以**父侧复核一遍**；`challenge_locked` 事件带 `issue_id`/`issue_key` |
+| 指标 | `compute()` 增 `linked_challenges` / `unlinked_challenges` / `join_rate` / `by_issue_key`（按缺陷身份分解状态） |
+| supernode | `evaluator_stats.challenge` 增 `linked` / `unlinked` / `join_rate` / `by_issue_key` |
+| 提示词 | 盲评阶段的出题说明新增一条 `issue_id` 用法（不引用仍合法） |
+
+### 19.4 判读方式
+
+- `join_rate` = 已结算的题里"带了与 key 一致的 issue 引用"的比例。它是"出题是否以挑错为地基"
+  的**直接测量**；累积几轮后再决定要不要升级成硬绑定。
+- `by_issue_key` 让 `claim_accuracy` 能按缺陷身份读，这正是将来把 §16 的混合项
+  从"两个样本集平均"改成"同一变量更严的测量"的前提。
+- 未绑定不是错误：它是**被观测到的状态**。若某轮 `join_rate = 1.0` 且 `unlinked = 0`，
+  说明作者已经在按 issue 出题，那时再谈硬约束才有意义。
+
+### 19.5 回归
+
+新增 `scripts/local/test_issue_challenge_link.py`（**31 断言**）：工具四种情形
+（未引用/匹配/未知 handle/key 不一致）+ `g<N>/` 与裸 handle 等价；`parse_proposal`
+放行 link 字段但继续拒未知字段；账本行两个键必在（空串语义）；`lock_payload` 含 link；
+`compute` 的 join 率与 `by_issue_key` 分桶；loop 侧四种复核路径与事件。
+十一套 challenge（40/36/39/tools/77/10/17/6/11/52/31）+ balrog 12 套 + 行为三套 +
+框架 5 套 + 13 个 checker（28 断言）+ `test_llm_retry_budget`（45/45）+ `compileall` 全绿。
