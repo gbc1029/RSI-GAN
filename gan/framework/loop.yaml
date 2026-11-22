@@ -278,14 +278,16 @@ challenge:
 eval:
   eval_base: eval_base          # 固定 root ref（初始 = initial task commit）
   # 每个 supernode 入档评估次数（docs/14 允许 2–3）。
-  # 2026-11-21 由 1 改为 **2**：1 轮时 `benchmark.val_std` 恒为 0，F_p 的
-  # `-beta*z_std` 退化为中性（方差项完全不生效），而 run #5–#8 的实测又显示
-  # 固定评估分数在 0.20/0.40/0.80 之间摆动 —— 单样本喂给选父是不该有的风险。
-  # 代价：每个 outer 多一次评估启动（episode 域 = 多 5 局），见
-  # `driver._launch_budget`（total = inner + eval_samples + challenge 1）。
-  # 仍为 1 时是一笔明确的成本取舍（消融显著性只看主线最后一代分数），
-  # 一旦改回 1 必须在论文里声明 val_std 无效。
-  eval_samples: 2
+  #
+  # 2026-11-21 定回 **1**，理由从"纯成本"变成了结构性的：
+  # 外层选父的开关是 `len(archive.reference) >= mome.cold_start_min(3)`，也就是说
+  # **前 3 个 outer 根本不会触发选父**（第 1 个 outer 时参考集只有 0 个 supernode）。
+  # 短跑（outer < 4）里 `val_mean/val_std` 不参与任何决策，第二轮评估买不到东西。
+  # 真要跑 ≥4 个 outer 的选父实验，再改成 2（那时 `val_std` 才有人读，否则
+  # F_p 的 `-beta*z_std` 恒中性，等于没实现）。
+  # 代价关系：episode 域每多一轮评估 = 每 outer 多 5 局；`driver._launch_budget`
+  # 的口径是 inner + eval_samples + challenge 轮。
+  eval_samples: 1
   # 评测题集（docs/14 §5.5 修订）：评估不再"每轮换一套题"，而是在一个 run 内
   # 固定不变。eval.subset 指向 held-out val 子集，eval.anchor_k 是其中的锚点题数，
   # 由 ckpt/sample_seed.json 的 eval_anchor_ids 落地（每个 run 只抽一次，跨 outer
