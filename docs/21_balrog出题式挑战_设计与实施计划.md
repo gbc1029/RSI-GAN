@@ -798,3 +798,94 @@ present→absent = 修复、父代本就 absent = unsupported；loop 的两个�
 `compute` 的 join 率与 `by_issue_key` 分桶；loop 侧四种复核路径与事件。
 十一套 challenge（40/36/39/tools/77/10/17/6/11/52/31）+ balrog 12 套 + 行为三套 +
 框架 5 套 + 13 个 checker（28 断言）+ `test_llm_retry_budget`（45/45）+ `compileall` 全绿。
+
+## 20. P2：出清不再能废掉一轮（2026-11-22）
+
+### 20.1 缺口（实测，不是推测）
+
+三轮验证运行 `a0_o3i3n2`（outer=3 / inner=3 / n=2，9 代）里 **2 代被判无效**
+（`score: null`），另有 2 代被插补。日志里的原因是一条看起来跟权限毫无关系的
+异常：
+
+```
+PermissionError: [Errno 13] Permission denied: 'cm'
+  at role_process._purge_dir_fd   (在 _worker_main 的 finally 里)
+→ 父进程看到 "role worker PermissionError" → planner_failed → inner_invalid
+```
+
+根因两段，缺一不可：
+
+1. **父进程拷贝目录时没有归一模式。** `_safe_copy` 会给**文件**补 `0o660`
+   （2026-11-02 的 ACL mask 教训），但**目录**一直是 `os.makedirs` 在
+   `umask 0o077` 下建出来的 `0700`。`gan/components/task/cm` 就是这样被 stage
+   成 `drwx------`（owner 是 driver，不是角色 uid）。
+2. **出清（purge）会抛异常，而它在 `finally` 里。** 递归删除走到那个目录时
+   `os.open(... O_DIRECTORY)` 直接 `EACCES`；`finally` 里抛出的异常**覆盖了已经
+   算好的返回值**，于是一次纯清理问题把一代人的工作判死。
+
+关键点：**这不是模型的问题，也不是判定的问题**，是框架自己把好的一代丢掉。
+只要不清掉，P1（扩缺陷类）跑出来的任何数据都会被这种噪声污染，每轮还要白烧
+约 \$2.5。
+
+### 20.2 修法（三处，最小改动）
+
+| # | 变更 | 落点 |
+|---|---|---|
+| P2-1 | 出清**永不抛**：每一步单独 try/except，收集 `skipped` 列表；外层再包一层，任何异常都只进 `skipped` | `role_process._purge_dir_fd` / `_purge_role_workspace`（返回值 `None` → `List[str]`） |
+| P2-2 | 拷贝后**归一目录模式**：`AccessBroker.ensure_traversable(root, mode=0o770)`，`grant()` 末尾在可读性自检**之前**跑一遍 | `access.py`（新增静态方法 + grant 接线） |
+| P2-3 | 残留**必须可见**：一行有界的 `[purge] role/instance: N entr(y/ies) left in place: ...` 进 stderr（arm 日志），并 append 一条 `workspace_purge_skipped{role,seat,instance,count,entries}` 到 `events.jsonl`（走既有的"父进程持有审计写权"通道） | `_worker_main` 的 finally 尾部 |
+
+两个刻意的取舍：
+
+- **顺序**：归一在 `unreadable` 自检**之前**。自检必须报告角色**真的**能读到什么；
+  先自检就等于把一个我们自己能修的 `access.grant-broken` 缺陷挂到账上。修了几个
+  目录这件事本身记成事实字段 `dirs_traversable`（干净拷贝为 0）。
+- **`0o770` 而不是 `0o750`**：继承给角色的 ACL 条目是 `u:<role>:rwx`，它的
+  `effective` 由 **mask**（= group 位）决定；把 group 写位摘掉会让角色重新变成
+  `#effective:---`。这与 `_safe_copy` 用 `0o660` 是同一条规矩。所有权仍不动
+  （chmod 只改 mask，从不改 owner）。
+
+### 20.3 验收（全离线，零花费）
+
+新增 `scripts/local/test_purge_failsoft.py`（**6 组 / 18 断言**）：
+
+1. 锁死的子目录 `0000` → **不抛**、返回 skip 列表、stderr 只有一行摘要、
+   能删的都删了、删不掉的那个**保留**（不静默丢）；
+2. 干净工作区 → skip 为空、根目录被清空（根本身保留）、无 stderr 噪声；
+3. 工作区不存在 → no-op；
+4. **`finally` 契约**：按 `_worker_main` 的形状跑一遍"先算出结果、再在 finally
+   里出清"，结果对象原样返回——这正是当初杀掉两代的机制；
+5. `ensure_traversable`：三个 `0700` 目录 + 根被修成 `0770`、文件不动、
+   第二遍是 no-op（幂等）；
+6. 修完之后目标目录可列出、文件可读。
+
+`test_ws_acl_mask.py` 从 11 → **20 断言**，新增真实 uid 的目录版：
+
+- **D1/D1b** 复现线上签名：目录 `0700` + `u:rsi_gan_planner:rwx` + `mask::---`
+  → 角色 `ls` 被拒、`getfacl` 显示 `#effective:---`；
+- **D2–D5** 归一之后角色能进、能读、mask 不再为零；
+- **D6** 幂等；
+- **E1/E2** 修好之后，当初那次失败的真实路径（`_purge_role_workspace` 扫 0700
+  目录）现在**清得干净**，一个残留都没有。
+
+### 20.4 为什么值得单独记一条
+
+失败的表现是"规划器失败"，真因却在清理代码里——一层完全不该有副作用的代码。
+这也解释了 `a0_o3i3n2` 的 `citable` 只有 1/9 的一部分原因：**有两代根本没跑完**。
+所以 P2 必须先修，P1（扩缺陷类）的测量才有意义。
+
+### 20.5 回归
+
+十三套 challenge（40/36/39/tools/77/10/17/6/11/52/31/**18**）+ balrog 12 套 +
+框架 9 套（20/18/35/26/48/45/28/60/repo_split）+ `compileall` 全绿。
+顺带修掉三处**陈旧本地断言**（都不是本次逻辑改动引起的，与 §17.4 同类）：
+
+- `regress_repo_split.test_evaluate_supernode`：仍假设 `eval_runner` 就是
+  `task_runner`（docs/14 §5.5 之后是**两个** runner），且把固定根评测的批次均值
+  断到 `benchmark.mean` 上（现在的契约是 `val_mean` / `val_n_valid`）；
+- `regress_repo_split.test_cooldown_and_verdict_stability`：仍断言旧的"共享
+  一位"版 `verdict_stability == 1.0`（现在是按 `issue_key` 机械绑定的，没有可
+  验证的声明就是 `None`）；
+- `test_verdict_stability_v2` C2 段：拿 `gan/design/seeds/planner.md` 当可授权
+  路径（种子**按设计**不在任何角色的读写根里），改为授权 `gan/roles/planner.py`，
+  并把"种子不可授权"加成一条正面断言（58/59 → **60/60**）。

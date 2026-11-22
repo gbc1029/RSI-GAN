@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Dict, Optional, TextIO
+from typing import Any, Dict, List, Optional, TextIO
 
 from gan.framework.access import SourceAccessDisabled
 
@@ -177,34 +177,94 @@ def _exact_keys(value: Dict[str, Any], expected: set[str], label: str) -> None:
         )
 
 
-def _purge_dir_fd(fd: int) -> None:
-    for name in os.listdir(fd):
-        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        if stat.S_ISDIR(info.st_mode):
-            child = os.open(
-                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=fd,
-            )
-            try:
-                _purge_dir_fd(child)
-            finally:
-                os.close(child)
-            os.rmdir(name, dir_fd=fd)
-        else:
-            os.unlink(name, dir_fd=fd)
+def _purge_dir_fd(fd: int, skipped: Optional[List[str]] = None,
+                  *, prefix: str = "") -> None:
+    """Best-effort recursive delete INSIDE one directory fd. Never raises.
 
+    WHY IT MUST NOT RAISE (measured 2026-11-22, 3-outer run): this runs in the
+    role worker's ``finally``, so an exception here REPLACED the method's real
+    result and the generation was voided as ``planner_failed``. The trigger was
+    an unopenable subdirectory (``gan/components/task/cm``, mode 0700, created
+    under the driver's umask) -- a CLEAN-UP problem destroyed work that had
+    already succeeded, in 2 of 9 generations.
 
-def _purge_role_workspace(output_dir: str, role: str, instance: str) -> None:
-    root = os.path.join(output_dir, "workspaces", role, instance)
-    if not os.path.exists(root):
-        return
-    fd = os.open(
-        root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-    )
+    So every step is individually guarded and the failures are COLLECTED, not
+    raised: an entry that cannot be removed is left in place and reported by the
+    caller. Deleting less than everything is always better than voiding a round.
+    """
+    grabbed = skipped if skipped is not None else []
     try:
-        _purge_dir_fd(fd)
-    finally:
-        os.close(fd)
+        names = os.listdir(fd)
+    except OSError as exc:
+        grabbed.append(f"{prefix or '.'}: listdir: {exc}")
+        return
+    for name in names:
+        rel = f"{prefix}/{name}" if prefix else str(name)
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except OSError as exc:
+            grabbed.append(f"{rel}: stat: {exc}")
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            child = None
+            try:
+                child = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            except OSError as exc:
+                grabbed.append(f"{rel}: open: {exc}")
+                continue
+            try:
+                _purge_dir_fd(child, grabbed, prefix=rel)
+            finally:
+                try:
+                    os.close(child)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(name, dir_fd=fd)
+            except OSError as exc:
+                grabbed.append(f"{rel}: rmdir: {exc}")
+        else:
+            try:
+                os.unlink(name, dir_fd=fd)
+            except OSError as exc:
+                grabbed.append(f"{rel}: unlink: {exc}")
+
+
+def _purge_role_workspace(output_dir: str, role: str, instance: str) -> List[str]:
+    """Clear one seat's workspace; returns the entries left behind (never raises).
+
+    The caller invokes this from a ``finally`` while a result is being returned,
+    so this function's ONLY job on the failure path is to say what it could not
+    remove. The report goes to stderr (the arm log) because a sandboxed worker
+    has no write path to ``logs/events.jsonl`` -- the trajectory write authority
+    belongs to the parent (docs/19 §12.28).
+    """
+    skipped: List[str] = []
+    root = os.path.join(output_dir, "workspaces", role, instance)
+    try:
+        if not os.path.exists(root):
+            return skipped
+        fd = os.open(
+            root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        try:
+            _purge_dir_fd(fd, skipped)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    except Exception as exc:  # noqa: BLE001 -- clean-up never sinks a result
+        skipped.append(f"{root}: {type(exc).__name__}: {exc}")
+    if skipped:
+        head = "; ".join(skipped[:5])
+        more = f" (+{len(skipped) - 5} more)" if len(skipped) > 5 else ""
+        print(f"[purge] {role}/{instance}: {len(skipped)} entr(y/ies) left in place: "
+              f"{head}{more}", file=sys.stderr)
+    return skipped
 
 
 def _dict_list(value: Any, label: str) -> None:
@@ -1471,8 +1531,9 @@ def _worker_main() -> None:
                                   if k in sig.parameters}
                     result = sink(*args, **kwargs)
             finally:
+                purge_skipped: List[str] = []
                 try:
-                    _purge_role_workspace(
+                    purge_skipped = _purge_role_workspace(
                         init["output_dir"], role_name,
                         f"{init['instance']}__{expected_seat}")
                 finally:
@@ -1499,6 +1560,24 @@ def _worker_main() -> None:
                             pass
                     finally:
                         role.cm_session = None
+                # PURGE REPORT (P2-3): a partial clean-up must be VISIBLE, not
+                # only audible. stderr carries it into the arm log, but a log is
+                # not an audit stream -- the same `events_path` append is
+                # forwarded to the parent (patched trajectory append) and lands
+                # in events.jsonl, so a scanner can count how often the seat
+                # tree survives. Emitted on the success path too: the leftover
+                # entries are the fact, and "it exited 0" must not hide them.
+                if purge_skipped:
+                    try:
+                        role_trajectory_log.append(
+                            role_paths.events_path(init["output_dir"]),
+                            {"type": "workspace_purge_skipped",
+                             "role": role_name, "seat": expected_seat,
+                             "instance": init["instance"],
+                             "count": len(purge_skipped),
+                             "entries": purge_skipped[:20]})
+                    except Exception:  # noqa: BLE001 -- sink is down
+                        pass
             if dataclasses.is_dataclass(result):
                 result = dataclasses.asdict(result)
             _json_bytes(result)

@@ -614,6 +614,13 @@ class AccessBroker:
                                      base_root=base_root, backup_dir=backup_dir,
                                      discarded=discarded)
 
+        # P2 (docs/21 §20): normalise DIRECTORY modes BEFORE the readability
+        # self-check. Order matters: the check must report what the role can
+        # actually read, and a 0700 directory created by the copy under the
+        # driver's umask would otherwise be reported as an `access.grant-broken`
+        # defect we are able to fix in the same call. The count is recorded so
+        # "we had to repair N directories" is a visible fact, not a silent fix.
+        dirs_fixed = self.ensure_traversable(src_root)
         rec = {
             "type": "source_access_grant",
             "role": role,
@@ -627,6 +634,9 @@ class AccessBroker:
             # the same call that made the copy, turns that into a recorded fact
             # instead of an agent's unverifiable complaint.
             "unreadable": self._unreadable_grants(granted, src_root),
+            # directories whose mode had to be repaired so the role can enter
+            # them (0 on a clean copy; non-zero is a copy-layer fact worth seeing)
+            "dirs_traversable": int(dirs_fixed),
             "skipped": skipped,
             "discarded": discarded,
             "backup_dir": backup_dir if discarded else None,
@@ -645,6 +655,47 @@ class AccessBroker:
                             "discarded": discarded,
                             "backup_dir": backup_dir if discarded else None}
         return granted
+
+    @staticmethod
+    def ensure_traversable(root: str, *, mode: int = 0o770) -> int:
+        """Make every DIRECTORY under ``root`` enterable by the role. Returns the
+        number of directories it had to change.
+
+        WHY (measured 2026-11-22, 3-outer run): ``_safe_copy`` re-asserts FILE
+        modes (0o660) but nothing ever touched DIRECTORY modes, and directories
+        are created by ``os.makedirs`` under the driver's private umask ``0o077``
+        -> 0700 -> a sandboxed role cannot even traverse it. The failure did not
+        look like a permission bug at all: the role worker's clean-up walk hit
+        one such directory (``gan/components/task/cm``) at exit, raised
+        ``PermissionError`` out of a ``finally``, and TWO generations of nine were
+        voided as ``planner_failed``.
+
+        Ownership is deliberately untouched (chmod rewrites the ACL mask, never
+        the owner) -- the same ruling as the file-mode fix, and the reason 0o770
+        is used instead of 0o750: it keeps the group write bit that the inherited
+        role ACL entry is masked against (docs/21 §17 / the ACL-mask lesson).
+
+        Best effort by design: a directory we cannot chmod is skipped, because
+        this runs inside grant/assembly paths that must not fail over cosmetics.
+        """
+        fixed = 0
+        try:
+            targets = [root]
+            for dirpath, dirnames, _files in os.walk(root):
+                targets.extend(os.path.join(dirpath, name) for name in dirnames)
+            for path in targets:
+                try:
+                    st = os.stat(path)
+                    if not stat.S_ISDIR(st.st_mode):
+                        continue
+                    if stat.S_IMODE(st.st_mode) != mode:
+                        os.chmod(path, mode)
+                        fixed += 1
+                except OSError:
+                    continue
+        except OSError:
+            return fixed
+        return fixed
 
     def _unreadable_grants(self, granted: List[str], src_root: str) -> List[str]:
         """Granted paths that are NOT readable in the workspace right now.
