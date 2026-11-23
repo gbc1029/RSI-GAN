@@ -57,7 +57,18 @@ from gan.framework import challenge_adjudication as contract
 #: with the ordinary channel by accident is worse than an honest "not yet".
 #: They light up the moment the row carries ``action_class_counts`` (stage 1
 #: extends the report); adding a name here is then a one-line change.
-SUPPORTED_DEFECT_CLASSES = ("process.dead-end",)
+SUPPORTED_DEFECT_CLASSES = ("process.dead-end", "process.step-exhaustion")
+
+#: classes that can be decided WITHOUT a declared ``defect_lines`` entry, because
+#: their predicate is absolute (spent the budget? yes/no). Declared here (not
+#: inferred from the name) so the FRAMEWORK can apply the same rule in the two
+#: places that need it -- ``adjudicate`` and the A-layer citable scan. Before
+#: this, both simply refused a domain with no lines, which would have made an
+#: absolute class unadjudicable AND silently uncitable in the same breath.
+CLASSES_WITHOUT_LINES = ("process.step-exhaustion",)
+
+#: the complement: classes whose predicate reads one of the declared lines.
+_NEEDS_LINES = frozenset(set(SUPPORTED_DEFECT_CLASSES) - set(CLASSES_WITHOUT_LINES))
 
 #: default progression tolerance for the D3 no-regression check. 0 = "must not
 #: get worse at all", which is legitimate because parent and child rows come from
@@ -103,11 +114,63 @@ def episode_dead_end(row: Optional[Mapping[str, Any]],
     return present if decided else None
 
 
+def episode_step_exhaustion(row: Optional[Mapping[str, Any]],
+                            lines: Mapping[str, float]) -> Optional[bool]:
+    """Did THIS episode spend the whole step budget WITHOUT finishing?
+
+    ABSOLUTE -- no declared line, no family table. Two decidability paths,
+    because archived rows predate the fields:
+
+    * ``stop_reason`` (P1-B, 2026-11-23) is what the episode loop actually did:
+      ``step_cap`` = the budget ran out; ``env_done`` = the env ended it;
+      ``loop_stop`` = the defensive neither; ``aborted`` = an infrastructure
+      drop, which must NEVER read as a behavioural defect (it would blame the
+      agent for a 502).
+    * Older rows carry no ``stop_reason`` but may carry ``step_cap`` + ``steps``.
+      Without them the answer is ``None``: guessing the family constant is
+      exactly how a threshold ends up measuring the benchmark, not the agent.
+
+    READ BEFORE USING IT AS A GENERATION-LEVEL SIGNAL: over 117 archived
+    generations (28 run/arms) the generation-level share of step-exhausted
+    episodes has a MEDIAN of 0.40 in EVERY arm (A0 0.66 vs A2 0.42, heavily
+    overlapping) and is family-skewed (putnext 84%, goto 20%). So it is NOT
+    discriminative as a per-generation verdict, and there is deliberately NO
+    ``issue_checks`` checker for this key -- a fixed-root "present in parent ->
+    absent in child" test would be a coin flip and would poison
+    ``verdict_stability``. It IS decidable and useful PER INSTANCE, which is
+    exactly what the challenge channel asks (one named episode, parent vs child).
+    The defect is real: those episodes are solvable in 9-15 steps by BabyAIBot
+    and spend the full 128.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    prog = _num(row.get("progression"))
+    if prog is None:
+        return None
+    reason = row.get("stop_reason")
+    if isinstance(reason, str) and reason:
+        if reason == "aborted":
+            return None
+        if reason == "step_cap":
+            return prog < 1.0
+        if reason in ("env_done", "loop_stop"):
+            return False
+        return None
+    cap = row.get("step_cap")
+    steps = row.get("steps")
+    if isinstance(cap, int) and not isinstance(cap, bool) \
+            and isinstance(steps, int) and not isinstance(steps, bool):
+        return steps >= cap and prog < 1.0
+    return None
+
+
 def defect_present(defect_class: str, row: Optional[Mapping[str, Any]],
                    lines: Mapping[str, float]) -> Optional[bool]:
     """Dispatch one per-episode predicate; ``None`` = not decidable."""
     if defect_class == "process.dead-end":
         return episode_dead_end(row, lines)
+    if defect_class == "process.step-exhaustion":
+        return episode_step_exhaustion(row, lines)
     return None
 
 
@@ -176,7 +239,10 @@ def adjudicate(challenge: Mapping[str, Any],
 
     if defect_class not in SUPPORTED_DEFECT_CLASSES:
         return undecidable(f"unsupported_defect_class:{defect_class or 'missing'}")
-    if not isinstance(lines, Mapping) or not lines:
+    if not isinstance(lines, Mapping) or (not lines and defect_class in _NEEDS_LINES):
+        # Only the classes that READ a line require one. An absolute class
+        # (``process.step-exhaustion``) must stay answerable in a domain that
+        # declares no defect_lines at all.
         return undecidable("defect_lines_undeclared")
 
     parent_row = item.get("parent_row")
@@ -244,10 +310,12 @@ def adjudicate(challenge: Mapping[str, Any],
 
 __all__ = [
     "ACTIONABILITY_BASIS",
+    "CLASSES_WITHOUT_LINES",
     "DEFAULT_PROGRESSION_TOL",
     "SUPPORTED_DEFECT_CLASSES",
     "adjudicate",
     "defect_families",
     "defect_present",
     "episode_dead_end",
+    "episode_step_exhaustion",
 ]

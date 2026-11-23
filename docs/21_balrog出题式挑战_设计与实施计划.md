@@ -889,3 +889,127 @@ PermissionError: [Errno 13] Permission denied: 'cm'
 - `test_verdict_stability_v2` C2 段：拿 `gan/design/seeds/planner.md` 当可授权
   路径（种子**按设计**不在任何角色的读写根里），改为授权 `gan/roles/planner.py`，
   并把"种子不可授权"加成一条正面断言（58/59 → **60/60**）。
+
+## 21. P1-B 投影 + `process.step-exhaustion`（2026-11-23）
+
+### 21.1 缺口：事实被算出来了，但没留下来
+
+harness 每局都算好了 `done`、`action_frequency`、
+`no_progress_action_counts`，写进了 episode JSON；但 `report.json` 的
+`episodes[]` 只保留**精简投影**（`steps` / `progression` /
+`invalid_actions` / `llm_calls` / 四个行为数字），而 `work/<genid>` 是临时的、
+train/eval 的 episode JSON 跑完就没了——整个 `a0_o3i3n2` 只剩下 cval 那 10 个。
+
+后果：某个事实**在写入时存在，跑完之后不可恢复**。任何依赖它的判据
+（checker / adjudicator / 离线审计）只能"运行时看得到、审计时看不到"，这正是
+把机械真值做厚的路上最不该有的形状。
+
+顺带暴露第二个问题：**步数上限根本不在行里**。`steps` 有，cap 没有，于是离线
+读者只能凭族常量去猜（goto/pickup = 64，其余 = 128）。一个要用来判"预算用完了"
+的判据，不能建立在"猜上限"之上。
+
+### 21.2 落点（纯新增，不删不改）
+
+| 层 | 字段 | 出处 |
+|---|---|---|
+| episode JSON | `env_done`、`step_cap`、`stop_reason`（`env_done`/`step_cap`/`loop_stop`，中断局 = `aborted`） | `domains/balrog/evaluator._play_episode` / `_record_aborted` |
+| `report.json` 行 | 上面三个 + `action_counts` + `no_progress_action_counts` | `domains/balrog/utils.collect_and_summarize_results` |
+| `report.json.behavior` | `stop_reason_counts`、`outcome_decided_episodes`、`episodes_step_exhausted`、`step_exhausted_share` | 同上 |
+
+两条规矩写进代码注释：
+
+- **`stop_reason` 是"循环怎么结束的"，`progression` 是"结果如何"**。两者必须
+  分开："预算用完"和"没解开"是两种缺陷，只有这一对能分开它们。
+- **中断局永远是 `stop_reason: "aborted"`，绝不能被读成 `step_cap`**——否则上游
+  一个 502 会被记成 agent 的行为缺陷。
+
+`behavior` 逐字透传（`compute_report_summary` 是 `dict(behavior)` 拷贝），所以
+框架侧不需要额外接线。
+
+### 21.3 新增可判缺陷类 `process.step-exhaustion`
+
+- **词表**：`gan/framework/issue_keys.py` 18 → **19**，`owner=planner`，
+  含义 "spent the whole step budget without finishing the task"。
+- **逐局判据**（`domains/balrog/challenge_adjudication.episode_step_exhaustion`）：
+  **绝对判据，无阈值**。
+  - 有 `stop_reason`：`step_cap` → `progression < 1`；`env_done` / `loop_stop` → 否；
+    `aborted` → `None`（不可判，不冤枉 agent）。
+  - 旧报告（无 `stop_reason`）：`step_cap` + `steps` 都在时回退到
+    `steps >= step_cap and progression < 1`；两者缺一则 `None`——**不猜族常量**。
+- **不需要 `defect_lines`**：`adjudicate` 原本"没有声明就拒判"，现在改成按类判断
+  （`_NEEDS_LINES = {"process.dead-end"}`）。一个绝对类必须能在没声明任何缺陷线的
+  域里被回答；`process.dead-end` 仍然必须声明（行为逐字节不变）。
+- `SUPPORTED_DEFECT_CLASSES` → `("process.dead-end", "process.step-exhaustion")`，
+  出题侧（`citable` / `defect_classes`）自动跟上，`issue_key == defect_class` 的
+  软绑定约定自然满足。
+
+### 21.4 为什么**刻意没有** generation 级 checker
+
+`issue_checks` 一个都没加。理由是量出来的，不是省事：
+
+对归档的 **117 代 / 28 个 run·arm** 逐代算"步数耗尽且未解开"的占比：
+
+```
+min 0.000   p25 0.250   median 0.400   p75 0.667   max 1.000   mean 0.455
+share == 0 的代数：20/117 (17.1%)
+```
+
+- **各臂几乎不分离**：`ablation_babyai_arms_1112b` A0 ≈ 0.60–0.90、
+  A1 ≈ 0.40–0.60、A2 ≈ 0.30–0.70，重叠严重；
+- **族偏斜严重**：putnext 84.2%、open 69.0%、pick_up_seq_go_to 33.2%、
+  pickup 26.4%、goto 19.7%。
+
+`verdict_stability` 要的是"父代有 → 子代没有"的**固定根**比较；在这个基线和方差
+下它会变成抛硬币，并且会把一个"每代都在"的东西钉成永远 PRESENT——那是把真值
+做脏，不是做厚。所以这一类**只走 challenge 通道**（单实例、父子对照），
+generation 级留空（`UNKNOWN`，`F_e` 里中性）。
+
+### 21.5 先证明"不是题目太难"
+
+如果 cap 太紧，这类就是基准属性而不是 agent 缺陷。用
+`domains/balrog/challenge_space.optimal_steps` 对**同 (family, seed)** 重放
+`BabyAIBot`：
+
+| 族 | 耗尽预算且未解开 | 最优策略只需 | `optimal >= cap` 的实例 |
+|---|---|---|---|
+| putnext | 12 / 14（全烧 128 步） | 9–15 步 | 0 |
+| open | 5 / 15（烧 128） | 10–14 步 | 0 |
+| goto | 1 / 18（烧 64） | 4 步 | 0 |
+| pickup | 1 / 18（烧 64） | 7 步 | 0 |
+| pick_up_seq_go_to | 1 / 15（烧 128） | 18 步 | 0 |
+
+没有一个实例的最优步数接近上限，所以**上限完全不是瓶颈**，这是真实的不收敛。
+
+### 21.6 与 `process.dead-end` 的分工
+
+`dead-end` 看的是**绕圈**（同一 `(state, action)` 反复重试、零位移）。putnext
+这批恰好相反：12 个耗尽局里 8 个 `revisit_share < 0.40`——**一直在到达新状态
+却始终收不了尾**。方向相反的两种病，修法也不同（"别再打转" vs "收敛/规划"），
+所以是两个键而不是一个键的两个变体。
+
+### 21.7 验收与回归
+
+新增 `scripts/local/test_step_exhaustion.py`（**44 断言**，四段）：
+
+- **A 词表**：新键在闭集、owner=planner、总数 18→19、旧键不变、未知键仍归
+  framework；
+- **B 真值表**：`step_cap`/`env_done`/`loop_stop`/`aborted` 四种取值，旧报告
+  回退，缺字段 → `None`；`defect_families` 的分母里 aborted 不计；
+- **C 端到端**：父耗尽/子完成 → `VERIFIED_REPAIR`（**空 `defect_lines` 也能判**）；
+  双 absent → `UNSUPPORTED`；父 absent 子 present → `REGRESSION_AFTER_FALSE_CHALLENGE`；
+  父为中断局 → `UNDECIDABLE`；同时验证 `dead-end` 在无声明时**仍然**拒判；
+  A 层 `citable_families` 用**同一条规则**（框架侧新增
+  `classes_without_lines_for`，豁免由域自己声明，框架不猜），否则会出现
+  "可判但不可引"的不对称；
+- **D 投影**：合成 episode JSON（含一条无 `stop_reason` 的旧行 + 一条中断局）走
+  真实的 `collect_and_summarize_results`，断言行字段、`behavior` 聚合、
+  `step_exhausted_share = 1/2`，且 `progression` / `question_points` 一字不变。
+
+校准与普查脚本（本地，`scripts/local/`，不入库）：
+`census_candidate_classes.py`（8 个候选类的 liveness 门槛）、
+`census_episode_json.py`（只有 episode JSON 才有的动作分布）、
+`check_optimal_steps.py`（§21.5）、`calibrate_step_exhaustion.py`（§21.4 的 117 代）。
+
+回归：13 套 challenge（40/36/39/tools/77/10/17/6/11/52/31/18/**44**）+
+balrog 12 套 + 框架 9 套 + `compileall` 全绿。`test_challenge_flow.py` 里
+"可判缺陷类必须只有 `process.dead-end`" 这条断言随词表一起更新为两类。

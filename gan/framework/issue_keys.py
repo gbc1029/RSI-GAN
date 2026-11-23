@@ -56,6 +56,13 @@ ISSUE_KEYS: Dict[str, Tuple[str, str]] = {
                         "budget/tool-call cap exhausted, run cut off mid-work"),
     "process.dead-end": (OWNER_PLANNER,
                          "repeated calls / loops never backtracked"),
+    # ``dead-end`` sees CYCLING (the same (state, action) pair re-tried). This one
+    # sees the MIRROR shape: the agent keeps reaching NEW states and still runs
+    # the whole step budget out (measured: putnext episodes that need 9-15 optimal
+    # steps burned 128). Distinct defect, distinct repair (plan/converge vs stop
+    # spinning), which is why it is a separate key and not a dead-end variant.
+    "process.step-exhaustion": (OWNER_PLANNER,
+                               "spent the whole step budget without finishing the task"),
     "process.observability": (OWNER_FRAMEWORK,
                               "evaluator cannot see the task's turns/tool calls"),
     # -- task decision quality ---------------------------------------------

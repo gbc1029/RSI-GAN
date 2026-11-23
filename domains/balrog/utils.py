@@ -341,6 +341,14 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
     behavior_revisit_traced_steps = 0
     behavior_degenerate_revisit = 0
     behavior_no_progress_actions = Counter()
+    # P1-B (2026-11-23): the per-episode facts that were COMPUTED but never
+    # PROJECTED. The episode JSON carries them, but train/eval work dirs are
+    # pruned, so a finished run kept only this row -- i.e. the datum existed at
+    # write time and was unrecoverable afterwards. Projecting costs one dict and
+    # makes every one of these decidable both live and offline.
+    behavior_stop_reasons = Counter()
+    behavior_step_exhausted = 0
+    behavior_outcome_decided = 0
     _idx = 0
     for env_name, episode_logs in results_summaries.items():
         for episode_log in episode_logs:
@@ -433,6 +441,30 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
                         behavior_no_progress_actions[str(act)] += int(n)
                     except (TypeError, ValueError):
                         continue
+                row["no_progress_action_counts"] = {
+                    str(a): int(n) for a, n in np_counts.items()
+                    if isinstance(n, (int, float)) and not isinstance(n, bool)}
+            # --- P1-B: stop reason / cap / executed-action counts -------------
+            # ``stop_reason`` is what the LOOP did (env_done | step_cap |
+            # loop_stop | aborted); ``progression`` is the OUTCOME. Keeping them
+            # apart is the point: "ran out of budget" and "failed" are
+            # different defects, and only the pair can tell them apart.
+            row["stop_reason"] = episode_log.get("stop_reason")
+            row["env_done"] = episode_log.get("env_done")
+            row["step_cap"] = episode_log.get("step_cap")
+            if isinstance(freq, dict) and freq:
+                row["action_counts"] = {
+                    str(a): int(n) for a, n in freq.items()
+                    if isinstance(n, (int, float)) and not isinstance(n, bool)}
+            reason = episode_log.get("stop_reason")
+            if isinstance(reason, str) and reason and not episode_log.get("aborted"):
+                behavior_stop_reasons[reason] += 1
+                # Denominator: episodes whose OUTCOME and STOP REASON are both
+                # known (an aborted episode has no behaviour to judge).
+                if isinstance(points, float):
+                    behavior_outcome_decided += 1
+                    if reason == "step_cap" and points < 1.0 - 1e-9:
+                        behavior_step_exhausted += 1
             # An ABORTED episode is scored 0.0 (it was played and lost) but it is
             # flagged, so "the agent fails this task" and "the infrastructure
             # killed this episode" stay distinguishable offline.
@@ -495,6 +527,19 @@ def collect_and_summarize_results(output_dir, planned_counts=None):
         # through the domain's declared ``action_classes`` (docs/20 §4.1) -- the
         # harness deliberately knows no action vocabulary.
         "no_progress_action_counts": dict(behavior_no_progress_actions),
+        # STOP-REASON family (P1-B). ``step_exhausted_share`` is the generation's
+        # share of episodes that spent the whole budget WITHOUT solving -- an
+        # absolute predicate (no threshold), so a per-episode consumer needs no
+        # declaration. EVIDENCE for the orchestrator: measured over 117 archived
+        # generations this share sits at a median 0.40 in EVERY arm (A0 0.66 vs
+        # A2 0.42), so it is NOT discriminative at generation level and must not
+        # become a ``verdict_stability`` input (see docs/21 §21).
+        "stop_reason_counts": dict(behavior_stop_reasons),
+        "outcome_decided_episodes": behavior_outcome_decided,
+        "episodes_step_exhausted": behavior_step_exhausted,
+        "step_exhausted_share": (
+            behavior_step_exhausted / behavior_outcome_decided
+            if behavior_outcome_decided else None),
     }
 
     # --- episode-domain objective facts (P1-9) -------------------------------

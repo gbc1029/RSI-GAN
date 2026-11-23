@@ -406,6 +406,11 @@ class EvaluatorManager:
             "failed_candidates": [],
             "action_frequency": {},
             "aborted": True,
+            # P1-B: an aborted episode has no stop reason of its own, and it must
+            # NEVER read as "step_cap" (that would turn an infrastructure drop
+            # into a behavioural defect).
+            "env_done": False,
+            "stop_reason": "aborted",
             "error": f"{type(error).__name__}: {error}"[:300],
         }
         if tb:
@@ -893,6 +898,21 @@ class Evaluator:
 
             episode_log["episode_return"] = episode_return
             episode_log["num_steps"] = step + 1  # pyright: ignore
+            # WHY THE LOOP ENDED (P1-B, additive only). ``num_steps`` alone cannot
+            # separate "the env said done", "the step budget ran out" and "the
+            # loop exited for another reason", and the cap itself was never in
+            # the row -- every offline reader had to guess the FAMILY constant
+            # (goto/pickup = 64, the rest 128). These three fields make the
+            # episode SELF-DESCRIBING, which is what lets a defect predicate be
+            # absolute (``stop_reason == "step_cap" and progression < 1``) with no
+            # threshold and no domain table.
+            _steps_taken = int(episode_log.get("num_steps") or 0)
+            _cap = int(max_steps_per_episode)
+            episode_log["env_done"] = bool(episode_log.get("done"))
+            episode_log["step_cap"] = _cap
+            episode_log["stop_reason"] = (
+                "env_done" if episode_log["env_done"]
+                else ("step_cap" if _steps_taken >= _cap else "loop_stop"))
             # Memory-window facts (方案 a): the DECLARED depth and how much of it
             # this episode actually used. Reported per episode so report.json (and
             # the offline tripwire) can tell "history was off" from "history was

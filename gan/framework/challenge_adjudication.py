@@ -217,9 +217,29 @@ def supported_classes_for(domain: str) -> tuple:
         return ()
 
 
+def classes_without_lines_for(domain: str) -> tuple:
+    """Classes the domain can decide WITHOUT a declared ``defect_lines`` entry.
+
+    An ABSOLUTE predicate (e.g. "did this episode spend its whole step budget?")
+    needs no threshold, so a domain that declares no lines can still answer it.
+    Declared by the domain, never inferred here: the framework must not guess
+    which of its classes are absolute. Empty for every domain that has not
+    adopted the field, which keeps the old "no lines => nothing citable"
+    behaviour byte-identical.
+    """
+    module = _challenge_submodule(domain, "challenge_adjudication")
+    classes = (getattr(module, "CLASSES_WITHOUT_LINES", ())
+               if module is not None else ())
+    try:
+        return tuple(str(c) for c in classes or ())
+    except TypeError:  # malformed => treat as "none", the conservative direction
+        return ()
+
+
 __all__ = [
     "UNDECIDABLE", "VERIFIED_REPAIR", "VERIFIED_UNRESOLVED",
     "UNSUPPORTED_CHALLENGE", "REGRESSION_AFTER_FALSE_CHALLENGE",
     "adjudicate", "validate_result", "register_adjudicator", "adjudicator_for",
     "defect_scan_for", "domain_module", "supported_classes_for",
+    "classes_without_lines_for",
 ]

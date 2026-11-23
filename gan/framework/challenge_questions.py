@@ -119,7 +119,9 @@ def citable_families(domain: str, defect_class: str,
     except RuntimeError as exc:
         raise ChallengeAdmissionError(
             f"defect_lines declaration is malformed: {exc}") from exc
-    if not lines:
+    if not lines and str(defect_class) not in adjudication.classes_without_lines_for(domain):
+        # Only the classes that READ a line need one; an absolute class stays
+        # citable and adjudicable in a domain that declares no defect_lines.
         return {}
     out = scan(list(report_rows or ()), str(defect_class), lines)
     return dict(out or {})
