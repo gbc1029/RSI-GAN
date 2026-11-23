@@ -847,8 +847,9 @@ def run_gan_driver(
         task_execution._require_sandboxable_proofgrader(
             "proofgrader.task_agent", trusted_prefix=python_prefix)
         if bool(cfg.get("challenge.enabled", False)):
+            from domains.imo.challenge_contract import PROTOCOL_VERSION
             task_execution._require_sandboxable_proofgrader(
-                "proofgrader.challenge_agent", trusted_prefix=python_prefix, expected_protocol=2)
+                "proofgrader.challenge_agent", trusted_prefix=python_prefix, expected_protocol=PROTOCOL_VERSION)
 
     models = {
         "task": model_registry.resolve("gan.task"),

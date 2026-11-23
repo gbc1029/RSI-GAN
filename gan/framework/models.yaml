@@ -33,8 +33,9 @@ dgmh:
   task: openai/gpt-4o-mini
 
 domains:
-  # Replay Gemini before changing this independent judge's default.
-  # Task and proof grader continue to use gan.task.
-  imo_challenge_adjudication: openai/gpt-4.1-mini
+  # Independent judge selected by the reviewed v3 replay; task/grader use gan.task.
+  imo_challenge_adjudication:
+    model: openai/glm-5.3-flash
+    reasoning_effort: high
   # external aider CLI used by the polyglot benchmark tooling (not our agent)
   polyglot_aider: gpt-3.5-turbo

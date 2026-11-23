@@ -175,7 +175,7 @@ def _packageize_proofgrader_repo(dst_dir: str, package_name: str = "proofgrader"
 
     if (pkg / "challenge_agent.py").is_file():
         # setup_default intentionally excludes domains (including datasets).
-        # The v2 judge needs only this frozen stdlib contract, never the data.
+        # The v3 judge needs only this frozen stdlib contract, never the data.
         contract_dir = pkg / "domains" / "imo"
         _ensure_init_py(pkg / "domains")
         _ensure_init_py(contract_dir)

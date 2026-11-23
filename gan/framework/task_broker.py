@@ -20,6 +20,8 @@ import time
 from multiprocessing.connection import Connection
 from typing import Any, Dict, Tuple
 
+from domains.imo.challenge_contract import PROTOCOL_VERSION
+
 
 # Scope ids are generation ids. The main loop uses plain integers ("0","1",...);
 # the fixed-root evaluation (docs/14 §5.5, eval_on_root.eval_genid) uses the
@@ -36,11 +38,11 @@ _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
-_CHALLENGE_ADJUDICATION_TASK_BRIEF = """Compare the parent and child proofs against the complete repair criterion. The fixed protocol-v2 judge returns parent_present, child_present, actionable, actionability_basis, modification_scope, and reason derived from quoted obligation checks, plus private assessment/confirmation and model/prompt provenance. Judge actionability from the REPAIR CRITERION only and modification_scope from the PLANNER TASK CHANGE only; these are an independent judgment from mathematical success. Concrete values named as acceptance evidence do not by themselves constitute leakage. Proposed repairs require a fresh independent confirmation. Do not expose private evidence to task/planner/evaluator feedback."""
+_CHALLENGE_ADJUDICATION_TASK_BRIEF = f"""Compare the parent and child proofs against the complete repair criterion. The fixed protocol-v{PROTOCOL_VERSION} judge returns parent_present, child_present, actionable, actionability_basis, modification_scope, and reason derived from source-referenced obligation checks, plus private assessment/confirmation and model/prompt provenance. Judge actionability from the REPAIR CRITERION only and modification_scope from the PLANNER TASK CHANGE only; these are an independent judgment from mathematical success. Concrete values named as acceptance evidence do not by themselves constitute leakage. Proposed repairs require a fresh independent confirmation. Do not expose private evidence to task/planner/evaluator feedback."""
 _CHALLENGE_ADJUDICATION_RESPONSE_CONTRACT = (
-    "Return the protocol_version=2 JSON envelope containing parent_present, "
+    f"Return the protocol_version={PROTOCOL_VERSION} JSON envelope containing parent_present, "
     "child_present, actionable, actionability_basis, modification_scope, reason, "
-    "assessment, confirmation, review_status, model and prompt_sha256. "
+    "assessment, confirmation, review_status, model, prompt_sha256 and response_format. "
     "Unknown presence is null. No markdown fences or surrounding prose."
 )
 
@@ -411,7 +413,7 @@ class _TaskBrokerState:
             if challenge_adjudication:
                 tx._require_sandboxable_proofgrader(
                     "proofgrader.challenge_agent",
-                    trusted_prefix=str(self.config["python_prefix"]), expected_protocol=2,
+                    trusted_prefix=str(self.config["python_prefix"]), expected_protocol=PROTOCOL_VERSION,
                 )
                 agent_path = tx._write_challenge_adjudicator_shim(
                     run_dir,
@@ -609,7 +611,7 @@ def broker_process_main(control: Connection, socket_path: str,
             if bool(config.get("challenge_enabled")):
                 tx._require_sandboxable_proofgrader(
                     "proofgrader.challenge_agent",
-                    trusted_prefix=trusted_prefix, expected_protocol=2,
+                    trusted_prefix=trusted_prefix, expected_protocol=PROTOCOL_VERSION,
                 )
         if os.path.lexists(socket_path):
             raise RuntimeError(f"task broker socket path already exists: {socket_path}")
