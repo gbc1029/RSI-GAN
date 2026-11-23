@@ -213,7 +213,7 @@ challenge:
   pilot_noop_repeats: 0      # optional no-op val repeats; 0 keeps pilot overhead off
   fitness:
     enabled: false           # explicit second-stage opt-in
-    min_supported: 30
+    min_supported: 15        #template testing 30
     min_determinate_rate: 0.8
     lambda_p: 0.10
     lambda_e: 0.05

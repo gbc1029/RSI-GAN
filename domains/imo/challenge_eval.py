@@ -6,23 +6,21 @@ import os
 
 import pandas as pd
 
-_ACTIONABILITY_BASES = {
-    "transferable_strategy", "instance_specific_content", "uncertain",
-}
-_MODIFICATION_SCOPES = {
-    "transferable_strategy", "instance_specific_memory", "answer_leakage",
-    "uncertain",
-}
+from domains.imo.challenge_adjudication_utils import format_input_dict
+from domains.imo.challenge_contract import validate_verdict
 
 
-def report_challenge_adjudication(dname, questions_path=None):
+def report_challenge_adjudication(dname, questions_path=None, expected_model=None):
     path = os.path.join(dname, "predictions.csv")
     frame = pd.read_csv(path, dtype=str, keep_default_na=False)
     qids = {}
+    inputs = {}
     if questions_path:
         questions = pd.read_csv(questions_path, dtype=str, keep_default_na=False)
         qids = dict(zip(questions["Challenge ID"].astype(str),
                         questions["Problem ID"].astype(str)))
+        inputs = {str(row["Challenge ID"]): format_input_dict(row)
+                  for _, row in questions.iterrows()}
     verdicts = {}
     invalid = []
     for _, row in frame.iterrows():
@@ -32,23 +30,15 @@ def report_challenge_adjudication(dname, questions_path=None):
             value = json.loads(str(row.get("prediction", "")).strip())
         except (TypeError, ValueError):
             value = None
-        valid = (
-            challenge_id and qid and isinstance(value, dict)
-            and set(value) == {"parent_present", "child_present",
-                               "actionable", "actionability_basis",
-                               "modification_scope", "reason"}
-            and (value.get("parent_present") is None
-                 or isinstance(value.get("parent_present"), bool))
-            and (value.get("child_present") is None
-                 or isinstance(value.get("child_present"), bool))
-            and isinstance(value.get("actionable"), bool)
-            and value.get("actionability_basis") in _ACTIONABILITY_BASES
-            and value.get("actionable") == (
-                value.get("actionability_basis") == "transferable_strategy")
-            and value.get("modification_scope") in _MODIFICATION_SCOPES
-            and isinstance(value.get("reason"), str)
-            and bool(value.get("reason", "").strip())
-        )
+        try:
+            if not challenge_id or not qid or challenge_id not in inputs:
+                raise ValueError("missing_original_judge_input")
+            validate_verdict(value, inputs[challenge_id])
+            if expected_model is not None and value["model"] != expected_model:
+                raise ValueError("unexpected_judge_model")
+            valid = True
+        except (ValueError, TypeError, KeyError):
+            valid = False
         if not valid:
             invalid.append(challenge_id or "<missing>")
             continue

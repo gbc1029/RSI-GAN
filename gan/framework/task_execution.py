@@ -16,6 +16,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import importlib.util
@@ -2800,6 +2801,7 @@ def _write_challenge_adjudicator_shim(
 def _require_sandboxable_proofgrader(
     module: str = "proofgrader.task_agent",
     trusted_prefix: Optional[str] = None,
+    expected_protocol: Optional[int] = None,
 ) -> None:
     """Require a proofgrader entry point to live inside the trusted prefix."""
     try:
@@ -2823,6 +2825,19 @@ def _require_sandboxable_proofgrader(
             f"(origin={origin or '<missing>'!r}, trusted_prefix={prefix!r}, "
             f"broker_prefix={os.path.realpath(sys.prefix)!r})"
         )
+    if expected_protocol is not None:
+        with open(origin, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read())
+        marker = next((node.value.value for node in tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name)
+                               and target.id == "JUDGE_PROTOCOL_VERSION"
+                               for target in node.targets)
+                       and isinstance(node.value, ast.Constant)), None)
+        if type(marker) is not int or marker != expected_protocol:
+            raise RuntimeError(
+                "installed challenge adjudicator protocol is stale; rebuild and "
+                "reinstall proofgrader into the trusted Python environment")
 
 
 def _open_grading_output(path: str, expected_owner_uid: Optional[int]) -> int:

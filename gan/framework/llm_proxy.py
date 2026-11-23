@@ -4,6 +4,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import secrets
 import socket
 import socketserver
@@ -22,6 +23,16 @@ def _normalize_model_name(model: Any) -> Optional[str]:
         return None
     prefix = "openai/"
     return model[len(prefix):] if model.startswith(prefix) else model
+
+
+def model_for_scope(models: Dict[str, str], scope: Dict[str, Any]) -> Optional[str]:
+    """Only root-issued challenge capabilities use the separate judge model."""
+    role = scope.get("role")
+    if (role == "task" and re.fullmatch(
+            r"challenge_outer(?:0|[1-9][0-9]{0,11})_gen(?:0|[1-9][0-9]{0,11})",
+            str(scope.get("scope_id") or ""))):
+        return models.get("challenge_adjudicator")
+    return models.get(role)
 
 
 class _UnixHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -480,7 +491,7 @@ class ParentLLMProxy:
             return
         requested_model = _normalize_model_name(body["model"])
         scoped_model = _normalize_model_name(scope.get("model"))
-        allowed_model = _normalize_model_name(self.models.get(scope["role"]))
+        allowed_model = _normalize_model_name(model_for_scope(self.models, scope))
         if requested_model != scoped_model or requested_model != allowed_model:
             self.audit_denied(scope, "model is not allowed for token scope", handler.path)
             handler._reply(403, {"error": {"message": "model policy denied"}})

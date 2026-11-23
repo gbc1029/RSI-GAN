@@ -318,6 +318,7 @@ def build_patch_from_workspace(broker, role: str, node_id,
 
     Handles modifications/additions AND deletions (files present in the repo but
     removed from the workspace, e.g. by ``unregister_component``).
+    Overlapping directory/file grants process each expanded file only once.
 
     ``report`` (optional, filled in place) records which files needed a
     three-way merge (``merged``) and which genuinely conflicted (``conflicts``,
@@ -338,6 +339,7 @@ def build_patch_from_workspace(broker, role: str, node_id,
     chunks: List[str] = []
     conflicts: List[Dict[str, str]] = []
     seen = set()
+    processed_files = set()
     for rel in granted:
         rel = str(rel).replace("\\", "/").lstrip("/")
         if not rel or rel in seen:
@@ -353,6 +355,9 @@ def build_patch_from_workspace(broker, role: str, node_id,
             if os.path.exists(b_root):
                 for b_file in _iter_files(b_root):
                     rel_file = os.path.relpath(b_file, src_root).replace(os.sep, "/")
+                    if rel_file in processed_files:
+                        continue
+                    processed_files.add(rel_file)
                     b_lines = _read_lines(b_file)
                     chunks.append(_no_newline_marker_diff(
                         [], b_lines, fromfile=f"a/{rel_file}", tofile=f"b/{rel_file}"))
@@ -361,13 +366,21 @@ def build_patch_from_workspace(broker, role: str, node_id,
             # the whole granted file/dir was deleted in the workspace
             for a_file in _iter_files(a_root):
                 rel_file = os.path.relpath(a_file, repo_root).replace(os.sep, "/")
+                if rel_file in processed_files:
+                    continue
+                processed_files.add(rel_file)
                 chunks.append(_deletion_diff(repo_root, rel_file))
             continue
         # modifications/additions
         b_files = set()
         for b_file in _iter_files(b_root):
             rel_file = os.path.relpath(b_file, src_root).replace(os.sep, "/")
+            # Presence is local to this directory scan, even if another grant
+            # already processed the file; otherwise it looks like a deletion.
             b_files.add(rel_file)
+            if rel_file in processed_files:
+                continue
+            processed_files.add(rel_file)
             # repo side ABSENT => the workspace file is a genuine ADDITION;
             # repo side PRESENT but unreadable => raise
             a_lines = _read_lines(os.path.join(repo_root, rel_file), missing_ok=True)
@@ -396,7 +409,8 @@ def build_patch_from_workspace(broker, role: str, node_id,
         if os.path.isdir(a_root):
             for a_file in _iter_files(a_root):
                 rel_file = os.path.relpath(a_file, repo_root).replace(os.sep, "/")
-                if rel_file not in b_files:
+                if rel_file not in b_files and rel_file not in processed_files:
+                    processed_files.add(rel_file)
                     chunks.append(_deletion_diff(repo_root, rel_file))
     if report is not None:
         report["conflicts"] = conflicts

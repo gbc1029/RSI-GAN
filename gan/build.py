@@ -451,8 +451,10 @@ def build_gan_loop(
     )
     loop_holder["loop"] = loop
     # explicit runtime record of the model configuration actually used
-    loop.log_event({"type": "model_config",
-                    **model_registry.describe(["gan.task", "gan.planner", "gan.evaluator"])})
+    model_keys = ["gan.task", "gan.planner", "gan.evaluator"]
+    if domain == "imo_proof" and cfg.get("challenge.enabled", False):
+        model_keys.append("domains.imo_challenge_adjudication")
+    loop.log_event({"type": "model_config", **model_registry.describe(model_keys)})
     if code_root:
         loop.log_event({"type": "code_init", "code_root": code_root, "layout": layout})
     # Repair a persisted role design that names something the committed tree

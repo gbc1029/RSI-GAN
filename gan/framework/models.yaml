@@ -17,7 +17,8 @@ gan:
   # away from the wall. planner/evaluator are bound by the per-call client
   # budget instead, so they take the higher-effort thinking mode.
   task:
-     model: openai/gpt-4o-mini
+     model: openai/gpt-4.1-mini
+#    template because of the 4o's 429
 #    model: openai/glm-5.3-flash
 #    reasoning_effort: low
   planner:
@@ -32,5 +33,8 @@ dgmh:
   task: openai/gpt-4o-mini
 
 domains:
+  # Replay Gemini before changing this independent judge's default.
+  # Task and proof grader continue to use gan.task.
+  imo_challenge_adjudication: openai/gpt-4.1-mini
   # external aider CLI used by the polyglot benchmark tooling (not our agent)
   polyglot_aider: gpt-3.5-turbo

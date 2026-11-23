@@ -173,6 +173,15 @@ def _packageize_proofgrader_repo(dst_dir: str, package_name: str = "proofgrader"
     # Write packaging config
     _write_pyproject(dst, package_name=package_name)
 
+    if (pkg / "challenge_agent.py").is_file():
+        # setup_default intentionally excludes domains (including datasets).
+        # The v2 judge needs only this frozen stdlib contract, never the data.
+        contract_dir = pkg / "domains" / "imo"
+        _ensure_init_py(pkg / "domains")
+        _ensure_init_py(contract_dir)
+        shutil.copyfile(Path(__file__).resolve().parent / "challenge_contract.py",
+                        contract_dir / "challenge_contract.py")
+
     # Rewrite imports inside the packaged code
     _rewrite_imports_under(pkg, package_name=package_name)
 

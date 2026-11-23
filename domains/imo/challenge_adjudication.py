@@ -13,6 +13,7 @@ import os
 from typing import Any, Mapping, Optional
 
 from gan.framework import challenge_adjudication as framework_adjudication
+from domains.imo.challenge_contract import validate_verdict
 
 _ACTIONABILITY_BASES = frozenset({
     "transferable_strategy", "instance_specific_content", "uncertain",
@@ -67,6 +68,12 @@ def _extract_side(verdict: Optional[Mapping[str, Any]], *, side: str,
                   challenge: Mapping[str, Any]) -> Optional[dict]:
     if verdict is None:
         return None
+    if "protocol_version" in verdict:
+        try:
+            validate_verdict({key: value for key, value in verdict.items()
+                              if key not in {"qid", "challenge_id"}})
+        except (ValueError, TypeError, KeyError):
+            return None
     expected_qid = str(challenge.get("qid") or "")
     if not expected_qid:
         return None
@@ -77,7 +84,7 @@ def _extract_side(verdict: Optional[Mapping[str, Any]], *, side: str,
         return None
 
     presence_key = f"{side}_present"
-    if not isinstance(verdict.get(presence_key), bool):
+    if verdict.get(presence_key) is not None and not isinstance(verdict.get(presence_key), bool):
         return None
     actionable = verdict.get("actionable")
     if not isinstance(actionable, bool):
@@ -90,7 +97,7 @@ def _extract_side(verdict: Optional[Mapping[str, Any]], *, side: str,
     scope = verdict.get("modification_scope")
     if scope not in _MODIFICATION_SCOPES:
         return None
-    return {presence_key: verdict[presence_key], "actionable": actionable,
+    return {presence_key: verdict.get(presence_key), "actionable": actionable,
             "actionability_basis": basis, "modification_scope": scope}
 
 
@@ -135,7 +142,14 @@ def adjudicate(
         evidence_ref=(f"{parent_evidence.get('report_path', '')} -> "
                       f"{child_evidence.get('report_path', '')}"),
     )
-    result["adjudicator"] = "imo_proof_fixed_v1"
+    is_v2 = all(v is not None and v.get("protocol_version") == 2
+                for v in (parent_verdict, child_verdict))
+    result["adjudicator"] = "imo_proof_fixed_v2" if is_v2 else "imo_proof_fixed_v1"
+    if is_v2:
+        # Content-free provenance only; evidence quotes never enter the ledger.
+        result["review_status"] = child_verdict.get("review_status")
+        result["model"] = child_verdict.get("model")
+        result["prompt_sha256"] = child_verdict.get("prompt_sha256")
     result["actionability_basis"] = actionability_basis
     result["modification_scope"] = modification_scope
     return result

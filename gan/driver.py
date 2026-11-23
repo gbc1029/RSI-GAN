@@ -848,13 +848,17 @@ def run_gan_driver(
             "proofgrader.task_agent", trusted_prefix=python_prefix)
         if bool(cfg.get("challenge.enabled", False)):
             task_execution._require_sandboxable_proofgrader(
-                "proofgrader.challenge_agent", trusted_prefix=python_prefix)
+                "proofgrader.challenge_agent", trusted_prefix=python_prefix, expected_protocol=2)
 
     models = {
         "task": model_registry.resolve("gan.task"),
         "planner": model_registry.resolve("gan.planner"),
         "evaluator": model_registry.resolve("gan.evaluator"),
     }
+    adjudicator_entry = None
+    if domain == "imo_proof" and bool(cfg.get("challenge.enabled", False)):
+        adjudicator_entry = model_registry.resolve_entry("domains.imo_challenge_adjudication")
+        models["challenge_adjudicator"] = adjudicator_entry["model"]
     proxy_dir = tempfile.mkdtemp(prefix="rsi-gan-proxy-", dir=_trusted_ipc_parent())
     os.chmod(proxy_dir, 0o711)
     try:
@@ -929,6 +933,7 @@ def run_gan_driver(
         "subset": subset,
         "num_samples": int(num_samples),
         "model": models["task"],
+        "adjudicator_entry": adjudicator_entry,
         # Same models.yaml entry as ``model``; resolve_entry() validated it at
         # startup. Rides the broker config (like the model), never the env.
         "reasoning_effort": model_registry.resolve_entry("gan.task").get("reasoning_effort"),

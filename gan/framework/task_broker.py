@@ -36,13 +36,12 @@ _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
-_CHALLENGE_ADJUDICATION_TASK_BRIEF = """Adjudicate one proof challenge by comparing the parent and child proofs against the stated defect claim and repair criterion. Return one JSON object with exactly these six keys: parent_present (boolean), child_present (boolean), actionable (boolean), actionability_basis (transferable_strategy, instance_specific_content, or uncertain), modification_scope (transferable_strategy, instance_specific_memory, answer_leakage, or uncertain), and reason (non-empty string). Assess parent_present and child_present independently from the proofs. Judge actionability_basis from the REPAIR CRITERION only: a repair is transferable when it teaches a reusable method and the task must still derive or verify the current answer, value, candidate, formula, or construction. Concrete values named as acceptance evidence do not make a method instance-specific. Use instance_specific_content only when the remedy requires supplying a qid/sibling-specific fact, current answer, or unique construction as pre-known input rather than asking the task to derive it, or other information that cannot be derived from the task input. Then judge modification_scope separately from the bounded PLANNER TASK CHANGE only; ignore the problem, claim, criterion, official solution, and proofs. Default to transferable_strategy. Use instance_specific_memory or answer_leakage only with positive evidence quoted from that task change. If actionability is false, its basis must be instance_specific_content or uncertain; modification_scope is still an independent judgment. Do not omit fields, add fields, or return null values."""
+_CHALLENGE_ADJUDICATION_TASK_BRIEF = """Compare the parent and child proofs against the complete repair criterion. The fixed protocol-v2 judge returns parent_present, child_present, actionable, actionability_basis, modification_scope, and reason derived from quoted obligation checks, plus private assessment/confirmation and model/prompt provenance. Judge actionability from the REPAIR CRITERION only and modification_scope from the PLANNER TASK CHANGE only; these are an independent judgment from mathematical success. Concrete values named as acceptance evidence do not by themselves constitute leakage. Proposed repairs require a fresh independent confirmation. Do not expose private evidence to task/planner/evaluator feedback."""
 _CHALLENGE_ADJUDICATION_RESPONSE_CONTRACT = (
-    "The response must be a non-empty string containing exactly one JSON object "
-    "with parent_present, child_present, actionable, actionability_basis, "
-    "modification_scope, and reason. Use booleans for the first three fields; "
-    "use the enumerated string values specified in the task instructions. "
-    "Do not include markdown fences or surrounding prose."
+    "Return the protocol_version=2 JSON envelope containing parent_present, "
+    "child_present, actionable, actionability_basis, modification_scope, reason, "
+    "assessment, confirmation, review_status, model and prompt_sha256. "
+    "Unknown presence is null. No markdown fences or surrounding prose."
 )
 
 
@@ -269,6 +268,12 @@ class _TaskBrokerState:
         domain = ("imo_challenge_adjudication" if challenge_adjudication
                   else str(self.config["domain"]))
         model = str(self.config["model"])
+        effort = self.config.get("reasoning_effort")
+        if challenge_adjudication:
+            entry = self.config.get("adjudicator_entry") or {}
+            if not entry.get("model"):
+                raise RuntimeError("independent challenge adjudicator model is not configured")
+            model, effort = str(entry["model"]), entry.get("reasoning_effort")
 
         parent_scored = bool(self.config["parent_scored"])
         # IMO proof train runs materialize the exact train batch in
@@ -406,7 +411,7 @@ class _TaskBrokerState:
             if challenge_adjudication:
                 tx._require_sandboxable_proofgrader(
                     "proofgrader.challenge_agent",
-                    trusted_prefix=str(self.config["python_prefix"]),
+                    trusted_prefix=str(self.config["python_prefix"]), expected_protocol=2,
                 )
                 agent_path = tx._write_challenge_adjudicator_shim(
                     run_dir,
@@ -434,7 +439,7 @@ class _TaskBrokerState:
                 expected_owner_uid=int(self.config["owner_uid"]),
                 # Fixed at root-side registration (same models.yaml entry as
                 # ``model``): the outer worker cannot influence it.
-                reasoning_effort=self.config.get("reasoning_effort"),
+                reasoning_effort=effort,
                 sample_seed=sample_seed,
                 anchor_ids=anchor_ids,
                 num_workers=int(self.config["harness_num_workers"]),
@@ -452,7 +457,7 @@ class _TaskBrokerState:
                     run_dir, "outputs", f"gan_{scope_id}")
                 from domains.imo.challenge_eval import report_challenge_adjudication
                 _report, challenge_report_path = report_challenge_adjudication(
-                    output_path, questions_path=questions_path)
+                    output_path, questions_path=questions_path, expected_model=model)
                 os.chown(
                     challenge_report_path,
                     int(self.config["owner_uid"]), int(self.config["owner_gid"]),
@@ -604,7 +609,7 @@ def broker_process_main(control: Connection, socket_path: str,
             if bool(config.get("challenge_enabled")):
                 tx._require_sandboxable_proofgrader(
                     "proofgrader.challenge_agent",
-                    trusted_prefix=trusted_prefix,
+                    trusted_prefix=trusted_prefix, expected_protocol=2,
                 )
         if os.path.lexists(socket_path):
             raise RuntimeError(f"task broker socket path already exists: {socket_path}")

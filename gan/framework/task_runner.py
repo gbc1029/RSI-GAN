@@ -569,11 +569,13 @@ class DomainTaskRunner:
             key: value for key, value in os.environ.items()
             if key.startswith("GAN_TASK_BROKER_")
         }
+        from gan.framework import models as model_registry
+        judge_entry = model_registry.resolve_entry("domains.imo_challenge_adjudication")
         rc, output = tx.run_harness_and_report(
             self.python, run_dir, "imo_challenge_adjudication", run_id,
-            self.subset, len(rows), self.default_model, env, self.timeout,
+            self.subset, len(rows), judge_entry["model"], env, self.timeout,
             questions_path=questions_path, scope_id=scope_id,
-            log_path=self.log_path, reasoning_effort=self.reasoning_effort,
+            log_path=self.log_path, reasoning_effort=judge_entry.get("reasoning_effort"),
         )
         if rc != 0:
             raise RuntimeError(
