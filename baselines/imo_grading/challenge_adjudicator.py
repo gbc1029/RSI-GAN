@@ -6,7 +6,8 @@ import json
 from agent.base_agent import AgentSystem
 from agent.llm_withtools import chat_with_agent
 from domains.imo.challenge_contract import (
-    PROTOCOL_VERSION, make_verdict, parse_assessment, prompt_digest, proposes_repair,
+    PROTOCOL_VERSION, assessment_failure, make_verdict, parse_assessment,
+    prompt_digest, proposes_repair,
 )
 
 # Literal deployment marker checked from the trusted installed source without
@@ -153,7 +154,14 @@ For each obligation and each side use:
 For parent_consistency/child_consistency check the full submitted proof for
 unresolved material contradictions related to these obligations. If none remain,
 use satisfied; uncertainty is uncertain. Quotes must come from that side only.
-Criterion quotes must be exact substrings of REPAIR CRITERION. A satisfied
+Criterion quotes must be exact substrings of REPAIR CRITERION. Use short,
+continuous verbatim excerpts (one formula or a short clause), not whole
+paragraphs. Do not insert ellipses, translate, paraphrase, change mathematical
+symbols, add quotation marks absent from the source, or join separate passages
+inside one quote. Put separate literal excerpts in separate array entries.
+Never use a sentence from CHALLENGE CLAIM as a criterion quote unless it is
+also literally present in REPAIR CRITERION. Parent and child quotes must come
+from their own proof, never from the other side or the claim. A satisfied
 obligation needs actual supporting text, not merely the correct final answer.
 Provide brief mathematical evidence, not a long reasoning transcript.
 
@@ -229,6 +237,11 @@ CHILD PROOF:
 """
 
 REPAIR_PROMPT = """Your previous output did not satisfy the assessment JSON/evidence contract. Return only the required assessment JSON. Preserve your mathematical findings; this is a format/evidence correction, not an independent mathematical review. Include all repair obligations and exact source quotations. Never invent quotes or replace a missing argument with the expected answer.
+Correct the invalid field reported below and recheck ALL quotations. Use short
+continuous literal source excerpts, not summaries or passages joined with
+ellipses. criterion_quote comes only from REPAIR CRITERION; parent/child quotes
+only from their respective proof; scope_quotes only from Task Change. Do not
+change mathematical findings merely to pass validation.
 {
   "obligations": [
     {
@@ -283,7 +296,7 @@ class TaskAgent(AgentSystem):
         super().__init__(model, chat_history_file=chat_history_file)
         self.reasoning_effort = reasoning_effort
 
-    def _assessment(self, instruction, inputs):
+    def _assessment(self, instruction, inputs, phase="initial"):
         history = chat_with_agent(
             instruction, model=self.model, msg_history=[], logging=self.log,
             tools_available=[], max_tool_calls=0,
@@ -293,11 +306,16 @@ class TaskAgent(AgentSystem):
             raw = history[-1].get("content", "") if history else ""
             try:
                 return parse_assessment(raw, inputs), history
-            except (ValueError, TypeError, KeyError):
-                self.log("challenge_assessment_invalid: format_or_evidence")
+            except (ValueError, TypeError, KeyError) as exc:
+                failure = assessment_failure(exc)
+                self.log(json.dumps({"kind": "challenge_assessment_invalid",
+                                     "phase": phase, "attempt": attempt + 1,
+                                     **failure}, sort_keys=True))
                 if attempt == 0:
                     history = chat_with_agent(
-                        REPAIR_PROMPT, model=self.model, msg_history=history,
+                        REPAIR_PROMPT + "\nVALIDATION FAILURE (code and field path only):\n"
+                        + json.dumps(failure, sort_keys=True),
+                        model=self.model, msg_history=history,
                         logging=self.log, tools_available=[], max_tool_calls=0,
                         reasoning_effort=self.reasoning_effort,
                     )
@@ -321,7 +339,7 @@ class TaskAgent(AgentSystem):
                 # Fresh history contains original evidence only: neither the
                 # first verdict nor its evidence selection is sent to review.
                 confirmation, review_history = self._assessment(
-                    REVIEW_INSTRUCTION + instruction, inputs)
+                    REVIEW_INSTRUCTION + instruction, inputs, phase="confirmation")
                 history = history + review_history
             except Exception as exc:
                 # No provider body/credential or reference text in diagnostics.
