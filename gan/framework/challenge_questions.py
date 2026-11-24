@@ -44,6 +44,15 @@ PROPOSAL_FIELDS = ("defect_class", "family", "evidence_ref", "repair_criterion")
 LINK_FIELDS = ("issue_id", "issue_key")
 
 
+def challenge_limits(cfg, domain):
+    """Preserve the two existing domain defaults; explicit run values win."""
+    proof = domain == "imo_proof"
+    k = cfg.get("challenge.max_k")
+    random_min = cfg.get("challenge.random_min")
+    return (int(k) if k is not None else (5 if proof else 2),
+            int(random_min) if random_min is not None else (10 if proof else 1))
+
+
 class ChallengeAdmissionError(RuntimeError):
     """A proposal failed A or B. The caller logs ``challenge_rejected``."""
 

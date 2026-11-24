@@ -238,15 +238,24 @@ issues:
 # ---------------------------------------------------------------------------
 challenge:
   enabled: false               # 阶段 1 打开；关 = 零行为影响（硬门）
-  max_k: 2                     # 每代最多几道题（占旋转位；预算见下）
+  max_k: null                  # default: episode=2; imo_proof=5; explicit values override
   # 批次预算：train 批 = anchor 5 + challenge <= max_k + 随机 >= 1 = num_samples。
   # 启动时 fail-closed 校验，违反即拒绝启动而不是静默截断（docs/21 §4.1）。
-  random_min: 1
+  random_min: null             # default: episode=1; imo_proof=10
   # challenge_val（eval 批）只做泛化确认，单独成列：绝不进 val_mean、
   # 不参与选父、不参与 stagnation。
   eval_max_per_challenge: 1
   # 结算用：修复判据 D3 的进度容差（0 = 同族同档下"不许降"）。
   progression_tol: 0.0
+  val_min_delta: null
+  pilot_noop_repeats: 0
+  fitness:                     # IMO qid protocol only; authoring uses metrics.fitness blend
+    enabled: false
+    min_supported: 15
+    min_determinate_rate: 0.8
+    lambda_p: 0.10
+    lambda_e: 0.05
+    lambda_precision: 0.05
   # 两阶段激活（沿用 IMO 纪律）：settled 样本数达到 min_supported 且
   # determinate_rate >= min_determinate_rate 才认为证据够（历史口径，仍记录）。
   #

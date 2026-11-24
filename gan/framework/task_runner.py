@@ -24,6 +24,8 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
+
 from gan.framework import task_execution as tx
 from gan.framework import paths, scores, code_repo
 from gan.framework.loader import load_registry, resolve_domain
@@ -78,6 +80,43 @@ def _final_output_summary(
 # one (it would report rejected:true to the receipt / events / evaluator
 # surfaces and hand the planner a phantom "fix the reported problem" hint).
 TASK_PATCH_REJECTED_NO_COMMIT = "no new code commit (patch rejected or absent)"
+
+
+def _task_change_summary(submitted_patch: Any, config: Any,
+                         parent: Optional[Node]) -> Dict[str, Any]:
+    """Build a bounded, score-free summary for the fixed challenge gate.
+
+    The adjudicator needs to judge the planner's actual task change, but it
+    must not receive an unbounded trajectory or hidden grader data.  Config
+    output is limited to changed keys against the persisted parent snapshot;
+    source patches contain only added lines and are length-capped.
+    """
+    raw_patch = str(submitted_patch or "")
+    added_patch = "\n".join(
+        line[1:] for line in raw_patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++"))
+    parent_config = {}
+    if parent is not None and isinstance(parent.meta, dict):
+        value = parent.meta.get("config_dict")
+        if isinstance(value, dict):
+            parent_config = value
+    current_config = config if isinstance(config, dict) else {}
+    changed = {}
+    for key in sorted(set(parent_config) | set(current_config), key=str):
+        before = parent_config.get(key)
+        after = current_config.get(key)
+        if before != after:
+            try:
+                encoded = json.dumps(after, ensure_ascii=False, sort_keys=True,
+                                     default=str)
+            except (TypeError, ValueError):
+                encoded = str(after)
+            changed[str(key)] = encoded[:2400]
+    return {
+        "submitted_patch_added": added_patch[:6000],
+        "config_changed": changed,
+        "patch_submitted": bool(raw_patch.strip()),
+    }
 
 
 def summarize_question_failures(path: str) -> Optional[Dict[str, Any]]:
@@ -471,10 +510,161 @@ class DomainTaskRunner:
                                "harness '[WARN] f5 audit channel delivered 0' "
                                "line in logs/task_runner.log)")
 
+    def adjudicate_proof_challenges(
+        self, parent: Node, child: Node, challenges: List[Dict[str, Any]],
+        *, outer: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Run the fixed parent/child adjudicator through the task broker."""
+        if self.domain != "imo_proof" or not challenges:
+            return {}
+        scope_id = f"challenge_outer{int(outer)}_gen{int(child.genid)}"
+        node_dir = paths.work_dir(self.output_dir, scope_id)
+        source_root = self.code_root or self.repo_root
+        run_dir, _ = tx.prepare_run_dir(
+            source_root, node_dir, "", domain="imo_proof")
+        audit_runtime = tx.materialize_audit_chain(run_dir)
+        if not audit_runtime["audit_files"]:
+            raise RuntimeError(
+                "fixed challenge adjudicator runtime is incomplete: "
+                + "; ".join(row.get("reason", "unknown audit runtime error")
+                             for row in audit_runtime["skipped"]))
+        run_id = f"gan_{scope_id}"
+        output_dir = os.path.join(run_dir, "outputs", run_id)
+        os.makedirs(output_dir, exist_ok=True)
+
+        def proof_rows(node: Node) -> Dict[str, str]:
+            path = os.path.join(
+                paths.runs_dir(self.output_dir, node.genid), "predictions.csv")
+            frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+            if "Problem ID" not in frame.columns or "prediction" not in frame.columns:
+                raise RuntimeError("archived proof predictions lack id or prediction")
+            if frame["Problem ID"].astype(str).duplicated().any():
+                raise RuntimeError("archived proof predictions contain duplicate ids")
+            return dict(zip(frame["Problem ID"].astype(str),
+                            frame["prediction"].astype(str)))
+
+        parent_proofs = proof_rows(parent)
+        child_proofs = proof_rows(child)
+        dataset, question_id_col, ground_truth_key = tx.load_dataset_frame(
+            self.repo_root, "imo_proof", self.subset)
+        trusted = dataset.copy()
+        trusted[question_id_col] = trusted[question_id_col].astype(str)
+        trusted = trusted.set_index(question_id_col, drop=False)
+        rows = []
+        unresolved: List[Dict[str, Any]] = []
+        for challenge in challenges:
+            qid = str(challenge.get("qid") or "")
+            if qid not in trusted.index:
+                unresolved.append({"challenge_id": challenge.get("challenge_id"),
+                                   "qid": qid, "reason": "missing_trusted_qid"})
+                continue
+            missing_sides = []
+            if qid not in parent_proofs:
+                missing_sides.append("parent")
+            if qid not in child_proofs:
+                missing_sides.append("child")
+            if missing_sides:
+                unresolved.append({
+                    "challenge_id": challenge.get("challenge_id"),
+                    "qid": qid,
+                    "reason": "missing_" + "_and_".join(missing_sides) + "_proof",
+                })
+                continue
+            reference = trusted.loc[qid]
+            rows.append({
+                "Challenge ID": str(challenge.get("challenge_id") or ""),
+                "Problem ID": qid,
+                "Problem": str(reference["Problem"]),
+                "Solution": str(reference[ground_truth_key]),
+                "Grading guidelines": str(reference["Grading guidelines"]),
+                "Parent Response": parent_proofs[qid],
+                "Child Response": child_proofs[qid],
+                "Defect Type": str(challenge.get("defect_type") or ""),
+                "Claim": str(challenge.get("claim") or ""),
+                "Evidence Ref": str(challenge.get("evidence_ref") or ""),
+                "Repair Criterion": str(challenge.get("repair_criterion") or ""),
+                "Task Change": json.dumps(
+                    (child.meta or {}).get("task_change") or {},
+                    ensure_ascii=False, sort_keys=True),
+            })
+        if unresolved:
+            self._event(
+                "challenge_adjudicator_unresolved",
+                genid=str(child.genid), requested=len(challenges),
+                resolved=len(rows), unresolved=unresolved,
+            )
+        if not rows:
+            return {}
+        input_dir = os.path.join(run_dir, "input")
+        os.makedirs(input_dir, exist_ok=True)
+        questions_path = os.path.join(input_dir, "questions.csv")
+        pd.DataFrame(rows).to_csv(questions_path, index=False)
+
+        env = {
+            key: value for key, value in os.environ.items()
+            if key.startswith("GAN_TASK_BROKER_")
+        }
+        from gan.framework import models as model_registry
+        judge_entry = model_registry.resolve_entry("domains.imo_challenge_adjudication")
+        rc, output = tx.run_harness_and_report(
+            self.python, run_dir, "imo_challenge_adjudication", run_id,
+            self.subset, len(rows), judge_entry["model"], env, self.timeout,
+            questions_path=questions_path, scope_id=scope_id,
+            log_path=self.log_path, reasoning_effort=judge_entry.get("reasoning_effort"),
+        )
+        if rc != 0:
+            raise RuntimeError(
+                "fixed challenge adjudicator failed: " + str(output)[-1000:])
+        failures_path = os.path.join(output_dir, "agent_evals",
+                                     "eval_failures.jsonl")
+        failure_summary = summarize_question_failures(failures_path)
+        if failure_summary:
+            self._event(
+                "challenge_adjudicator_question_failures",
+                genid=str(child.genid), **failure_summary)
+            if failure_summary.get("all_failed"):
+                raise RuntimeError(
+                    "fixed challenge adjudicator had no successful questions: "
+                    f"{failure_summary}")
+        report_path = os.path.join(output_dir, "report.json")
+        with open(report_path, "r", encoding="utf-8") as stream:
+            report = json.load(stream)
+        verdicts = report.get("challenge_adjudications")
+        if not isinstance(verdicts, dict):
+            raise RuntimeError("fixed challenge adjudicator report is malformed")
+        invalid_ids = report.get("invalid_challenge_ids")
+        if isinstance(invalid_ids, list) and invalid_ids:
+            self._event(
+                "challenge_adjudicator_invalid_verdicts",
+                genid=str(child.genid), requested=len(rows),
+                parsed=len(verdicts), invalid_challenge_ids=[str(value)
+                for value in invalid_ids],
+            )
+        if rows and not verdicts:
+            raise RuntimeError(
+                "fixed challenge adjudicator produced no usable verdicts: "
+                f"{report.get('invalid_challenge_ids') or []}")
+        evidence_dir = paths.runs_dir(self.output_dir, child.genid)
+        os.makedirs(evidence_dir, exist_ok=True)
+        shutil.copy2(
+            report_path, os.path.join(evidence_dir, "challenge_adjudication.json"))
+        determinate = sum(
+            1 for verdict in verdicts.values()
+            if isinstance(verdict, dict)
+            and isinstance(verdict.get("parent_present"), bool)
+            and isinstance(verdict.get("child_present"), bool)
+            and verdict.get("actionable") is True)
+        self._event(
+            "challenge_adjudicator_done", genid=str(child.genid),
+            requested=len(rows), parsed=len(verdicts), determinate=determinate)
+        return {str(key): dict(value) for key, value in verdicts.items()
+                if isinstance(value, dict)}
+
     # -- runner ------------------------------------------------------------
     def __call__(self, plan: Optional[Dict[str, Any]] = None, parent: Optional[Node] = None,
                  genid: Any = None, base: Optional[str] = None,
-                 fixed_episode_override: Optional[Dict[str, Any]] = None) -> Node:
+                 fixed_episode_override: Optional[Dict[str, Any]] = None,
+                 challenge_ids: Optional[List[Any]] = None) -> Node:
         """Run one generation / evaluation round.
 
         ``fixed_episode_override`` (docs/21 §4.1) runs a DIFFERENT pinned episode
@@ -484,6 +674,8 @@ class DomainTaskRunner:
         Shape: ``{"episode_ids": [...], "per_task": n}``.
         """
         plan = plan or {}
+        active_challenge_ids = list(dict.fromkeys(
+            str(q) for q in (challenge_ids or [])))
         records = plan.get("records", []) or []
         config = plan.get("config")
         if not isinstance(config, dict):
@@ -502,9 +694,21 @@ class DomainTaskRunner:
                 raise ValueError(
                     "fixed_episode_override requires per_task > 0 "
                     f"(got {pinned_per_task})")
+        submitted_patch = patch_str
+        task_change = _task_change_summary(submitted_patch, config, parent)
+        challenge_audit: Dict[str, Any] = {"triggered": False, "reason": None}
+        if active_challenge_ids:
+            from gan.framework import challenge_ledger
+            challenge_audit = challenge_ledger.audit_single_question_hardcoding(
+                active_challenge_ids, patch_str, config)
+            if challenge_audit.get("triggered"):
+                # Refuse before code_repo.apply_task_patch: the suspicious
+                # response must never enter the task lineage.
+                patch_str = ""
 
         node_dir = paths.work_dir(self.output_dir, genid)
         os.makedirs(node_dir, exist_ok=True)
+        sample_info: Dict[str, Any] = {}
 
         # Branch-per-node: the selected parent's code state (checked out by the
         # loop BEFORE planning) is the base; the task patch is committed on top
@@ -520,6 +724,8 @@ class DomainTaskRunner:
         task_patch_files = []
         patch_applied = False
         task_patch_rejected = None
+        if challenge_audit.get("triggered"):
+            task_patch_rejected = "challenge response failed framework audit"
         if self.code_root and base:
             res = code_repo.apply_task_patch(
                 apply_target, "planner", patch_str, genid,
@@ -534,7 +740,10 @@ class DomainTaskRunner:
                 task_patch_files = code_repo.changed_files(patch_str)
             # Only a PROPOSED patch with no new commit is a rejection --
             # "no patch proposed" must not masquerade as one.
-            task_patch_rejected = task_patch_rejection(patch_str, task_code_commit, base_commit)
+            task_patch_rejected = (
+                "challenge response failed framework audit"
+                if challenge_audit.get("triggered") else
+                task_patch_rejection(patch_str, task_code_commit, base_commit))
         elif (patch_str or "").strip() and apply_target:
             # legacy path (no base resolved): pre-branch time-line HEAD behaviour
             try:
@@ -715,7 +924,8 @@ class DomainTaskRunner:
                         sample_mode=sample_info.get("mode"),
                         sample_seed=sample_info.get("sample_seed"),
                         sampled_ids=sample_info.get("sampled_ids"),
-                        anchor_ids=sample_info.get("anchor_ids"))
+                        anchor_ids=sample_info.get("anchor_ids"),
+                        challenge_ids=sample_info.get("challenge_ids"))
             report = tx.read_report(report_path) if rc == 0 else None
             if report is not None:
                 self._event("task_eval_done", genid=str(genid),
@@ -750,7 +960,8 @@ class DomainTaskRunner:
                         sample_mode=sample_info.get("mode"),
                         sample_seed=sample_info.get("sample_seed"),
                         sampled_ids=sample_info.get("sampled_ids"),
-                        anchor_ids=sample_info.get("anchor_ids"))
+                        anchor_ids=sample_info.get("anchor_ids"),
+                        challenge_ids=sample_info.get("challenge_ids"))
             predictions_path = os.path.join(output_path, "predictions.csv")
             report = None
             if os.path.exists(predictions_path):
@@ -814,13 +1025,36 @@ class DomainTaskRunner:
                     reasoning_effort=self.reasoning_effort,
                 )
             else:
-                sample_info = {}
-                rc, _out = tx.run_harness_and_report(
-                    self.python, run_dir, self.domain, run_id, self.subset,
-                    self.num_samples, model, env, self.timeout,
-                    dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
-                    reasoning_effort=self.reasoning_effort,
-                )
+                if self.domain == "imo_proof":
+                    # Materialize the selected questions in the framework so
+                    # the actual train qids are auditable and can be bound to
+                    # a blind challenge. The selection rule is unchanged:
+                    # seeded runs use the existing per-generation seed and
+                    # anchors; no-seed runs retain the legacy prefix.
+                    per_gen_seed = (
+                        tx.derive_sample_seed(self.sample_seed_base, str(genid))
+                        if self.sample_seed_base is not None else None
+                    )
+                    questions_path, _ground_truth, sample_info = tx.prepare_questions(
+                        self.repo_root, run_dir, self.domain, self.subset,
+                        self.num_samples, sample_seed=per_gen_seed,
+                        anchor_ids=self.anchor_ids,
+                        challenge_ids=active_challenge_ids,
+                    )
+                    rc, _out = tx.run_harness_and_report(
+                        self.python, run_dir, self.domain, run_id, self.subset,
+                        self.num_samples, model, env, self.timeout,
+                        questions_path=questions_path, scope_id=str(genid),
+                        log_path=self.log_path,
+                        reasoning_effort=self.reasoning_effort,
+                    )
+                else:
+                    rc, _out = tx.run_harness_and_report(
+                        self.python, run_dir, self.domain, run_id, self.subset,
+                        self.num_samples, model, env, self.timeout,
+                        dataset_root=self.repo_root, scope_id=str(genid), log_path=self.log_path,
+                        reasoning_effort=self.reasoning_effort,
+                    )
             if self.domain == "imo_proof":
                 self._event("task_harness_done", genid=str(genid), rc=rc,
                             duration_s=round(time.time() - _t_harness, 1),
@@ -1098,6 +1332,8 @@ class DomainTaskRunner:
                 "code_ref_mode": code_ref_mode,
                 "task_patch_files": task_patch_files,
                 "task_patch_rejected": task_patch_rejected,
+                "challenge_audit": challenge_audit,
+                "task_change": task_change,
                 "records": records,
                 "report_summary": report_summary,
                 "score_status": score_status,
@@ -1105,6 +1341,11 @@ class DomainTaskRunner:
                 "toolset_report": toolset_report,
                 "design_stripped": design_stripped or None,
                 "final_output_summary": final_output_summary,
+                "sample_mode": sample_info.get("mode"),
+                "sample_seed": sample_info.get("sample_seed"),
+                "sampled_ids": list(sample_info.get("sampled_ids") or []),
+                "sample_anchor_ids": list(sample_info.get("anchor_ids") or []),
+                "sample_challenge_ids": list(sample_info.get("challenge_ids") or []),
                 # Reserved cost keys of this generation (docs/10 §10): the
                 # effective values that governed the child + the clamp records
                 # (the receipt projects the clamps to the planner).

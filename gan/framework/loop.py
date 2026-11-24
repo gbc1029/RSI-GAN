@@ -500,6 +500,10 @@ class GanLoop:
         self._attempt = uuid.uuid4().hex[:8]
         # role self-edit commits made by this run (audit)
         self._role_commits: Dict[str, str] = {}
+        # Frozen after role restoration at outer entry. Inner/challenge records
+        # must remain attributed to the design that actually ran them, even
+        # though self-improve mutates the live design before supernode write.
+        self._outer_versions: Dict[str, Optional[str]] = {}
         # -- outer-level selection (docs/14) ---------------------------------
         self.outer_select_enabled = bool(cfg.get("outer_select.enabled", False))
         self.tournament_k = int(cfg.get("outer_select.tournament_k", 3))
@@ -578,6 +582,20 @@ class GanLoop:
         self.lambda_novelty = float(cfg.get("fitness.lambda_novelty", 0.2))
         self.w1_calibration = float(cfg.get("fitness.w1_calibration", 0.6))
         self.w2_verdict_stability = float(cfg.get("fitness.w2_verdict_stability", 0.4))
+        self.challenge_fitness_enabled = bool(
+            cfg.get("challenge.fitness.enabled", False)) and bool(
+                self.domains and self.domains[0] == "imo_proof")
+        self.challenge_fitness_min_supported = int(
+            cfg.get("challenge.fitness.min_supported", 30))
+        self.challenge_fitness_min_determinate_rate = float(
+            cfg.get("challenge.fitness.min_determinate_rate", 0.8))
+        self.challenge_lambda_p = float(cfg.get("challenge.fitness.lambda_p", 0.10))
+        self.challenge_lambda_e = float(cfg.get("challenge.fitness.lambda_e", 0.05))
+        self.challenge_lambda_precision = float(
+            cfg.get("challenge.fitness.lambda_precision", 0.05))
+        self.challenge_val_min_delta = cfg.get("challenge.val_min_delta")
+        self.challenge_noop_repeats = max(0, int(
+            cfg.get("challenge.pilot_noop_repeats", 0) or 0))
         self._archive: Any = None
         self._outer_select_rng = random.Random()
         self.cooldown_window = int(cfg.get("outer_select.cooldown_window", 3))
@@ -632,8 +650,10 @@ class GanLoop:
         # exactly like one that was answered).
         # ------------------------------------------------------------------
         self.challenge_enabled = bool(cfg.get("challenge.enabled", False))
-        self.challenge_max_k = int(cfg.get("challenge.max_k", 0) or 0)
-        self.challenge_random_min = int(cfg.get("challenge.random_min", 1) or 0)
+        self.challenge_domain = (self.domains[0] if self.domains else "")
+        from gan.framework.challenge_questions import challenge_limits
+        self.challenge_max_k, self.challenge_random_min = challenge_limits(
+            cfg, self.challenge_domain)
         self.challenge_progression_tol = float(cfg.get("challenge.progression_tol", 0.0) or 0.0)
         self.challenge_metrics_cfg = {
             "min_supported": int(cfg.get("challenge.metrics.min_supported", 30) or 30),
@@ -660,7 +680,6 @@ class GanLoop:
             "determinate_min": float(
                 cfg.get("challenge.metrics.fitness.determinate_min", 0.8) or 0.0),
         }
-        self.challenge_domain = (self.domains[0] if self.domains else "")
         self._challenge_cfg_state = {"authorable": False, "reason": "disabled"}
         # Closed vocabularies the author may use (empty when authoring is off).
         self._challenge_defect_classes: List[str] = []
@@ -1109,6 +1128,34 @@ class GanLoop:
             return hashlib.sha256(data.encode("utf-8")).hexdigest()
         except Exception:  # noqa: BLE001 -- advisory stamp
             return None
+
+    def _capture_outer_versions(self, outer: int) -> Dict[str, Optional[str]]:
+        """Freeze active role design/code versions for one outer."""
+        from gan.framework import code_repo
+        roles_commit = None
+        roles_root = self._roles_root()
+        if roles_root:
+            try:
+                roles_commit = code_repo.current_commit(roles_root)
+            except Exception:  # noqa: BLE001 -- advisory metadata
+                roles_commit = None
+        self._outer_versions = {
+            "planner_design_hash": self._design_hash("planner"),
+            "evaluator_design_hash": self._design_hash("evaluator"),
+            "planner_commit": roles_commit,
+            "evaluator_commit": roles_commit,
+        }
+        self.log_event({"type": "outer_versions_frozen", "outer": outer,
+                        **self._outer_versions})
+        return dict(self._outer_versions)
+
+    def _frozen_role_version(self, role: str) -> str:
+        """Version identity required by challenge credit attribution (§2.10)."""
+        design = self._outer_versions.get(f"{role}_design_hash")
+        commit = self._outer_versions.get(f"{role}_commit")
+        if design and commit:
+            return f"{design}@{commit}"
+        return str(design or commit or "unknown")
 
     def _impute_score(self, parent: Optional[Node]) -> Optional[float]:
         """Impute a missing benchmark score: siblings' median, else parent score."""
@@ -2761,7 +2808,7 @@ class GanLoop:
         other child and its ``max_k`` slot spent for nothing. The next child now
         reserves and consumes the SAME materialized question.
         """
-        if not self.challenge_enabled:
+        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
             return
         try:
             n = _challenge_ledger_mod.release_for_child(
@@ -2777,7 +2824,7 @@ class GanLoop:
     def _challenge_consume(self, parent: Any, genid: Any,
                            plan_result: Dict[str, Any]) -> None:
         """Consume the reservation once the plan session actually ran."""
-        if not self.challenge_enabled:
+        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
             return
         try:
             ledger = self._challenge_data()
@@ -2799,7 +2846,7 @@ class GanLoop:
         (``qid``), the child side from the fresh ``instances.train`` episode --
         no extra episode is ever run for this (decision D2 scheme b).
         """
-        if not self.challenge_enabled:
+        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
             return
         adjudicate = _challenge_adjudication.adjudicator_for(self.challenge_domain)
         if adjudicate is None:
@@ -3021,7 +3068,7 @@ class GanLoop:
         generation whose published citable table was non-empty but which got no
         admitted challenge is recorded as ``challenge_authoring_missed``.
         """
-        if not self.challenge_enabled:
+        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
             return {}
         try:
             ledger = self._challenge_data()
@@ -3121,6 +3168,259 @@ class GanLoop:
         except Exception:  # noqa: BLE001 -- advisory
             return []
 
+    def _proof_challenges_enabled(self) -> bool:
+        """Select the existing qid replay path, separate from authored episodes."""
+        domains = getattr(self, "domains", ["imo_proof"])
+        return bool(domains and domains[0] == "imo_proof")
+
+    def _available_parent_challenges(self, parent: Any) -> List[Dict[str, Any]]:
+        """Project unconsumed IMO challenges for the next planner session."""
+        if not getattr(self, "challenge_enabled", False) or not self._proof_challenges_enabled() or parent is None:
+            return []
+        from gan.framework import challenge_ledger
+        rows = challenge_ledger.available_for_parent(
+            challenge_ledger.load(self.output_dir), parent_node=parent.genid)
+        fields = ("challenge_id", "qid", "defect_type", "claim",
+                  "evidence_ref", "repair_criterion")
+        return [{key: row.get(key) for key in fields} for row in rows]
+
+    def _public_challenge_results(self, genids: Iterable[Any]) -> List[Dict[str, Any]]:
+        """Sanitized settled results; never projects private grader evidence."""
+        if not getattr(self, "challenge_enabled", False):
+            return []
+        from gan.framework import challenge_ledger
+        wanted = {str(genid) for genid in genids}
+        fields = ("challenge_id", "qid", "defect_type", "claim", "defect_class", "family")
+        results = []
+        for row in (challenge_ledger.load(
+                self.output_dir, getattr(self, "challenge_domain", "imo_proof"))
+                    .get("challenges", {}).values()):
+            if (not isinstance(row, dict)
+                    or str(row.get("consumed_child_node")) not in wanted):
+                continue
+            adjudication = row.get("adjudication")
+            if not isinstance(adjudication, dict):
+                continue
+            results.append({
+                **{key: row.get(key) for key in fields},
+                "state": adjudication.get("state"),
+                "reason": adjudication.get("reason"),
+                "actionable": adjudication.get("actionable"),
+            })
+        return results
+
+    def _consume_parent_challenges(self, parent: Any, child: Any) -> List[str]:
+        """Bind and consume a parent's challenges on a successful direct child."""
+        if not getattr(self, "challenge_enabled", False) or not self._proof_challenges_enabled() or parent is None:
+            return []
+        from gan.framework import challenge_ledger
+        data = challenge_ledger.load(self.output_dir)
+        producer_rows = challenge_ledger.available_for_parent(
+            data, parent_node=parent.genid)
+        if not producer_rows:
+            return []
+        expected_qids = {str(row.get("qid")) for row in producer_rows}
+        actual_qids = {str(qid) for qid in (child.meta.get("sample_challenge_ids") or [])}
+        missing_qids = sorted(expected_qids - actual_qids)
+        if missing_qids:
+            raise challenge_ledger.ChallengeError(
+                "child train sample omitted parent challenge qid(s): "
+                + ", ".join(missing_qids))
+        rows = challenge_ledger.reserve_for_child(
+            data, parent_node=parent.genid, child_node=child.genid,
+            challenge_ids=[row.get("challenge_id") for row in producer_rows])
+        if not rows:
+            return []
+        challenge_ledger.save(self.output_dir, data, self.ledger_writer)
+        rows = challenge_ledger.consume_for_child(
+            data, parent_node=parent.genid, child_node=child.genid,
+            planner_version=self._frozen_role_version("planner"),
+            challenge_ids=[row.get("challenge_id") for row in producer_rows])
+        challenge_ledger.save(self.output_dir, data, self.ledger_writer)
+        return [str(row.get("challenge_id")) for row in rows]
+
+    def _lock_node_challenges(self, child: Any, ctx: Any, outer: int) -> List[str]:
+        """Lock evaluator proposals after the blind/reveal session completes."""
+        if not getattr(self, "challenge_enabled", False) or not self._proof_challenges_enabled():
+            return []
+        from gan.framework import challenge_ledger
+        data = challenge_ledger.load(self.output_dir)
+        ids = challenge_ledger.lock(
+            data,
+            outer=outer,
+            parent_node=child.genid,
+            evaluator_version=self._frozen_role_version("evaluator"),
+            challenges=list(getattr(ctx, "challenges", []) or []),
+            allowed_qids=list(child.meta.get("sampled_ids") or []),
+            max_k=self.challenge_max_k,
+        )
+        challenge_ledger.save(self.output_dir, data, self.ledger_writer)
+        return [str(value) for value in ids]
+
+    def _proof_challenge_evidence(self, node: Any, qid: Any) -> Dict[str, Any]:
+        archived_report = os.path.join(
+            paths.runs_dir(self.output_dir, node.genid), "report.json")
+        report_path = (archived_report if os.path.isfile(archived_report)
+                       else node.meta.get("report_path"))
+        points = self._read_per_question(node.genid).get(str(qid))
+        qid_evaluated = points is not None
+        return {
+            "qid": str(qid),
+            "points": points,
+            # Coverage/status are normally generation-wide.  Challenge
+            # adjudication must use the challenged qid's own evidence so an
+            # unrelated missing proof cannot make this edge undecidable.
+            "qid_coverage": 1.0 if qid_evaluated else 0.0,
+            "qid_score_status": "ok" if qid_evaluated else "missing",
+            "coverage": node.value.coverage,
+            "score_status": node.value.score_status,
+            "imputed": bool(node.meta.get("imputed")),
+            "report_path": report_path,
+        }
+
+    def _record_challenge_response_audit(
+            self, child: Any, parent: Any, challenges: List[Dict[str, Any]],
+            plan_result: Dict[str, Any], parent_cfg: Dict[str, Any]) -> None:
+        """Record planner stance separately from externally judged proof truth."""
+        expected = [str(row.get("challenge_id")) for row in challenges]
+        by_id: Dict[str, Dict[str, Any]] = {}
+        for row in plan_result.get("challenge_responses") or []:
+            if isinstance(row, dict):
+                cid = str(row.get("challenge_id") or "")
+                if cid and cid not in by_id:
+                    by_id[cid] = row
+        child_cfg = plan_result.get("config")
+        try:
+            config_changed = json.dumps(
+                child_cfg if isinstance(child_cfg, dict) else {},
+                ensure_ascii=False, sort_keys=True, default=str) != json.dumps(
+                parent_cfg if isinstance(parent_cfg, dict) else {},
+                ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            config_changed = child_cfg != parent_cfg
+        observed_action = bool(child.meta.get("patch_applied")) or config_changed
+        acted_kinds = {"acted", "acted_differently"}
+        rows: List[Dict[str, Any]] = []
+        claimed_acted = observed = consistent = received = 0
+        for cid in expected:
+            response = by_id.get(cid)
+            kind = str(response.get("response_kind")) if response else None
+            has_response = kind is not None
+            claimed = kind in acted_kinds
+            matches = (claimed == observed_action) if has_response else False
+            claimed_acted += int(claimed)
+            observed += int(observed_action)
+            consistent += int(matches)
+            received += int(has_response)
+            rows.append({
+                "challenge_id": cid,
+                "claimed_response_kind": kind,
+                "response_received": has_response,
+                "observed_action": observed_action,
+                "response_consistent": matches,
+            })
+        total = len(expected)
+        audit = {
+            "challenge_count": total,
+            "response_received_count": received,
+            "claimed_acted_rate": (claimed_acted / total) if total else None,
+            "observed_action_rate": (observed / total) if total else None,
+            "response_consistency_rate": (consistent / total) if total else None,
+            "response_retry_attempted": bool(plan_result.get("challenge_response_retry")),
+            "challenge_response_deficit": bool(
+                total >= 5 and observed_action is False),
+            "rows": rows,
+        }
+        child.meta["challenge_response_audit"] = audit
+        self.log_event({"type": "challenge_response_audit", "genid": str(child.genid),
+                        **{key: value for key, value in audit.items() if key != "rows"}})
+
+    def _settle_parent_challenges(self, parent: Any, child: Any) -> List[Dict[str, Any]]:
+        """Persist conservative parent/child challenge adjudications."""
+        if not getattr(self, "challenge_enabled", False) or not self._proof_challenges_enabled() or parent is None:
+            return []
+        from gan.framework import challenge_adjudication, challenge_ledger
+        data = challenge_ledger.load(self.output_dir)
+        rows = [row for row in data.get("challenges", {}).values()
+                if isinstance(row, dict)
+                and str(row.get("consumed_child_node")) == str(child.genid)]
+        verdicts: Dict[str, Dict[str, Any]] = {}
+        is_imo_proof = bool(self.domains) and self.domains[0] == "imo_proof"
+        if rows and is_imo_proof:
+            try:
+                verdicts = self.task_runner.adjudicate_proof_challenges(
+                    parent, child, rows, outer=int((child.meta or {}).get("outer_id")))
+            except Exception as exc:  # noqa: BLE001 -- becomes UNDECIDABLE
+                soft_fail(
+                    f"fixed challenge adjudicator failed for child {child.genid}: {exc}",
+                    event_path=paths.events_path(self.output_dir),
+                    event_type="challenge_adjudicator_failed",
+                    genid=str(child.genid),
+                )
+        settled: List[Dict[str, Any]] = []
+        for row in rows:
+            qid = str(row.get("qid"))
+            parent_evidence = self._proof_challenge_evidence(parent, qid)
+            child_evidence = self._proof_challenge_evidence(child, qid)
+            verdict = verdicts.get(str(row.get("challenge_id")))
+            if verdict is not None:
+                parent_evidence["challenge_verdict"] = verdict
+                child_evidence["challenge_verdict"] = verdict
+            if is_imo_proof:
+                from domains.imo import challenge_adjudication as domain_adjudication
+                result = domain_adjudication.adjudicate(
+                    row, parent_evidence, child_evidence)
+            else:
+                result = challenge_adjudication.adjudicate(
+                    row, parent_evidence, child_evidence,
+                    evidence_ref=(f"runs/{parent.genid}/report.json -> "
+                                  f"runs/{child.genid}/report.json"),
+                )
+            challenge_ledger.settle(
+                data, challenge_id=row.get("challenge_id"), adjudication=result)
+            settled.append({
+                "challenge_id": str(row.get("challenge_id")),
+                "qid": qid,
+                "state": result["state"],
+                "reason": result["reason"],
+                "modification_scope": result.get("modification_scope"),
+            })
+        if rows:
+            challenge_ledger.save(self.output_dir, data, self.ledger_writer)
+        return settled
+
+    def _challenge_metrics_for_outer(self, outer: int,
+                                     outer_genids: List[Any]) -> Dict[str, Any]:
+        """Compute pilot challenge metrics for challenges consumed this outer."""
+        if not self.challenge_enabled or not self._proof_challenges_enabled():
+            return {}
+        from gan.framework import challenge_adjudication, challenge_ledger, challenge_metrics
+        data = challenge_ledger.load(self.output_dir)
+        genids = {str(g) for g in outer_genids}
+        rows: List[Dict[str, Any]] = []
+        gains: Dict[str, float] = {}
+        for row in (data.get("challenges", {}).values() or []):
+            if not isinstance(row, dict) or row.get("status") != challenge_ledger.STATUS_CONSUMED:
+                continue
+            child_id = str(row.get("consumed_child_node") or "")
+            child = self.task_tree.get(child_id)
+            child_outer = str((child.meta or {}).get("outer_id")) if child else ""
+            if child_id not in genids and child_outer != str(outer):
+                continue
+            rows.append(row)
+            result = row.get("adjudication") or {}
+            if result.get("state") in {
+                    challenge_adjudication.VERIFIED_REPAIR,
+                    challenge_adjudication.VERIFIED_UNRESOLVED}:
+                parent = self.task_tree.get(str(row.get("producer_node")))
+                if parent is not None and child is not None:
+                    parent_points = self._read_per_question(parent.genid).get(str(row.get("qid")))
+                    child_points = self._read_per_question(child.genid).get(str(row.get("qid")))
+                    if parent_points is not None and child_points is not None:
+                        gains[str(row.get("challenge_id"))] = (
+                            float(child_points) - float(parent_points)) / 7.0
+        return challenge_metrics.compute(rows, gains)
+
     def _record_supernode(self, outer: int, outer_genids: List[Any]) -> None:
         """Aggregate + persist the per-outer supernode (advisory sink)."""
         try:
@@ -3138,6 +3438,7 @@ class GanLoop:
             coverage = None
             op_dist: Dict[str, int] = {}
             response_kind: Dict[str, int] = {}
+            response_audits: List[Dict[str, Any]] = []
             issues: List[Dict[str, Any]] = []
             eval_points = set()
             predicted: List[float] = []
@@ -3163,6 +3464,9 @@ class GanLoop:
                     if isinstance(r, dict) and r.get("op") == "respond_issue" and r.get("response_kind"):
                         rk = str(r["response_kind"])
                         response_kind[rk] = response_kind.get(rk, 0) + 1
+                audit = (node.meta or {}).get("challenge_response_audit")
+                if isinstance(audit, dict):
+                    response_audits.append(audit)
                 fb = (node.meta or {}).get("feedback") or {}
                 issues.extend(fb.get("issues") or [])
                 eval_points.update(self._read_eval_points(g))
@@ -3211,6 +3515,31 @@ class GanLoop:
             except Exception:  # noqa: BLE001 -- advisory
                 tr = {"verified": 0, "hits": 0, "unsupported": 0, "judged": 0}
                 verdict_stability = None
+            challenge_stats = self._challenge_metrics_for_outer(outer, outer_genids)
+            response_total = sum(int(a.get("challenge_count") or 0)
+                                 for a in response_audits)
+            response_metrics = {
+                "challenge_count": response_total,
+                "claimed_acted_rate": (
+                    sum(float(a.get("claimed_acted_rate") or 0.0)
+                        * int(a.get("challenge_count") or 0)
+                        for a in response_audits) / response_total
+                    if response_total else None),
+                "observed_action_rate": (
+                    sum(float(a.get("observed_action_rate") or 0.0)
+                        * int(a.get("challenge_count") or 0)
+                        for a in response_audits) / response_total
+                    if response_total else None),
+                "response_consistency_rate": (
+                    sum(float(a.get("response_consistency_rate") or 0.0)
+                        * int(a.get("challenge_count") or 0)
+                        for a in response_audits) / response_total
+                    if response_total else None),
+                "response_retry_count": sum(
+                    bool(a.get("response_retry_attempted")) for a in response_audits),
+                "challenge_response_deficit_count": sum(
+                    bool(a.get("challenge_response_deficit")) for a in response_audits),
+            }
 
             # CHALLENGE WIRING (docs/21 §16). Two facts, one meaning:
             #
@@ -3229,7 +3558,7 @@ class GanLoop:
             challenge_block: Dict[str, Any] = {}
             vs_effective = verdict_stability
             try:
-                if self.challenge_enabled:
+                if self.challenge_enabled and self._challenge_cfg_state.get("authorable"):
                     cstats = self._challenge_stats()
                     if cstats and not cstats.get("error"):
                         blend = _challenge_metrics.blend_verdict_stability(
@@ -3291,18 +3620,34 @@ class GanLoop:
                 "challenge": challenge_block,
             }
 
+            if self._proof_challenges_enabled() and challenge_stats:
+                epayload["challenge"] = {
+                    key: challenge_stats.get(key)
+                    for key in ("state_counts", "supported_challenges",
+                                "undecidable_challenges", "challenge_precision_raw",
+                                "challenge_precision_smoothed", "evaluator_adversarial_score",
+                                "point_gain_count")
+                }
+
             payload = {
                 "outer": outer,
-                "planner_design_hash": self._design_hash("planner"),
-                "evaluator_design_hash": self._design_hash("evaluator"),
+                "code_layout": getattr(self.roots, "layout", "single"),
+                "planner_design_hash": (self._outer_versions.get("planner_design_hash")
+                                         or self._design_hash("planner")),
+                "evaluator_design_hash": (self._outer_versions.get("evaluator_design_hash")
+                                           or self._design_hash("evaluator")),
+                "planner_version_id": self._frozen_role_version("planner"),
+                "evaluator_version_id": self._frozen_role_version("evaluator"),
                 "designs": {
                     "planner": self._design_snapshot("planner"),
                     "evaluator": self._design_snapshot("evaluator"),
                 },
                 "code_commits": {
                     "task": task_commit,
-                    "planner": self._role_commits.get("planner") or roles_head,
-                    "evaluator": self._role_commits.get("evaluator") or roles_head,
+                    "planner": (self._outer_versions.get("planner_commit")
+                                 or roles_head),
+                    "evaluator": (self._outer_versions.get("evaluator_commit")
+                                   or roles_head),
                 },
                 "root_genid": str(outer_genids[0]) if outer_genids else None,
                 "subtree": [str(g) for g in outer_genids],
@@ -3320,6 +3665,7 @@ class GanLoop:
                     # evaluation set, identical for every supernode -> that is
                     # what ``fitness_p`` compares and what the selection orders by.
                     "val_mean": None,
+                    "planner_root_val_mean": None,
                     "val_std": None,
                     "val_n_valid": 0,
                     # Honest FACT, not configuration intent: only a dedicated
@@ -3332,8 +3678,31 @@ class GanLoop:
                     "val_anchor_ids": [],
                     "eval_baseline": None,   # filled by evaluate_on_root (B4)
                     "reevaluated": False,    # -> true after evaluate_on_root (B4)
+                    # IMO challenge protocol: paired task validation is filled
+                    # at the outer boundary after the candidate is selected.
+                    "task_val_mean": None,
+                    "task_parent_val_mean": None,
+                    "task_val_delta": None,
+                    "task_val_n_valid": 0,
+                    "task_val_question_n": 0,
+                    "task_val_candidate_genid": None,
+                    "task_val_parent_genid": None,
+                    "task_val_noop_deltas": [],
+                    "task_val_noop_abs_q75": None,
                 },
-                "planner_stats": {"op_dist": op_dist, "response_kind": response_kind},
+                "planner_stats": {
+                    "op_dist": op_dist,
+                    "response_kind": response_kind,
+                    "challenge": {
+                        key: challenge_stats.get(key)
+                        for key in ("state_counts", "supported_challenges",
+                                    "undecidable_challenges", "repair_rate_raw",
+                                    "repair_rate_smoothed",
+                                    "planner_adversarial_score",
+                                    "mean_anchor_point_gain", "point_gain_count")
+                    } if challenge_stats else {},
+                    "challenge_response": response_metrics,
+                },
                 "evaluator_stats": epayload,
             }
             record_supernode(self.output_dir, outer, payload, writer=self.ledger_writer)
@@ -3370,12 +3739,62 @@ class GanLoop:
                    if last >= outer - self.cooldown_window}
         try:
             from gan.framework.outer_select import select_and_restore
+            evaluator_fitness: Dict[int, float] = {}
+            if self.challenge_fitness_enabled:
+                from gan.framework import challenge_ledger, challenge_metrics
+                from gan.framework import fitness as F
+                from gan.framework.supernode import load_supernode
+                rows = list((challenge_ledger.load(self.output_dir)
+                             .get("challenges", {}).values()) or [])
+                activation = challenge_metrics.activation_status(
+                    rows, min_supported=self.challenge_fitness_min_supported,
+                    min_determinate_rate=self.challenge_fitness_min_determinate_rate)
+                if activation.get("active"):
+                    def version_metrics(sn: Dict[str, Any]) -> Dict[str, Any]:
+                        version = str(sn.get("evaluator_version_id")
+                                      or sn.get("evaluator_design_hash") or "")
+                        return challenge_metrics.compute([
+                            row for row in rows if isinstance(row, dict)
+                            and str(row.get("producer_evaluator_version") or "") == version
+                        ])
+
+                    ref_metrics = [version_metrics(ref) for oid in arch.reference
+                                   if (ref := load_supernode(self.output_dir, oid))]
+                    ref_adv = [float(value) for metrics in ref_metrics
+                               if isinstance((value := metrics.get(
+                                   "evaluator_adversarial_score")), (int, float))]
+                    ref_precision = [float(value) for metrics in ref_metrics
+                                     if isinstance((value := metrics.get(
+                                         "challenge_precision_smoothed")), (int, float))]
+                    for entry in arch.elite_entries():
+                        oid = int(entry["outer"])
+                        candidate = load_supernode(self.output_dir, oid)
+                        if not candidate:
+                            continue
+                        metrics = version_metrics(candidate)
+                        adv = metrics.get("evaluator_adversarial_score")
+                        precision = metrics.get("challenge_precision_smoothed")
+                        base = entry.get("fitness_e_base")
+                        if not isinstance(base, (int, float)):
+                            base = entry.get("fitness_e")
+                        if not isinstance(base, (int, float)):
+                            continue
+                        evaluator_fitness[oid] = float(base)
+                        if isinstance(adv, (int, float)):
+                            evaluator_fitness[oid] += self.challenge_lambda_e * F.z_ref(
+                                float(adv), ref_adv)
+                        if isinstance(precision, (int, float)):
+                            evaluator_fitness[oid] += self.challenge_lambda_precision * F.z_ref(
+                                float(precision), ref_precision)
+                self.log_event({"type": "challenge_fitness_selection", "outer": outer,
+                                "activation": activation,
+                                "dynamic_evaluator_candidates": len(evaluator_fitness)})
             sn, report = select_and_restore(
                 self.output_dir, arch, self._roles_root(), self.ledger_writer,
                 self._outer_select_rng, tournament_k=self.tournament_k,
                 max_tries=self.restore_max_tries,
                 tool_overlap_threshold=self.heal_tool_overlap,
-                exclude=exclude)
+                exclude=exclude, evaluator_fitness=evaluator_fitness)
             if sn is None:
                 self.log_event({"type": "outer_parent_none", "outer": outer,
                                 "reason": report.get("reason")})
@@ -3395,8 +3814,9 @@ class GanLoop:
         if not self.outer_select_enabled:
             return
         try:
-            from gan.framework.supernode import load_supernode
+            from gan.framework.supernode import load_supernode, update_supernode
             from gan.framework import fitness as F
+            from gan.framework import challenge_ledger, challenge_metrics
             sn = load_supernode(self.output_dir, outer)
             if not sn:
                 return
@@ -3409,13 +3829,84 @@ class GanLoop:
                 return
             refs = [r for o in arch.reference
                     if (r := load_supernode(self.output_dir, o)) is not None]
+            all_challenges = (list((challenge_ledger.load(self.output_dir)
+                                    .get("challenges", {}).values()) or [])
+                              if self._proof_challenges_enabled() else [])
+            activation = challenge_metrics.activation_status(
+                all_challenges,
+                min_supported=self.challenge_fitness_min_supported,
+                min_determinate_rate=self.challenge_fitness_min_determinate_rate)
+            outer_challenge = ((sn.get("planner_stats") or {}).get("challenge") or {})
+            gate = challenge_metrics.challenge_gate(outer_challenge)
+            benchmark = sn.get("benchmark") or {}
+            val_n = len(benchmark.get("val_anchor_ids") or [])
+            default_delta = (2.0 / (7.0 * val_n)) if val_n > 0 else None
+            configured_delta = (float(self.challenge_val_min_delta)
+                                if isinstance(self.challenge_val_min_delta, (int, float))
+                                else default_delta)
+            noop_q75 = benchmark.get("task_val_noop_abs_q75")
+            if isinstance(noop_q75, (int, float)) and configured_delta is not None:
+                configured_delta = max(configured_delta, float(noop_q75))
+            generalized_repair = bool(
+                gate.get("passed")
+                and configured_delta is not None
+                and isinstance(benchmark.get("task_val_delta"), (int, float))
+                and float(benchmark["task_val_delta"]) >= configured_delta)
+            challenge_active = bool(
+                self.challenge_fitness_enabled and activation.get("active"))
+            sn["challenge_fitness"] = {
+                "enabled": self.challenge_fitness_enabled,
+                "active": challenge_active,
+                "activation": activation,
+                "outer_gate": gate,
+                "generalized_repair": generalized_repair,
+                "val_min_delta": configured_delta,
+                "noop_abs_q75": noop_q75,
+            }
+            update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
+            fp_base = F.fitness_p(sn, refs, beta=self.beta_variance,
+                                  lambda_=self.lambda_novelty,
+                                  novelty_k=self.novelty_k, x_ops=self.buckets[0])
+            fe_base = F.fitness_e(sn, refs, w1=self.w1_calibration,
+                                  w2=self.w2_verdict_stability,
+                                  lambda_=self.lambda_novelty,
+                                  novelty_k=self.novelty_k, x_ops=self.buckets[0])
             fp = F.fitness_p(sn, refs, beta=self.beta_variance,
                              lambda_=self.lambda_novelty,
-                             novelty_k=self.novelty_k, x_ops=self.buckets[0])
-            fe = F.fitness_e(sn, refs, w1=self.w1_calibration,
-                             w2=self.w2_verdict_stability,
-                             lambda_=self.lambda_novelty,
-                             novelty_k=self.novelty_k, x_ops=self.buckets[0])
+                             novelty_k=self.novelty_k, x_ops=self.buckets[0],
+                             challenge_active=challenge_active,
+                             lambda_adv=self.challenge_lambda_p,
+                             generalized_repair=generalized_repair)
+            # Evaluator credit belongs to the producer version. Use a current
+            # ledger snapshot for Pareto insertion so F_e_adv can affect
+            # archive survival, while retaining fitness_e_base unchanged;
+            # outer-select recomputes the same terms from the live ledger after
+            # later challenges settle.
+            fe = fe_base
+            if challenge_active and isinstance(fe_base, (int, float)):
+                def version_metrics(node: Dict[str, Any]) -> Dict[str, Any]:
+                    version = str(node.get("evaluator_version_id")
+                                  or node.get("evaluator_design_hash") or "")
+                    return challenge_metrics.compute([
+                        row for row in all_challenges if isinstance(row, dict)
+                        and str(row.get("producer_evaluator_version") or "") == version
+                    ])
+
+                candidate_metrics = version_metrics(sn)
+                reference_metrics = [version_metrics(ref) for ref in refs]
+                ref_adv = [float(value) for metrics in reference_metrics
+                           if isinstance((value := metrics.get(
+                               "evaluator_adversarial_score")), (int, float))]
+                ref_precision = [float(value) for metrics in reference_metrics
+                                 if isinstance((value := metrics.get(
+                                     "challenge_precision_smoothed")), (int, float))]
+                adv = candidate_metrics.get("evaluator_adversarial_score")
+                precision = candidate_metrics.get("challenge_precision_smoothed")
+                if isinstance(adv, (int, float)):
+                    fe += self.challenge_lambda_e * F.z_ref(float(adv), ref_adv)
+                if isinstance(precision, (int, float)):
+                    fe += self.challenge_lambda_precision * F.z_ref(
+                        float(precision), ref_precision)
             # An entry with no benchmark at all has NO comparable F_p: it would
             # never be pruned (_dominates returns False on None), would occupy a
             # per-cell capacity slot, and could win a tournament draw when its
@@ -3435,6 +3926,8 @@ class GanLoop:
                 "outer": outer,
                 "fitness_p": fp,
                 "fitness_e": fe,
+                "fitness_p_base": fp_base,
+                "fitness_e_base": fe_base,
                 "design_hash": sn.get("planner_design_hash"),
                 "op_dist": (sn.get("planner_stats") or {}).get("op_dist"),
                 "issues_per_task": (sn.get("evaluator_stats") or {}).get("issues_per_task"),
@@ -3443,6 +3936,13 @@ class GanLoop:
             arch.save()
             self.log_event({"type": "supernode_archived", "outer": outer,
                             "fitness_p": fp, "fitness_e": fe, "cell": key})
+            self.log_event({"type": "challenge_fitness_status", "outer": outer,
+                            "enabled": self.challenge_fitness_enabled,
+                            "active": challenge_active,
+                            "activation": activation,
+                            "outer_gate": gate,
+                            "generalized_repair": generalized_repair,
+                            "val_min_delta": configured_delta})
         except Exception as e:  # noqa: BLE001 -- advisory sink, never fatal
             soft_fail(f"archive upsert failed (outer {outer}): {e}",
                       event_path=paths.events_path(self.output_dir),
@@ -3905,6 +4405,7 @@ class GanLoop:
                 # an in-run measurement with an out-of-run one (and made the
                 # pre/post-evaluation numbers incomparable).
                 sn["benchmark"]["val_mean"] = result["mean"]
+                sn["benchmark"]["planner_root_val_mean"] = result["mean"]
                 sn["benchmark"]["val_std"] = result["std"]
                 sn["benchmark"]["val_n_valid"] = result["n_valid"]
                 sn["benchmark"]["val_subset"] = (
@@ -3946,8 +4447,127 @@ class GanLoop:
                 close = getattr(eval_planner, "close", None)
                 if close is not None and eval_planner is not self.planner:
                     close()
-            except Exception:  # noqa: BLE001 -- advisory
+            except Exception:  # noqa: BLE001 -- advisory cleanup
                 pass
+
+    def _evaluate_task_pair_val(self, outer: int, outer_genids: List[Any], *,
+                                branch_limit: int, depth_limit: int,
+                                method: str, ucb_c: float,
+                                depth_penalty: float, cost_penalty: float,
+                                lcb_delta: float, lcb_z: float) -> None:
+        """Evaluate the selected task candidate and its direct parent together.
+
+        This is a framework-only diagnostic gate for ``imo_proof``. It reuses
+        the fixed-id evaluation runner, but supplies each node's persisted task
+        config and code commit with an empty plan, so no planner is involved and
+        no evaluation round becomes a task-tree node.
+        """
+        if not self.challenge_enabled or not self._proof_challenges_enabled() or self.eval_runner is None:
+            return
+        fixed_ids = list(getattr(self.eval_runner, "fixed_question_ids", None) or [])
+        if not fixed_ids or self.eval_runner is self.task_runner:
+            return
+        try:
+            from gan.framework import code_repo
+            from gan.framework.supernode import load_supernode, update_supernode
+
+            report: Dict[str, Any] = {}
+            candidates = self.task_tree.select_parents(
+                k=1, branch_limit=branch_limit, depth_limit=depth_limit,
+                method=method, ucb_c=ucb_c, depth_penalty=depth_penalty,
+                cost_penalty=cost_penalty, outer_id=outer,
+                exclude={"initial"},
+                lcb_delta=lcb_delta, lcb_z=lcb_z, report=report)
+            candidate = candidates[0] if candidates else None
+            if candidate is None:
+                self.log_event({"type": "task_pair_val_skipped", "outer": outer,
+                                "reason": "no_candidate", "selection": report})
+                return
+            parent = (self.task_tree.get(candidate.parent_genid)
+                      if candidate.parent_genid is not None else
+                      self.task_tree.get("initial"))
+            if parent is None:
+                self.log_event({"type": "task_pair_val_skipped", "outer": outer,
+                                "reason": "no_direct_parent",
+                                "candidate": str(candidate.genid)})
+                return
+
+            task_root = self._task_root()
+            main_head = None
+            if task_root:
+                main_head = code_repo.current_commit(task_root)
+
+            def run_node(node: Any, label: str) -> Optional[Dict[str, Any]]:
+                config = self._parent_config(node)
+                base = ((node.meta or {}).get("task_code_commit")
+                        or (node.meta or {}).get("code_commit")
+                        or self.eval_base_ref)
+                genid = f"taskval_outer{outer}_{label}"
+                plan = {"records": [], "responses": [], "config": config,
+                        "patch": "", "patch_proposed": ""}
+                evaluated = self.eval_runner(
+                    plan=plan, parent=node, genid=genid, base=base)
+                if evaluated is None or evaluated.value.score is None:
+                    return None
+                if evaluated.value.score_status not in _MEASURED:
+                    return None
+                return {
+                    "mean": float(evaluated.value.score),
+                    "coverage": evaluated.value.coverage,
+                    "score_status": evaluated.value.score_status,
+                    "genid": str(node.genid),
+                }
+
+            try:
+                candidate_val = run_node(candidate, "candidate")
+                parent_val = run_node(parent, "parent")
+                noop_deltas: List[float] = []
+                noop_repeats = int(getattr(self, "challenge_noop_repeats", 0) or 0)
+                if candidate_val is not None and noop_repeats:
+                    for index in range(1, noop_repeats + 1):
+                        repeat = run_node(candidate, f"noop{index}")
+                        if repeat is not None:
+                            noop_deltas.append(float(repeat["mean"])
+                                                - float(candidate_val["mean"]))
+            finally:
+                if task_root and main_head:
+                    code_repo.checkout(task_root, main_head)
+                    self._rebuild_composed_view()
+            sn = load_supernode(self.output_dir, outer)
+            if not sn:
+                return
+            benchmark = sn.setdefault("benchmark", {})
+            benchmark["task_val_mean"] = (candidate_val or {}).get("mean")
+            benchmark["task_parent_val_mean"] = (parent_val or {}).get("mean")
+            benchmark["task_val_delta"] = (
+                candidate_val["mean"] - parent_val["mean"]
+                if candidate_val is not None and parent_val is not None else None)
+            benchmark["task_val_n_valid"] = int(candidate_val is not None) + int(parent_val is not None)
+            benchmark["task_val_question_n"] = len(fixed_ids)
+            benchmark["task_val_candidate_genid"] = str(candidate.genid)
+            benchmark["task_val_parent_genid"] = str(parent.genid)
+            benchmark["task_val_noop_deltas"] = noop_deltas
+            if noop_deltas:
+                absolute = sorted(abs(value) for value in noop_deltas)
+                index = max(0, min(len(absolute) - 1,
+                                   int(0.75 * len(absolute) + 0.999999) - 1))
+                benchmark["task_val_noop_abs_q75"] = absolute[index]
+            else:
+                benchmark["task_val_noop_abs_q75"] = None
+            update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
+            self.log_event({
+                "type": "task_pair_val_recorded", "outer": outer,
+                "candidate_genid": str(candidate.genid),
+                "parent_genid": str(parent.genid),
+                "task_val_mean": benchmark["task_val_mean"],
+                "task_parent_val_mean": benchmark["task_parent_val_mean"],
+                "task_val_delta": benchmark["task_val_delta"],
+                "n_valid": benchmark["task_val_n_valid"],
+            })
+        except Exception as e:  # noqa: BLE001 -- diagnostic val is advisory
+            soft_fail(f"task pair val failed (outer {outer}): {e}",
+                      event_path=paths.events_path(self.output_dir),
+                      event_type="task_pair_val_failed", outer=outer)
 
     def _refresh_roles(self, outer: int) -> None:
         """Rebuild planner/evaluator for a new outer generation (instance refresh).
@@ -4575,7 +5195,7 @@ class GanLoop:
         is the single most useful thing to say, and it stops the round from filing
         a claim that cannot be supported.
         """
-        if not self.challenge_enabled:
+        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
             return {}
         if self.broker is None or not hasattr(self.broker, "challenge"):
             return {}
@@ -4632,6 +5252,7 @@ class GanLoop:
                 # just the trajectory replay) for the four shipped eval points;
                 # audit-file only, no evaluator-projection key is added.
                 "eval_point_results": list(getattr(ctx, "eval_point_results", []) or []),
+                "challenges": list(getattr(ctx, "challenges", []) or []),
             }
             d = paths.runs_dir(self.output_dir, child.genid)
             os.makedirs(d, exist_ok=True)
@@ -4908,6 +5529,7 @@ class GanLoop:
             # fresh role instances (design + tools + chat + workspace) for this outer
             self._select_outer_parent(outer)
             self._refresh_roles(outer)
+            self._capture_outer_versions(outer)
             # pin the outer's entry HEAD as the base for parent=initial children
             # (HEAD drifts to task-branch tips during the outer)
             self._pin_outer_base(outer)
@@ -4995,6 +5617,9 @@ class GanLoop:
                 self._parent_receipt = parent_receipt
                 self._parent_digest = (
                     None if cross_outer else parent_meta.get("feedback_digest"))
+                parent_challenges = self._available_parent_challenges(parent)
+                parent_challenge_results = self._public_challenge_results(
+                    [parent.genid])
                 parent_predicted_score = parent_meta.get("predicted_score")
                 parent_benchmark_score = parent_meta.get("benchmark_score")
                 evaluator_issues = (parent_feedback or {}).get("issues")
@@ -5083,6 +5708,28 @@ class GanLoop:
                             "inner": inner, "genid": str(genid),
                             "reason": "planner signature lacks require_deep_patch",
                         })
+                plan_challenge_kwargs: Dict[str, Any] = {}
+                if plan_challenges and self._accepts_kwarg(self.planner.plan, "challenges"):
+                    plan_challenge_kwargs["challenges"] = plan_challenges
+                if parent_challenges:
+                    if self._accepts_kwarg(self.planner.plan, "parent_challenges"):
+                        plan_challenge_kwargs["parent_challenges"] = parent_challenges
+                    else:
+                        self.log_event({
+                            "type": "challenge_projection_skipped",
+                            "seat": "planner", "genid": str(genid),
+                            "reason": "planner signature lacks parent_challenges",
+                        })
+                if parent_challenge_results:
+                    if self._accepts_kwarg(self.planner.plan, "challenge_results"):
+                        plan_challenge_kwargs["challenge_results"] = (
+                            parent_challenge_results)
+                    else:
+                        self.log_event({
+                            "type": "challenge_projection_skipped",
+                            "genid": str(genid),
+                            "reason": "planner signature lacks challenge_results",
+                        })
 
                 try:
                     if disable_plan:
@@ -5111,7 +5758,7 @@ class GanLoop:
                             max_tool_calls=plan_ck.get("plan_max_tool_calls", self.plan_max_tool_calls),
                             tool_repeat_limit=self.tool_repeat_limit,
                             carried_over=plan_carried,
-                            challenges=plan_challenges,
+                            **plan_challenge_kwargs,
                             **plan_cost_kwargs,
                         ) or {}
                 except code_repo.RepoIntegrityError:
@@ -5146,9 +5793,22 @@ class GanLoop:
                     "planner", "plan", outer, genid,
                     cm_summary=plan_cm_summary)
 
+                task_challenge_kwargs: Dict[str, Any] = {}
+                if parent_challenges:
+                    if not self._accepts_kwarg(self.task_runner, "challenge_ids"):
+                        self._archive_invalid(
+                            "challenge_runner_incompatible", parent, parents,
+                            genid,
+                            "task runner signature lacks challenge_ids",
+                            outer=outer, inner=inner)
+                        self._save_checkpoint("inner", outer, inner)
+                        continue
+                    task_challenge_kwargs["challenge_ids"] = [
+                        str(row.get("qid")) for row in parent_challenges]
                 try:
-                    child = self.task_runner(plan=plan_result, parent=parent, genid=genid,
-                                             base=base)
+                    child = self.task_runner(
+                        plan=plan_result, parent=parent, genid=genid,
+                        base=base, **task_challenge_kwargs)
                 except code_repo.RepoIntegrityError:
                     raise  # undefined code tree: never degrade to task_runner_failed
                 except Exception as e:
@@ -5160,6 +5820,22 @@ class GanLoop:
                     self._save_checkpoint("inner", outer, inner)
                     continue
 
+                try:
+                    consumed_challenges = self._consume_parent_challenges(parent, child)
+                except Exception as e:
+                    self._archive_invalid("challenge_ledger_failed", parent, parents,
+                                          genid, str(e), outer=outer, inner=inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
+                child.meta["consumed_challenge_ids"] = consumed_challenges
+                if parent_challenges:
+                    self._record_challenge_response_audit(
+                        child, parent, parent_challenges, plan_result,
+                        # planner may mutate the local parent_cfg object in
+                        # place; reload the persisted parent snapshot for a
+                        # trustworthy config-diff comparison.
+                        self._parent_config(parent))
+
                 # DAG: record all parents used
                 child.parents = [p.genid for p in parents]
                 child.parent_genid = parent.genid
@@ -5168,15 +5844,33 @@ class GanLoop:
                 # Design stamp (docs/13 §2.2): outer + design hashes + three commits
                 # + which candidate pool supplied the parent (blood-lineage audit).
                 child.meta["outer_id"] = outer
-                child.meta["planner_design_hash"] = self._design_hash("planner")
-                child.meta["evaluator_design_hash"] = self._design_hash("evaluator")
+                child.meta["planner_design_hash"] = (
+                    self._outer_versions.get("planner_design_hash")
+                    or self._design_hash("planner"))
+                child.meta["evaluator_design_hash"] = (
+                    self._outer_versions.get("evaluator_design_hash")
+                    or self._design_hash("evaluator"))
                 child.meta["task_commit"] = child.meta.get("code_commit")
-                child.meta["planner_commit"] = self._role_commits.get("planner")
-                child.meta["evaluator_commit"] = self._role_commits.get("evaluator")
+                child.meta["planner_commit"] = self._outer_versions.get("planner_commit")
+                child.meta["evaluator_commit"] = self._outer_versions.get("evaluator_commit")
                 child.meta["source_pool"] = "global" if use_global else "subtree"
                 child.meta["deep_probe_required"] = require_deep_probe
                 child.meta["deep_probe_patch_proposed"] = bool(
                     plan_result.get("deep_probe_patch_proposed"))
+                # Deterministic qid/answer leakage is a planner-modification
+                # hard gate.  The task run is retained as evidence, but this
+                # child must never be promoted to a parent or evaluated as a
+                # successful repair.  The invalid-child path is local to this
+                # generation, so sibling children and the outer loop continue.
+                direct_audit = (child.meta.get("challenge_audit") or {})
+                if direct_audit.get("hard_gate"):
+                    self._finalize_invalid_node(
+                        child, "challenge_modification_hard_gate",
+                        str(direct_audit.get("reason") or
+                            "challenge modification audit triggered"),
+                        outer, inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
                 if base and self.code_root:
                     # audit: per-generation ref pinned by the patch application
                     self.log_event({"type": "code_branch", "genid": str(genid),
@@ -5287,6 +5981,23 @@ class GanLoop:
                     # without the kwarg keeps the pre-C reveal rule — audited).
                     eval_cost_kwargs["reveal_max_tool_calls"] = \
                         eval_ck["evaluate_reveal_max_tool_calls"]
+                challenge_eval_kwargs: Dict[str, Any] = {}
+                if self.challenge_enabled and self._proof_challenges_enabled():
+                    challenge_fields = {
+                        "challenge_enabled": self.challenge_enabled,
+                        "challenge_domain": (self.domains[0] if self.domains else None),
+                        "challenge_allowed_qids": list(child.meta.get("sampled_ids") or []),
+                        "challenge_max_k": self.challenge_max_k,
+                    }
+                    if all(self._accepts_kwarg(self.evaluator.evaluate, key)
+                           for key in challenge_fields):
+                        challenge_eval_kwargs.update(challenge_fields)
+                    else:
+                        self.log_event({
+                            "type": "challenge_projection_skipped",
+                            "seat": "evaluator", "genid": str(genid),
+                            "reason": "evaluator signature lacks challenge parameters",
+                        })
                 try:
                     if disable_eval:
                         # A2: skip the evaluator — the planner's only signal
@@ -5334,6 +6045,7 @@ class GanLoop:
                             carried_over=([] if (text_feedback_off
                                                 or (parent_feedback or {}).get("issues"))
                                           else self._carried_over("evaluator")),
+                            **challenge_eval_kwargs,
                             **eval_cost_kwargs,
                         )
                 except code_repo.RepoIntegrityError:
@@ -5397,6 +6109,36 @@ class GanLoop:
                 # use the selected parent's history rather than loop order.
                 child.meta["predicted_score"] = getattr(ctx, "predicted_score", None)
                 child.meta["benchmark_score"] = child.value.score
+                from gan.framework import challenge_ledger
+                try:
+                    child.meta["challenge_ids"] = self._lock_node_challenges(
+                        child, ctx, outer)
+                except challenge_ledger.ChallengeError as e:
+                    self._archive_invalid("challenge_invalid", parent, parents,
+                                          genid, str(e), outer=outer, inner=inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
+                try:
+                    child.meta["challenge_adjudications"] = (
+                        self._settle_parent_challenges(parent, child))
+                except challenge_ledger.ChallengeError as e:
+                    self._archive_invalid("challenge_adjudication_failed", parent, parents,
+                                          genid, str(e), outer=outer, inner=inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
+                modification_gate_rows = [
+                    row for row in (child.meta.get("challenge_adjudications") or [])
+                    if row.get("modification_scope") in {
+                        "instance_specific_memory", "answer_leakage",
+                    }
+                ]
+                if modification_gate_rows:
+                    self._finalize_invalid_node(
+                        child, "challenge_modification_hard_gate",
+                        json.dumps(modification_gate_rows, ensure_ascii=False,
+                                   sort_keys=True), outer, inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
                 run_dir = paths.runs_dir(self.output_dir, genid)
                 os.makedirs(run_dir, exist_ok=True)
                 packet.save(os.path.join(run_dir, "packet.json"))
@@ -5526,16 +6268,37 @@ class GanLoop:
                                     "anchor_parent_points": anc_parent})
                     break
 
+            # Active-version boundary: record, evaluate, and archive the
+            # version that actually completed this outer's inner work before
+            # self-improvement produces the next candidate.
+            self._update_issue_ledger(outer, outer_genids)
+            self._record_supernode(outer, outer_genids)
+            self._evaluate_supernode(outer)
+            self._evaluate_task_pair_val(
+                outer, outer_genids,
+                branch_limit=bl, depth_limit=dl, method=method,
+                ucb_c=ucb_c, depth_penalty=depth_penalty,
+                cost_penalty=cost_penalty, lcb_delta=lcb_delta, lcb_z=lcb_z)
+            try:
+                self._challenge_val_round(outer)
+            except Exception as e:  # noqa: BLE001 -- retain the authored-val fail-soft boundary
+                self.log_event({"type": "challenge_val_failed", "outer": outer,
+                                "error": f"{type(e).__name__}: {e}"[:400]})
+            self._archive_supernode(outer)
+
             # ---------------- outer self-improvement ----------------
             # Each role's own instance assembly rides its self-improve
             # payload — the CURRENT outer's assembly state is visible at the
             # decision point (kept/adjusted eval_points / planner prompt).
             # The digests list is the experience stream; ``last_feedback`` is not
             # part of this payload.
+            public_challenge_results = self._public_challenge_results(outer_genids)
             recent_eval = {"digests": self._digests[-I_max:],
+                           "challenge_results": public_challenge_results,
                            "toolset_report": getattr(self.evaluator, "assembly_report", None)}
             recent_plan = {"advantages": self._advantages[-I_max:],
                            "task_tree_size": len(self.task_tree),
+                           "challenge_results": public_challenge_results,
                            "toolset_report": getattr(self.planner, "assembly_report", None)}
             # Self-improve payload facts: CM failure reports ride ALWAYS
             # (diagnostics), the cost material only under cost.record_usage
@@ -5757,24 +6520,4 @@ class GanLoop:
                             "self_cost_tokens": self_own_costs,
                             "duration_s": round(time.time() - _outer_t0, 1)})
             self._save_checkpoint("outer", outer, I_max)
-            # Issue continuity: accumulate this outer's raises/verdicts/stances
-            # (and their mechanical truth) under the closed issue_key vocabulary.
-            # MUST run BEFORE _record_supernode: verdict_stability is read back
-            # from the ledger this call just wrote.
-            self._update_issue_ledger(outer, outer_genids)
-            self._record_supernode(outer, outer_genids)
-            self._evaluate_supernode(outer)
-            # CHALLENGE-VAL (docs/21 §4.1): ONE extra fixed round per outer that
-            # plays the challenges' ``instances.eval`` siblings with the
-            # supernode's code. It is a SEPARATE round on purpose -- the frozen
-            # core eval above must stay byte-identical, because ``val_mean`` is
-            # what selects parents. Runs AFTER the eval round so it never delays
-            # the decision-grade number, and its failure is advisory.
-            try:
-                self._challenge_val_round(outer)
-            except Exception as e:  # noqa: BLE001 -- advisory, never fatal
-                self.log_event({"type": "challenge_val_failed", "outer": outer,
-                                "error": f"{type(e).__name__}: {e}"[:400]})
-            self._archive_supernode(outer)
-
         return self.task_tree

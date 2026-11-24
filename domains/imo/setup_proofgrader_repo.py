@@ -5,12 +5,15 @@ import os
 import shutil
 import fnmatch
 import re
+import shlex
+import sys
 from pathlib import Path
 
-from utils.constants import REPO_NAME
-from utils.git_utils import apply_patch, commit_repo
-from utils.gl_utils import get_patch_files, get_saved_score, load_archive_data
-
+# Direct execution sets sys.path[0] to domains/imo rather than the repository
+# root. Resolve the root from this file before importing project modules.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 def get_mae_score(domain, output_dir, genid, split="train"):
     # Get score from eval file
@@ -144,7 +147,7 @@ def _packageize_proofgrader_repo(dst_dir: str, package_name: str = "proofgrader"
     _ensure_init_py(pkg)
 
     # Move common top-level modules/folders into the package namespace if they exist
-    move_candidates = ["task_agent.py", "domains", "utils", "agent"]
+    move_candidates = ["task_agent.py", "challenge_agent.py", "domains", "utils", "agent"]
     for name in move_candidates:
         src = dst / name
         if not src.exists():
@@ -169,6 +172,15 @@ def _packageize_proofgrader_repo(dst_dir: str, package_name: str = "proofgrader"
 
     # Write packaging config
     _write_pyproject(dst, package_name=package_name)
+
+    if (pkg / "challenge_agent.py").is_file():
+        # setup_default intentionally excludes domains (including datasets).
+        # The v3 judge needs only this frozen stdlib contract, never the data.
+        contract_dir = pkg / "domains" / "imo"
+        _ensure_init_py(pkg / "domains")
+        _ensure_init_py(contract_dir)
+        shutil.copyfile(Path(__file__).resolve().parent / "challenge_contract.py",
+                        contract_dir / "challenge_contract.py")
 
     # Rewrite imports inside the packaged code
     _rewrite_imports_under(pkg, package_name=package_name)
@@ -258,6 +270,12 @@ def setup_default(dst_dir, proofautograder=False):
         shutil.copyfile(src_file, dst_file)
         print(f"Copied {src_file} → {dst_file}")
 
+    challenge_src = os.path.join(
+        src, "baselines/imo_grading/challenge_adjudicator.py")
+    challenge_dst = os.path.join(dst_dir, "challenge_agent.py")
+    shutil.copyfile(challenge_src, challenge_dst)
+    print(f"Copied {challenge_src} → {challenge_dst}")
+
     # Package-ize the copied repo so it can be installed/imported cleanly
     _packageize_proofgrader_repo(dst_dir, package_name="proofgrader")
 
@@ -267,6 +285,10 @@ def setup_from_run(dst_dir, generate_dir):
     Create ./proofgrader_repo by copying best node from an optimization run,
     applying patches, committing, then package-ize into 'proofgrader'.
     """
+    from utils.constants import REPO_NAME
+    from utils.git_utils import apply_patch, commit_repo
+    from utils.gl_utils import get_patch_files, get_saved_score, load_archive_data
+
     N = 3
     domain = "imo_grading"
     archive = load_archive_data(os.path.join(generate_dir, "archive.jsonl"), last_only=True)["archive"]
@@ -301,6 +323,10 @@ def setup_from_run(dst_dir, generate_dir):
         with open(patch_file, "r") as f:
             patch_str = f.read()
         apply_patch(dst_dir, patch_str)
+
+    challenge_src = os.path.join(
+        ".", "baselines/imo_grading/challenge_adjudicator.py")
+    shutil.copyfile(challenge_src, os.path.join(dst_dir, "challenge_agent.py"))
 
     # Commit it just in case
     _ = commit_repo(dst_dir)
@@ -338,7 +364,8 @@ def main():
     print("\nDone.")
     print("Next steps:")
     print(
-        "python -m pip install --no-deps --no-build-isolation "
+        f"{shlex.quote(os.path.realpath(sys.executable))} -m pip install "
+        "--no-deps --no-build-isolation "
         "--force-reinstall ./proofgrader_repo"
     )
 

@@ -20,6 +20,8 @@ import time
 from multiprocessing.connection import Connection
 from typing import Any, Dict, Tuple
 
+from domains.imo.challenge_contract import PROTOCOL_VERSION
+
 
 # Scope ids are generation ids. The main loop uses plain integers ("0","1",...);
 # the fixed-root evaluation (docs/14 §5.5, eval_on_root.eval_genid) uses the
@@ -35,10 +37,29 @@ _SCOPE_RE = re.compile(
     r"(?:0|[1-9][0-9]{0,11}"
     r"|eval_outer(?:0|[1-9][0-9]{0,11})_s(?:0|[1-9][0-9]{0,11})"
     r"|cval_outer(?:0|[1-9][0-9]{0,11})"
+    r"|taskval_outer(?:0|[1-9][0-9]{0,11})_(?:candidate|parent|noop[1-9][0-9]{0,11})"
+    r"|challenge_outer(?:0|[1-9][0-9]{0,11})_gen(?:0|[1-9][0-9]{0,11})"
     r")\Z")
 _MAX_REQUEST_BYTES = 16 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+_CHALLENGE_ADJUDICATION_TASK_BRIEF = f"""Compare the parent and child proofs against the complete repair criterion. The fixed protocol-v{PROTOCOL_VERSION} judge returns parent_present, child_present, actionable, actionability_basis, modification_scope, and reason derived from source-referenced obligation checks, plus private assessment/confirmation and model/prompt provenance. Judge actionability from the REPAIR CRITERION only and modification_scope from the PLANNER TASK CHANGE only; these are an independent judgment from mathematical success. Concrete values named as acceptance evidence do not by themselves constitute leakage. Proposed repairs require a fresh independent confirmation. Do not expose private evidence to task/planner/evaluator feedback."""
+_CHALLENGE_ADJUDICATION_RESPONSE_CONTRACT = (
+    f"Return the protocol_version={PROTOCOL_VERSION} JSON envelope containing parent_present, "
+    "child_present, actionable, actionability_basis, modification_scope, reason, "
+    "assessment, confirmation, review_status, model, prompt_sha256 and response_format. "
+    "Unknown presence is null. No markdown fences or surrounding prose."
+)
+
+
+def task_contract_for_run(domain: str, task_brief: str,
+                          response_contract: str) -> Tuple[str, str]:
+    """Select the framework-owned task instructions for a broker run."""
+    if domain == "imo_challenge_adjudication":
+        return (_CHALLENGE_ADJUDICATION_TASK_BRIEF,
+                _CHALLENGE_ADJUDICATION_RESPONSE_CONTRACT)
+    return task_brief, response_contract
 
 
 class _OuterNotActive(RuntimeError):
@@ -252,10 +273,22 @@ class _TaskBrokerState:
         from gan.framework import task_execution as tx
         from gan.framework.loader import load_registry, resolve_domain
 
-        domain = str(self.config["domain"])
+        challenge_adjudication = scope_id.startswith("challenge_outer")
+        domain = ("imo_challenge_adjudication" if challenge_adjudication
+                  else str(self.config["domain"]))
         model = str(self.config["model"])
+        effort = self.config.get("reasoning_effort")
+        if challenge_adjudication:
+            entry = self.config.get("adjudicator_entry") or {}
+            if not entry.get("model"):
+                raise RuntimeError("independent challenge adjudicator model is not configured")
+            model, effort = str(entry["model"]), entry.get("reasoning_effort")
 
         parent_scored = bool(self.config["parent_scored"])
+        # IMO proof train runs materialize the exact train batch in
+        # ``input/questions.csv`` so challenge anchors cannot be lost to a
+        # second sandbox-side sample. Proof grading still happens afterwards.
+        imo_proof_task = str(self.config.get("domain") or "") == "imo_proof"
         # Fixed-root eval runners materialize their explicit question list
         # before asking the broker. Treat that scope like a parent-scored run
         # for input selection, including independent domains such as imo_proof.
@@ -263,7 +296,7 @@ class _TaskBrokerState:
         # episode set, no questions.csv -- under its own scope prefix, so it is
         # launched by the same fixed-plan path and cannot fall back to a rotating
         # draw.
-        fixed_eval = scope_id.startswith(("eval_outer", "cval_outer"))
+        fixed_eval = scope_id.startswith(("eval_outer", "cval_outer", "taskval_outer"))
         questions_path = os.path.join(run_dir, "input", "questions.csv")
         launch_num_samples = int(self.config["num_samples"])
         grading_subset = str(self.config["subset"])
@@ -290,8 +323,14 @@ class _TaskBrokerState:
                 raise RuntimeError(str(exc)) from exc
             launch_num_samples = int(fixed_plan["num_samples"])
             grading_subset = str(fixed_plan["subset"])
+        if challenge_adjudication or (imo_proof_task and not fixed_eval):
+            import pandas as pd
+            launch_num_samples = len(pd.read_csv(questions_path, dtype=str))
+            if launch_num_samples < 1:
+                raise RuntimeError("IMO proof/challenge adjudication has no input rows")
         # A questions.csv launch and an episode launch are mutually exclusive.
-        question_input = parent_scored or bool(fixed_plan.get("questions_required"))
+        question_input = (parent_scored or challenge_adjudication or imo_proof_task
+                          or bool(fixed_plan.get("questions_required")))
         if question_input and not os.path.isfile(questions_path):
             raise RuntimeError(f"task questions file is missing: {questions_path}")
 
@@ -364,10 +403,11 @@ class _TaskBrokerState:
             "GAN_QUESTION_TIMEOUT_S": str(int(self.config["question_timeout_s"])),
             "GAN_LLM_TIMEOUT_S": str(float(self.config["llm_client_timeout_s"])),
         })
-        task_brief = str(self.config.get("task_brief") or "")
+        task_brief, response_contract = task_contract_for_run(
+            domain, str(self.config.get("task_brief") or ""),
+            str(self.config.get("response_contract") or ""))
         if task_brief:
             env["GAN_TASK_BRIEF"] = task_brief
-        response_contract = str(self.config.get("response_contract") or "")
         if response_contract:
             env["GAN_RESPONSE_CONTRACT"] = response_contract
 
@@ -384,7 +424,7 @@ class _TaskBrokerState:
                 # rotating half and ``sample_seed`` must stay None. The
                 # challenge-val round is the same shape with its own id list.
                 anchor_ids = list(fixed_plan["anchor_ids"])
-            elif (not parent_scored and not fixed_eval
+            elif (not parent_scored and not fixed_eval and not imo_proof_task
                     and str(self.config.get("sampling_mode", "")) == "seeded"):
                 seed_path = os.path.join(str(self.config["output_dir"]),
                                          "ckpt", "sample_seed.json")
@@ -404,10 +444,17 @@ class _TaskBrokerState:
                         anchor_ids = anchor_ids + [str(x) for x in extra]
                 except (OSError, ValueError, KeyError):
                     sample_seed = None  # fall back to the legacy prefix slice
-            # The balrog harness needs ``dataset_root`` (it is also the signal
-            # that makes the harness build the SANDBOXED agent factory) and no
-            # questions file; the question domains need the file and must NOT
-            # see the label root.
+            agent_path = "./task_agent.py"
+            if challenge_adjudication:
+                tx._require_sandboxable_proofgrader(
+                    "proofgrader.challenge_agent",
+                    trusted_prefix=str(self.config["python_prefix"]), expected_protocol=PROTOCOL_VERSION,
+                )
+                agent_path = tx._write_challenge_adjudicator_shim(
+                    run_dir,
+                    expected_owner_uid=int(self.config["owner_uid"]),
+                    expected_owner_gid=int(self.config["owner_gid"]),
+                )
             rc, output = tx._run_harness_and_report_local(
                 str(self.config["python"]),
                 run_dir,
@@ -425,7 +472,7 @@ class _TaskBrokerState:
                 expected_owner_uid=int(self.config["owner_uid"]),
                 # Fixed at root-side registration (same models.yaml entry as
                 # ``model``): the outer worker cannot influence it.
-                reasoning_effort=self.config.get("reasoning_effort"),
+                reasoning_effort=effort,
                 sample_seed=sample_seed,
                 anchor_ids=anchor_ids,
                 num_workers=int(self.config["harness_num_workers"]),
@@ -436,8 +483,20 @@ class _TaskBrokerState:
                 python_prefix=str(self.config["python_prefix"]),
                 sandbox_etc_dir=str(self.config["sandbox_etc_dir"]),
                 sandbox_profile=dict(self.config["sandbox_profile"]),
+                agent_path=agent_path,
             )
-            if domain == "imo_proof" and rc == 0:
+            if challenge_adjudication and rc == 0:
+                output_path = os.path.join(
+                    run_dir, "outputs", f"gan_{scope_id}")
+                from domains.imo.challenge_eval import report_challenge_adjudication
+                _report, challenge_report_path = report_challenge_adjudication(
+                    output_path, questions_path=questions_path, expected_model=model)
+                os.chown(
+                    challenge_report_path,
+                    int(self.config["owner_uid"]), int(self.config["owner_gid"]),
+                    follow_symlinks=False,
+                )
+            elif domain == "imo_proof" and rc == 0:
                 grading_rc, grading_output = tx.run_imo_proof_grading(
                     str(self.config["python"]),
                     run_dir,
@@ -575,6 +634,16 @@ def broker_process_main(control: Connection, socket_path: str,
     server = None
     thread = None
     try:
+        if str(config.get("domain") or "") == "imo_proof":
+            from gan.framework import task_execution as tx
+            trusted_prefix = str(config["python_prefix"])
+            tx._require_sandboxable_proofgrader(
+                "proofgrader.task_agent", trusted_prefix=trusted_prefix)
+            if bool(config.get("challenge_enabled")):
+                tx._require_sandboxable_proofgrader(
+                    "proofgrader.challenge_agent",
+                    trusted_prefix=trusted_prefix, expected_protocol=PROTOCOL_VERSION,
+                )
         if os.path.lexists(socket_path):
             raise RuntimeError(f"task broker socket path already exists: {socket_path}")
         state = _TaskBrokerState(config)

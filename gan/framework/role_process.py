@@ -279,9 +279,14 @@ def _validated_result(method: str, value: Any) -> Any:
         fields = {
             "predicted_score", "issues", "fix_verdicts", "penalties",
             "eval_point_results", "weaknesses", "token_budget_exhausted",
-            "truncated", "challenges",
+            "truncated",
         }
-        _exact_keys(value, fields, "evaluate result")
+        challenge_fields = fields | {"challenges"}
+        if set(value) == fields:
+            value = dict(value)
+            value["challenges"] = []
+        elif set(value) != challenge_fields:
+            _exact_keys(value, challenge_fields, "evaluate result")
         score = value["predicted_score"]
         if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
             raise RoleProcessError("evaluate predicted_score must be numeric or null")
@@ -303,8 +308,24 @@ def _validated_result(method: str, value: Any) -> Any:
             "patch_rejection", "attempts", "truncated", "budget_exhausted",
             "token_budget_exhausted", "deep_probe_required",
             "deep_probe_patch_proposed", "challenge_responses",
+            "challenge_response_retry",
         }
-        _exact_keys(value, fields, "plan result")
+        deep_fields = {"deep_probe_required", "deep_probe_patch_proposed"}
+        challenge_fields = {"challenge_responses", "challenge_response_retry"}
+        legacy_fields = fields - deep_fields - challenge_fields
+        deep_legacy_fields = fields - challenge_fields
+        challenge_legacy_fields = fields - deep_fields
+        outer_supernode_fields = fields - {"challenge_response_retry"}
+        if set(value) in (
+                legacy_fields, deep_legacy_fields, challenge_legacy_fields,
+                outer_supernode_fields):
+            value = dict(value)
+            value.update({name: False for name in deep_fields
+                          if name not in value})
+            value.setdefault("challenge_responses", [])
+            value.setdefault("challenge_response_retry", False)
+        else:
+            _exact_keys(value, fields, "plan result")
         _dict_list(value["records"], "plan records")
         _dict_list(value["responses"], "plan responses")
         _dict_list(value["challenge_responses"], "plan challenge_responses")
@@ -330,7 +351,8 @@ def _validated_result(method: str, value: Any) -> Any:
         raise RoleProcessError(f"{method} attempts must be an integer")
     bool_fields = ("truncated", "budget_exhausted", "token_budget_exhausted")
     if method == "plan":
-        bool_fields += ("deep_probe_required", "deep_probe_patch_proposed")
+        bool_fields += ("deep_probe_required", "deep_probe_patch_proposed",
+                        "challenge_response_retry")
     for field in bool_fields:
         if type(value[field]) is not bool:
             raise RoleProcessError(f"{method} {field} must be a boolean")

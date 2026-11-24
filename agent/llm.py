@@ -338,7 +338,7 @@ def _reasoning_effort(explicit):
 
 
 def _completion_kwargs(model, messages, temperature, max_tokens,
-                       reasoning_effort=None, api_key=None, call_id=None):
+                       reasoning_effort=None, api_key=None, call_id=None, response_format=None):
     """Model-specific completion kwargs (GPT-5 / Claude-Haiku quirks)."""
     kw = {
         "model": model, 
@@ -371,17 +371,19 @@ def _completion_kwargs(model, messages, temperature, max_tokens,
     effort = _reasoning_effort(reasoning_effort)
     if effort is not None:
         kw["extra_body"] = {"reasoning_effort": effort}
+    if response_format is not None:
+        kw.setdefault("extra_body", {})["response_format"] = response_format
     return kw
 
 
 def _attempt_completion(model, messages, temperature, max_tokens,
-                        reasoning_effort=None, api_key=None, call_id=None):
+                        reasoning_effort=None, api_key=None, call_id=None, response_format=None):
     """One network attempt (transient 5xx re-classified, then backoff retries)."""
     try:
         return litellm.completion(
             **_completion_kwargs(model, messages, temperature, max_tokens,
                                  reasoning_effort=reasoning_effort, api_key=api_key,
-                                 call_id=call_id)
+                                 call_id=call_id, response_format=response_format)
         )
     except BaseException as _exc:  # noqa: BLE001 -- re-raise unchanged by default
         _backoff_record_failure(_exc)
@@ -540,6 +542,7 @@ def get_response_from_llm(
     msg_history=None,
     reasoning_effort: str | None = None,
     api_key: str | None = None,
+    response_format: dict | None = None,
 ) -> Tuple[str, list, dict]:
     if msg_history is None:
         msg_history = []
@@ -561,7 +564,7 @@ def get_response_from_llm(
             response = _completion_with_backoff(
                 model, new_msg_history, temperature, max_tokens,
                 reasoning_effort=reasoning_effort, api_key=api_key,
-                call_id=ctx.call_id)
+                call_id=ctx.call_id, response_format=response_format)
         except BaseException as _exc:
             _emit_llm_call_record(_llm_call_record(ctx, "error", exc=_exc))
             raise

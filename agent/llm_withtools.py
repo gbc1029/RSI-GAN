@@ -623,12 +623,14 @@ def chat_with_agent(
               # Wired ONLY by framework callers that built it (loop / task
               # worker); None = pre-D behaviour (no seam at all).
                           # -> $GAN_TOOLS_LOAD_REPORT env fallback (legacy).
+    response_format=None,  # Optional fixed-judge JSON constraint, forwarded unchanged.
 ):
     # One binding covers all call turns below (initial, budget-exhausted,
     # malformed-feedback, repeat-break, tool-result): the knob is per-SESSION
     # config, identical on every turn.
     get_response_fn = partial(get_response_from_llm,
-                              reasoning_effort=reasoning_effort, api_key=api_key)
+                              reasoning_effort=reasoning_effort, api_key=api_key,
+                              **({"response_format": response_format} if response_format is not None else {}))
 
     # Per-call LLM records (agent/llm.py `llm_call` rows) go to a SIDECAR next
     # to this session's trajectory — never into the trajectory itself (agent
@@ -1054,10 +1056,16 @@ def chat_with_agent(
                 pass
 
     if return_info:
+        # Preserve the final call's termination facts for callers that need to
+        # distinguish an incomplete response from an ordinary parse failure.
+        # ``info`` is the last successful LLM call in this session.
+        last_info = info if isinstance(info, dict) else {}
         return new_msg_history, {"truncated": truncated, "tool_calls": num_tool_calls,
                                  "repeat_break": repeat_break,
                                  "token_budget_exhausted": token_budget_exhausted,
-                                 "total_tokens": (tokens_used if tokens_used else None)}
+                                 "total_tokens": (tokens_used if tokens_used else None),
+                                 "finish_reason": last_info.get("finish_reason"),
+                                 "usage": last_info.get("usage")}
     return new_msg_history
 
 if __name__ == "__main__":

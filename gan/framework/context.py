@@ -35,21 +35,10 @@ class PlanContext:
     # the loop BEFORE the session (never by a tool), so the model cannot widen
     # its own mandate.
     challenges: List[Dict[str, Any]] = field(default_factory=list)
+    challenge_response_ids: frozenset = field(default_factory=frozenset)
 
     def record(self, op: str, **detail: Any) -> None:
         self.records.append({"op": op, **detail})
-
-    def add_challenge_response(self, challenge_id: str, response_kind: str,
-                               addressed: bool = True,
-                               feedback: str = "") -> None:
-        # Same discipline as `add_response`: the structured stance is what crosses
-        # to the framework; `feedback` stays in the session record only.
-        self.challenge_responses.append({
-            "challenge_id": str(challenge_id),
-            "response_kind": str(response_kind),
-            "addressed": bool(addressed),
-            "feedback": feedback or "",
-        })
 
     def add_response(self, issue_id: str, accepted: bool, feedback: str = "",
                      response_kind: str = "unspecified") -> None:
@@ -58,6 +47,19 @@ class PlanContext:
         self.responses.append({"issue_id": issue_id, "accepted": bool(accepted),
                                "feedback": feedback or "",
                                "response_kind": str(response_kind)})
+
+    def configure_challenge_responses(self, challenge_ids) -> None:
+        self.challenge_response_ids = frozenset(
+            str(value) for value in (challenge_ids or []) if str(value))
+
+    def add_challenge_response(self, challenge_id: str, response_kind: str,
+                               addressed: bool = True, feedback: str = "") -> None:
+        self.challenge_responses.append({
+            "challenge_id": str(challenge_id),
+            "response_kind": str(response_kind),
+            "addressed": bool(addressed),
+            "feedback": feedback or "",
+        })
 
 
 def set_plan_context(ctx: PlanContext):
@@ -109,6 +111,22 @@ class EvalContext:
             "issue_id": issue_id, "fixed": bool(fixed), "evidence": evidence or "",
             "judged_by": "evaluator",
         })
+
+    def configure_challenges(self, *, domain: Optional[str], allowed_qids,
+                             max_k: int, blind_only: bool) -> None:
+        self._challenge_domain = str(domain or "")
+        self._challenge_allowed_qids = frozenset(
+            str(qid) for qid in (allowed_qids or []))
+        self._challenge_max_k = int(max_k)
+        self._challenge_blind_only = bool(blind_only)
+
+    def challenge_config(self) -> Dict[str, Any]:
+        return {
+            "domain": getattr(self, "_challenge_domain", ""),
+            "allowed_qids": getattr(self, "_challenge_allowed_qids", frozenset()),
+            "max_k": getattr(self, "_challenge_max_k", 0),
+            "blind_only": getattr(self, "_challenge_blind_only", False),
+        }
 
 
 def set_eval_context(ctx: EvalContext):

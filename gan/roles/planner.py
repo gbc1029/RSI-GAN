@@ -56,6 +56,22 @@ _DEEP_PROBE_NOTE = (
     "the round remains valid and the missed probe will only be audited."
 )
 
+_CHALLENGE_DESIGN_NOTE = (
+    "\n## Challenge-to-task design boundary\n"
+    "Translate the listed challenges into a reusable task capability, not a "
+    "qid-specific patch. You may combine several heterogeneous defects as "
+    "separate conditional strategy sections in one prompt/config change. "
+    "The task must still identify the current structure, choose its parameters, "
+    "perform the main derivation, handle boundary cases, and verify the result. "
+    "Method names (for example CRT), applicability checks, structural pattern "
+    "recognition, concrete theorem conditions, and failure branches are allowed. "
+    "Never include a challenge qid, the current problem's unique object or "
+    "construction, a current answer or answer-equivalent intermediate result, "
+    "reference-solution text, or a qid-specific branch in the task change. "
+    "Such instance memory or answer leakage is a framework hard-gate and the "
+    "child cannot become a parent."
+)
+
 
 class Planner(Role):
     def __init__(self, model: str, output_dir: str, instance: Optional[str] = None, **kwargs):
@@ -79,6 +95,8 @@ class Planner(Role):
         require_deep_patch: bool = False,
         carried_over: Optional[List[Dict[str, Any]]] = None,
         challenges: Optional[List[Dict[str, Any]]] = None,
+        parent_challenges: Optional[List[Dict[str, Any]]] = None,
+        challenge_results: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         parts = ["Improve the task agent's DESIGN for the next generation."]
         if task_brief:
@@ -125,6 +143,35 @@ class Planner(Role):
                 "\n```json\n"
                 f"{json.dumps(evaluator_issues, ensure_ascii=False, indent=2)[:4000]}\n```"
             )
+        proof_challenges = [c for c in (parent_challenges or challenges or [])
+                            if "defect_type" in c]
+        episode_challenges = [c for c in (parent_challenges or challenges or [])
+                              if "defect_type" not in c]
+        if proof_challenges:
+            parts.append(
+                "\n## Blind proof challenges from the direct parent\n"
+                "Address these qid-bound challenges in the task design. They are "
+                "framework-carried train evidence, not grader scores or validation "
+                "information. Prefer a reusable repair that generalizes beyond the "
+                "listed qids; do not hard-code a qid or copy a reference solution.\n"
+                "Call `respond_challenge` exactly once for every challenge_id. "
+                "`acted` means only that a task change was attempted; it is not "
+                "proof of repair. Use `disputed`, `deferred`, or `out_of_scope` "
+                "when you are not claiming a repair.\n"
+                # Challenges are an atomic input contract.  Do not truncate the
+                # serialized list: slicing JSON can hide a claim/criterion or
+                # leave the planner with malformed JSON at the end of the block.
+                f"```json\n{json.dumps(proof_challenges, ensure_ascii=False, indent=2)}\n```"
+            )
+            parts.append(_CHALLENGE_DESIGN_NOTE)
+        if challenge_results:
+            parts.append(
+                "\n## Settled challenge results on this selected parent\n"
+                "These are framework-adjudicated public states from earlier fixes. "
+                "Use them to avoid repeating failed local repairs. They contain no "
+                "grader score, reference solution, grading guideline, or val data.\n"
+                f"```json\n{json.dumps(challenge_results, ensure_ascii=False, indent=2)}\n```"
+            )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
             parts.append(
                 "\n## Diff summary (what changed last round, sanitized)\n"
@@ -145,7 +192,7 @@ class Planner(Role):
                 "failed. The evaluator re-detects and re-prescribes them itself.\n"
                 f"```json\n{json.dumps(carried_over, ensure_ascii=False, indent=2)[:1200]}\n```"
             )
-        if challenges:
+        if episode_challenges:
             # CHALLENGE (docs/21 §4): a same-family fresh episode is waiting in
             # this generation's batch. The planner cannot see the instance or its
             # seed (L1) -- only the defect class, the family and the mechanical
@@ -163,7 +210,7 @@ class Planner(Role):
                 "strategy that only works on the episodes you have seen will be "
                 "recorded as unrepaired."
                 "\n```json\n"
-                f"{json.dumps(challenges, ensure_ascii=False, indent=2)[:3000]}\n```"
+                f"{json.dumps(episode_challenges, ensure_ascii=False, indent=2)}\n```"
             )
         if parent_predicted_score is not None or parent_benchmark_score is not None:
             parts.append(
@@ -201,17 +248,24 @@ class Planner(Role):
         response_contract: Optional[str] = None,
         carried_over: Optional[List[Dict[str, Any]]] = None,
         challenges: Optional[List[Dict[str, Any]]] = None,
+        parent_challenges: Optional[List[Dict[str, Any]]] = None,
+        challenge_results: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         if parent_feedback is not None and not validate_feedback(parent_feedback):
             raise ValueError("incompatible feedback schema_version")
 
         task_design = config if isinstance(config, dict) else {}
+        if parent_challenges is not None and challenges is not None and parent_challenges != challenges:
+            raise ValueError("conflicting challenge projections")
+        parent_challenges = parent_challenges if parent_challenges is not None else challenges
         plan_ctx = PlanContext(config=task_design, node_id=node_id, output_dir=self.output_dir)
         # CHALLENGES awaiting an answer (docs/21 §4): framework-injected so the
         # `respond_challenge` tool can check ids and the instruction can list
         # them. `challenges` is never writable by a tool -- the model answers
         # them, it does not choose them.
-        plan_ctx.challenges = [dict(c) for c in (challenges or []) if isinstance(c, dict)]
+        plan_ctx.challenges = [dict(c) for c in (parent_challenges or []) if isinstance(c, dict)]
+        plan_ctx.configure_challenge_responses(
+            [row.get("challenge_id") for row in (parent_challenges or [])])
         # F4/C1: the framework's output contract rides the design context so
         # the AUTHOR sees it at the point of rewriting the task prompt
         # (soft constraint: known to exist; not a set_config-writable key).
@@ -232,6 +286,7 @@ class Planner(Role):
         attempts = 0
         rejected = None
         exhausted = False
+        challenge_response_retry = False
         # Receipt aggregation (§4.1): a session spans SEVERAL chat runs (main
         # + rejection retries); last_run_info only remembers the LAST one, so
         # a token stop / tool-cap stop in an early run was masked by a
@@ -260,10 +315,28 @@ class Planner(Role):
                     if broker is not None else False,
                     require_deep_patch=require_deep_patch,
                     carried_over=carried_over,
-                    challenges=plan_ctx.challenges),
+                    parent_challenges=parent_challenges,
+                    challenge_results=challenge_results),
                 max_tool_calls=max_tool_calls, tool_repeat_limit=tool_repeat_limit,
                 trajectory_file=traj)
             _absorb_run_flags()
+
+            if parent_challenges:
+                expected = {str(row.get("challenge_id")) for row in parent_challenges}
+                received = {str(row.get("challenge_id"))
+                            for row in plan_ctx.challenge_responses}
+                missing = sorted(expected - received)
+                if missing:
+                    challenge_response_retry = True
+                    hist = self.run(
+                        "# Challenge response ledger incomplete\n"
+                        "Record exactly one `respond_challenge` response for each "
+                        "missing challenge_id below. This is a response-only pass: "
+                        "do not edit the task, change config, or call other tools.\n"
+                        + json.dumps(missing, ensure_ascii=False),
+                        msg_history=hist, max_tool_calls=max_tool_calls,
+                        tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
+                    _absorb_run_flags()
 
             def _build_patch() -> tuple[str, str]:
                 """Return ``(patch, refusal)``.
@@ -356,10 +429,8 @@ class Planner(Role):
         return {
             "records": records,
             "responses": plan_ctx.responses,
-            # Structured stances on this round's challenges (docs/21). The
-            # evaluator NEVER sees these free of the mechanical verdict: the
-            # adjudicator decides, the stance only explains.
             "challenge_responses": plan_ctx.challenge_responses,
+            "challenge_response_retry": challenge_response_retry,
             "config": task_design,
             "patch": "" if rejected else patch_str,
             "patch_proposed": patch_str,

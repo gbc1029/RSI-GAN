@@ -28,6 +28,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from gan.framework import paths
 from gan.framework.ledger import guard_writer
 
+DOMAIN = "imo_proof"  # Default only for the existing qid-bound API.
 LEDGER_VERSION = 1
 
 STATUS_LOCKED = "locked"
@@ -98,12 +99,12 @@ def audit_hardcoding(episode_ids: Iterable[Any], patch: Any = "",
             "modification_scope": None}
 
 
-def empty(domain: str) -> Dict[str, Any]:
+def empty(domain: str = DOMAIN) -> Dict[str, Any]:
     return {"version": LEDGER_VERSION, "domain": str(domain), "locks": {},
             "challenges": {}}
 
 
-def _normalise(data: Any, domain: str) -> Dict[str, Any]:
+def _normalise(data: Any, domain: str = DOMAIN) -> Dict[str, Any]:
     if not isinstance(data, dict):
         return empty(domain)
     if data.get("version") != LEDGER_VERSION or data.get("domain") != str(domain):
@@ -116,7 +117,7 @@ def _normalise(data: Any, domain: str) -> Dict[str, Any]:
     return data
 
 
-def load(output_dir: str, domain: str) -> Dict[str, Any]:
+def load(output_dir: str, domain: str = DOMAIN) -> Dict[str, Any]:
     path = paths.challenge_ledger_path(output_dir)
     if not os.path.isfile(path):
         return empty(domain)
@@ -127,7 +128,7 @@ def load(output_dir: str, domain: str) -> Dict[str, Any]:
         return empty(domain)
 
 
-def save(output_dir: str, data: Dict[str, Any], writer: Any, domain: str) -> None:
+def save(output_dir: str, data: Dict[str, Any], writer: Any, domain: str = DOMAIN) -> None:
     guard_writer(writer, "challenge ledger")
     clean = _normalise(data, domain)
     path = paths.challenge_ledger_path(output_dir)
@@ -145,7 +146,7 @@ def _text(value: Any, field: str) -> str:
     return text
 
 
-def validate_candidate(item: Mapping[str, Any], *, allowed_families: Iterable[Any],
+def _validate_family_candidate(item: Mapping[str, Any], *, allowed_families: Iterable[Any],
                        seen: Iterable[Any] = ()) -> Dict[str, str]:
     """Validate one blind candidate without mutating or revealing ledger state."""
     if not isinstance(item, Mapping):
@@ -180,7 +181,7 @@ def _challenge_id(outer: Any, producer_node: Any, index: int) -> str:
     return f"ch-{outer}-{producer_node}-{index}"
 
 
-def lock(data: Dict[str, Any], *, domain: str, outer: Any, producer_node: Any,
+def _lock_family(data: Dict[str, Any], *, domain: str, outer: Any, producer_node: Any,
          evaluator_version: Any, challenges: Sequence[Mapping[str, Any]],
          allowed_families: Iterable[Any], max_k: int = 2,
          qids: Optional[Sequence[Any]] = None) -> List[str]:
@@ -211,7 +212,7 @@ def lock(data: Dict[str, Any], *, domain: str, outer: Any, producer_node: Any,
     payload: List[Dict[str, str]] = []
     seen: List[tuple] = []
     for item in items:
-        row = validate_candidate(item, allowed_families=allowed_families, seen=seen)
+        row = _validate_family_candidate(item, allowed_families=allowed_families, seen=seen)
         seen.append((row["defect_class"], row["family"]))
         payload.append(row)
     existing = locks.get(key)
@@ -381,5 +382,141 @@ __all__ = [
     "STATUS_CONSUMED", "ChallengeError", "empty", "load", "save", "lock",
     "attach_instances", "validate_candidate", "available_for_parent",
     "reserve_for_child", "consume_for_child", "release_for_child", "settle",
-    "audit_hardcoding",
+    "audit_hardcoding", "audit_single_question_hardcoding",
 ]
+
+_PROOF_REQUIRED = ("qid", "defect_type", "claim", "evidence_ref", "repair_criterion")
+
+def audit_single_question_hardcoding(
+    challenge_qids: Iterable[Any], patch: Any = "", config: Any = None,
+) -> Dict[str, Any]:
+    """Reject challenge-specific qid/answer leakage in a task response.
+
+    The planner may use general proof methods. This mechanical pass covers
+    explicit challenge identifiers and protected answer/grader fields in the
+    submitted patch or task config; semantic transferability is judged later
+    by the fixed adjudicator. It never reads held-out val data.
+    """
+    qids = [str(q).strip() for q in (challenge_qids or []) if str(q).strip()]
+    try:
+        blob = json.dumps(config, ensure_ascii=False, sort_keys=True,
+                          default=str) if config is not None else ""
+    except (TypeError, ValueError):
+        blob = str(config or "")
+    raw_patch = str(patch or "")
+    added_patch = "\n".join(
+        line[1:] for line in raw_patch.splitlines()
+        if line.startswith("+") and not line.startswith("+++"))
+    text = f"{added_patch}\n{blob}"
+    for qid in qids:
+        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(qid)
+                     + r"(?![A-Za-z0-9_])", text):
+            return {"triggered": True, "reason": "challenge_qid_embedded",
+                    "qid": qid, "hard_gate": True,
+                    "modification_scope": "instance_specific_memory"}
+    match = _PROTECTED_RESPONSE_KEYS.search(text)
+    if match:
+        return {"triggered": True, "reason": "protected_answer_or_grader_field",
+                "token": match.group(0), "hard_gate": True,
+                "modification_scope": "answer_leakage"}
+    return {"triggered": False, "reason": None, "hard_gate": False,
+            "modification_scope": None}
+
+def _validate_proof_candidate(item: Mapping[str, Any], *, allowed_qids: Iterable[Any],
+                       seen_qids: Iterable[Any] = ()) -> Dict[str, str]:
+    """Validate one blind candidate without mutating or revealing ledger state."""
+    if not isinstance(item, Mapping):
+        raise ChallengeError("each challenge must be an object")
+    forbidden = _FORBIDDEN.intersection(item)
+    if forbidden:
+        raise ChallengeError("blind challenge contains revealed field(s): "
+                             + ", ".join(sorted(forbidden)))
+    row = {field: _text(item.get(field), field) for field in _PROOF_REQUIRED}
+    allowed = {str(qid) for qid in allowed_qids}
+    if row["qid"] not in allowed:
+        raise ChallengeError(f"challenge qid is not an allowed train qid: {row['qid']}")
+    if row["qid"] in {str(qid) for qid in seen_qids}:
+        raise ChallengeError(f"duplicate challenge qid: {row['qid']}")
+    return row
+
+def _lock_proof(
+    data: Dict[str, Any], *, outer: Any, parent_node: Any,
+    evaluator_version: Any, challenges: Sequence[Mapping[str, Any]],
+    allowed_qids: Iterable[Any], max_k: int = 5,
+) -> List[str]:
+    """Blind-lock a bounded set of qid-bound challenges.
+
+    The operation is idempotent for a resumed generation.  A second lock with
+    the same producer key must contain the exact same payload; a different
+    payload is rejected rather than silently replacing evidence.
+    """
+    if not isinstance(data, dict):
+        raise ChallengeError("challenge ledger must be a mapping")
+    if data.get("version") != LEDGER_VERSION or data.get("domain") != DOMAIN:
+        raise ChallengeError("unsupported challenge ledger")
+    if not isinstance(max_k, int) or max_k < 1:
+        raise ChallengeError("max_k must be a positive integer")
+    items = list(challenges or [])
+    if len(items) > max_k:
+        raise ChallengeError(f"challenge count exceeds max_k={max_k}")
+    allowed = {str(qid) for qid in allowed_qids}
+    key = _lock_key(outer, parent_node, evaluator_version)
+    locks = data.setdefault("locks", {})
+    records = data.setdefault("challenges", {})
+    payload: List[Dict[str, str]] = []
+    seen_qids = set()
+    for item in items:
+        row = _validate_proof_candidate(item, allowed_qids=allowed, seen_qids=seen_qids)
+        seen_qids.add(row["qid"])
+        payload.append(row)
+    existing = locks.get(key)
+    if existing is not None:
+        if existing.get("payload") != payload:
+            raise ChallengeError("resumed challenge lock payload does not match")
+        return list(existing.get("challenge_ids") or [])
+
+    ids: List[str] = []
+    for index, row in enumerate(payload):
+        challenge_id = _challenge_id(outer, parent_node, index)
+        if challenge_id in records:
+            raise ChallengeError(f"challenge id collision: {challenge_id}")
+        records[challenge_id] = {
+            "challenge_id": challenge_id,
+            "outer": outer,
+            "producer_node": str(parent_node),
+            "producer_evaluator_version": str(evaluator_version),
+            **row,
+            "status": STATUS_LOCKED,
+            "reserved_child_node": None,
+            "consumed_child_node": None,
+            ADJUDICATION_FIELD: None,
+        }
+        ids.append(challenge_id)
+    locks[key] = {"payload": copy.deepcopy(payload), "challenge_ids": ids}
+    return ids
+
+
+def validate_candidate(item, *, allowed_families=None, seen=(), allowed_qids=None, seen_qids=()):
+    if allowed_qids is not None:
+        return _validate_proof_candidate(item, allowed_qids=allowed_qids, seen_qids=seen_qids)
+    if allowed_families is None:
+        raise ChallengeError("allowed families or qids must be supplied")
+    return _validate_family_candidate(item, allowed_families=allowed_families, seen=seen)
+
+
+def lock(data, *, domain=DOMAIN, outer, producer_node=None, parent_node=None,
+         evaluator_version, challenges, allowed_families=None, max_k=None,
+         qids=None, allowed_qids=None):
+    if max_k is None:
+        max_k = 5 if allowed_qids is not None else 2
+    if allowed_qids is not None:
+        if domain != DOMAIN or data.get("domain") != DOMAIN:
+            raise ChallengeError("qid-bound challenges require imo_proof")
+        return _lock_proof(data, outer=outer,
+                           parent_node=parent_node if parent_node is not None else producer_node,
+                           evaluator_version=evaluator_version, challenges=challenges,
+                           allowed_qids=allowed_qids, max_k=max_k)
+    return _lock_family(data, domain=domain, outer=outer,
+                        producer_node=producer_node if producer_node is not None else parent_node,
+                        evaluator_version=evaluator_version, challenges=challenges,
+                        allowed_families=allowed_families or (), max_k=max_k, qids=qids)

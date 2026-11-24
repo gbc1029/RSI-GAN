@@ -37,11 +37,12 @@ def _evidence_ok(evidence: Optional[Mapping[str, Any]]) -> bool:
         return False
     if bool(evidence.get("imputed")):
         return False
-    # A generation may have PARTIAL coverage because an unrelated item failed.
-    # Adjudication is item-bound, so prefer the item's own evidence (docs/21 §5.2)
-    # instead of rejecting every item on that edge.
-    status = evidence.get("qid_score_status", evidence.get("score_status"))
-    if status not in {"ok"}:
+    # A generation may have partial coverage because an unrelated qid failed.
+    # Challenge settlement is qid-bound, so prefer the runner's per-qid
+    # evidence when it is available instead of rejecting every qid on that
+    # edge because of the generation-wide status.
+    score_status = evidence.get("qid_score_status", evidence.get("score_status"))
+    if score_status not in {"ok"}:
         return False
     if evidence.get("points") is None:
         return False

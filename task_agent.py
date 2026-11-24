@@ -98,6 +98,17 @@ class TaskAgent(AgentSystem):
             return "", "response must be a non-blank string"
         return prediction, None
 
+    @staticmethod
+    def _chat_with_info(*args, **kwargs):
+        """Run one chat session while retaining its final call metadata."""
+        result = chat_with_agent(*args, return_info=True, **kwargs)
+        if (isinstance(result, tuple) and len(result) == 2
+                and isinstance(result[1], dict)):
+            return result
+        # Keep compatibility with older injected chat helpers used by direct
+        # runs and tests that return only the message history.
+        return result, {}
+
     def forward(self, inputs):
         """
         A design-driven agent that solves a given task.
@@ -144,7 +155,7 @@ class TaskAgent(AgentSystem):
 }}
 </json>"""
 
-        new_msg_history = chat_with_agent(
+        new_msg_history, call_info = self._chat_with_info(
             instruction,
             model=self.model,
             msg_history=[],
@@ -177,6 +188,10 @@ class TaskAgent(AgentSystem):
         except Exception as e:
             prediction, extraction_error = "", f"extraction error: {e}"
         if extraction_error:
+            length_exhausted = call_info.get("finish_reason") == "length"
+            if length_exhausted:
+                self.log("prediction_extract_length_exhausted: final LLM "
+                         "response hit the output limit")
             self.log(f"prediction_extract failed: {extraction_error}; "
                      "requesting one format-repair turn")
             # Domain-aware requirement (F4/C1): the framework-derived contract
@@ -186,7 +201,17 @@ class TaskAgent(AgentSystem):
             response_requirement = (os.environ.get("GAN_RESPONSE_CONTRACT")
                                     or "The response must contain the complete "
                                        "final answer from your prior work.")
-            repair_instruction = f"""Your previous final output could not be accepted: {extraction_error}.
+            if length_exhausted:
+                repair_instruction = f"""Your previous final output was cut off by the output limit ({extraction_error}).
+
+Do not repeat the full derivation or any commentary. Return the shortest complete final answer you can, keeping only the essential proof steps. Do not call any tool. Return exactly one tagged JSON object with no markdown fences and no text outside the tags. The response value must be a non-empty JSON string; write math in plain text without LaTeX backslash escapes. {response_requirement}
+<json>
+{{
+    "response": "compact complete final answer"
+}}
+</json>"""
+            else:
+                repair_instruction = f"""Your previous final output could not be accepted: {extraction_error}.
 
 Do not call any tool. Return your final answer as exactly one tagged JSON object, with no markdown fences and no text outside the tags. The response value must be a non-empty JSON string; write math in plain text without LaTeX backslash escapes. {response_requirement}
 <json>
@@ -194,8 +219,9 @@ Do not call any tool. Return your final answer as exactly one tagged JSON object
     "response": "final answer"
 }}
 </json>"""
+            repair_info = {}
             try:
-                new_msg_history = chat_with_agent(
+                new_msg_history, repair_info = self._chat_with_info(
                     repair_instruction,
                     model=self.model,
                     msg_history=new_msg_history,
@@ -210,6 +236,9 @@ Do not call any tool. Return your final answer as exactly one tagged JSON object
             except Exception as e:
                 prediction, extraction_error = "", f"format-repair turn failed: {e}"
             if extraction_error:
+                if repair_info.get("finish_reason") == "length":
+                    self.log("prediction_extract_length_exhausted: short "
+                             "format-repair also hit the output limit")
                 self.log(f"prediction_extract repair failed: {extraction_error}")
 
         return prediction, new_msg_history

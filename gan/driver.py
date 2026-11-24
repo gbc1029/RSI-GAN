@@ -15,6 +15,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import wraps
+import importlib
 import json
 import multiprocessing
 import os
@@ -99,6 +100,7 @@ def _clean_broker_start_environment():
         "HOME": "/tmp",
         "TMPDIR": "/tmp",
         "GAN_SECURE_MODE": "1",
+        "PYTHONNOUSERSITE": "1",
         "PYTHON_DOTENV_DISABLED": "1",
     })
     os.environ.clear()
@@ -108,6 +110,48 @@ def _clean_broker_start_environment():
     finally:
         os.environ.clear()
         os.environ.update(previous)
+
+
+def _sanitize_user_site_imports() -> None:
+    """Remove user installs before privileged runtime imports and spawning."""
+    import site
+
+    os.environ["PYTHONNOUSERSITE"] = "1"
+    raw_roots = site.getusersitepackages()
+    roots = [raw_roots] if isinstance(raw_roots, str) else list(raw_roots or [])
+    if os.name == "posix":
+        raw_uid = os.environ.get("SUDO_UID", "")
+        if raw_uid.isdigit():
+            import pwd
+            try:
+                home = pwd.getpwuid(int(raw_uid)).pw_dir
+            except KeyError:
+                pass
+            else:
+                roots.append(os.path.join(
+                    home, ".local", "lib",
+                    f"python{sys.version_info.major}.{sys.version_info.minor}",
+                    "site-packages",
+                ))
+    roots = [os.path.realpath(path) for path in roots if path]
+
+    def in_user_site(path: str) -> bool:
+        if not path:
+            return False
+        resolved = os.path.realpath(path)
+        try:
+            return any(os.path.commonpath([root, resolved]) == root
+                       for root in roots)
+        except ValueError:
+            return False
+
+    sys.path[:] = [path for path in sys.path if not in_user_site(path)]
+    for name, module in list(sys.modules.items()):
+        if name != "proofgrader" and not name.startswith("proofgrader."):
+            continue
+        if in_user_site(str(getattr(module, "__file__", "") or "")):
+            sys.modules.pop(name, None)
+    importlib.invalidate_caches()
 
 
 def _validate_run_paths(repo_root: str, output_dir: str) -> tuple[str, str]:
@@ -627,7 +671,9 @@ def _materialize_run_roots(repo_root: str, output_dir: str, layout: str):
     return code_root, roots
 
 
-def _launch_budget(cfg: Any, inner: Optional[int]) -> tuple[int, int, int]:
+def _launch_budget(cfg: Any, inner: Optional[int], *, paired_val: bool = False,
+                   noop_repeats: int = 0,
+                   challenge_adjudication: bool = False) -> tuple[int, int, int]:
     """Per-outer TASK LAUNCH budget: ``(inner_generations, eval_rounds, total)``.
 
     The privileged broker refills a launch counter per outer (``register_outer``)
@@ -663,9 +709,20 @@ def _launch_budget(cfg: Any, inner: Optional[int]) -> tuple[int, int, int]:
                          else int(cfg.get("loop.inner_max", 3)))
     eval_rounds = (max(0, int(cfg.get("eval.eval_samples", 3)))
                    if bool(cfg.get("outer_select.enabled", False)) else 0)
-    challenge_rounds = 1 if bool(cfg.get("challenge.enabled", False)) else 0
-    return (inner_generations, eval_rounds,
-            inner_generations + eval_rounds + challenge_rounds)
+    # The IMO challenge protocol performs one candidate and one direct-parent
+    # fixed-val run at the outer boundary.  They are ordinary task-broker
+    # launches, but are not part of ``eval.eval_samples`` and therefore need
+    # their own explicit reservation.
+    paired_val_rounds = (2 + max(0, int(noop_repeats))
+                         if paired_val else 0)
+    # At most one fixed adjudicator batch is launched after each inner task.
+    # The first generation normally has no parent challenge, but reserving the
+    # full inner count keeps resume/branch selection within a simple hard cap.
+    adjudication_rounds = inner_generations if challenge_adjudication else 0
+    challenge_val_rounds = (1 if bool(cfg.get("challenge.enabled", False))
+                            and not challenge_adjudication else 0)
+    extra_rounds = eval_rounds + paired_val_rounds + adjudication_rounds + challenge_val_rounds
+    return inner_generations, extra_rounds, inner_generations + extra_rounds
 
 
 def _resolve_eval_subset(raw: str, domain_config: Any) -> tuple[str, str]:
@@ -705,6 +762,7 @@ def run_gan_driver(
     resume: bool = False,
     force: bool = False,
 ) -> str:
+    _sanitize_user_site_imports()
     from gan.framework import checkpoint as ckpt_mod
     from gan.framework import models as model_registry
     from gan.framework import task_execution as task_execution
@@ -864,12 +922,23 @@ def run_gan_driver(
     slow_prefix_note = _slow_prefix_note(python_prefix)
     if slow_prefix_note:
         print(f"WARNING: {slow_prefix_note}", flush=True)
+    if domain == "imo_proof":
+        task_execution._require_sandboxable_proofgrader(
+            "proofgrader.task_agent", trusted_prefix=python_prefix)
+        if bool(cfg.get("challenge.enabled", False)):
+            from domains.imo.challenge_contract import PROTOCOL_VERSION
+            task_execution._require_sandboxable_proofgrader(
+                "proofgrader.challenge_agent", trusted_prefix=python_prefix, expected_protocol=PROTOCOL_VERSION)
 
     models = {
         "task": model_registry.resolve("gan.task"),
         "planner": model_registry.resolve("gan.planner"),
         "evaluator": model_registry.resolve("gan.evaluator"),
     }
+    adjudicator_entry = None
+    if domain == "imo_proof" and bool(cfg.get("challenge.enabled", False)):
+        adjudicator_entry = model_registry.resolve_entry("domains.imo_challenge_adjudication")
+        models["challenge_adjudicator"] = adjudicator_entry["model"]
     proxy_dir = tempfile.mkdtemp(prefix="rsi-gan-proxy-", dir=_trusted_ipc_parent())
     os.chmod(proxy_dir, 0o711)
     try:
@@ -918,6 +987,7 @@ def run_gan_driver(
     }
     domain_cfg = resolve_domain(reg, domain)
     safe_broker_env["GAN_SECURE_MODE"] = "1"
+    safe_broker_env["PYTHONNOUSERSITE"] = "1"
     safe_broker_env["PYTHON_DOTENV_DISABLED"] = "1"
     # Per-outer budgets must cover the LARGER of the main-line and evaluation
     # question sets -- otherwise every evaluation launch is refused ("task
@@ -943,6 +1013,7 @@ def run_gan_driver(
         "subset": subset,
         "num_samples": int(num_samples),
         "model": models["task"],
+        "adjudicator_entry": adjudicator_entry,
         # Same models.yaml entry as ``model``; resolve_entry() validated it at
         # startup. Rides the broker config (like the model), never the env.
         "reasoning_effort": model_registry.resolve_entry("gan.task").get("reasoning_effort"),
@@ -965,6 +1036,7 @@ def run_gan_driver(
         # run-persistent seed file at launch time (per generation) so a resume
         # reuses the same base seed without restart-order constraints.
         "sampling_mode": str((cfg.get("sampling") or {}).get("mode", "seeded")),
+        "challenge_enabled": bool(cfg.get("challenge.enabled", False)),
         "sandbox_profile": sandbox_profile,
         "owner_uid": owner_uid,
         "owner_gid": owner_gid,
@@ -1125,6 +1197,27 @@ def run_gan_driver(
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": sampling_mode})
 
+        # Paired task validation is enabled only when the IMO challenge
+        # protocol has a dedicated fixed-id evaluation runner.  Recompute the
+        # broker reservation after the run-persistent eval ids are known; this
+        # keeps legacy domains/arms unchanged while preventing mid-outer
+        # ``task launch budget exhausted`` failures in the challenge arm.
+        paired_val = bool(
+            domain == "imo_proof"
+            and bool((cfg.get("challenge") or {}).get("enabled", False))
+            and eval_anchor_ids
+        )
+        noop_repeats = (int((cfg.get("challenge") or {})
+                            .get("pilot_noop_repeats", 0) or 0)
+                        if paired_val else 0)
+        I_max, eval_rounds, task_launch_budget = _launch_budget(
+            cfg, inner, paired_val=paired_val,
+            noop_repeats=noop_repeats,
+            challenge_adjudication=(
+                domain == "imo_proof"
+                and bool((cfg.get("challenge") or {}).get("enabled", False))),
+        )
+
         start = (int(newest["index"]) + 1) if (resume and newest) else 1
         _driver_t0 = time.time()
         # Arm identity rides the RUN, not just the directory name: a folder
@@ -1159,6 +1252,15 @@ def run_gan_driver(
             # two runs' inner-loop stopping behaviour incomparable -- the regime
             # guard must see it.
             "sampling.anchor_k": int((cfg.get("sampling") or {}).get("anchor_k", 0) or 0),
+            "challenge.enabled": bool(cfg.get("challenge.enabled", False)),
+            "challenge.pilot_noop_repeats": int(
+                cfg.get("challenge.pilot_noop_repeats", 0) or 0),
+            "challenge.fitness.enabled": bool(
+                cfg.get("challenge.fitness.enabled", False)),
+            "challenge.fitness.min_supported": int(
+                cfg.get("challenge.fitness.min_supported", 30)),
+            "challenge.fitness.min_determinate_rate": float(
+                cfg.get("challenge.fitness.min_determinate_rate", 0.8)),
             # Parent-selection policy. ``lcb`` (confidence set) and ``ucb``
             # (legacy additive bonus) explore different lineages from the same
             # tree, so two runs that differ here are NOT comparable -- the

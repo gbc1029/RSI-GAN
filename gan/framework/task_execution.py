@@ -16,6 +16,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib
 import importlib.util
@@ -86,7 +87,7 @@ _SANDBOXED_BALROG_DOMAINS = {"balrog_babyai", "balrog_babaisai"}
 _UNWIRED_BALROG_DOMAINS = ("balrog_minihack", "balrog_nle", "balrog_crafter",
                            "balrog_textworld")
 _SANDBOXED_HARNESS_DOMAINS = _SANDBOXED_BALROG_DOMAINS | {
-    "imo_proof", "imo_proof_grading",
+    "imo_proof", "imo_proof_grading", "imo_challenge_adjudication",
 }
 _SANDBOX_USER_ENV = "GAN_TASK_SANDBOX_USER"
 _SANDBOX_PROFILE_KEYS = {
@@ -381,6 +382,24 @@ _CM_RESERVED_STEMS = ({os.path.splitext(f)[0] for f in _CM_CORE_FILES}
                       | {"cm_policy", "cm_assembly"})
 
 
+def materialize_audit_chain(run_dir: str) -> Dict[str, Any]:
+    """Deliver the frozen audit-chain module into a sandbox run directory."""
+    report: Dict[str, Any] = {"audit_files": [], "skipped": []}
+    source = os.path.join(os.path.dirname(__file__), "traj_chain.py")
+    target = os.path.join(run_dir, ".gan_runtime", "traj_chain.py")
+    if not os.path.isfile(source):
+        report["skipped"].append({"file": "traj_chain.py",
+                                  "reason": "missing in framework"})
+        return report
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copy2(source, target)
+    with open(source, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()[:12]
+    report["audit_files"].append({"file": "traj_chain.py",
+                                  "sha256_12": digest})
+    return report
+
+
 def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
                             code_root: Optional[str] = None
                             ) -> Dict[str, Any]:
@@ -408,26 +427,11 @@ def materialize_cm_snapshot(run_dir: str, config: Dict[str, Any],
     report: Dict[str, Any] = {"core_files": [], "policy": None, "skipped": [],
                               "assembly": None, "policy_selection": None,
                               "audit_files": []}
-    # A″ (docs/19 §12.65): the AUDIT module the harness needs is delivered the
-    # SAME way the CM core is — copied into ``.gan_runtime`` and imported as a
-    # top-level module. ``gan/framework/traj_chain.py`` is stdlib-only and
-    # self-contained, so this is a COPY (one implementation), never a fork.
-    # Why it must exist inside the sandbox at all: the task harness is the one
-    # trusted writer of the task trajectory (F5, §12.28) and it runs in the
-    # stage, where ``gan/`` is deliberately absent (``_RUNTIME_DIRS``). An
-    # import of ``gan.framework.traj_chain`` there is a ModuleNotFoundError at
-    # process start — measured 2026-11-09 R1: rc=1 in 0.3s, every score null.
-    _audit_src = os.path.join(os.path.dirname(__file__), "traj_chain.py")
-    _audit_dst = os.path.join(run_dir, ".gan_runtime", "traj_chain.py")
-    if os.path.isfile(_audit_src):
-        os.makedirs(os.path.dirname(_audit_dst), exist_ok=True)
-        shutil.copy2(_audit_src, _audit_dst)
-        with open(_audit_src, "rb") as fh:
-            _ad = __import__("hashlib").sha256(fh.read()).hexdigest()[:12]
-        report["audit_files"].append({"file": "traj_chain.py", "sha256_12": _ad})
-    else:
-        report["skipped"].append({"file": "traj_chain.py",
-                                  "reason": "missing in framework"})
+    # The sandbox has no ``gan/`` package, so the harness imports this frozen
+    # stdlib-only module from its staged runtime directory.
+    audit_report = materialize_audit_chain(run_dir)
+    report["audit_files"].extend(audit_report["audit_files"])
+    report["skipped"].extend(audit_report["skipped"])
     core_src = os.path.join(os.path.dirname(__file__), "cm")
     dst_root = os.path.join(run_dir, ".gan_runtime", "cm")
     os.makedirs(dst_root, exist_ok=True)
@@ -1354,18 +1358,21 @@ def select_seeded_positions(
     num_samples: int,
     sample_seed: int,
     anchor_ids: Optional[List[str]] = None,
+    challenge_ids: Optional[List[str]] = None,
 ) -> Tuple[List[int], Dict[str, Any]]:
     """Position-level seeded draw -- the ONE sampling policy for every domain.
 
-    Anchor rows first (ids present in ``anchor_ids``, pool order,
-    deduplicated; capped at HALF the budget so the anchor core can never
-    consume it), then the remainder drawn WITHOUT replacement from the rest
-    of the pool with ``random.Random(sample_seed)``. Deterministic for a
-    given (seed, pool); returned positions are in pool order. ``select_samples``
-    (CSV domains) and :func:`prepare_polyglot_questions` (metadata domains)
-    both delegate here so the two selection modes can never drift apart.
+    Base anchor rows come first (capped at HALF the budget), followed by every
+    distinct challenge row. The remainder is drawn WITHOUT replacement from
+    the rest of the pool with ``random.Random(sample_seed)``. Challenge rows
+    are never silently truncated; callers must reduce the challenge set or
+    increase ``num_samples`` when the requested set does not fit.
     """
     anchor_req = [str(a) for a in (anchor_ids or [])]
+    challenge_req = [str(q) for q in (challenge_ids or [])]
+    missing_challenges = [q for q in challenge_req if q not in set(ids)]
+    if missing_challenges:
+        raise ValueError(f"challenge qid(s) missing from train subset: {missing_challenges}")
     anchor_set: Dict[str, int] = {}
     for pos, qid in enumerate(ids):
         if qid in anchor_req and qid not in anchor_set:
@@ -1373,16 +1380,27 @@ def select_seeded_positions(
     anchor_positions = sorted(anchor_set.values())
     # Anchor core must never consume the whole budget: cap at half.
     anchor_positions = anchor_positions[: max(0, num_samples // 2)]
-    n_anchor = len(anchor_positions)
-    pool_positions = [p for p in range(len(ids)) if p not in set(anchor_positions)]
-    n_rest = min(num_samples - n_anchor, len(pool_positions))
+    anchor_position_set = set(anchor_positions)
+    challenge_positions = sorted({
+        pos for pos, qid in enumerate(ids)
+        if qid in set(challenge_req) and pos not in anchor_position_set
+    })
+    if len(anchor_positions) + len(challenge_positions) > num_samples:
+        raise ValueError(
+            "base anchors plus challenge anchors exceed num_samples: "
+            f"{len(anchor_positions)} + {len(challenge_positions)} > {num_samples}")
+    selected_anchor_positions = anchor_position_set | set(challenge_positions)
+    pool_positions = [p for p in range(len(ids)) if p not in selected_anchor_positions]
+    n_rest = min(num_samples - len(selected_anchor_positions), len(pool_positions))
     rng = random.Random(int(sample_seed))
     drawn = sorted(rng.sample(pool_positions, n_rest)) if n_rest > 0 else []
-    positions = sorted(anchor_positions + drawn)
+    positions = sorted(anchor_positions + challenge_positions + drawn)
+    challenge_set = set(challenge_req)
     return positions, {
         "mode": "seeded",
         "sample_seed": int(sample_seed),
         "anchor_ids": [ids[p] for p in anchor_positions],
+        "challenge_ids": [ids[p] for p in positions if ids[p] in challenge_set],
         "sampled_ids": [str(ids[p]) for p in positions],
     }
 
@@ -1393,31 +1411,60 @@ def select_samples(
     num_samples: int,
     sample_seed: Optional[int] = None,
     anchor_ids: Optional[List[str]] = None,
+    challenge_ids: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Question selection with two modes (replaces the fixed prefix slice).
 
     - ``sample_seed is None``: legacy behaviour -- the first ``num_samples``
       rows of the file (deterministic prefix; kept as the explicit A/B base).
-    - ``sample_seed is not None``: anchor rows first (``anchor_ids`` present in
-      the pool, dataset order, deduplicated), then the remainder drawn without
+    - ``sample_seed is not None``: base anchor rows first (``anchor_ids``),
+      then required ``challenge_ids``, then the remainder drawn without
       replacement from the rest of the pool with ``random.Random(sample_seed)``.
       Selection is deterministic for a given (seed, pool) and recorded via the
       returned info dict. ``num_samples <= 0`` returns the full dataset.
 
     Returns ``(selected_dataset, info)`` where info carries the audit fields
-    (mode / seed / anchor ids actually present / sampled ids in file order).
+    (mode / seed / base anchor ids / challenge ids / sampled ids in file order).
     """
+    challenge_req = [str(q) for q in (challenge_ids or [])]
     if num_samples is None or num_samples <= 0:
+        ids = [str(v) for v in dataset[question_id_col].tolist()]
+        missing = [q for q in challenge_req if q not in set(ids)]
+        if missing:
+            raise ValueError(f"challenge qid(s) missing from train subset: {missing}")
+        challenge_set = set(challenge_req)
         return dataset, {"mode": "all", "sample_seed": None,
-                         "anchor_ids": [], "sampled_ids": []}
+                         "anchor_ids": [],
+                         "challenge_ids": [q for q in ids if q in challenge_set],
+                         "sampled_ids": (ids if challenge_req else [])}
     if sample_seed is None:
-        selected = dataset.iloc[:num_samples]
+        ids = [str(v) for v in dataset[question_id_col].tolist()]
+        id_set = set(ids)
+        missing = [q for q in challenge_req if q not in id_set]
+        if missing:
+            raise ValueError(f"challenge qid(s) missing from train subset: {missing}")
+        selected_positions = list(range(min(int(num_samples), len(ids))))
+        selected_set = set(selected_positions)
+        challenge_positions = [pos for pos, qid in enumerate(ids)
+                               if qid in set(challenge_req)
+                               and pos not in selected_set]
+        if len(selected_positions) + len(challenge_positions) > int(num_samples):
+            raise ValueError(
+                "legacy prefix plus challenge anchors exceed num_samples: "
+                f"{len(selected_positions)} + {len(challenge_positions)} > {num_samples}")
+        remaining = [pos for pos in range(len(ids))
+                     if pos not in selected_set and pos not in set(challenge_positions)]
+        take = int(num_samples) - len(selected_positions) - len(challenge_positions)
+        selected_positions = sorted(selected_positions + challenge_positions + remaining[:take])
+        selected = dataset.iloc[selected_positions]
+        selected_ids = [ids[pos] for pos in selected_positions]
         return selected, {"mode": "legacy_prefix", "sample_seed": None,
                           "anchor_ids": [],
-                          "sampled_ids": [str(v) for v in selected[question_id_col].tolist()]}
+                          "challenge_ids": [q for q in selected_ids if q in set(challenge_req)],
+                          "sampled_ids": selected_ids}
     ids = [str(v) for v in dataset[question_id_col].tolist()]
     positions, info = select_seeded_positions(
-        ids, int(num_samples), int(sample_seed), anchor_ids)
+        ids, int(num_samples), int(sample_seed), anchor_ids, challenge_ids)
     selected = dataset.iloc[positions]
     return selected, info
 
@@ -2008,6 +2055,7 @@ def prepare_questions(
     num_samples: int,
     sample_seed: Optional[int] = None,
     anchor_ids: Optional[List[str]] = None,
+    challenge_ids: Optional[List[str]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Write questions-only input and retain ground truth in parent memory.
 
@@ -2019,6 +2067,7 @@ def prepare_questions(
     dataset, sample_info = select_samples(
         dataset, question_id_col, num_samples,
         sample_seed=sample_seed, anchor_ids=anchor_ids,
+        challenge_ids=challenge_ids,
     )
     return _write_questions(dataset, question_id_col, ground_truth_key, run_dir, sample_info)
 
@@ -3287,23 +3336,85 @@ def _write_proofgrader_shim(
     return "./.gan_runtime/proofgrader_task_agent.py"
 
 
-def _require_sandboxable_proofgrader() -> None:
-    """Require proofgrader to live inside the trusted Python prefix."""
+def _write_challenge_adjudicator_shim(
+    run_dir: str,
+    expected_owner_uid: Optional[int] = None,
+    expected_owner_gid: Optional[int] = None,
+) -> str:
+    """Create the fixed adjudicator entry point with the grader's ownership rules."""
+    grader_shim = _write_proofgrader_shim(
+        run_dir, expected_owner_uid=expected_owner_uid,
+        expected_owner_gid=expected_owner_gid)
+    shim_path = os.path.join(run_dir, ".gan_runtime", "challenge_agent.py")
+    if expected_owner_uid is None:
+        with open(shim_path, "w", encoding="utf-8") as stream:
+            stream.write("from proofgrader.challenge_agent import TaskAgent\n")
+        os.chmod(shim_path, 0o644)
+    else:
+        # The proofgrader helper already validated and created the private
+        # runtime directory. Replace a framework-created sibling using the same
+        # owner/mode contract; task-controlled links are rejected.
+        if os.path.lexists(shim_path):
+            raise RuntimeError("challenge adjudicator shim path already exists")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(shim_path, flags, 0o600)
+        try:
+            os.fchown(fd, int(expected_owner_uid), int(expected_owner_gid))
+            payload = b"from proofgrader.challenge_agent import TaskAgent\n"
+            if os.write(fd, payload) != len(payload):
+                raise OSError("short write while creating challenge adjudicator shim")
+            os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+    # The ordinary grader shim is unused in this scope. Removing it avoids
+    # exposing a second entry point while preserving the validated directory.
     try:
-        spec = importlib.util.find_spec("proofgrader.task_agent")
+        os.remove(os.path.join(run_dir, grader_shim.removeprefix("./")))
+    except OSError:
+        pass
+    return "./.gan_runtime/challenge_agent.py"
+
+
+def _require_sandboxable_proofgrader(
+    module: str = "proofgrader.task_agent",
+    trusted_prefix: Optional[str] = None,
+    expected_protocol: Optional[int] = None,
+) -> None:
+    """Require a proofgrader entry point to live inside the trusted prefix."""
+    try:
+        spec = importlib.util.find_spec(module)
     except (ImportError, ModuleNotFoundError, ValueError) as exc:
-        raise RuntimeError("proofgrader.task_agent is not importable") from exc
+        raise RuntimeError(f"{module} is not importable") from exc
     origin = os.path.realpath(str(spec.origin or "")) if spec else ""
-    prefix = os.path.realpath(sys.prefix)
-    if not origin or not (
-        origin == prefix
-        or origin.startswith(prefix + os.sep)
-        or origin.startswith(os.path.realpath("/usr") + os.sep)
-    ):
-        raise RuntimeError(
-            "proofgrader.task_agent must be installed inside the trusted Python "
-            "environment; editable source outside the sandbox is refused"
+    prefix = os.path.realpath(trusted_prefix or sys.prefix)
+    trusted_roots = (prefix, os.path.realpath("/usr"))
+    try:
+        trusted = bool(origin) and any(
+            os.path.commonpath([root, origin]) == root
+            for root in trusted_roots
         )
+    except ValueError:
+        trusted = False
+    if not trusted:
+        raise RuntimeError(
+            f"{module} must be installed inside the trusted Python "
+            "environment; editable source outside the sandbox is refused "
+            f"(origin={origin or '<missing>'!r}, trusted_prefix={prefix!r}, "
+            f"broker_prefix={os.path.realpath(sys.prefix)!r})"
+        )
+    if expected_protocol is not None:
+        with open(origin, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read())
+        marker = next((node.value.value for node in tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name)
+                               and target.id == "JUDGE_PROTOCOL_VERSION"
+                               for target in node.targets)
+                       and isinstance(node.value, ast.Constant)), None)
+        if type(marker) is not int or marker != expected_protocol:
+            raise RuntimeError(
+                "installed challenge adjudicator protocol is stale; rebuild and "
+                "reinstall proofgrader into the trusted Python environment")
 
 
 def _open_grading_output(path: str, expected_owner_uid: Optional[int]) -> int:
@@ -3459,6 +3570,17 @@ def _prepare_imo_proof_grading_input(
     os.mkdir(grading_input_dir, mode=0o755)
     grading_input_path = os.path.join(grading_input_dir, "predictions.csv")
     grading_input.to_csv(grading_input_path, index=False)
+    source_manifest = {
+        "requested_total": int(len(predictions)),
+        "question_ids_ungraded": [
+            str(qid) for qid, value in zip(
+                predictions[question_id_col], predictions["prediction"]
+            ) if not str(value).strip()
+        ],
+    }
+    manifest_path = os.path.join(grading_input_dir, "source_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as stream:
+        json.dump(source_manifest, stream, ensure_ascii=False, indent=2)
     if expected_owner_uid is not None:
         if input_root_created:
             os.chown(
@@ -3474,8 +3596,13 @@ def _prepare_imo_proof_grading_input(
             grading_input_path, int(expected_owner_uid), int(expected_owner_gid),
             follow_symlinks=False,
         )
+        os.chown(
+            manifest_path, int(expected_owner_uid), int(expected_owner_gid),
+            follow_symlinks=False,
+        )
     os.chmod(grading_input_dir, 0o755)
     os.chmod(grading_input_path, 0o644)
+    os.chmod(manifest_path, 0o644)
     return grading_input_dir
 
 
@@ -3522,7 +3649,7 @@ def run_imo_proof_grading(
         expected_owner_uid,
         expected_owner_gid,
     )
-    _require_sandboxable_proofgrader()
+    _require_sandboxable_proofgrader(trusted_prefix=python_prefix)
     grading_run_id = f"{run_id}_proof_grading"
     _prepare_harness_output_dir(
         run_dir, grading_run_id,
@@ -3579,7 +3706,15 @@ def run_imo_proof_grading(
     if os.path.lexists(src):
         raise RuntimeError(f"imo_proof grading report path already exists: {src}")
     from domains.imo.proof_eval import report_proof_grading
-    report_proof_grading(grading_dir)
+    source_manifest = {}
+    manifest_path = os.path.join(grading_input_dir, "source_manifest.json")
+    with open(manifest_path, "r", encoding="utf-8") as stream:
+        source_manifest = json.load(stream)
+    report_proof_grading(
+        grading_dir,
+        source_requested_total=source_manifest.get("requested_total"),
+        source_question_ids_ungraded=source_manifest.get("question_ids_ungraded"),
+    )
     dst = os.path.join(predictions_dir, "report.json")
     if not os.path.isfile(src):
         raise RuntimeError(f"imo_proof grading report is missing: {src}")

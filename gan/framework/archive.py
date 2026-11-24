@@ -200,6 +200,8 @@ class MomeArchive:
             "outer": int(outer),
             "fitness_p": entry.get("fitness_p"),
             "fitness_e": entry.get("fitness_e"),
+            "fitness_p_base": entry.get("fitness_p_base"),
+            "fitness_e_base": entry.get("fitness_e_base"),
             "design_hash": entry.get("design_hash"),
         }
         cell = self.cells.setdefault(key, {"elite": []})

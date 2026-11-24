@@ -8,7 +8,9 @@ changes, both recorded in ``docs/21_balrog出题式挑战_设计与实施计划.
    unresolved). That formula pays the author for producing questions the task
    agent CANNOT fix, which is exactly the wrong pressure once the evaluator is
    the author: it rewards "make it hard" over "make it diagnostic". It is not
-   returned at all, so it cannot be wired by accident.
+   consumed by the authored-episode path. The qid-bound IMO path retains its
+   original adversarial score fields for compatibility; the loop selects only
+   one domain's scoring path.
 2. **``challenge_calibration`` is added.** The evaluator still emits its own
    ``judge_fix`` prediction; the adjudicator supplies the mechanical truth. The
    agreement rate is the "does my own reading of the defect match reality"
@@ -129,6 +131,7 @@ def _truth_repaired(state: str) -> Optional[bool]:
 def compute(rows: Iterable[Mapping[str, Any]],
             point_gains: Optional[Mapping[str, float]] = None) -> dict:
     """Compute the metrics from immutable settled challenge rows."""
+    rows = list(rows or ())
     counts: Counter = Counter()
     scopes: Counter = Counter()
     agree = 0
@@ -212,6 +215,10 @@ def compute(rows: Iterable[Mapping[str, Any]],
                             and _state_of(row) not in (None, adjudication.UNDECIDABLE)
                             and row.get("outer") is not None}),
         # --- fitness terms (docs/21 §7) ---
+        "challenge_precision_raw": _ratio(a + b, supported),
+        "challenge_precision_smoothed": float((a + b + 1) / (supported + 2)),
+        "evaluator_adversarial_score": _ratio(b - a - c - d, supported),
+        "planner_adversarial_score": _ratio(a - b - d, a + b + d),
         "precision_raw": _ratio(a + b, supported),
         "precision_smoothed": float((a + b + 1) / (supported + 2)),
         # Same quantity under the name the WIRED path uses: "was the defect I
@@ -382,4 +389,23 @@ def fitness_terms(metrics: Mapping[str, Any], *,
 
 
 __all__ = ["DEFAULT_WEIGHTS", "activation_status", "blend_verdict_stability",
-           "compute", "fitness_terms"]
+           "compute", "fitness_terms", "challenge_gate"]
+
+
+def challenge_gate(metrics: Mapping[str, Any], *, min_supported: int = 2,
+                   min_repair_rate: float = 0.5,
+                   min_anchor_gain: float = 0.0) -> Dict[str, Any]:
+    """Apply the §2.3 per-outer challenge gate without scoring it."""
+    supported = int(metrics.get("supported_challenges") or 0)
+    if supported < int(min_supported):
+        return {"status": "insufficient_evidence", "passed": False}
+    counts = metrics.get("state_counts") or {}
+    regression = int(counts.get(adjudication.REGRESSION_AFTER_FALSE_CHALLENGE, 0) or 0)
+    gain = metrics.get("mean_anchor_point_gain")
+    passed = bool(
+        float(metrics.get("repair_rate_smoothed") or 0.0) > float(min_repair_rate)
+        and isinstance(gain, (int, float))
+        and float(gain) >= float(min_anchor_gain)
+        and regression == 0)
+    return {"status": "passed" if passed else "failed", "passed": passed,
+            "false_challenge_regression": regression}

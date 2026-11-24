@@ -31,6 +31,8 @@ class Evaluator(Role):
         cost_statement: str = "",
         benchmark_score: Optional[float] = None,
         carried_over: Optional[List[Dict[str, Any]]] = None,
+        challenge_enabled: bool = False,
+        challenge_max_k: int = 5,
     ) -> str:
         parts = [
             "Evaluate the task agent this round.",
@@ -187,6 +189,16 @@ class Evaluator(Role):
                 "prescription was written against an older design and older code.\n"
                 f"```json\n{json.dumps(carried_over, ensure_ascii=False, indent=2)[:1200]}\n```"
             )
+        if challenge_enabled and blind_enabled:
+            parts.append(
+                "\n## BLIND CHALLENGE PHASE\n"
+                "For each real, falsifiable proof defect worth testing, you may call "
+                f"`submit_challenge` at most {int(challenge_max_k)} times. Bind each "
+                "challenge to a train qid and provide a short evidence pointer plus "
+                "a concrete repair criterion. Do this before the benchmark score is "
+                "revealed. Do not include scores, val/test information, reference "
+                "solutions, or grading guidelines."
+            )
         if parent_feedback and parent_feedback.get("diff_summary") is not None:
             # The block is scoped to the parent round explicitly --
             # the ops list LAGS one round by design, per the ledger decision,
@@ -254,6 +266,10 @@ class Evaluator(Role):
         tool_repeat_limit: Optional[int] = None,
         cost_statement: str = "",
         carried_over: Optional[List[Dict[str, Any]]] = None,
+        challenge_enabled: bool = False,
+        challenge_domain: Optional[str] = None,
+        challenge_allowed_qids: Optional[List[Any]] = None,
+        challenge_max_k: int = 5,
     ) -> EvalContext:
         """Two-phase evaluation: blind first, then reveal benchmark (if provided).
 
@@ -278,6 +294,12 @@ class Evaluator(Role):
         # recording stays legal for the whole session.
         ctx.blind_discipline = bool(blind_enabled)
         ctx.revealed = False
+        ctx.configure_challenges(
+            domain=challenge_domain,
+            allowed_qids=challenge_allowed_qids,
+            max_k=challenge_max_k,
+            blind_only=bool(challenge_enabled and blind_enabled),
+        )
         tb_exhausted_any = False
         truncated_any = False
 
@@ -301,7 +323,9 @@ class Evaluator(Role):
             hist = self.run(self._blind_instruction(run_summary or {}, parent_feedback, blind_enabled, task_brief,
                                                     cost_statement=cost_statement,
                                                     benchmark_score=(benchmark_score if not blind_enabled else None),
-                                                    carried_over=carried_over),
+                                                    carried_over=carried_over,
+                                                    challenge_enabled=challenge_enabled,
+                                                    challenge_max_k=challenge_max_k),
                             max_tool_calls=blind_cap,
                             tool_repeat_limit=tool_repeat_limit,
                             trajectory_file=self.session_trajectory(node_id))
@@ -351,6 +375,7 @@ class Evaluator(Role):
         from gan.framework.trajectory import outer_session_index
         digests = (recent or {}).get("digests") or []
         digest_text = "\n\n".join(str(d)[:2000] for d in digests[-3:]) or "(no digests yet)"
+        challenge_results = list((recent or {}).get("challenge_results") or [])
         # seat="self_improve": the self seat writes OUTER-level files, so the
         # prompt must list ITS OWN sessions (not the plan/evaluate ones).
         sessions = outer_session_index(self.output_dir,
@@ -389,6 +414,11 @@ class Evaluator(Role):
             + ((f"\n{cost_stmt}\n") if cost_stmt else "")
             + ((f"\n## Recent costs (per-session, framework-measured; your own sessions)\n"
                 f"{costs_json}\n") if costs_json else "")
+            + (("\n## Framework-adjudicated challenge outcomes\n"
+                "Use these public states to improve challenge precision and difficulty; "
+                "they contain no private reference or val evidence.\n"
+                f"{json.dumps(challenge_results, ensure_ascii=False)[:4000]}\n")
+               if challenge_results else "")
             + ((f"\n## Your context-manager assembly (framework-measured; fix it with "
                 f"`request_source_access` + `edit_source`)\n"
                 f"{cm_json}\n") if cm_json else "")

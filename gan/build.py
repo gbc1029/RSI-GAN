@@ -25,6 +25,29 @@ _LLM_RETRY_BUDGET_S = 300.0
 from gan.framework.access import AccessBroker
 from gan.framework import models as model_registry
 from gan.framework import paths
+
+
+def validate_challenge_sampling_capacity(
+    num_samples: int, base_anchor_k: int, challenge_max_k: int,
+    random_min: int = 10,
+) -> None:
+    """Fail fast when the worst-case train draw cannot keep random coverage."""
+    if int(num_samples) <= 0:
+        return
+    available = int(num_samples) - int(base_anchor_k) - int(challenge_max_k)
+    if available < 0:
+        raise ValueError(
+            "challenge.max_k plus fixed train anchors exceeds num_samples: "
+            f"{challenge_max_k} + {base_anchor_k} > {num_samples}")
+    if available < int(random_min):
+        raise ValueError(
+            "challenge capacity leaves fewer than the required random train "
+            "questions: "
+            f"num_samples={num_samples}, base_anchor_k={base_anchor_k}, "
+            f"challenge_max_k={challenge_max_k}, random_min={random_min}, "
+            f"available_random={available}")
+
+
 from gan.framework.frozen import deny_paths as frozen_deny_paths
 from gan.framework.loader import load_gan_loop_config
 from gan.framework.role_process import RoleProcess
@@ -205,6 +228,17 @@ def build_gan_loop(
     domain = str(domains[0]).strip()
     if not domain:
         raise ValueError(f"domains parses to an empty domain (got {domains!r})")
+    challenge_enabled = bool(cfg.get("challenge.enabled", False)) \
+        and domain == "imo_proof"
+    if challenge_enabled and int(num_samples) > 0:
+        from gan.framework.challenge_questions import challenge_limits
+        challenge_max_k, challenge_random_min = challenge_limits(cfg, domain)
+        if challenge_max_k < 1:
+            raise ValueError("IMO challenge.max_k must be positive when enabled")
+        base_anchor_k = len(dict.fromkeys(str(q) for q in (anchor_ids or [])))
+        validate_challenge_sampling_capacity(
+            num_samples, base_anchor_k, challenge_max_k,
+            random_min=max(0, challenge_random_min))
     repo_root = os.path.abspath(repo_root)
 
     # Per-domain token budgets (docs/10 §10): domains.yaml token_budget_per_gen
@@ -469,8 +503,10 @@ def build_gan_loop(
     )
     loop_holder["loop"] = loop
     # explicit runtime record of the model configuration actually used
-    loop.log_event({"type": "model_config",
-                    **model_registry.describe(["gan.task", "gan.planner", "gan.evaluator"])})
+    model_keys = ["gan.task", "gan.planner", "gan.evaluator"]
+    if domain == "imo_proof" and cfg.get("challenge.enabled", False):
+        model_keys.append("domains.imo_challenge_adjudication")
+    loop.log_event({"type": "model_config", **model_registry.describe(model_keys)})
     if code_root:
         loop.log_event({"type": "code_init", "code_root": code_root, "layout": layout})
     # Repair a persisted role design that names something the committed tree
