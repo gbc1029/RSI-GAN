@@ -217,7 +217,7 @@ def _lock_family(data: Dict[str, Any], *, domain: str, outer: Any, producer_node
         payload.append(row)
     existing = locks.get(key)
     if existing is not None:
-        if existing.get("payload") != payload:
+        if existing.get("payload") != payload or list(existing.get("qids") or []) != bound:
             raise ChallengeError("resumed challenge lock payload does not match")
         return list(existing.get("challenge_ids") or [])
 

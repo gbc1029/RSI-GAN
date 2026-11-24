@@ -206,9 +206,11 @@ class Planner(Role):
                 "structured stance (acted / acted_differently / out_of_scope / "
                 "disputed / deferred). A requirement to read carefully: a fresh "
                 "episode of the SAME family runs in this generation's batch, and a "
-                "mechanical check decides whether the defect is gone -- so a "
-                "strategy that only works on the episodes you have seen will be "
-                "recorded as unrepaired."
+                "mechanical check decides whether the defect is gone without "
+                "losing progression. Hidden siblings are checked separately on "
+                "the selected task candidate. An acted stance is not repair "
+                "evidence. Teach a reusable strategy; do not embed episode IDs, "
+                "instance-specific answers, or protected grader information."
                 "\n```json\n"
                 f"{json.dumps(episode_challenges, ensure_ascii=False, indent=2)}\n```"
             )
@@ -258,6 +260,7 @@ class Planner(Role):
         if parent_challenges is not None and challenges is not None and parent_challenges != challenges:
             raise ValueError("conflicting challenge projections")
         parent_challenges = parent_challenges if parent_challenges is not None else challenges
+        episode_challenges = any("defect_class" in row for row in (parent_challenges or []))
         plan_ctx = PlanContext(config=task_design, node_id=node_id, output_dir=self.output_dir)
         # CHALLENGES awaiting an answer (docs/21 §4): framework-injected so the
         # `respond_challenge` tool can check ids and the instruction can list
@@ -334,7 +337,11 @@ class Planner(Role):
                         "missing challenge_id below. This is a response-only pass: "
                         "do not edit the task, change config, or call other tools.\n"
                         + json.dumps(missing, ensure_ascii=False),
-                        msg_history=hist, max_tool_calls=max_tool_calls,
+                        msg_history=hist,
+                        **({"tools_available": ["respond_challenge"]}
+                           if episode_challenges else {}),
+                        max_tool_calls=(min(max_tool_calls, len(missing) + 1)
+                                        if episode_challenges else max_tool_calls),
                         tool_repeat_limit=tool_repeat_limit, trajectory_file=traj)
                     _absorb_run_flags()
 

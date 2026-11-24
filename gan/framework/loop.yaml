@@ -249,7 +249,7 @@ challenge:
   progression_tol: 0.0
   val_min_delta: null
   pilot_noop_repeats: 0
-  fitness:                     # IMO qid protocol only; authoring uses metrics.fitness blend
+  fitness:                     # planner gate in both domains; evaluator bonus only for IMO
     enabled: false
     min_supported: 15
     min_determinate_rate: 0.8

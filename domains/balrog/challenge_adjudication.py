@@ -36,6 +36,7 @@ pilot's ``actionable`` flag 72/72 true and therefore useless.
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Mapping, Optional
 
 from gan.framework import challenge_adjudication as contract
@@ -75,17 +76,31 @@ _NEEDS_LINES = frozenset(set(SUPPORTED_DEFECT_CLASSES) - set(CLASSES_WITHOUT_LIN
 #: the SAME family and (by admission) the same difficulty band.
 DEFAULT_PROGRESSION_TOL = 0.0
 
-#: the framework state machine refuses to call anything actionable unless the
-#: change it attributes is transferable; a challenge built from the closed
-#: defect vocabulary and generator-drawn instances is transferable BY
-#: CONSTRUCTION (there is no instance-specific material to memorise).
-ACTIONABILITY_BASIS = "transferable_strategy"
+#: Actionability here is the ability to decide a declared episode predicate.
+#: It does not establish that the planner's actual modification is transferable.
+ACTIONABILITY_BASIS = "mechanical_episode_predicate"
+
+
+def repair_obligation(defect_class: str, lines: Mapping[str, float], tol: float) -> str:
+    """The actual checker obligation, independent of the author's wording."""
+    if defect_class == "process.step-exhaustion":
+        test = "Do not exhaust the recorded step budget without completing the episode."
+    elif defect_class == "process.dead-end":
+        line = lines.get("cycle_degenerate_revisit_share")
+        if _num(line) is None:
+            raise ValueError("dead-end threshold is not declared")
+        test = (f"Avoid zero displacement and repeated state/action share >= {line}; "
+                "the recorded evidence must decide the declared dead-end predicate.")
+    else:
+        raise ValueError("unsupported mechanical defect class")
+    return (test + f" Progression must be at least the source episode's progression minus {tol}. "
+            "Missing, aborted or incomparable evidence cannot verify repair.")
 
 
 def _num(value: Any) -> Optional[float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    return float(value) if math.isfinite(value) else None
 
 
 def episode_dead_end(row: Optional[Mapping[str, Any]],
@@ -247,8 +262,18 @@ def adjudicate(challenge: Mapping[str, Any],
 
     parent_row = item.get("parent_row")
     child_row = item.get("child_row")
+    for row, evidence in ((parent_row, parent_evidence), (child_row, child_evidence)):
+        if (not isinstance(row, Mapping) or row.get("aborted")
+                or row.get("stop_reason") == "aborted"
+                or not isinstance(evidence, Mapping)
+                or _num(evidence.get("points")) is None
+                or not 0 <= evidence["points"] <= 1
+                or not contract._evidence_ok(evidence)):
+            return undecidable("missing_or_unusable_episode_evidence")
     parent_present = defect_present(defect_class, parent_row, lines)
     child_present = defect_present(defect_class, child_row, lines)
+    observed_child_present = child_present
+    progression_delta = None
 
     # D3: a "repair" that costs progression is not a repair. Checked BEFORE the
     # state machine so the state machine stays a pure function of three booleans.
@@ -277,6 +302,8 @@ def adjudicate(challenge: Mapping[str, Any],
                 # The claimed defect is gone but the episode got WORSE: the
                 # honest verdict is "not a repair", not "repaired".
                 child_present = True
+    if contract._evidence_ok(parent_evidence) and contract._evidence_ok(child_evidence):
+        progression_delta = float(child_evidence["points"]) - float(parent_evidence["points"])
 
     scope = None
     try:
@@ -290,9 +317,6 @@ def adjudicate(challenge: Mapping[str, Any],
         scope = audit.get("modification_scope")
     except Exception:  # noqa: BLE001 -- an unauditable change is "uncertain", not "clean"
         scope = "uncertain"
-    if scope is None:
-        scope = ACTIONABILITY_BASIS
-
     result = contract.adjudicate(
         item,
         parent_evidence,
@@ -305,6 +329,10 @@ def adjudicate(challenge: Mapping[str, Any],
     )
     result["actionability_basis"] = ACTIONABILITY_BASIS
     result["defect_class"] = defect_class
+    result["observed_child_present"] = observed_child_present
+    result["progression_delta"] = progression_delta if result["state"] != contract.UNDECIDABLE else None
+    if observed_child_present is False and child_present is True and result["state"] == contract.VERIFIED_UNRESOLVED:
+        result["reason"] = "defect_absent_but_progression_regressed"
     return contract.validate_result(result)
 
 
@@ -318,4 +346,5 @@ __all__ = [
     "defect_present",
     "episode_dead_end",
     "episode_step_exhaustion",
+    "repair_obligation",
 ]

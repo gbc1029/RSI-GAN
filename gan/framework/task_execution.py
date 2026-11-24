@@ -2012,17 +2012,34 @@ def register_challenge_val_episodes(output_dir: str, scope_id: Any,
     per_task = int(per_task or 0)
     if per_task <= 0:
         raise RuntimeError("challenge_val per_task must be positive")
-    # ONE fallback per task that has no challenge id, in the caller's order: the
-    # harness runs EVERY declared task, so a task with no anchor would otherwise
-    # fall back to a time-seeded rotating episode (an exam nobody asked for).
-    fallback_by_task: Dict[str, str] = {}
+    # The harness runs the same number of episodes for every task. Fill every
+    # unused slot so the actual plan never contains unpinned random episodes.
+    fallback_by_task: Dict[str, List[str]] = {}
     for raw in (fallback_ids or ()):
         task, _seed = split_episode_id(str(raw))
-        fallback_by_task.setdefault(task, str(raw))
-    have = {split_episode_id(i)[0] for i in ids}
-    full = list(ids) + [v for t, v in fallback_by_task.items() if t not in have]
-    counts = Counter(split_episode_id(i)[0] for i in full)
+        fallback_by_task.setdefault(task, []).append(str(raw))
+    full = list(ids)
+    used = set(full)
+    counts = Counter(split_episode_id(i)[0] for i in ids)
     per_task = max(per_task, max(counts.values()) if counts else 1)
+    tasks = list(info.get("episode_tasks") or dict.fromkeys([*fallback_by_task, *counts]))
+    if set(counts) - set(tasks):
+        raise ValueError("challenge-val includes an undeclared task")
+    for task in tasks:
+        fallback = iter(fallback_by_task.get(task, []))
+        ordinal = 0
+        while counts[task] < per_task:
+            eid = next(fallback, None)
+            if eid is None:
+                seed = derive_episode_seed(int(info["base_seed"]),
+                                           f"cval-padding:{scope_id}", task, ordinal)
+                ordinal += 1
+                eid = episode_id(task, seed)
+            if eid in used:
+                continue
+            used.add(eid)
+            full.append(eid)
+            counts[task] += 1
     table = info.get("challenge_val_episodes")
     if not isinstance(table, dict):
         table = {}

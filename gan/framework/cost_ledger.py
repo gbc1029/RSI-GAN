@@ -651,8 +651,7 @@ def reconcile(output_dir: str) -> Dict[str, Any]:
                 sub = os.path.join(outer_dir, name)
                 if not os.path.isdir(sub):
                     continue
-                if not (name.isdigit() or name.startswith("eval_outer")
-                        or name.startswith("cval_outer")):
+                if not (name.isdigit() or name.startswith(("eval_outer", "cval_outer", "taskval_outer"))):
                     continue
                 rec = session_cost_from_file(
                     os.path.join(sub, "task.jsonl"),

@@ -173,6 +173,7 @@ def _seed_candidates(base_seed: int, family: str, count: int) -> List[int]:
 def materialize(family: str, *, base_seed: int, params: Mapping[str, Any],
                 exclude_seeds: Iterable[int] = (),
                 exclude_fingerprints: Iterable[str] = (),
+                source_id: Optional[str] = None,
                 max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> Dict[str, Any]:
     """Draw ONE same-family instance PAIR (``train`` + ``eval``).
 
@@ -207,27 +208,38 @@ def materialize(family: str, *, base_seed: int, params: Mapping[str, Any],
     admitted: List[Dict[str, Any]] = []
 
     env_wrapped = _make_env(family, num_dists)
+    source = None
+
+    def describe(seed: int) -> Dict[str, Any]:
+        env_wrapped.reset(seed=seed)
+        print_sha = fingerprint(env_wrapped)
+        steps, solved = optimal_steps(env_wrapped, seed)
+        return {
+            "family": family, "seed": seed, "episode_id": f"{family}#{seed}",
+            "grid_sha1": print_sha, "optimal_steps": steps,
+            "solved": solved, "num_dists": num_dists,
+        }
+
     try:
+        if source_id is not None:
+            from utils.episode_seed import split_episode_id
+            source_family, source_seed = split_episode_id(source_id)
+            if source_family != family:
+                raise ChallengeSpaceError("source episode belongs to a different family")
+            source = describe(source_seed)
+            validate_episode(source, params)
+            used_seeds.add(source_seed)
+            used_prints.add(source["grid_sha1"])
         for seed in _seed_candidates(base_seed, family, max_attempts):
             if seed in used_seeds:
                 rejected.append({"seed": seed, "reason": "seed_already_planned"})
                 continue
             try:
-                env_wrapped.reset(seed=seed)
-                print_sha = fingerprint(env_wrapped)      # AT RESET, before rollout
-                steps, solved = optimal_steps(env_wrapped, seed)
+                instance = describe(seed)
             except Exception as exc:  # noqa: BLE001 -- a generator failure is a refusal
                 rejected.append({"seed": seed, "reason": f"generator_error: {exc}"})
                 continue
-            instance = {
-                "family": family,
-                "seed": int(seed),
-                "episode_id": f"{family}#{int(seed)}",
-                "grid_sha1": print_sha,
-                "optimal_steps": int(steps),
-                "solved": bool(solved),
-                "num_dists": num_dists,
-            }
+            print_sha = instance["grid_sha1"]
             if print_sha in used_prints:
                 rejected.append({"seed": seed, "reason": "duplicate_layout",
                                  "grid_sha1": print_sha})
@@ -257,6 +269,7 @@ def materialize(family: str, *, base_seed: int, params: Mapping[str, Any],
         "family": family,
         "train": admitted[0],
         "eval": admitted[1],
+        **({"source": source} if source is not None else {}),
         "band": {"low": max(int(params.get("min_optimal_steps", 4)),
                             int(params.get("optimal_steps_p10", 4))),
                  "high": int(params.get("optimal_steps_p90", 0))},

@@ -1197,16 +1197,11 @@ def run_gan_driver(
             _log_event(output_dir, {"type": "sampling_seed_ready",
                                     "mode": sampling_mode})
 
-        # Paired task validation is enabled only when the IMO challenge
-        # protocol has a dedicated fixed-id evaluation runner.  Recompute the
-        # broker reservation after the run-persistent eval ids are known; this
-        # keeps legacy domains/arms unchanged while preventing mid-outer
-        # ``task launch budget exhausted`` failures in the challenge arm.
-        paired_val = bool(
-            domain == "imo_proof"
-            and bool((cfg.get("challenge") or {}).get("enabled", False))
-            and eval_anchor_ids
-        )
+        # Reserve candidate and parent launches once the fixed eval plans are known.
+        from gan.framework.challenge_questions import authorable
+        paired_val = bool(cfg.get("challenge.enabled", False) and (
+            (domain == "imo_proof" and eval_anchor_ids)
+            or (eval_episode_ids and authorable(domain, domain_cfg)[0])))
         noop_repeats = (int((cfg.get("challenge") or {})
                             .get("pilot_noop_repeats", 0) or 0)
                         if paired_val else 0)

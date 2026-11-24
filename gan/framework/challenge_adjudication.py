@@ -218,6 +218,13 @@ def supported_classes_for(domain: str) -> tuple:
         return ()
 
 
+def repair_obligation_for(domain: str) -> Optional[Any]:
+    """Optional renderer for the mechanical obligation actually adjudicated."""
+    module = _challenge_submodule(domain, "challenge_adjudication")
+    fn = getattr(module, "repair_obligation", None) if module is not None else None
+    return fn if callable(fn) else None
+
+
 def classes_without_lines_for(domain: str) -> tuple:
     """Classes the domain can decide WITHOUT a declared ``defect_lines`` entry.
 
@@ -242,5 +249,5 @@ __all__ = [
     "UNSUPPORTED_CHALLENGE", "REGRESSION_AFTER_FALSE_CHALLENGE",
     "adjudicate", "validate_result", "register_adjudicator", "adjudicator_for",
     "defect_scan_for", "domain_module", "supported_classes_for",
-    "classes_without_lines_for",
+    "classes_without_lines_for", "repair_obligation_for",
 ]

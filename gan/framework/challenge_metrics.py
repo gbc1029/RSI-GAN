@@ -394,14 +394,15 @@ __all__ = ["DEFAULT_WEIGHTS", "activation_status", "blend_verdict_stability",
 
 def challenge_gate(metrics: Mapping[str, Any], *, min_supported: int = 2,
                    min_repair_rate: float = 0.5,
-                   min_anchor_gain: float = 0.0) -> Dict[str, Any]:
+                   min_anchor_gain: float = 0.0,
+                   gain_key: str = "mean_anchor_point_gain") -> Dict[str, Any]:
     """Apply the §2.3 per-outer challenge gate without scoring it."""
     supported = int(metrics.get("supported_challenges") or 0)
     if supported < int(min_supported):
         return {"status": "insufficient_evidence", "passed": False}
     counts = metrics.get("state_counts") or {}
     regression = int(counts.get(adjudication.REGRESSION_AFTER_FALSE_CHALLENGE, 0) or 0)
-    gain = metrics.get("mean_anchor_point_gain")
+    gain = metrics.get(gain_key)
     passed = bool(
         float(metrics.get("repair_rate_smoothed") or 0.0) > float(min_repair_rate)
         and isinstance(gain, (int, float))

@@ -222,7 +222,8 @@ def materialize_pair(proposal: Mapping[str, Any], *, domain: str,
                      domain_cfg: Optional[Mapping[str, Any]],
                      base_seed: int,
                      exclude_seeds: Iterable[int] = (),
-                     exclude_fingerprints: Iterable[str] = ()) -> Dict[str, Any]:
+                     exclude_fingerprints: Iterable[str] = (),
+                     source_id: Optional[str] = None) -> Dict[str, Any]:
     """Draw the same-family instance PAIR for one admitted proposal.
 
     Every exclusion the framework knows about is fed in: the frozen anchor and
@@ -246,6 +247,7 @@ def materialize_pair(proposal: Mapping[str, Any], *, domain: str,
             str(proposal.get("family")), base_seed=int(base_seed), params=params,
             exclude_seeds=list(exclude_seeds or ()),
             exclude_fingerprints=list(exclude_fingerprints or ()),
+            **({"source_id": source_id} if source_id is not None else {}),
             max_attempts=max_attempts)
     except Exception as exc:  # noqa: BLE001 -- a generator refusal is an A/B refusal
         raise ChallengeAdmissionError(str(exc)) from exc

@@ -38,6 +38,7 @@ import inspect
 import hashlib
 import glob
 import json
+import math
 import os
 import random
 import re
@@ -104,26 +105,35 @@ def _challenge_val_scope(outer: Any) -> str:
 def _challenge_evidence(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """One episode row -> the ``_evidence_ok`` shape the contract validates.
 
-    ``qid_score_status`` is "ok" only for a PLAYED, non-aborted row: an aborted
-    episode carries ``progression: 0.0`` by construction (it was played and lost),
-    and reading that zero as evidence would manufacture "the defect is present in
-    the child" out of an infrastructure failure.
+    Only a played episode with valid progression is evidence. An infrastructure
+    abort must not be interpreted as a behavioral defect or its absence.
     """
-    if not isinstance(row, dict):
+    if not isinstance(row, dict) or not row.get("id"):
         return None
     points = row.get("progression")
-    try:
-        value = float(points) if points is not None else None
-    except (TypeError, ValueError):
-        value = None
-    aborted = bool(row.get("aborted"))
-    return {
-        "qid": str(row.get("id") or ""),
-        "points": value,
-        "qid_score_status": ("aborted" if aborted else "ok"),
-        "qid_coverage": (0.0 if value is None else 1.0),
-        "imputed": False,
-    }
+    if (type(points) not in (int, float) or not math.isfinite(points)
+            or not 0 <= points <= 1 or row.get("aborted") or row.get("imputed")
+            or row.get("stop_reason") == "aborted"):
+        return None
+    return {"qid": str(row["id"]), "points": points, "qid_score_status": "ok",
+            "qid_coverage": 1.0, "imputed": False}
+
+
+def _challenge_episode_rows(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Index episode evidence; a duplicate ID is ambiguous, even if one row looks valid."""
+    index = {}
+    seen = set()
+    for row in report.get("episodes") or []:
+        if not isinstance(row, dict) or not row.get("id"):
+            continue
+        eid = str(row["id"])
+        if eid in seen:
+            index.pop(eid, None)
+        else:
+            seen.add(eid)
+            if _challenge_evidence(row) is not None:
+                index[eid] = row
+    return index
 
 
 def _balrog_primitive(domain: str, defect_class: str, row: Dict[str, Any],
@@ -2557,7 +2567,7 @@ class GanLoop:
                             "reason": "no issue cited by the author"})
             return "", ""
         target = issue_by_id.get(raw)
-        if target is None:
+        if target is None and raw == wanted:
             for qid, it in issue_by_id.items():
                 if bare(qid) == wanted:
                     target = it
@@ -2598,8 +2608,7 @@ class GanLoop:
             # nothing. Recorded before the early return (docs/21 §16).
             self._challenge_authoring_round(genid, 0, 0)
             return []
-        report = self._challenge_report(genid)
-        rows = [r for r in (report.get("episodes") or []) if isinstance(r, dict)]
+        rows = list(_challenge_episode_rows(self._challenge_report(genid)).values())
         if not rows:
             # NO usable report = this generation's evidence does not exist, so no
             # family can be citable and no question can be adjudicated. Say THAT,
@@ -2620,6 +2629,8 @@ class GanLoop:
         cfg = self._challenge_domain_cfg()
         admitted: List[Dict[str, Any]] = []
         qids: List[str] = []
+        pairs: List[Dict[str, Any]] = []
+        author_criteria: List[str] = []
         # ISSUE ↔ CHALLENGE JOIN (docs/21 §19). The tool already checked the
         # citation against the issues reported this round; it is re-checked HERE
         # because the loop owns the ledger, the tool is agent-reachable code, and
@@ -2632,8 +2643,32 @@ class GanLoop:
                 issue_by_id[str(it["issue_id"]).strip()] = it
         try:
             ledger = self._challenge_data()
+            evaluator_version = self._design_hash("evaluator") or "unknown"
             seen_instances = [row for row in (ledger.get("challenges") or {}).values()
                               if isinstance(row, dict)]
+            previous = {
+                (row.get("defect_class"), row.get("family")): row
+                for row in seen_instances
+                if str(row.get("producer_node")) == str(genid) and row.get("outer") == outer
+                and row.get("producer_evaluator_version") == evaluator_version
+            }
+            used_seeds, used_prints = [], []
+            from utils.episode_seed import split_episode_id
+            seed_path = paths.ckpt_dir(self.output_dir)
+            with open(os.path.join(seed_path, "sample_seed.json"), encoding="utf-8") as stream:
+                seed_info = json.load(stream)
+            fixed_ids = (list(seed_info.get("anchor_ids") or [])
+                         + list(seed_info.get("eval_episode_ids") or []))
+            used_seeds.extend(split_episode_id(eid)[1] for eid in fixed_ids)
+            for other in seen_instances:
+                for side in ("train", "eval"):
+                    instance = (other.get("instances") or {}).get(side) or {}
+                    if instance.get("seed") is not None:
+                        used_seeds.append(int(instance["seed"]))
+                    if instance.get("grid_sha1"):
+                        used_prints.append(str(instance["grid_sha1"]))
+            base_seed = int(seed_info["base_seed"]) + int(genid)
+            lines = self._challenge_lines(cfg)
             for proposal in proposals:
                 defect_class = str(proposal.get("defect_class") or "")
                 link_id, link_key = self._challenge_resolve_issue(
@@ -2658,77 +2693,68 @@ class GanLoop:
                                     "family": str(proposal.get("family") or ""),
                                     "reason": str(e)[:400]})
                     continue
-                # The framework picks WHICH episode the claim is about: the first
-                # cited-family episode where the defect primitive actually fired.
-                qid = ""
-                for r in rows:
-                    if str(r.get("task") or "") != row["family"]:
-                        continue
-                    present = _balrog_primitive(self.challenge_domain, defect_class, r,
-                                                self._challenge_lines(cfg))
-                    if present:
-                        qid = str(r.get("id") or "")
-                        if qid:
-                            break
-                if not qid:
+                old = previous.get((defect_class, row["family"])) or {}
+                pair = old.get("instances")
+                qid = str(old.get("qid") or "")
+                if not pair:
+                    # Freeze only after both generated instances AND the old
+                    # diagnosis episode can be placed in the same difficulty band.
+                    for evidence in rows:
+                        if (evidence.get("task") != row["family"]
+                                or _balrog_primitive(self.challenge_domain, defect_class,
+                                                     evidence, lines) is not True):
+                            continue
+                        qid = str(evidence["id"])
+                        try:
+                            generated = _challenge_questions.materialize_pair(
+                                row, domain=self.challenge_domain, domain_cfg=cfg,
+                                base_seed=base_seed, exclude_seeds=used_seeds,
+                                exclude_fingerprints=used_prints, source_id=qid)
+                        except _challenge_questions.ChallengeAdmissionError:
+                            continue
+                        pair = {key: generated[key] for key in ("source", "train", "eval", "band")}
+                        break
+                if not pair or not qid:
                     self.log_event({"type": "challenge_rejected", "genid": str(genid),
-                                    "defect_class": defect_class,
-                                    "family": row["family"],
-                                    "reason": "no_offending_episode_found"})
+                                    "defect_class": defect_class, "family": row["family"],
+                                    "reason": "no_comparable_source_and_instance_pair"})
                     continue
                 admitted.append(row)
                 qids.append(qid)
+                pairs.append(pair)
+                render = _challenge_adjudication.repair_obligation_for(self.challenge_domain)
+                author_criteria.append(row["repair_criterion"])
+                if render is not None:
+                    row["repair_criterion"] = render(
+                        defect_class, lines, self.challenge_progression_tol)
+                for side in ("train", "eval"):
+                    used_seeds.append(int(pair[side]["seed"]))
+                    used_prints.append(str(pair[side]["grid_sha1"]))
             if not admitted:
                 self._challenge_authoring_round(genid, len(proposals), 0)
                 return []
+
+            # Stage the entire admission. A failed materialization or a ledger
+            # conflict cannot leave an unplayable LOCKED row in the live cache.
+            staged = deepcopy(ledger)
             ids = _challenge_ledger_mod.lock(
-                ledger, domain=self.challenge_domain, outer=outer,
-                producer_node=genid,
-                evaluator_version=self._design_hash("evaluator") or "unknown",
-                challenges=admitted,
-                allowed_families=sorted({r["family"] for r in admitted}),
+                staged, domain=self.challenge_domain, outer=outer,
+                producer_node=genid, evaluator_version=evaluator_version,
+                challenges=admitted, allowed_families={r["family"] for r in admitted},
                 max_k=self.challenge_max_k, qids=qids)
-            # Materialize NOW (still blind): the instance pair is framework-chosen
-            # and its seeds must not collide with the frozen anchor / eval core or
-            # with each other.
-            used_seeds: List[int] = []
-            used_prints: List[str] = []
-            for other in seen_instances:
-                inst = other.get("instances") or {}
-                for side in ("train", "eval"):
-                    row_i = inst.get(side) if isinstance(inst, dict) else None
-                    if isinstance(row_i, dict):
-                        used_seeds.append(int(row_i.get("seed") or 0))
-                        used_prints.append(str(row_i.get("grid_sha1") or ""))
+            for cid, pair, criterion in zip(ids, pairs, author_criteria):
+                record = staged["challenges"][cid]
+                record.setdefault("author_repair_criterion", criterion)
+                if record.get("instances") != pair:
+                    _challenge_ledger_mod.attach_instances(staged, challenge_id=cid, instances=pair)
+            _challenge_ledger_mod.save(self.output_dir, staged, self.ledger_writer,
+                                       self.challenge_domain)
+            self._challenge_cache = staged
             for cid, row in zip(ids, admitted):
-                base_seed = int(self._run_base_seed() or 0) + int(genid) \
-                    if self._run_base_seed() is not None else int(genid)
-                pair = _challenge_questions.materialize_pair(
-                    row, domain=self.challenge_domain, domain_cfg=cfg,
-                    base_seed=base_seed, exclude_seeds=used_seeds,
-                    exclude_fingerprints=used_prints)
-                _challenge_ledger_mod.attach_instances(
-                    ledger, challenge_id=cid, instances={
-                        "train": pair["train"], "eval": pair["eval"],
-                        "band": pair.get("band"),
-                    })
-                used_seeds.extend([int(pair["train"]["seed"]), int(pair["eval"]["seed"])])
-                used_prints.extend([str(pair["train"]["grid_sha1"]),
-                                    str(pair["eval"]["grid_sha1"])])
-                self.log_event({
-                    "type": "challenge_locked", "genid": str(genid),
-                    "challenge_id": cid,
-                    "defect_class": row["defect_class"], "family": row["family"],
-                    "qid": qids[ids.index(cid)] if cid in ids else "",
-                    # linkage (docs/21 §19): "" = unlinked, already logged as
-                    # `challenge_unlinked`
-                    "issue_id": row.get("issue_id") or "",
-                    "issue_key": row.get("issue_key") or "",
-                    "train": pair["train"]["episode_id"],
-                    "eval": pair["eval"]["episode_id"],
-                    "band": pair.get("band"),
-                })
-            self._challenge_save()
+                self.log_event({"type": "challenge_locked", "genid": str(genid),
+                                "challenge_id": cid, "defect_class": row["defect_class"],
+                                "family": row["family"], "issue_id": row.get("issue_id"),
+                                "issue_key": row.get("issue_key")})
             self._challenge_authoring_round(genid, len(proposals), len(admitted))
             return ids
         except Exception as e:  # noqa: BLE001 -- challenge machinery never sinks a round
@@ -2737,17 +2763,6 @@ class GanLoop:
             # A framework failure is not an authoring miss: count the round only.
             self._challenge_authoring_round(genid, len(proposals), 0, judge=False)
             return []
-
-    def _run_base_seed(self) -> Optional[int]:
-        """The run-persistent base seed (challenge instance derivation root)."""
-        try:
-            with open(os.path.join(self.output_dir, "ckpt", "sample_seed.json"),
-                      "r", encoding="utf-8") as f:
-                info = json.load(f)
-            value = info.get("base_seed")
-            return int(value) if value is not None else None
-        except Exception:  # noqa: BLE001
-            return None
 
     def _challenge_available(self, parent: Any, genid: Any) -> List[Dict[str, Any]]:
         """Challenges the parent produced and this child must answer.
@@ -2763,10 +2778,14 @@ class GanLoop:
             ledger = self._challenge_data()
             rows = _challenge_ledger_mod.available_for_parent(
                 ledger, parent_node=getattr(parent, "genid", parent))
+            rows = [row for row in rows if all(
+                ((row.get("instances") or {}).get(side) or {}).get("episode_id")
+                for side in ("train", "eval"))]
             if not rows:
                 return []
             rows = _challenge_ledger_mod.reserve_for_child(
-                ledger, parent_node=getattr(parent, "genid", parent), child_node=genid)
+                ledger, parent_node=getattr(parent, "genid", parent), child_node=genid,
+                challenge_ids=[row["challenge_id"] for row in rows])
             self._challenge_save()
         except Exception as e:  # noqa: BLE001 -- never block a plan on the ledger
             self.log_event({"type": "challenge_available_failed", "genid": str(genid),
@@ -2792,9 +2811,9 @@ class GanLoop:
                                 "genid": str(genid), "count": len(train_ids),
                                 "challenge_ids": [r["challenge_id"] for r in out]})
             except Exception as e:  # noqa: BLE001 -- refused registration = no question
+                self._challenge_release(genid)
                 self.log_event({"type": "challenge_episodes_unregistered",
-                                "genid": str(genid),
-                                "error": f"{type(e).__name__}: {e}"[:400]})
+                                "genid": str(genid), "error_type": type(e).__name__})
                 return []
         return out
 
@@ -2821,23 +2840,54 @@ class GanLoop:
             self.log_event({"type": "challenge_release_failed", "genid": str(genid),
                             "error": f"{type(e).__name__}: {e}"[:300]})
 
-    def _challenge_consume(self, parent: Any, genid: Any,
-                           plan_result: Dict[str, Any]) -> None:
-        """Consume the reservation once the plan session actually ran."""
-        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
-            return
+    def _challenge_consume(self, parent: Any, child: Node,
+                           challenges: List[Dict[str, Any]]) -> List[str]:
+        """Consume once the frozen train episode appears in the actual harness plan."""
+        if not challenges or not self._authored_challenges_enabled():
+            return []
+        ledger = self._challenge_data()
         try:
-            ledger = self._challenge_data()
+            with open(os.path.join(paths.runs_dir(self.output_dir, child.genid),
+                                   "episode_plan.json"), encoding="utf-8") as stream:
+                plan = json.load(stream)
+            planned = [str(item["id"]) for item in plan["episodes"]
+                       if isinstance(item, dict) and item.get("id")]
+        except (OSError, ValueError, TypeError, KeyError):
+            planned = []
+        ids = []
+        for item in challenges:
+            cid = item["challenge_id"]
+            row = ledger["challenges"][cid]
+            eid = row["instances"]["train"]["episode_id"]
+            if planned.count(str(eid)) == 1:
+                ids.append(cid)
+            else:
+                self.log_event({"type": "challenge_train_not_scheduled",
+                                "genid": str(child.genid), "challenge_id": cid})
+        if ids:
             _challenge_ledger_mod.consume_for_child(
-                ledger, parent_node=getattr(parent, "genid", parent), child_node=genid,
-                planner_version=self._design_hash("planner") or "unknown")
+                ledger, parent_node=parent.genid, child_node=child.genid,
+                planner_version=self._design_hash("planner") or "unknown",
+                challenge_ids=ids)
             self._challenge_save()
-            responses = plan_result.get("challenge_responses") or []
-            self.log_event({"type": "challenge_consumed", "genid": str(genid),
-                            "responses": len(responses)})
-        except Exception as e:  # noqa: BLE001
-            self.log_event({"type": "challenge_consume_failed", "genid": str(genid),
-                            "error": f"{type(e).__name__}: {e}"[:400]})
+            self.log_event({"type": "challenge_consumed", "genid": str(child.genid),
+                            "challenge_ids": ids})
+        self._challenge_release(child.genid)
+        return ids
+
+    def _audit_authored_challenge_change(self, challenges, plan_result):
+        """Check submitted edits before running them; return only a public reason."""
+        if not challenges:
+            return None
+        records = self._challenge_data()["challenges"]
+        ids = []
+        for item in challenges:
+            row = records[item["challenge_id"]]
+            ids.append(row.get("qid") or "")
+            ids.extend(row["instances"][side]["episode_id"] for side in ("train", "eval"))
+        audit = _challenge_ledger_mod.audit_hardcoding(
+            ids, patch=plan_result.get("patch"), config=plan_result.get("config"))
+        return audit.get("reason") if audit.get("hard_gate") else None
 
     def _challenge_settle(self, parent: Any, child: Node, outer: int) -> None:
         """Adjudicate the challenges this generation was asked to answer.
@@ -2851,204 +2901,179 @@ class GanLoop:
         adjudicate = _challenge_adjudication.adjudicator_for(self.challenge_domain)
         if adjudicate is None:
             return
-        try:
-            ledger = self._challenge_data()
-            rows = [r for r in (ledger.get("challenges") or {}).values()
-                    if isinstance(r, dict)
-                    and str(r.get("consumed_child_node")) == str(child.genid)]
-            if not rows:
-                return
-            cfg = self._challenge_domain_cfg()
-            lines = self._challenge_lines(cfg)
-            contract = cfg.get("output_contract") or {}
-            parent_report = self._challenge_report(getattr(parent, "genid", parent))
-            child_report = self._challenge_report(child.genid)
-            parent_rows = {str(r.get("id")): r for r in
-                           (parent_report.get("episodes") or []) if isinstance(r, dict)}
-            child_rows = {str(r.get("id")): r for r in
-                          (child_report.get("episodes") or []) if isinstance(r, dict)}
-            for row in rows:
-                inst = (row.get("instances") or {}).get("train") or {}
-                parent_row = parent_rows.get(str(row.get("qid") or ""))
-                child_row = child_rows.get(str(inst.get("episode_id") or ""))
-                item = {
-                    **row,
-                    "defect_lines": lines,
-                    "parent_row": parent_row,
-                    "child_row": child_row,
-                    "progression_tol": self.challenge_progression_tol,
-                    "patch": (child.meta or {}).get("patch") or "",
-                    "config": (child.meta or {}).get("config_dict") or {},
-                }
-                try:
-                    result = adjudicate(item,
-                                        _challenge_evidence(parent_row),
-                                        _challenge_evidence(child_row))
-                except Exception as e:  # noqa: BLE001 -- one bad row, not the batch
-                    self.log_event({"type": "challenge_settle_failed",
-                                    "genid": str(child.genid),
-                                    "challenge_id": row.get("challenge_id"),
-                                    "error": f"{type(e).__name__}: {e}"[:400]})
-                    continue
-                _challenge_ledger_mod.settle(
-                    ledger, challenge_id=row.get("challenge_id"), adjudication=result)
-                self.log_event({"type": "challenge_settled", "genid": str(child.genid),
-                                "outer": outer,
-                                "challenge_id": row.get("challenge_id"),
-                                "defect_class": row.get("defect_class"),
-                                "family": row.get("family"),
-                                "state": result.get("state"),
-                                "reason": result.get("reason")})
-            self._challenge_save()
-        except Exception as e:  # noqa: BLE001
-            self.log_event({"type": "challenge_settle_failed",
-                            "genid": str(getattr(child, "genid", "")),
-                            "error": f"{type(e).__name__}: {e}"[:400]})
-
-    def _challenge_val_round(self, outer: int) -> None:
-        """Play the challenges' ``instances.eval`` siblings with the supernode code.
-
-        Shape A of docs/21 §4.1: a dedicated fixed round whose episode plan is
-        the sibling instance of every challenge this outer's generations
-        answered. Why not extra slots in the core eval round: the frozen core must
-        stay byte-identical (``val_mean`` selects parents), and the harness runs
-        EVERY declared task, so squeezing in two episodes would change the core's
-        per-task count. Why a round at all (instead of the same batch): the
-        sibling is the GENERALIZATION check -- it must be played by the code
-        under evaluation and it must not be part of the exam the generation was
-        tuned on.
-
-        Result: ``benchmark.challenge_val`` per challenge id, never inside
-        ``val_mean``, never an input to fitness or parent selection.
-        """
-        if not self.challenge_enabled or not self._challenge_cfg_state.get("authorable"):
-            return
-        if self.eval_runner is None or self.eval_runner is self.task_runner:
-            # No dedicated evaluation runner = no fixed-root evaluation infra in
-            # this run; the sibling needs it. Recorded, never guessed.
-            self.log_event({"type": "challenge_val_skipped", "outer": outer,
-                            "reason": "no dedicated eval runner"})
-            return
-        eval_base = self._resolve_eval_base()
-        if eval_base is None:
-            self.log_event({"type": "challenge_val_skipped", "outer": outer,
-                            "reason": "no evaluation base"})
-            return
         ledger = self._challenge_data()
-        rows = [r for r in (ledger.get("challenges") or {}).values()
-                if isinstance(r, dict) and r.get("status") == "consumed"
-                and (r.get("instances") or {}).get("eval")]
+        rows = self._consumed_episode_challenges(parent, child)
         if not rows:
             return
-        scope = _challenge_val_scope(outer)
-        ids: List[str] = []
-        for row in rows:
-            eid = str(((row.get("instances") or {}).get("eval") or {})
-                      .get("episode_id") or "")
-            if eid:
-                ids.append(eid)
-        if not ids:
-            return
-        # One fallback (frozen core) episode per task with NO challenge, so the
-        # harness's per-task launch stays deterministic instead of drawing a
-        # rotating episode for that task.
-        fallback = [str(x) for x in (getattr(self.eval_runner, "fixed_episode_ids", []) or [])]
-        try:
-            # The REGISTERED plan is what the broker pins for the harness, and it
-            # is the challenge episodes PLUS one fallback per task without one.
-            # The per-call override below must hand the runner THAT list, not the
-            # challenge-only one: `task_runner` compares the harness's actual plan
-            # against the override id-for-id and FAILS CLOSED on any difference
-            # ("the harness did not run the frozen episode set"). Measured
-            # 2026-11-21 (run #7, the first cval round that ever launched):
-            # `fixed_eval_plan_mismatch {expected: 1, got: 5, missing: 0}`, i.e.
-            # the exam was RIGHT and only the comparison list was short -- the
-            # round ran 5 correct episodes and was thrown away.
-            pinned = tx.register_challenge_val_episodes(
-                self.output_dir, scope, ids, per_task=1, fallback_ids=fallback)
-        except Exception as e:  # noqa: BLE001 -- registration refused = no round
-            self.log_event({"type": "challenge_val_unregistered", "outer": outer,
-                            "error": f"{type(e).__name__}: {e}"[:400]})
-            return
-        if not pinned:
-            return
-        initial = self.task_tree.get("initial")
-        plan_result = self._empty_plan_result(
-            self._parent_config(initial) if initial is not None else {})
-        if not (isinstance(self.eval_runner, DomainTaskRunner)
-                or self._accepts_kwarg(self.eval_runner, "fixed_episode_override")):
-            self.log_event({"type": "challenge_val_skipped", "outer": outer,
-                            "reason": "eval runner has no per-round episode override"})
-            return
-        # per_task must cover the largest per-task count actually pinned (a task
-        # with two challenges needs two slots); the fallback episodes fill the
-        # remaining tasks' single slot. Counted over the PINNED list so the
-        # number the runner checks is the number the harness used.
-        per_task = 1
-        counts: Dict[str, int] = {}
-        for raw in pinned:
-            task = str(raw).rsplit("#", 1)[0]
-            counts[task] = counts.get(task, 0) + 1
-        per_task = max([per_task] + list(counts.values()))
-        try:
-            node = self.eval_runner(
-                plan=plan_result, parent=initial, genid=scope, base=eval_base,
-                fixed_episode_override={"episode_ids": list(pinned),
-                                        "per_task": per_task})
-        except Exception as e:  # noqa: BLE001 -- advisory round
-            self.log_event({"type": "challenge_val_round_failed", "outer": outer,
-                            "scope": scope,
-                            "error": f"{type(e).__name__}: {e}"[:400]})
-            return
-        if node is None:
-            self.log_event({"type": "challenge_val_round_empty", "outer": outer,
-                            "scope": scope})
-            return
-        report = self._challenge_report(scope)
-        epub = {str(r.get("id")): r for r in (report.get("episodes") or [])
-                if isinstance(r, dict)}
+        parent_rows = _challenge_episode_rows(self._challenge_report(parent.genid))
+        child_rows = _challenge_episode_rows(self._challenge_report(child.genid))
         lines = self._challenge_lines()
-        column: Dict[str, Any] = {}
+        checker_path = inspect.getsourcefile(adjudicate)
+        with open(checker_path, "rb") as stream:
+            checker_sha = hashlib.sha256(stream.read()).hexdigest()
         for row in rows:
-            cid = str(row.get("challenge_id") or "")
-            inst = (row.get("instances") or {}).get("eval") or {}
-            ep = epub.get(str(inst.get("episode_id") or ""))
-            present = (_balrog_primitive(self.challenge_domain,
-                                         str(row.get("defect_class") or ""), ep, lines)
-                       if isinstance(ep, dict) else None)
+            if row.get("adjudication") is not None:
+                continue  # A resumed generation cannot rewrite settled truth.
+            cid = row["challenge_id"]
+            pair = row.get("instances") or {}
+            source, train = pair.get("source") or {}, pair.get("train") or {}
+            source_id, train_id = row.get("qid"), train.get("episode_id")
+            parent_row, child_row = parent_rows.get(source_id), child_rows.get(train_id)
+            parent_ev, child_ev = _challenge_evidence(parent_row), _challenge_evidence(child_row)
+            band = pair.get("band") or {}
+            comparable = (
+                source.get("episode_id") == source_id
+                and all(instance.get("family") == row.get("family")
+                        and instance.get("solved") is True
+                        and bool(instance.get("grid_sha1"))
+                        and type(instance.get("num_dists")) is int
+                        and type(instance.get("optimal_steps")) is int
+                        and type(band.get("low")) is int and type(band.get("high")) is int
+                        and band["low"] <= instance["optimal_steps"] <= band["high"]
+                        for instance in (source, train))
+                and source.get("num_dists") == train.get("num_dists")
+                and source_id != train_id
+                and source.get("grid_sha1") != train.get("grid_sha1"))
+            reason = None
+            if not comparable:
+                reason = "source_and_train_difficulty_unverified"
+            elif (not parent_ev or not child_ev
+                  or parent_row.get("task") != row.get("family")
+                  or child_row.get("task") != row.get("family")):
+                reason = "missing_or_unusable_episode_evidence"
+            try:
+                if reason is None:
+                    result = _challenge_adjudication.validate_result(adjudicate(
+                        {**row, "defect_lines": lines, "parent_row": parent_row,
+                         "child_row": child_row,
+                         "progression_tol": self.challenge_progression_tol},
+                        parent_ev, child_ev))
+            except Exception:  # one malformed result must not leave the batch unsettled
+                reason = "mechanical_adjudication_failed"
+            if reason is not None:
+                result = {"state": _challenge_adjudication.UNDECIDABLE, "reason": reason}
+            result.update({
+                "adjudicator": "balrog_mechanical_v1",
+                "checker_sha256": checker_sha,
+                "evidence": {
+                    "parent_genid": str(parent.genid), "child_genid": str(child.genid),
+                    "parent_episode_id": source_id, "child_episode_id": train_id,
+                    "defect_lines": lines, "progression_tol": self.challenge_progression_tol,
+                    "source_train_comparable": comparable,
+                    "parent_row_sha256": hashlib.sha256(json.dumps(
+                        parent_row, sort_keys=True).encode()).hexdigest(),
+                    "child_row_sha256": hashlib.sha256(json.dumps(
+                        child_row, sort_keys=True).encode()).hexdigest(),
+                },
+            })
+            _challenge_ledger_mod.settle(ledger, challenge_id=cid, adjudication=result)
+            self.log_event({"type": "challenge_settled", "genid": str(child.genid),
+                            "outer": outer, "challenge_id": cid, "state": result["state"],
+                            "reason": result["reason"]})
+        self._challenge_save()
+
+    def _consumed_episode_challenges(self, parent: Node, candidate: Node) -> List[Dict[str, Any]]:
+        return [row for row in (self._challenge_data().get("challenges") or {}).values()
+                if isinstance(row, dict) and row.get("status") == "consumed"
+                and str(row.get("producer_node")) == str(parent.genid)
+                and str(row.get("consumed_child_node")) == str(candidate.genid)]
+
+    def _episode_validation_run(self, node: Node, outer: int, scope: str,
+                                **runner_kwargs) -> Optional[Node]:
+        """Run a persisted task snapshot in a private evaluation scope."""
+        from gan.framework import code_repo
+        meta = node.meta or {}
+        base = meta.get("task_code_commit") or meta.get("code_commit")
+        root = self._task_root()
+        config = meta.get("config_dict")
+        if str(node.genid) == "initial":
+            manifest = code_repo.read_manifest(self.output_dir)
+            base = base or ((manifest.get("task") or {}).get("commit")
+                            if manifest.get("layout") == "split" else manifest.get("commit"))
+            config = self._parent_config(node)
+        if not base or not root or not isinstance(config, dict):
+            self.log_event({"type": "challenge_eval_snapshot_missing", "outer": outer,
+                            "scope": scope, "genid": str(node.genid)})
+            return None
+        main_head = code_repo.current_commit(root)
+        try:
+            evaluated = self.eval_runner(
+                plan=self._empty_plan_result(config),
+                parent=node, genid=scope, base=base, **runner_kwargs)
+            if evaluated is not None and evaluated.meta.get("run_dir"):
+                try:
+                    trajectory.collect(evaluated.meta["run_dir"], f"gan_{scope}",
+                                       self.output_dir, f"{outer}_eval", scope)
+                except Exception as exc:
+                    self.log_event({"type": "challenge_eval_trajectory_failed", "scope": scope,
+                                    "error_type": type(exc).__name__})
+            return evaluated
+        finally:
+            code_repo.checkout(root, main_head)
+            self._rebuild_composed_view()
+            if not self.keep_workdirs:
+                prune.safe_rmtree(paths.work_dir(self.output_dir, scope),
+                                  label=f"challenge evaluation cleanup ({scope})",
+                                  event_path=paths.events_path(self.output_dir))
+
+    def _challenge_val_round(self, outer: int, candidate: Optional[Node] = None) -> None:
+        """Check the selected candidate on its own hidden siblings, separately from core val."""
+        if not self._authored_challenges_enabled() or candidate is None:
+            return
+        from gan.framework.supernode import load_supernode, update_supernode
+        if self.eval_runner is None or self.eval_runner is self.task_runner:
+            return
+        parent = self.task_tree.get(candidate.parent_genid)
+        if parent is None:
+            return
+        rows = self._consumed_episode_challenges(parent, candidate)
+        if not rows:
+            self.log_event({"type": "challenge_val_skipped", "outer": outer,
+                            "reason": "candidate_has_no_consumed_challenge",
+                            "candidate_genid": str(candidate.genid)})
+            return
+
+        hidden = {row["challenge_id"]: (row.get("instances") or {}).get("eval") or {}
+                  for row in rows}
+        ids = [item["episode_id"] for item in hidden.values() if item.get("episode_id")]
+        scope = _challenge_val_scope(outer)
+        evaluated = None
+        if ids:
+            try:
+                pinned = tx.register_challenge_val_episodes(
+                    self.output_dir, scope, ids, per_task=1,
+                    fallback_ids=self.eval_runner.fixed_episode_ids)
+                from utils.episode_seed import anchor_seeds_by_task
+                per_task = max(map(len, anchor_seeds_by_task(pinned).values()))
+                evaluated = self._episode_validation_run(
+                    candidate, outer, scope,
+                    fixed_episode_override={"episode_ids": pinned, "per_task": per_task})
+            except Exception as exc:
+                self.log_event({"type": "challenge_val_round_failed", "outer": outer,
+                                "scope": scope, "error_type": type(exc).__name__})
+        episodes = _challenge_episode_rows(self._challenge_report(scope)) if evaluated else {}
+        lines = self._challenge_lines()
+        column = {}
+        for row in rows:
+            cid = row["challenge_id"]
+            ep = episodes.get(hidden[cid].get("episode_id"))
+            present = (_balrog_primitive(self.challenge_domain, row["defect_class"], ep, lines)
+                       if ep is not None and ep.get("task") == row.get("family") else None)
             column[cid] = {
-                "defect_class": row.get("defect_class"),
-                "family": row.get("family"),
-                "episode_id": inst.get("episode_id"),
-                "defect_present": present,
-                "progression": (ep or {}).get("progression"),
-                "aborted": bool((ep or {}).get("aborted")),
-                # Generalization asks the SAME question the adjudicator asked on
-                # the train instance; it is reported beside the verdict, never
-                # folded into it (the ledger adjudication is immutable and was
-                # settled at the generation boundary).
-                "generalized": (None if present is None else not present),
+                "defect_class": row.get("defect_class"), "family": row.get("family"),
+                "defect_present": present, "progression": ep.get("progression") if ep else None,
+                "generalized": None if present is None else not present,
+                "candidate_genid": str(candidate.genid), "parent_genid": str(parent.genid),
             }
         self._challenge_val_last = dict(column)
-        self.log_event({"type": "challenge_val_ready", "outer": outer,
-                        "scope": scope, "challenges": len(column),
-                        "generalized": sum(1 for v in column.values()
-                                           if v.get("generalized") is True),
-                        "undecidable": sum(1 for v in column.values()
-                                           if v.get("generalized") is None)})
-        try:
-            from gan.framework.supernode import load_supernode, update_supernode
-
-            sn = load_supernode(self.output_dir, outer)
-            if sn:
-                sn.setdefault("benchmark", {})["challenge_val"] = column
-                # Same ledger gate as every other supernode write (the token is
-                # threaded, never re-minted): a decision-grade artifact must not
-                # gain an unguarded writer just because the value is diagnostic.
-                update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
-        except Exception as e:  # noqa: BLE001 -- the column is also in events
-            self.log_event({"type": "challenge_val_stamp_failed", "outer": outer,
-                            "error": f"{type(e).__name__}: {e}"[:300]})
+        self.log_event({"type": "challenge_val_ready", "outer": outer, "scope": scope,
+                        "candidate_genid": str(candidate.genid), "challenges": len(column),
+                        "generalized": sum(v["generalized"] is True for v in column.values()),
+                        "undecidable": sum(v["generalized"] is None for v in column.values())})
+        sn = load_supernode(self.output_dir, outer)
+        if sn:
+            sn.setdefault("benchmark", {})["challenge_val"] = column
+            update_supernode(self.output_dir, outer, sn, writer=self.ledger_writer)
 
     def _challenge_stats(self) -> Dict[str, Any]:
         """Cumulative challenge metrics -- OBSERVABILITY + the ONE wired term.
@@ -3168,6 +3193,10 @@ class GanLoop:
         except Exception:  # noqa: BLE001 -- advisory
             return []
 
+    def _authored_challenges_enabled(self) -> bool:
+        return bool(getattr(self, "challenge_enabled", False)
+                    and getattr(self, "_challenge_cfg_state", {}).get("authorable"))
+
     def _proof_challenges_enabled(self) -> bool:
         """Select the existing qid replay path, separate from authored episodes."""
         domains = getattr(self, "domains", ["imo_proof"])
@@ -3190,7 +3219,9 @@ class GanLoop:
             return []
         from gan.framework import challenge_ledger
         wanted = {str(genid) for genid in genids}
-        fields = ("challenge_id", "qid", "defect_type", "claim", "defect_class", "family")
+        authored = self._authored_challenges_enabled()
+        fields = (("challenge_id", "defect_class", "family") if authored else
+                  ("challenge_id", "qid", "defect_type", "claim", "defect_class", "family"))
         results = []
         for row in (challenge_ledger.load(
                 self.output_dir, getattr(self, "challenge_domain", "imo_proof"))
@@ -3204,7 +3235,8 @@ class GanLoop:
             results.append({
                 **{key: row.get(key) for key in fields},
                 "state": adjudication.get("state"),
-                "reason": adjudication.get("reason"),
+                "reason": (None if authored and adjudication.get("adjudicator") != "balrog_mechanical_v1"
+                           else adjudication.get("reason")),
                 "actionable": adjudication.get("actionable"),
             })
         return results
@@ -3281,7 +3313,7 @@ class GanLoop:
     def _record_challenge_response_audit(
             self, child: Any, parent: Any, challenges: List[Dict[str, Any]],
             plan_result: Dict[str, Any], parent_cfg: Dict[str, Any]) -> None:
-        """Record planner stance separately from externally judged proof truth."""
+        """Record planner stance separately from independently judged repair."""
         expected = [str(row.get("challenge_id")) for row in challenges]
         by_id: Dict[str, Dict[str, Any]] = {}
         for row in plan_result.get("challenge_responses") or []:
@@ -3327,8 +3359,9 @@ class GanLoop:
             "observed_action_rate": (observed / total) if total else None,
             "response_consistency_rate": (consistent / total) if total else None,
             "response_retry_attempted": bool(plan_result.get("challenge_response_retry")),
-            "challenge_response_deficit": bool(
-                total >= 5 and observed_action is False),
+            "challenge_response_deficit": (
+                received < total if self._authored_challenges_enabled()
+                else bool(total >= 5 and observed_action is False)),
             "rows": rows,
         }
         child.meta["challenge_response_audit"] = audit
@@ -3829,18 +3862,24 @@ class GanLoop:
                 return
             refs = [r for o in arch.reference
                     if (r := load_supernode(self.output_dir, o)) is not None]
+            authored = self._authored_challenges_enabled()
             all_challenges = (list((challenge_ledger.load(self.output_dir)
                                     .get("challenges", {}).values()) or [])
-                              if self._proof_challenges_enabled() else [])
+                              if self._proof_challenges_enabled() else
+                              list(self._challenge_data()["challenges"].values()) if authored else [])
             activation = challenge_metrics.activation_status(
                 all_challenges,
                 min_supported=self.challenge_fitness_min_supported,
                 min_determinate_rate=self.challenge_fitness_min_determinate_rate)
             outer_challenge = ((sn.get("planner_stats") or {}).get("challenge") or {})
-            gate = challenge_metrics.challenge_gate(outer_challenge)
+            gate = challenge_metrics.challenge_gate(
+                outer_challenge, gain_key=("mean_progression_gain" if authored
+                                           else "mean_anchor_point_gain"))
             benchmark = sn.get("benchmark") or {}
             val_n = len(benchmark.get("val_anchor_ids") or [])
-            default_delta = (2.0 / (7.0 * val_n)) if val_n > 0 else None
+            # Balrog uses normalized progression, not the IMO 0–7 scale.
+            default_delta = (0.0 if authored else
+                             (2.0 / (7.0 * val_n)) if val_n > 0 else None)
             configured_delta = (float(self.challenge_val_min_delta)
                                 if isinstance(self.challenge_val_min_delta, (int, float))
                                 else default_delta)
@@ -3851,11 +3890,16 @@ class GanLoop:
                 gate.get("passed")
                 and configured_delta is not None
                 and isinstance(benchmark.get("task_val_delta"), (int, float))
-                and float(benchmark["task_val_delta"]) >= configured_delta)
-            challenge_active = bool(
-                self.challenge_fitness_enabled and activation.get("active"))
+                and float(benchmark["task_val_delta"]) >= configured_delta
+                and (not authored or (
+                    benchmark["task_val_delta"] > 0
+                    and outer_challenge.get("candidate_genid") == benchmark.get("task_val_candidate_genid")
+                    and outer_challenge.get("parent_genid") == benchmark.get("task_val_parent_genid"))))
+            fitness_enabled = (self.challenge_fitness_enabled or
+                               (authored and bool(self.cfg.get("challenge.fitness.enabled", False))))
+            challenge_active = bool(fitness_enabled and activation.get("active"))
             sn["challenge_fitness"] = {
-                "enabled": self.challenge_fitness_enabled,
+                "enabled": fitness_enabled,
                 "active": challenge_active,
                 "activation": activation,
                 "outer_gate": gate,
@@ -3883,7 +3927,7 @@ class GanLoop:
             # outer-select recomputes the same terms from the live ledger after
             # later challenges settle.
             fe = fe_base
-            if challenge_active and isinstance(fe_base, (int, float)):
+            if self.challenge_fitness_enabled and challenge_active and isinstance(fe_base, (int, float)):
                 def version_metrics(node: Dict[str, Any]) -> Dict[str, Any]:
                     version = str(node.get("evaluator_version_id")
                                   or node.get("evaluator_design_hash") or "")
@@ -3937,7 +3981,7 @@ class GanLoop:
             self.log_event({"type": "supernode_archived", "outer": outer,
                             "fitness_p": fp, "fitness_e": fe, "cell": key})
             self.log_event({"type": "challenge_fitness_status", "outer": outer,
-                            "enabled": self.challenge_fitness_enabled,
+                            "enabled": fitness_enabled,
                             "active": challenge_active,
                             "activation": activation,
                             "outer_gate": gate,
@@ -4454,29 +4498,37 @@ class GanLoop:
                                 branch_limit: int, depth_limit: int,
                                 method: str, ucb_c: float,
                                 depth_penalty: float, cost_penalty: float,
-                                lcb_delta: float, lcb_z: float) -> None:
+                                lcb_delta: float, lcb_z: float) -> Optional[Node]:
         """Evaluate the selected task candidate and its direct parent together.
 
-        This is a framework-only diagnostic gate for ``imo_proof``. It reuses
-        the fixed-id evaluation runner, but supplies each node's persisted task
-        config and code commit with an empty plan, so no planner is involved and
-        no evaluation round becomes a task-tree node.
+        Reuses the fixed evaluation runner with persisted task snapshots and an
+        empty plan. Authored episodes also return the selected node for hidden
+        validation; neither evaluation round becomes a task-tree node.
         """
-        if not self.challenge_enabled or not self._proof_challenges_enabled() or self.eval_runner is None:
-            return
-        fixed_ids = list(getattr(self.eval_runner, "fixed_question_ids", None) or [])
-        if not fixed_ids or self.eval_runner is self.task_runner:
-            return
+        authored = self._authored_challenges_enabled()
+        if (not self.challenge_enabled or not (authored or self._proof_challenges_enabled())
+                or self.eval_runner is None or self.eval_runner is self.task_runner):
+            return None
+        fixed_ids = list(getattr(self.eval_runner,
+                                 "fixed_episode_ids" if authored else "fixed_question_ids",
+                                 None) or [])
+        if not fixed_ids:
+            return None
+        candidate = None
         try:
             from gan.framework import code_repo
             from gan.framework.supernode import load_supernode, update_supernode
 
             report: Dict[str, Any] = {}
+            exclude = {"initial"}
+            if authored:
+                current = {str(g) for g in outer_genids}
+                exclude.update(str(g) for g in self.task_tree.nodes if str(g) not in current)
             candidates = self.task_tree.select_parents(
                 k=1, branch_limit=branch_limit, depth_limit=depth_limit,
                 method=method, ucb_c=ucb_c, depth_penalty=depth_penalty,
                 cost_penalty=cost_penalty, outer_id=outer,
-                exclude={"initial"},
+                exclude=exclude,
                 lcb_delta=lcb_delta, lcb_z=lcb_z, report=report)
             candidate = candidates[0] if candidates else None
             if candidate is None:
@@ -4494,15 +4546,24 @@ class GanLoop:
 
             task_root = self._task_root()
             main_head = None
-            if task_root:
+            if task_root and not authored:
                 main_head = code_repo.current_commit(task_root)
 
             def run_node(node: Any, label: str) -> Optional[Dict[str, Any]]:
+                genid = f"taskval_outer{outer}_{label}"
+                if authored:
+                    evaluated = self._episode_validation_run(node, outer, genid)
+                    rows = _challenge_episode_rows(self._challenge_report(genid)) if evaluated else {}
+                    selected = [rows[eid]["progression"] for eid in fixed_ids if eid in rows]
+                    if not selected:
+                        return None
+                    return {"mean": statistics.mean(selected),
+                            "coverage": len(selected) / len(fixed_ids),
+                            "genid": str(node.genid)}
                 config = self._parent_config(node)
                 base = ((node.meta or {}).get("task_code_commit")
                         or (node.meta or {}).get("code_commit")
                         or self.eval_base_ref)
-                genid = f"taskval_outer{outer}_{label}"
                 plan = {"records": [], "responses": [], "config": config,
                         "patch": "", "patch_proposed": ""}
                 evaluated = self.eval_runner(
@@ -4523,10 +4584,11 @@ class GanLoop:
                 parent_val = run_node(parent, "parent")
                 noop_deltas: List[float] = []
                 noop_repeats = int(getattr(self, "challenge_noop_repeats", 0) or 0)
-                if candidate_val is not None and noop_repeats:
+                if (candidate_val is not None and noop_repeats
+                        and (not authored or candidate_val["coverage"] == 1.0)):
                     for index in range(1, noop_repeats + 1):
                         repeat = run_node(candidate, f"noop{index}")
-                        if repeat is not None:
+                        if repeat is not None and (not authored or repeat["coverage"] == 1.0):
                             noop_deltas.append(float(repeat["mean"])
                                                 - float(candidate_val["mean"]))
             finally:
@@ -4541,7 +4603,22 @@ class GanLoop:
             benchmark["task_parent_val_mean"] = (parent_val or {}).get("mean")
             benchmark["task_val_delta"] = (
                 candidate_val["mean"] - parent_val["mean"]
-                if candidate_val is not None and parent_val is not None else None)
+                if candidate_val is not None and parent_val is not None
+                and (not authored or candidate_val["coverage"] == parent_val["coverage"] == 1.0)
+                else None)
+            if authored:
+                benchmark["task_val_candidate_coverage"] = (candidate_val or {}).get("coverage")
+                benchmark["task_val_parent_coverage"] = (parent_val or {}).get("coverage")
+                rows = self._consumed_episode_challenges(parent, candidate)
+                gains = {row["challenge_id"]: row["adjudication"]["progression_delta"]
+                         for row in rows if isinstance((row.get("adjudication") or {})
+                                                       .get("progression_delta"), (int, float))}
+                metrics = _challenge_metrics.compute(rows, gains)
+                metrics["mean_progression_gain"] = metrics.pop("mean_anchor_point_gain")
+                sn.setdefault("planner_stats", {})["challenge"] = {
+                    **metrics, "candidate_genid": str(candidate.genid),
+                    "parent_genid": str(parent.genid),
+                }
             benchmark["task_val_n_valid"] = int(candidate_val is not None) + int(parent_val is not None)
             benchmark["task_val_question_n"] = len(fixed_ids)
             benchmark["task_val_candidate_genid"] = str(candidate.genid)
@@ -4568,6 +4645,7 @@ class GanLoop:
             soft_fail(f"task pair val failed (outer {outer}): {e}",
                       event_path=paths.events_path(self.output_dir),
                       event_type="task_pair_val_failed", outer=outer)
+        return candidate if authored else None
 
     def _refresh_roles(self, outer: int) -> None:
         """Rebuild planner/evaluator for a new outer generation (instance refresh).
@@ -5779,11 +5857,6 @@ class GanLoop:
                 # qualified id, so it still joins the parent issue in the digest
                 # and the ledger instead of becoming a silent "unjudged".
                 self._normalize_plan_issue_refs(plan_result, parent_feedback)
-                # The plan session ran -> the reservation is now a consumption
-                # (docs/21 D4: one generation, then closed forever). Recorded even
-                # when the planner answered nothing: "consumed with no stance" is
-                # a fact the stats read, not an absence.
-                self._challenge_consume(parent, genid, plan_result)
                 # Settled plan session -> cost ledger (A5). Success-only: a
                 # planner_failed round has no settled session to record. The
                 # close settles the summary AND clears the stamps in one place.
@@ -5793,6 +5866,14 @@ class GanLoop:
                     "planner", "plan", outer, genid,
                     cm_summary=plan_cm_summary)
 
+                audit_reason = self._audit_authored_challenge_change(plan_challenges, plan_result)
+                if audit_reason:
+                    self.log_event({"type": "challenge_modification_refused",
+                                    "genid": str(genid), "reason": audit_reason})
+                    self._archive_invalid("challenge_modification_hard_gate", parent, parents,
+                                          genid, audit_reason, outer=outer, inner=inner)
+                    self._save_checkpoint("inner", outer, inner)
+                    continue
                 task_challenge_kwargs: Dict[str, Any] = {}
                 if parent_challenges:
                     if not self._accepts_kwarg(self.task_runner, "challenge_ids"):
@@ -5821,16 +5902,18 @@ class GanLoop:
                     continue
 
                 try:
-                    consumed_challenges = self._consume_parent_challenges(parent, child)
+                    consumed_challenges = (self._challenge_consume(parent, child, plan_challenges)
+                                           if plan_challenges else
+                                           self._consume_parent_challenges(parent, child))
                 except Exception as e:
                     self._archive_invalid("challenge_ledger_failed", parent, parents,
                                           genid, str(e), outer=outer, inner=inner)
                     self._save_checkpoint("inner", outer, inner)
                     continue
                 child.meta["consumed_challenge_ids"] = consumed_challenges
-                if parent_challenges:
+                if parent_challenges or plan_challenges:
                     self._record_challenge_response_audit(
-                        child, parent, parent_challenges, plan_result,
+                        child, parent, parent_challenges or plan_challenges, plan_result,
                         # planner may mutate the local parent_cfg object in
                         # place; reload the persisted parent snapshot for a
                         # trustworthy config-diff comparison.
@@ -5880,6 +5963,15 @@ class GanLoop:
                                     "applied": bool(child.meta.get("patch_applied")),
                                     "ref_ok": child.meta.get("code_ref_ok", True),
                                     "ref_mode": child.meta.get("code_ref_mode", "")})
+
+                if plan_challenges and consumed_challenges:
+                    try:
+                        self._challenge_settle(parent, child, outer)
+                    except Exception as e:
+                        self._finalize_invalid_node(
+                            child, "challenge_adjudication_failed", type(e).__name__, outer, inner)
+                        self._save_checkpoint("inner", outer, inner)
+                        continue
 
                 # score / imputation / validity
                 self._finalize_child(child, parent)
@@ -6145,17 +6237,6 @@ class GanLoop:
                 child.meta["packet_path"] = os.path.join(run_dir, "packet.json")
 
                 child.source_access_log = self._source_access_log(outer)
-                # CHALLENGE truth (docs/21 §5): now that the child's own episode
-                # rows exist, the mechanical adjudicator can decide each challenge
-                # this generation was asked to answer.
-                #
-                # It DOES now reach fitness, indirectly and only through ONE
-                # number (docs/21 §16): the settled states feed
-                # ``claim_accuracy``, which ``_record_supernode`` blends into
-                # ``verdict_stability_effective`` under a sample-size anneal. The
-                # verdict itself is still immutable and still never a direct
-                # reward -- there is no "repaired => points" path.
-                self._challenge_settle(parent, child, outer)
                 self.task_tree.add_node(child)
                 self._append_score(child)
                 self._write_eval(child, ctx, packet)
@@ -6274,13 +6355,13 @@ class GanLoop:
             self._update_issue_ledger(outer, outer_genids)
             self._record_supernode(outer, outer_genids)
             self._evaluate_supernode(outer)
-            self._evaluate_task_pair_val(
+            task_val_candidate = self._evaluate_task_pair_val(
                 outer, outer_genids,
                 branch_limit=bl, depth_limit=dl, method=method,
                 ucb_c=ucb_c, depth_penalty=depth_penalty,
                 cost_penalty=cost_penalty, lcb_delta=lcb_delta, lcb_z=lcb_z)
             try:
-                self._challenge_val_round(outer)
+                self._challenge_val_round(outer, task_val_candidate)
             except Exception as e:  # noqa: BLE001 -- retain the authored-val fail-soft boundary
                 self.log_event({"type": "challenge_val_failed", "outer": outer,
                                 "error": f"{type(e).__name__}: {e}"[:400]})
