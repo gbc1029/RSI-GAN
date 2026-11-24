@@ -1,6 +1,6 @@
 # IMO proof 对抗性 Challenge 测试设计
 
-> 状态：设计定稿，尚未实现。
+> 状态：已实现；本文保留设计约定及增量修复记录。2026-11-22 实验复核与本轮变更见 §8。
 >
 > 适用范围：`imo_proof`。本设计保持现有 task / planner / evaluator 三角色、inner / outer
 > 双循环和外部 proof grader，不引入第四个可进化角色。
@@ -663,3 +663,277 @@ child，保留上一有效 parent 并结束该 outer。challenge 本身的 `acti
 - 在 task runner 记录 bounded `task_change` 摘要，并在 challenge adjudication 输入中传递。
 - 对机械 hardcoding 和 adjudicator 语义 gate 分别接入 child invalid-parent 路径。
 - 增加 CRT/通用策略不触发机械 gate、实例记忆不计 repair、transferable strategy 正常 repair 的回归测试。
+
+## 8. 10×4 实验复核：计分口径说明与重叠授权补丁修复（2026-11-22）
+
+实验：`imo-proof-challenge-4.1mini-10x4-30q-20261120-234051`。
+修复重叠源码授权造成的重复文件 diff；计分逻辑保留，其他裁判和 challenge 生命周期问题不在本轮修改范围。
+
+### 8.1 部分评分与数学能力指标：保留原逻辑
+
+**最终决定：不将 429、超时或 grader 失败造成的未评分题按 0 分计入选择分，
+不改成以原定题数为分母的交付得分。** 指标继续描述成功评分题上的数学表现：
+
+```text
+points_percentage = sum(成功评分题的 0..7 分数) / (7 * 成功评分题数)
+coverage = 成功评分题数 / 原定题数
+```
+
+未评分题保持未知；成功评分题上的真实 0 分仍计入上述分母。已有 partial 结果继续按原逻辑使用，
+不新增 coverage 淘汰门槛，不要求每个 outer 成功评分题数相等。固定根 val、task 父子 val 差、
+no-op 波动估计及 fitness 消费逻辑均不修改。
+
+这是面对不可避免的题数波动所保留的实验取舍，不代表不同成功题子集的均分完全等价。
+若失败题并非随机缺失，不同子集的难度构成会影响跨 outer 或父子比较；分析时需同时给出
+`total`、`requested_total`、`coverage` 和 `question_ids_ungraded`，不能仅凭均分上升认定能力提高。
+也不能将未评分题数增加直接解释为数学能力退化。
+
+本轮实例：outer 5 的 task candidate 评出 17/20 题、parent 评出 20/20 题，原始均分差为
+`+0.0571428571`；outer 9 分别为 14/20 与 19/20，均分差为 `+0.0445757250`。
+这些结果保留有效，但正差值不单独构成完整固定题集上的数学能力提升证据。
+换用 gpt-4.1-mini 后运行中仍有 429，因此上述波动同时包含接口失败因素。
+
+
+### 8.2 重叠授权导致重复 diff：已修复
+
+gen 11 同时持有目录授权和目录内的精确文件授权。`runs/11/patch_proposed.diff` 对
+`gan/components/task/skills/{bash,editor}.py` 和
+`gan/components/task/tools/{knowledge,write_file}.py` 各生成两份完全相同的文件 diff；
+`runs/11/patch_receipt.json` 记录补丁因 `patch does not apply` 被拒绝。
+
+根因位于 `gan/patch.py:build_patch_from_workspace`：旧 `seen` 只对授权路径字符串去重，
+不能识别目录展开后的文件与另一条精确授权指向同一文件。重复修改/删除 hunk 被依次应用时，
+后一个 hunk 面对的已不是原始基线，导致拒绝；这不是数学能力或模型随机性问题。
+
+最小修复：保留授权层的 `seen`，新增函数内的 `processed_files`，按展开后的仓库相对文件路径
+去重，新增、修改、整路径删除及目录内删除四条分支共用。同一文件只进行一次差异/合并处理，
+不通过删除授权或对 diff 文本去重来规避问题。目录扫描的 `b_files` 必须先记录文件存在，
+再跳过已处理文件，避免另一条授权已处理的文件被误判为删除。
+
+
+## 9. 修复信用校正与独立裁判模型试验（2026-11-23）
+
+范围仅限固定 adjudicator 的数学核查、信用契约、模型授权及原实验重放；不改 planner、proof grader
+评分公式、fitness 公式或 challenge 消费生命周期。
+
+> 当前实现已升级为 §9.8 的 protocol 3。§9.1–9.7 保留版本演变记录；其中 v2 引文格式及 `--variants v2` 命令仅描述当时实现，当前复测请用 §9.8 的 `--variants v3`。
+
+### 9.1 原问题与 v2 核查协议
+
+实验 `imo-proof-challenge-4.1mini-10x4-30q-20261120-234051` 中，`ch-2-5-0` 的旧裁判理由承认
+父子证明均未满足修复标准，却输出 `child_present=false`；`ch-6-21-0` 则将补回遗漏解视为修好，
+忽略正文继续使用错误 LTE 并排除该解。单独检查六个返回字段的类型不能消除这种误信用。
+
+新版 `baselines/imo_grading/challenge_adjudicator.py` 按顺序执行：完整拆解 repair criterion 的
+数学义务、定位提交证明的实际支持、独立核查数学、尝试反证、检查整份输出中与该缺陷相关的
+未解决矛盾。换术语、引用未证明的另一条定理、添加正确公式或最终答案都不自动构成修复。
+不得从参考解补齐提交证明未给出的关键步骤；接受满足原义务的替代证明，不要求照抄参考解。
+已明确撤回且被完整独立正确证明替代的错误尝试不作为仍存缺陷；无关错误也不否定局部修复。
+
+模型输出 `obligations[]`，每项包含 criterion 原文引用、具体义务及 parent/child 的
+`status=satisfied|violated|uncertain`、原证明引用、简短数学核查依据；另有 parent/child 的
+whole-output consistency 检查。actionability 与修改是否泄露答案仍分开判断，泄露证据只能
+引用 bounded Task Change，不能取自题目、证明或参考解。
+
+`domains/imo/challenge_contract.py` 为 frozen stdlib-only 共享契约。它机械核对字段、枚举、
+引用来源和结论一致性，从检查结果派生 presence，不再接受模型独立填写一个可能与检查矛盾的
+presence 布尔值。某项明确 violated => 缺陷仍在；无 violated 但有 uncertain => 不确定；
+全部 satisfied 且无相关未解决矛盾 => 缺陷消失。成功义务必须有支持引用；缺失论证的 violated
+可无引用，但需说明缺失。引用只做空白规范化后的原文匹配，不声称机械证明数学正确、引文足以
+支持结论或模型没有遗漏义务，这些仍需真实样本验收。
+
+### 9.2 独立复核与格式修复
+
+只有首次检查拟授予 repair credit（parent 缺陷存在、child 消失、actionable、修改可迁移）才追加
+一次独立数学复核。新会话只收到原始全部输入与同一核查协议，不收到首次判定和首次选择的证据。
+两次都支持 repair 才 confirmed；分歧为 `UNDECIDABLE`，复核调用/格式失败为 unavailable，
+均不给修复信用，不把分歧自动算成 VERIFIED_UNRESOLVED。
+
+格式/证据契约失败仍最多补一次格式修复；它沿用该次会话，并明确不算独立数学复核。
+最终 envelope 包含 `protocol_version=2`、两份核查记录、派生 presence、review_status、实际
+model 和包含主 prompt/复核/格式指令的 SHA256。report parser 使用原输入重新检查引文与派生
+结论，模型标识也须匹配 broker 固定模型。旧六字段输出不再被新 report parser 接收；旧归档
+artifact 的适配读取保留，不改写历史账本或历史成绩。
+
+### 9.3 原实验重放与验收
+
+`scripts/replay_imo_challenge.py` 读取原实验 `work/challenge*/repo/input/questions.csv`。
+已离线检查找到 26 批、47 个唯一 challenge；原题、参考解、评分细则、父子证明和当时 Task Change
+原样重放，不重新生成 task。原实验目录只读，输出必须另置。
+
+pilot 使用 `tests/fixtures/imo_challenge_acceptance.json` 中预先声明的 8 个真实案例，覆盖
+错误更名、遗漏论证、结论与正文矛盾及一个真实局部修复正例 `ch-5-16-1`，防止全部判失败假过关。
+这些是定向人工复核标签，不是全部 47 个案例的金标准，标签和理由不得送给 LLM。
+同一输入比较 4.1/原 prompt、Gemini/原 prompt、4.1/v2、Gemini/v2。
+原 prompt 固定存于只含提示词的 fixture；v2 执行实际 `TaskAgent.forward`，替换的仅是交互读入
+凭据的 OpenAI-compatible transport。
+
+### 9.5 验证状态与手动命令
+
+WSL 仓库根目录（Python 使用项目可信环境；如名为 venv_nat，则用其解释器）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 venv_nat/bin/python -B scripts/check_imo_adjudicator.py \
+  --output /path/outside-live-run/adjudicator-offline
+
+PYTHONDONTWRITEBYTECODE=1 venv_nat/bin/python -B scripts/replay_imo_challenge.py \
+  --run /path/to/imo-proof-challenge-4.1mini-10x4-30q-20261120-234051 \
+  --output /path/outside-live-run/adjudicator-pilot --phase pilot
+```
+
+pilot 命令会依次比较两模型、两版本，启动时交互读入 URL 和 key。模型不可用写单独状态文件，
+不偷偷回退。pilot 通过后选择模型做 full（此例仅表示候选，不预断 Gemini 胜出）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 venv_nat/bin/python -B scripts/replay_imo_challenge.py \
+  --run /path/to/imo-proof-challenge-4.1mini-10x4-30q-20261120-234051 \
+  --output /path/outside-live-run/adjudicator-full --phase full \
+  --models openai/gemini-3.5-flash --variants v2
+```
+
+正式生产前需把新版裁判安装进实际运行解释器。可用最小白名单打包，避免原 setup 全树复制
+将本机配置带入包；该命令只暂存可安装包，不安装、不删旧包、不触碰 git：
+
+```bash
+venv_nat/bin/python -B scripts/check_imo_adjudicator.py --build-package \
+  --output /path/outside-live-run/adjudicator-package
+venv_nat/bin/python -m pip install --no-deps --no-build-isolation --force-reinstall \
+  /path/outside-live-run/adjudicator-package/package
+```
+
+本批未执行 add、commit、merge，保留已有暂存和未暂存改动。模型最终选择和数学验收尚待重放结果，
+不能据此宣布 planner 指导问题已解决。
+
+### 9.6 首次 pilot 的错误分类与定向补录修正（2026-11-23）
+
+adjudicator-review-20261123/pilot` 保存的原始响应中，
+离线重检全部 27 次 v2 调用（含格式/证据补录）：没有真正的 JSON 语法错误。
+4.1 的 16 次响应全部因引文不属于指定原文而被拒；Gemini 有 5 次合法 assessment、2 次引文不匹配、
+1 次 scope_reason 为空、3 次 HTTP 503 无响应。该计数是调用级协议结果，不是数学验收通过数。
+
+原因：
+
+1. 模型把 claim 句子放进 criterion_quote，或把证明改写、拼接、增加省略号后作为原文引文。
+   如 `m0_v2/ch-1-0-0` 的 criterion_quote 来自 claim/证明而不是 Repair Criterion，child 引文
+   还缩写了正文。该拒绝符合原文溯源契约，不能通过模糊匹配或忽略引用校验来发放信用。
+2. `_assessment` 捕获校验失败时仅记录通用 `format_or_evidence`，补录不告知失败字段；两次
+   失败后返回空字符串。重放端随后执行 `json.loads("")`，把已知的证据契约拒绝误报为
+   `JSONDecodeError`。这属于本次新增代码的诊断缺陷，并非 4.1 返回内容全是坏 JSON。
+
+修正：原校验规则不放宽，错误记录仅含安全 code、field、phase、attempt，不含私有引用或异常正文；
+补录收到实际失败字段，要求重检全部引文，用短小连续原文，不改符号、不翻译、不拼接，不跨
+parent/child/claim/criterion 字段取证。仅做格式/证据补录，不把它当独立数学复核，也不为通过
+校验改写数学结论。prompt hash 随主/补录指令更新。
+
+重放端对裁判空返回记录 `assessment_invalid`（或无判定记录 `judge_no_verdict`），不再解码空串；
+逐例 JSON 保留 `judge_diagnostics`，comparison.csv 与 REPORT.md 显示 validation_code/field。
+空 scope_reason 单独标为 `empty_scope_reason`，避免误报为 modification_scope 枚举错误。
+HTTP 503 与协议错误、数学上的 UNDECIDABLE 继续分开；不增加自动 provider 重试或改变评分逻辑。
+
+新增 `--phase audit --source-output <旧输出>`，可无 API、只读重检保存的响应，另存
+`diagnostics.csv`、`diagnostics.json`、`REPORT.md`；不改旧结果和原实验。首次 pilot 已通过此方式
+核验，生成诊断产物。旧 v2 结果因协议失败仍不能计入模型数学表现比较。
+
+
+### 9.7 GLM-5.3-flash 替代候选与调用预算（2026-11-23）
+
+第二轮 `pilot-v2-r2` 中 Gemini 有 4 个 HTTP 503、1 个 HTTP 429，仅 3 个案例成功返回且均为
+VERIFIED_UNRESOLVED；局部修复正例仍缺测，不足以判定 pilot PASS。4.1 有 4 例最终引用校验
+失败、3 例最终 invalid_json、1 例复核不可用；不能将协议失败解释为数学能力结果。
+
+前两次结果支持判定gemini-5.3-flash接口不稳定（大量503中只有少数200，还会出现429）
+
+
+新候选的定向复测命令（沿用 RUN/OUT，另开目录）：
+
+```bash
+python -B scripts/replay_imo_challenge.py --run "$RUN" \
+  --output "$OUT/pilot-glm-v2" --phase pilot --variants v2 \
+  --models openai/glm-5.3-flash --glm-reasoning-effort high \
+  --glm-max-tokens 32768 --timeout 600
+```
+
+
+### 9.8 4.1 协议失败根因与来源编号协议 v3（2026-11-23）
+
+**根因与边界。** 对第二轮 `pilot-v2-r2/m0_v2` 保存的 18 次原始响应重检：6 次真实
+JSON 语法错误、11 次合法 JSON 的引用溯源失败、1 次完整合法 assessment。8 个案例最终为
+7 次首评契约失败、1 次独立复核不可用。全部调用 status=ok、finish_reason=stop，输出仅
+733–1320 tokens，未触及 12000 上限；本轮不是限流或截断导致。`ch-1-0-0`、`ch-6-21-0`、
+`ch-6-23-0` 把字符串边界写成反斜杠转义的双引号；`ch-2-5-0` 拼接不同原文段落，
+`ch-6-21-1` 添加原文没有的单引号。主/补录 prompt 的 JSON 示例本身合法，transport 未额外
+改写反斜杠。此前 §9.6 修正了解码空返回的误报和字段定位，没有消除这些模型输出错误。
+
+移除“数学判断时还要逐字抄录并转义证明”的协议负担，保持修复义务、
+actionability、泄露判断、独立复核、原 proof grader、fitness 和 partial outer 计分口径不变。
+默认生产裁判仍为 4.1-mini；不在本批解决 planner 指导问题，也不据离线通过宣称数学验收成功。
+
+**模型输出与存储接口。** `challenge_contract.PROTOCOL_VERSION` 与裁判部署字面标记均为 3。
+框架按原始行顺序编号，保留内容、空行和行尾；四种来源分别为 R=Repair Criterion、P=Parent
+Proof、C=Child Proof、T=Task Change。模型只返回 `criterion_refs`、检查对象的 `refs`、
+`scope_refs`，元素如 `P0042` 或闭区间 `P0042-P0044`；不返回引文字符串。
+跨来源、越界、倒序、格式错误、全空白证据均拒绝。成功义务仍必须有证据；缺失论证的 violated
+可以无 refs，并在 verification 说明缺失。原义务拆解和全篇一致性检查继续存在。
+
+`parse_assessment` 是 wire→canonical 的唯一转换入口：检查编号，按原文还原
+`criterion_quotes`、检查对象 `quotes`、`scope_quotes`。模型不得自行提供这些引文字段；
+canonical artifact 同时保存 refs 与程序生成的引文。报告解析器使用未编号的原始 questions.csv
+重新解析来源，逐项检查引文与编号解析结果完全相等，再复验派生 presence、review_status 和
+固定模型；不能只凭编号存在或格式合法认定数学修好。缺失/矛盾的证据继续不给信用。
+
+**JSON 约束与重试。** 生产裁判及 v3 replay 共用能力探测函数和同一完整 assessment schema。
+每个生产 TaskAgent 实例首次 forward 探测一次，之后沿用；replay 在每个模型开始 v3 前探测一次，
+再把结果传给实际生产 forward。探测只用合成数据，不带原题、参考解或人工标签：先请求严格
+json_schema，以要求额外字段的冲突请求检查实际行为；格式被拒或未执行时，再探测 json_object。
+两者均未验证则不运行 v3 数学判断。HTTP 400/422/501 才允许尝试下一格式，401/403/429/503、
+超时等调用错误不作为不支持格式处理。选择与探测状态明确记录，不退回无约束文本。
+一次探测是能力证据，不保证网关以后每次永远遵守约束，所有实际响应仍须通过本地完整校验。
+
+通用客户端仅新增默认 None 的可选 response_format 参数，既有位置参数顺序保留；仅固定裁判
+传入。经 chat_with_agent → get_response_from_llm → LiteLLM extra_body 发送，避免
+全局 drop_params 静默剔除；与 reasoning_effort 合并，不覆盖它。现有父代理原样透传请求体，
+模型/token/UID/目录授权规则不变。回放 HTTP transport 接收同一参数并记录所选格式；GLM 的
+high effort、32768 tokens 和非 GLM 的原预算均保留。
+
+首评、一次格式补录、fresh-history 独立复核使用同一格式。JSON 错误提供安全的行/列/位置和
+预定义错误类别；编号错误提供字段路径、正确来源前缀与行数，不附带原文、异常正文或 API 信息。
+补录仍仅一次，仍不是数学复核。两次拟修复结论均通过才给信用；复核不可用或分歧仍无信用。
+
+**版本与评分链兼容。** broker 的任务说明、响应契约及 driver/broker 共三处安装预检都使用共享版本常量，
+拒绝旧部署标记；最终结算 provenance 为 `imo_proof_fixed_v3`。最终 envelope 新增实际
+`response_format=json_schema|json_object`。新报告入口不接收 v1/v2 输出，也不把旧引用自动转为
+新编号；旧 v2 原始回放仅由 `scripts/imo_challenge_v2_audit.py` 的冻结只读解析器审计，且不打包
+到生产。既有 v1 归档 artifact 的历史适配读取保留，不改写历史 ledger/成绩。v3 replay arm
+明确命名为 mN_v3，CLI 当前变体为 v1/v3，防止旧结果与新 prompt 混在同一个 arm。
+
+最小安装包仍只纳入共享 stdlib contract 和必要运行时代码，不纳入原实验、数据集、配置或密钥。
+引文/参考解只留私有裁判 artifact；public settlement 和角色投影不扩展私有证据。
+```
+```
+### 9.9 WSL 代理集成测试接口补齐（2026-11-23）
+
+运行 §9.8 检查后，`adjudicator-v3-20261123-194803/offline/test_llm_proxy.py.log`
+的三个错误均发生在 setUp,已修
+
+
+### 9.10 GLM 独立裁判部署选择、标签勘误与原实验全量复核（2026-11-23）
+
+`models.yaml:domains.imo_challenge_adjudication` 改为
+`{model: openai/glm-5.3-flash, reasoning_effort: high}`。task 与 proof grader 保持 gan.task，
+不改数学 prompt、v3 契约、独立复核、32768 生产输出预算或评分/fitness。
+
+
+
+**已核验8例的真实统计基线。** 原正式实验4.1账本不是后来的4.1/v1或4.1/v3重放：
+
+| 来源 | 有明确判定/已核验 | 错判 | 数学误判率 | 错发修复信用/授予修复数 |
+|---|---:|---:|---:|---:|
+| 原正式实验4.1账本 | 8/8 | 5 | 62.50% | 5/7（71.43%） |
+| 后续4.1/v3 pilot | 4/8 | 3 | 75.00% | 3/4（75.00%） |
+| GLM/high/v3 pilot | 8/8 | 0 | 0.00% | 0/2（0.00%） |
+
+数学误判率分母是已人工核验且裁判作出明确判断的案例。4.1/v3 另有3例 UNDECIDABLE 和1例契约拒绝
+
+在原47题上重新判定后认定adjudicator目前基本可信
+```
+
